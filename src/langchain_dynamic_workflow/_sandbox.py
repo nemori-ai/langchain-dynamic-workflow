@@ -23,6 +23,7 @@ from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
+from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.protocol import (
     BackendProtocol,
     EditResult,
@@ -38,6 +39,74 @@ from deepagents.backends.state import StateBackend
 
 SANDBOX_ID_PREFIX = "leaf"
 """Prefix applied to every derived sandbox identity for readability in logs."""
+
+SHARED_ROUTE_PREFIX = "/shared/"
+"""Route prefix that hands a leaf's files off to the shared artifact store."""
+
+
+def normalize_path(path: str) -> str:
+    """Canonicalize an absolute path, rejecting any ``..`` escape above root.
+
+    Collapses ``.`` and empty segments and resolves ``..`` segments. A ``..``
+    that would climb above the root is a hard error rather than a silent clamp:
+    that is the guard that stops a path like ``/shared/../secret`` from escaping
+    its route and reaching another backend's namespace.
+
+    Args:
+        path: An absolute path (it is treated as rooted at ``/`` regardless of a
+            leading slash).
+
+    Returns:
+        The canonical absolute path, e.g. ``/shared/a/b``; the bare root is
+        returned as ``/``.
+
+    Raises:
+        ValueError: If a ``..`` segment would escape above the root.
+    """
+    parts: list[str] = []
+    for segment in path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if not parts:
+                raise ValueError(f"path {path!r} escapes root via '..' traversal")
+            parts.pop()
+            continue
+        parts.append(segment)
+    return "/" + "/".join(parts)
+
+
+def normalize_within_route(path: str, *, route_prefix: str) -> str:
+    """Canonicalize ``path`` and reject a ``..`` escape out of ``route_prefix``.
+
+    Generalizes :func:`normalize_path`: in addition to forbidding an escape above
+    root, a path that lexically targets ``route_prefix`` (e.g. ``/shared/...``)
+    must still resolve under that prefix. This blocks ``/shared/../secret`` from
+    climbing out of the shared route into another backend's namespace before the
+    composite ever routes it — the independent traversal guard the #2884
+    route-isolation leak requires.
+
+    Args:
+        path: The requested absolute path.
+        route_prefix: The route the path is checked against (e.g. ``/shared/``).
+
+    Returns:
+        The canonical absolute path.
+
+    Raises:
+        ValueError: If a ``..`` segment escapes above root, or if a path that
+            targets ``route_prefix`` resolves outside it.
+    """
+    canonical = normalize_path(path)
+    bare_prefix = "/" + route_prefix.strip("/")
+    targets_route = path.lstrip("/").startswith(route_prefix.strip("/") + "/") or path.rstrip(
+        "/"
+    ).endswith(route_prefix.rstrip("/"))
+    if targets_route and canonical != bare_prefix and not canonical.startswith(bare_prefix + "/"):
+        raise ValueError(
+            f"path {path!r} escapes root via '..' traversal out of route {route_prefix!r}"
+        )
+    return canonical
 
 
 def leaf_id_from_key(journal_key: str) -> str:
@@ -423,3 +492,193 @@ class SandboxManager:
         async with self._slot_freed:
             if self._slots.pop(leaf_id, None) is not None:
                 self._slot_freed.notify()
+
+
+class SharedArtifactStore:
+    """A process-shared store for explicit ``/shared/`` artifact hand-off.
+
+    Writes are *namespaced by producer* so two leaves writing the same logical
+    path never clobber each other, while reads merge across namespaces so a
+    consumer can pick up a producer's artifact by its logical path. That split is
+    what makes the hand-off both collision-free on write and discoverable on read.
+
+    The store is the single shared object handed to every per-leaf composite
+    backend; the per-leaf isolation lives in each leaf's *own* backend, never
+    here — so a leaf's non-shared files can never reach this store.
+    """
+
+    def __init__(self) -> None:
+        # Keyed by (producer namespace, canonical path) so producers are isolated
+        # on write; reads scan namespaces in sorted order for a deterministic
+        # resolution when two producers wrote the same path.
+        self._artifacts: dict[tuple[str, str], str] = {}
+
+    def write_namespaced(self, producer: str, path: str, content: str) -> None:
+        """Store ``content`` under ``producer``'s namespace at ``path``."""
+        self._artifacts[(producer, normalize_path(path))] = content
+
+    def read_namespaced(self, producer: str, path: str) -> str | None:
+        """Read ``producer``'s artifact at ``path``, or ``None`` on miss."""
+        return self._artifacts.get((producer, normalize_path(path)))
+
+    def read_merged(self, path: str) -> str | None:
+        """Read ``path`` across all producer namespaces (deterministic order).
+
+        Args:
+            path: The logical shared path.
+
+        Returns:
+            The artifact content from the first matching namespace in sorted
+            producer order, or ``None`` if no producer wrote that path.
+        """
+        canonical = normalize_path(path)
+        for (_producer, stored_path), content in sorted(self._artifacts.items()):
+            if stored_path == canonical:
+                return content
+        return None
+
+    def stored_paths_under(self, prefix_path: str) -> list[str]:
+        """Return the distinct shared paths under ``prefix_path`` (merged view).
+
+        Args:
+            prefix_path: The directory path whose contents to list.
+
+        Returns:
+            Sorted distinct canonical paths at or under ``prefix_path``.
+        """
+        canonical = normalize_path(prefix_path)
+        prefix = canonical if canonical.endswith("/") else f"{canonical}/"
+        seen = {
+            stored_path
+            for (_producer, stored_path) in self._artifacts
+            if stored_path == canonical or stored_path.startswith(prefix)
+        }
+        return sorted(seen)
+
+
+class _NamespacedSharedView(BackendProtocol):
+    """A per-producer view over a :class:`SharedArtifactStore` (the ``/shared/`` route).
+
+    Writes land in the owning producer's namespace; reads merge across all
+    namespaces so a consumer leaf can pick up another leaf's artifact. This view
+    is the backend the composite routes ``/shared/`` paths to; the composite has
+    already stripped the ``/shared/`` prefix, so paths arrive rooted at ``/``.
+
+    Args:
+        store: The shared artifact store backing every producer's view.
+        producer: The owning leaf's producer namespace for writes.
+    """
+
+    def __init__(self, *, store: SharedArtifactStore, producer: str) -> None:
+        self._store = store
+        self._producer = producer
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        """Write ``content`` to the producer's shared namespace at ``file_path``."""
+        self._store.write_namespaced(self._producer, file_path, content)
+        return WriteResult(path=file_path)
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        """Read ``file_path`` merged across shared namespaces."""
+        content = self._store.read_merged(file_path)
+        if content is None:
+            return ReadResult(error=f"File '{file_path}' not found in shared store")
+        return ReadResult(file_data=FileData(content=content, encoding="utf-8"))
+
+    def ls(self, path: str) -> LsResult:
+        """List shared artifacts under ``path`` (merged across namespaces)."""
+        entries: list[FileInfo] = [
+            FileInfo(path=stored_path, is_dir=False, size=0, modified_at="")
+            for stored_path in self._store.stored_paths_under(path)
+        ]
+        return LsResult(entries=entries)
+
+
+class _GuardedBackend(BackendProtocol):
+    """Normalizes every path and blocks ``..`` traversal before delegating.
+
+    The wrapper runs *before* the composite routes a path, so a traversal that
+    tries to escape the ``/shared/`` route (e.g. ``/shared/../secret``) is
+    canonicalized and rejected at the boundary rather than slipping into another
+    backend's namespace — the independent guard the #2884 route-isolation leak
+    demands. A normalization error is returned as an operation error (rather than
+    raised) so a leaf's file tool surfaces it as a recoverable failure.
+
+    Args:
+        inner: The composite backend to delegate normalized paths to.
+        route_prefix: The shared route a ``..`` escape must not climb out of.
+    """
+
+    def __init__(self, *, inner: BackendProtocol, route_prefix: str) -> None:
+        self._inner = inner
+        self._route_prefix = route_prefix
+
+    def _safe(self, path: str) -> str:
+        """Canonicalize ``path``, blocking escapes out of the shared route."""
+        return normalize_within_route(path, route_prefix=self._route_prefix)
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        """Normalize ``file_path`` then delegate; block traversal escapes."""
+        try:
+            safe = self._safe(file_path)
+        except ValueError as exc:
+            return WriteResult(error=str(exc))
+        return self._inner.write(safe, content)
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        """Normalize ``file_path`` then delegate; block traversal escapes."""
+        try:
+            safe = self._safe(file_path)
+        except ValueError as exc:
+            return ReadResult(error=str(exc))
+        return self._inner.read(safe, offset=offset, limit=limit)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        """Normalize ``file_path`` then delegate; block traversal escapes."""
+        try:
+            safe = self._safe(file_path)
+        except ValueError as exc:
+            return EditResult(error=str(exc))
+        return self._inner.edit(safe, old_string, new_string, replace_all=replace_all)
+
+    def ls(self, path: str) -> LsResult:
+        """Normalize ``path`` then delegate; block traversal escapes."""
+        try:
+            safe = self._safe(path)
+        except ValueError as exc:
+            return LsResult(error=str(exc))
+        return self._inner.ls(safe)
+
+
+def build_leaf_backend(
+    *,
+    isolated: BackendProtocol,
+    shared_store: SharedArtifactStore,
+    producer: str,
+) -> BackendProtocol:
+    """Wrap a per-leaf isolated backend with a guarded ``/shared/`` hand-off route.
+
+    The returned backend routes ``/shared/`` paths to a producer-namespaced view
+    of ``shared_store`` (explicit artifact hand-off) and every other path to the
+    leaf's own ``isolated`` backend (private per-leaf workspace). All paths pass
+    through a traversal guard first, so a ``..`` escape from the shared route into
+    another namespace is blocked at the boundary — the per-leaf isolation never
+    relies on the composite's prefix routing alone.
+
+    Args:
+        isolated: The leaf's private backend for non-shared paths.
+        shared_store: The process-shared artifact store backing ``/shared/``.
+        producer: The leaf's producer namespace for shared writes.
+
+    Returns:
+        A guarded composite backend ready to hand to the leaf.
+    """
+    shared_view = _NamespacedSharedView(store=shared_store, producer=producer)
+    composite = CompositeBackend(default=isolated, routes={SHARED_ROUTE_PREFIX: shared_view})
+    return _GuardedBackend(inner=composite, route_prefix=SHARED_ROUTE_PREFIX)
