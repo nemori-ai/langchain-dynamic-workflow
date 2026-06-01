@@ -70,6 +70,16 @@ def make_deep_leaf() -> Callable[[str], tuple[Runnable[Any, Any], CountingFakeMo
     return factory
 
 
+@pytest.fixture
+def make_counting_model() -> Callable[[str], CountingFakeModel]:
+    """Return a factory building a bare counting fake model (for host agents)."""
+
+    def factory(reply: str = "ok") -> CountingFakeModel:
+        return CountingFakeModel(reply=reply)
+
+    return factory
+
+
 class UsageFakeModel(BaseChatModel):
     """A fake chat model that emits ``usage_metadata`` and a model name.
 
