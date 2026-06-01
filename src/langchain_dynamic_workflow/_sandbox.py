@@ -594,7 +594,7 @@ class _NamespacedSharedView(BackendProtocol):
         return LsResult(entries=entries)
 
 
-class _GuardedBackend(BackendProtocol):
+class _GuardedBackend(SandboxBackendProtocol):
     """Normalizes every path and blocks ``..`` traversal before delegating.
 
     The wrapper runs *before* the composite routes a path, so a traversal that
@@ -606,12 +606,30 @@ class _GuardedBackend(BackendProtocol):
 
     Args:
         inner: The composite backend to delegate normalized paths to.
+        isolated: The leaf's isolated sandbox; ``id`` and ``execute`` delegate to
+            it so the guarded backend stays a usable execution sandbox.
         route_prefix: The shared route a ``..`` escape must not climb out of.
     """
 
-    def __init__(self, *, inner: BackendProtocol, route_prefix: str) -> None:
+    def __init__(
+        self,
+        *,
+        inner: BackendProtocol,
+        isolated: SandboxBackendProtocol,
+        route_prefix: str,
+    ) -> None:
         self._inner = inner
+        self._isolated = isolated
         self._route_prefix = route_prefix
+
+    @property
+    def id(self) -> str:
+        """The owning leaf's sandbox identity (delegated to the isolated backend)."""
+        return self._isolated.id
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        """Run a shell command in the isolated sandbox (execution is not routable)."""
+        return self._isolated.execute(command, timeout=timeout)
 
     def _safe(self, path: str) -> str:
         """Canonicalize ``path``, blocking escapes out of the shared route."""
@@ -658,27 +676,29 @@ class _GuardedBackend(BackendProtocol):
 
 def build_leaf_backend(
     *,
-    isolated: BackendProtocol,
+    isolated: SandboxBackendProtocol,
     shared_store: SharedArtifactStore,
     producer: str,
-) -> BackendProtocol:
-    """Wrap a per-leaf isolated backend with a guarded ``/shared/`` hand-off route.
+) -> SandboxBackendProtocol:
+    """Wrap a per-leaf isolated sandbox with a guarded ``/shared/`` hand-off route.
 
     The returned backend routes ``/shared/`` paths to a producer-namespaced view
     of ``shared_store`` (explicit artifact hand-off) and every other path to the
-    leaf's own ``isolated`` backend (private per-leaf workspace). All paths pass
+    leaf's own ``isolated`` sandbox (private per-leaf workspace). All paths pass
     through a traversal guard first, so a ``..`` escape from the shared route into
     another namespace is blocked at the boundary — the per-leaf isolation never
-    relies on the composite's prefix routing alone.
+    relies on the composite's prefix routing alone. ``id`` and ``execute`` delegate
+    to the isolated sandbox, so the wrapped backend remains a usable execution
+    sandbox.
 
     Args:
-        isolated: The leaf's private backend for non-shared paths.
+        isolated: The leaf's private execution sandbox for non-shared paths.
         shared_store: The process-shared artifact store backing ``/shared/``.
         producer: The leaf's producer namespace for shared writes.
 
     Returns:
-        A guarded composite backend ready to hand to the leaf.
+        A guarded composite sandbox ready to hand to the leaf.
     """
     shared_view = _NamespacedSharedView(store=shared_store, producer=producer)
     composite = CompositeBackend(default=isolated, routes={SHARED_ROUTE_PREFIX: shared_view})
-    return _GuardedBackend(inner=composite, route_prefix=SHARED_ROUTE_PREFIX)
+    return _GuardedBackend(inner=composite, isolated=isolated, route_prefix=SHARED_ROUTE_PREFIX)

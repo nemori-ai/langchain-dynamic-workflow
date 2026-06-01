@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from deepagents.backends.protocol import SandboxBackendProtocol
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -30,7 +31,7 @@ from ._determinism import CallSequenceGuard
 from ._journal import InMemoryJournalStore, JournalStore
 from ._progress import ProgressEntry, ProgressLog, ProgressSink
 from ._roster import Roster
-from ._sandbox import SandboxManager
+from ._sandbox import SandboxManager, SharedArtifactStore, build_leaf_backend
 
 
 def _default_progress_sink(entry: ProgressEntry) -> None:
@@ -94,6 +95,11 @@ async def run_workflow(
     saver: BaseCheckpointSaver[Any] = checkpointer if checkpointer is not None else InMemorySaver()
     limit = resolve_max_concurrency(max_concurrency)
     gate = ConcurrencyGate(limit=limit)
+    # One shared artifact store per run: every execution leaf's backend routes its
+    # /shared/ paths here (producer-namespaced), so a producer leaf can hand an
+    # artifact off to a consumer leaf while each leaf's non-shared files stay
+    # private to its own isolated sandbox.
+    shared_store = SharedArtifactStore()
 
     @task
     async def leaf_task(
@@ -140,7 +146,17 @@ async def run_workflow(
         async with sandbox_manager.lease(
             leaf_id=leaf_id, needs_execution=needs_execution
         ) as backend:
-            configurable["sandbox_backend"] = backend
+            if needs_execution and isinstance(backend, SandboxBackendProtocol):
+                # Give the execution leaf the /shared/ hand-off route on top of its
+                # isolated sandbox: non-shared paths stay private, /shared/ paths go
+                # to the run-shared store under this leaf's producer namespace.
+                configurable["sandbox_backend"] = build_leaf_backend(
+                    isolated=backend, shared_store=shared_store, producer=leaf_id
+                )
+            else:
+                # Reasoning leaf: hand its StateBackend through unwrapped (it
+                # allocates no sandbox and does no /shared/ hand-off).
+                configurable["sandbox_backend"] = backend
             return await _invoke()
 
     async def leaf_runner(

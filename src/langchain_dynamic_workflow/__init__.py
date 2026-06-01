@@ -16,6 +16,7 @@ from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal
 from ._progress import ProgressEntry, ProgressKind, ProgressSink
 from ._result import fold_result
 from ._roster import Roster, RosterEntry
+from ._sandbox import SandboxManager
 
 __version__ = version("langchain-dynamic-workflow")
 
@@ -31,6 +32,7 @@ __all__ = [
     "ProgressSink",
     "Roster",
     "RosterEntry",
+    "SandboxManager",
     "WorkflowBudgetExceededError",
     "WorkflowDeterminismError",
     "__version__",
