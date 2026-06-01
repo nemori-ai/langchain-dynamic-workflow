@@ -16,13 +16,14 @@ resolves named workflows through a
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.types import Command
+from pydantic import BaseModel, Field
 
 from ._background import BgRunManager, BgStatus
 from ._engine import run_workflow
@@ -38,6 +39,31 @@ _Command = Command[Any]
 
 WORKFLOW_RUNS_STATE_KEY = "workflow_runs"
 """State-channel key tracking launched background runs (survives compaction)."""
+
+
+class WorkflowToolSchema(BaseModel):
+    """Arguments accepted by the multi-command workflow tool.
+
+    ``runtime`` is injected by the tool node and is deliberately absent here so it
+    is never advertised to the model; the model supplies only these fields.
+    """
+
+    command: Literal["run", "status", "resume", "cancel"] = Field(
+        description="Which workflow operation to perform."
+    )
+    workflow: str | None = Field(
+        default=None,
+        description="The registered workflow name to launch (required for 'run').",
+    )
+    run_id: str | None = Field(
+        default=None,
+        description="The target run id (required for 'status' / 'resume' / 'cancel').",
+    )
+    args: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional arguments passed to the launched workflow (for 'run').",
+    )
+
 
 _WORKFLOW_TOOL_DESCRIPTION = """\
 Run a dynamic orchestration workflow in the background and poll it.
@@ -222,12 +248,17 @@ def create_workflow_tool(
 
     async def workflow_tool(
         command: str,
-        runtime: _ToolRuntime,
         workflow: str | None = None,
         run_id: str | None = None,
         args: dict[str, Any] | None = None,
+        *,
+        runtime: _ToolRuntime,
     ) -> str | _Command:
-        """Dispatch a workflow command (``run`` / ``status`` / ``resume`` / ``cancel``)."""
+        """Dispatch a workflow command (``run`` / ``status`` / ``resume`` / ``cancel``).
+
+        ``runtime`` is keyword-only and injected by the tool node; it is never
+        part of the model-facing schema.
+        """
         if command == "run":
             return _run_command(runtime, workflow=workflow, args=args)
         if command == "status":
@@ -238,11 +269,22 @@ def create_workflow_tool(
             return await _cancel_command(runtime, run_id=run_id)
         return f"unknown command {command!r}; expected one of: run, status, resume, cancel."
 
+    # Under ``from __future__ import annotations`` the ``runtime`` annotation is a
+    # string at runtime, so the tool's injected-arg detection (which reads the raw
+    # ``__annotations__`` via ``inspect.signature``) would not recognize it and the
+    # injected ToolRuntime would be stripped before reaching the coroutine. Pin the
+    # resolved type on the runtime parameter so it is detected as an injected arg.
+    workflow_tool.__annotations__["runtime"] = ToolRuntime
+
+    # An explicit args_schema (infer_schema=False) keeps the injected ToolRuntime
+    # parameter out of the model-facing schema; schema inference cannot handle it.
     # from_function is typed loosely upstream; the constructed value is a
     # StructuredTool, so narrow it back for our strict surface.
     tool: StructuredTool = StructuredTool.from_function(  # pyright: ignore[reportUnknownMemberType]
         coroutine=workflow_tool,
         name="workflow",
         description=_WORKFLOW_TOOL_DESCRIPTION,
+        infer_schema=False,
+        args_schema=WorkflowToolSchema,
     )
     return tool

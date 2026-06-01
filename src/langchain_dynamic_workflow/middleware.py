@@ -127,11 +127,11 @@ class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
         """The shared background run manager backing this middleware."""
         return self._manager
 
-    async def abefore_model(
+    async def abefore_model(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         state: WorkflowState,
         runtime: Runtime[Any],
-        config: RunnableConfig | None = None,
+        config: RunnableConfig,
     ) -> dict[str, Any] | None:
         """Inject a ``<workflow_notification>`` for any completed runs on this thread.
 
@@ -140,6 +140,13 @@ class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
         appending a single in-band notification message. Draining is one-shot, so
         each completion is injected exactly once. Returns ``None`` when nothing is
         pending, leaving the host turn untouched.
+
+        The ``config`` parameter is annotated as a bare ``RunnableConfig`` (not
+        ``RunnableConfig | None``) on purpose: under ``from __future__ import
+        annotations`` the runtime annotation is a string, and the graph node runner
+        only injects ``config`` when that string matches its accepted set — the
+        ``| None`` spelling is not in that set, so it would silently leave config
+        unbound and the host thread id would fall back to the wrong queue.
         """
         thread_id = _host_thread_id(config)
         notices = self._manager.drain_notifications(thread_id)
