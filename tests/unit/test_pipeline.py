@@ -92,19 +92,28 @@ async def test_pipeline_does_not_deadlock_when_all_items_fail() -> None:
 
 
 async def test_pipeline_respects_concurrency_gate_across_stages() -> None:
-    # The global gate is shared across all stages; total in-flight stage work
-    # must never exceed the limit.
+    # The global gate is shared across all stages and bounds in-flight LEAF work.
+    # Real stages call agent(), which wraps the leaf in gate.run; here the stages
+    # acquire the same gate directly to model that single chokepoint. Total leaf
+    # work in flight across BOTH stages must never exceed the limit, even though
+    # each stage runs its own worker group.
     gate = ConcurrencyGate(limit=2)
     in_flight = 0
     peak = 0
 
     async def busy(prev: int, item: int, index: int) -> int:
         nonlocal in_flight, peak
-        in_flight += 1
-        peak = max(peak, in_flight)
-        await asyncio.sleep(0.01)
-        in_flight -= 1
-        return prev
+
+        async def _leaf() -> int:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return prev
+
+        # Mirror agent(): the leaf invocation is what acquires the shared gate.
+        return await gate.run(_leaf)
 
     results = await run_pipeline(
         list(range(8)),
@@ -113,6 +122,7 @@ async def test_pipeline_respects_concurrency_gate_across_stages() -> None:
     )
     assert results == list(range(8))
     assert peak <= 2
+    assert peak == 2  # the cap saturates across both stages, not just one
 
 
 async def test_pipeline_tiny_queue_backpressure_does_not_deadlock() -> None:

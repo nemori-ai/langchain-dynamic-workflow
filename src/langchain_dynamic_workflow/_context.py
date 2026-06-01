@@ -104,9 +104,13 @@ class Ctx:
         never raises, mirroring Claude Code's ``parallel`` semantics — filter the
         ``None`` holes downstream.
 
-        Concurrency is bounded by the shared gate: even with many thunks, only up
-        to the gate's limit run at once. The barrier means this returns only once
-        every thunk has settled.
+        Concurrency is bounded by the shared gate, which is acquired by the leaf
+        ``agent()`` calls inside the thunks — not by this fan-out layer itself.
+        Gating only at the leaf is what keeps the cap correct under nesting: an
+        orchestration frame (e.g. a thunk that itself calls ``parallel``) does not
+        hold a slot while it awaits its children, so a ``parallel`` inside a
+        ``parallel`` cannot starve the pool into deadlock nor leak slots past the
+        cap. The barrier means this returns only once every thunk has settled.
 
         Args:
             thunks: The zero-argument awaitable factories to fan out.
@@ -118,7 +122,7 @@ class Ctx:
 
         async def _guarded(thunk: Callable[[], Awaitable[T]]) -> T | None:
             try:
-                return await self._gate.run(thunk)
+                return await thunk()
             except Exception:
                 # Failure isolation: one bad thunk must not abort the barrier.
                 return None

@@ -36,7 +36,7 @@ class Ctx:
 - [ ] `pipeline` 无 barrier（断言 A 已 stage3 时 B 仍 stage1，用 instrumented 时序）；stage 抛错 → 该 item `None` 跳后续；结果按输入下标保序。
 - [ ] 并发上限：instrumented fake 断言最大在飞 ≤ 配置上限。
 - [ ] 半途中断后 resume（同 journal）：已完成叶子 0 模型调用、未完成 live。
-- [ ] `pipeline` 中途异常/预算耗尽不死锁、队列优雅排空。
+- [ ] `pipeline` 中途异常不死锁、队列优雅排空（**预算耗尽不死锁交给 Phase 3**：本阶段无 budget 代码，见「交给 Phase 3+ 的点」）。
 - [ ] ruff/pyright/pytest 全绿。
 
 ## 指标

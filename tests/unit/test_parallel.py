@@ -3,11 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
+
+from langchain_core.runnables import Runnable, RunnableLambda
 
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
 from langchain_dynamic_workflow._context import Ctx
 from langchain_dynamic_workflow._journal import InMemoryJournalStore
 from langchain_dynamic_workflow._roster import Roster
+
+
+def _noop_runnable() -> Runnable[Any, Any]:
+    """A roster placeholder; the cap test drives a custom leaf_runner instead."""
+
+    async def _call(inp: dict[str, Any]) -> dict[str, Any]:
+        return {"messages": []}
+
+    return RunnableLambda(_call)
 
 
 def _ctx() -> Ctx:
@@ -64,30 +76,31 @@ async def test_parallel_empty_returns_empty_list() -> None:
 
 
 async def test_parallel_respects_concurrency_gate() -> None:
-    # The gate passed to parallel must cap in-flight thunks.
+    # The shared gate caps in-flight LEAVES (agent() calls), the real unit of
+    # work — not orchestration frames. Thunks fan out through ctx.agent, whose
+    # leaf runner is the single chokepoint that acquires the gate.
     gate = ConcurrencyGate(limit=2)
-
-    async def _leaf(agent_type: str, prompt: str) -> dict[str, object]:
-        return {"messages": []}
-
-    ctx = Ctx(
-        roster=Roster(),
-        journal=InMemoryJournalStore(),
-        leaf_runner=_leaf,
-        gate=gate,
-    )
-
     in_flight = 0
     peak = 0
 
-    async def work(value: int) -> int:
+    async def _leaf(agent_type: str, prompt: str) -> dict[str, object]:
         nonlocal in_flight, peak
         in_flight += 1
         peak = max(peak, in_flight)
         await asyncio.sleep(0.01)
         in_flight -= 1
-        return value
+        return {"messages": [], "result": prompt}
 
-    results = await ctx.parallel([lambda i=i: work(i) for i in range(10)])
-    assert results == list(range(10))
+    ctx = Ctx(
+        roster=Roster().register("worker", _noop_runnable()),
+        journal=InMemoryJournalStore(),
+        leaf_runner=_leaf,
+        gate=gate,
+    )
+
+    results = await ctx.parallel(
+        [lambda i=i: ctx.agent(f"q{i}", agent_type="worker") for i in range(10)]
+    )
+    assert len(results) == 10
     assert peak <= 2
+    assert peak == 2  # the cap actually saturates, not over- or under-shoots

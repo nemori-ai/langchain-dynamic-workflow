@@ -9,9 +9,12 @@ Mechanics:
 
 - Each stage owns a bounded :class:`~asyncio.Queue`, providing backpressure so a
   flood of items cannot exhaust memory by materializing every stage at once.
-- Each stage runs a worker group that pulls an envelope, acquires the shared
-  :class:`~langchain_dynamic_workflow._concurrency.ConcurrencyGate`, runs the
-  stage function, and forwards the envelope to the next stage's queue.
+- Each stage runs a worker group that pulls an envelope, runs the stage function,
+  and forwards the envelope to the next stage's queue. The worker count per stage
+  is itself bounded by the shared
+  :class:`~langchain_dynamic_workflow._concurrency.ConcurrencyGate` limit, and the
+  leaf ``agent()`` calls inside the stages acquire the gate — so leaf concurrency
+  is capped at the gate limit without an orchestration frame ever holding a slot.
 - A stage that raises drops that item to ``None``; the item skips all remaining
   stages and its result slot is filled immediately.
 - Results are collected by the item's original input index, so the returned list
@@ -72,8 +75,9 @@ async def run_pipeline(
     Args:
         items: The input items; each travels through every stage independently.
         stages: The ordered stage functions, each ``(prev, original, index)``.
-        gate: The shared concurrency gate bounding in-flight stage work across
-            all stages.
+        gate: The shared concurrency gate. Its limit bounds the per-stage worker
+            count, and the leaf ``agent()`` calls inside the stages acquire it, so
+            leaf concurrency across all stages stays within the cap.
         queue_maxsize: Bounded capacity of each stage's queue (backpressure).
 
     Returns:
@@ -110,8 +114,8 @@ async def run_pipeline(
                 if envelope is _POISON:
                     return
                 try:
-                    next_payload = await gate.run(
-                        lambda env=envelope: stage_fn(env.payload, env.original, env.index)
+                    next_payload = await stage_fn(
+                        envelope.payload, envelope.original, envelope.index
                     )
                 except Exception:
                     # Failure isolation: drop this item, skip remaining stages.
