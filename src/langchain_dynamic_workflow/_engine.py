@@ -24,6 +24,7 @@ from ._concurrency import (
     with_max_concurrency,
 )
 from ._context import Ctx
+from ._determinism import CallSequenceGuard
 from ._journal import InMemoryJournalStore, JournalStore
 from ._roster import Roster
 
@@ -80,10 +81,23 @@ async def run_workflow(
         # once across every fan-out path in this run.
         return await leaf_task(agent_type, prompt)
 
+    recorded_sequence = await journal_store.get_sequence()
+
     @entrypoint(checkpointer=saver)
     async def _run(_input: Any) -> Any:
-        ctx = Ctx(roster=roster, journal=journal_store, leaf_runner=leaf_runner, gate=gate)
-        return await orchestrate(ctx)
+        sequence_guard = CallSequenceGuard(recorded=recorded_sequence)
+        ctx = Ctx(
+            roster=roster,
+            journal=journal_store,
+            leaf_runner=leaf_runner,
+            gate=gate,
+            sequence_guard=sequence_guard,
+        )
+        result = await orchestrate(ctx)
+        # Persist the observed call sequence only after the run completes, so the
+        # determinism backstop has a record to replay against on the next resume.
+        await journal_store.put_sequence(ctx.observed_call_sequence)
+        return result
 
     base_config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
     # The gate is the precise cap; the substrate semaphore is pinned high (never

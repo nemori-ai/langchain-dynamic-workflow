@@ -74,11 +74,14 @@ def journal_key(
 
 @runtime_checkable
 class JournalStore(Protocol):
-    """Storage backend for journaled leaf results.
+    """Storage backend for journaled leaf results and the call sequence.
 
     Implementations must be safe for concurrent ``get``/``put`` from multiple
-    in-flight leaves within a single workflow run. Each value is a
-    :class:`JournalRecord` carrying the leaf's folded result and token usage.
+    in-flight leaves within a single workflow run. Each result value is a
+    :class:`JournalRecord` carrying the leaf's folded result and token usage. The
+    store also persists the ordered sequence of leaf call-keys, which the
+    determinism backstop replays to detect divergence; the sequence lives in its
+    own slot so it never collides with content-hash result keys.
     """
 
     async def get(self, key: str) -> JournalRecord | None:
@@ -89,12 +92,21 @@ class JournalStore(Protocol):
         """Persist ``value`` under ``key`` (success-only; caller-enforced)."""
         ...
 
+    async def get_sequence(self) -> list[str] | None:
+        """Return the recorded ordered call-key sequence, or ``None`` if unset."""
+        ...
+
+    async def put_sequence(self, sequence: list[str]) -> None:
+        """Persist the ordered call-key sequence observed on a completed run."""
+        ...
+
 
 class InMemoryJournalStore:
     """In-process journal store; the v1 default (same-session resume)."""
 
     def __init__(self) -> None:
         self._data: dict[str, JournalRecord] = {}
+        self._sequence: list[str] | None = None
 
     async def get(self, key: str) -> JournalRecord | None:
         """Return the cached record for ``key``, or ``None`` on miss."""
@@ -103,3 +115,11 @@ class InMemoryJournalStore:
     async def put(self, key: str, value: JournalRecord) -> None:
         """Persist ``value`` under ``key``."""
         self._data[key] = value
+
+    async def get_sequence(self) -> list[str] | None:
+        """Return the recorded ordered call-key sequence, or ``None`` if unset."""
+        return list(self._sequence) if self._sequence is not None else None
+
+    async def put_sequence(self, sequence: list[str]) -> None:
+        """Persist the ordered call-key sequence observed on a completed run."""
+        self._sequence = list(sequence)

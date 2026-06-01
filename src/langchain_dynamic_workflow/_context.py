@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar
 
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
+from ._determinism import CallSequenceGuard
 from ._journal import JournalRecord, JournalStore, journal_key
 from ._pipeline import Stage, run_pipeline
 from ._result import fold_result
@@ -35,6 +36,9 @@ class Ctx:
         leaf_runner: Callable that invokes a resolved leaf as a durable task.
         gate: Shared concurrency gate bounding in-flight leaves; a bounded
             default is created when omitted.
+        sequence_guard: Determinism backstop recording / validating the ordered
+            leaf call-key sequence; a fresh recording guard is created when
+            omitted.
     """
 
     def __init__(
@@ -44,6 +48,7 @@ class Ctx:
         journal: JournalStore,
         leaf_runner: LeafRunner,
         gate: ConcurrencyGate | None = None,
+        sequence_guard: CallSequenceGuard | None = None,
     ) -> None:
         self._roster = roster
         self._journal = journal
@@ -51,6 +56,14 @@ class Ctx:
         self._gate = (
             gate if gate is not None else ConcurrencyGate(limit=resolve_max_concurrency(None))
         )
+        self._sequence_guard = (
+            sequence_guard if sequence_guard is not None else CallSequenceGuard(recorded=None)
+        )
+
+    @property
+    def observed_call_sequence(self) -> list[str]:
+        """The ordered leaf call-keys observed this run (for journal persistence)."""
+        return self._sequence_guard.sequence
 
     async def agent(
         self,
@@ -85,6 +98,10 @@ class Ctx:
             schema=None,
             isolation=isolation,
         )
+        # Determinism backstop: record this call-key (fresh run) or validate it
+        # against the recorded sequence (replay). A divergence fails loud here,
+        # before any cache entry is served.
+        self._sequence_guard.observe(key)
         cached = await self._journal.get(key)
         if cached is not None:
             return cached.result

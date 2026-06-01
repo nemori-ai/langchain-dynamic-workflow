@@ -10,6 +10,7 @@ from importlib.metadata import version
 
 from ._context import Ctx
 from ._engine import Orchestrator, run_workflow
+from ._errors import WorkflowBudgetExceededError, WorkflowDeterminismError
 from ._journal import InMemoryJournalStore, JournalStore, journal_key
 from ._result import fold_result
 from ._roster import Roster, RosterEntry
@@ -23,6 +24,8 @@ __all__ = [
     "Orchestrator",
     "Roster",
     "RosterEntry",
+    "WorkflowBudgetExceededError",
+    "WorkflowDeterminismError",
     "__version__",
     "fold_result",
     "journal_key",
