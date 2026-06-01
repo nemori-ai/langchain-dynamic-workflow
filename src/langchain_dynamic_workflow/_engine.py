@@ -26,7 +26,7 @@ from ._concurrency import (
     resolve_max_concurrency,
     with_max_concurrency,
 )
-from ._context import Ctx, LeafOutcome
+from ._context import Ctx, LeafOutcome, WorkflowResolver
 from ._determinism import CallSequenceGuard
 from ._journal import InMemoryJournalStore, JournalStore
 from ._progress import ProgressEntry, ProgressLog, ProgressSink
@@ -54,6 +54,7 @@ async def run_workflow(
     budget: int | None = None,
     on_progress: ProgressSink | None = None,
     sandbox_manager: SandboxManager | None = None,
+    workflows: WorkflowResolver | None = None,
 ) -> Any:
     """Run an orchestration script to completion and return its final result.
 
@@ -90,6 +91,10 @@ async def run_workflow(
             is pinned to the hard ceiling so it is never unbounded yet never
             throttles below the gate — setting both to the same value makes the two
             semaphores interleave and the effective cap fall one below the target.
+        workflows: Optional named-workflow resolver enabling ``ctx.workflow(name,
+            args)`` one-level inline nesting. The inner workflow shares this run's
+            journal, budget, gate, and progress log. When omitted, any
+            ``ctx.workflow()`` call raises ``LookupError``.
 
     Returns:
         Whatever the orchestration callable returns.
@@ -209,6 +214,7 @@ async def run_workflow(
             sequence_guard=sequence_guard,
             budget=run_budget,
             progress=progress,
+            workflows=workflows,
         )
         try:
             result = await orchestrate(ctx)

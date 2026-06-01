@@ -29,3 +29,15 @@ class WorkflowBudgetExceededError(RuntimeError):
     raises this. Leaves already in flight are allowed to finish and their results
     are kept.
     """
+
+
+class WorkflowNestingError(RuntimeError):
+    """Raised when a workflow nests another workflow more than one level deep.
+
+    A workflow script may inline another workflow with ``ctx.workflow(name, args)``
+    exactly one level; the inner workflow runs in the same durable-execution scope
+    and shares the parent's journal, budget, and concurrency gate. Calling
+    ``ctx.workflow(...)`` again from inside an already-nested workflow would create
+    a second nesting level, which the engine refuses by raising this instead of
+    silently allowing unbounded recursion.
+    """

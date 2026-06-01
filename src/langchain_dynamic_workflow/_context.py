@@ -19,7 +19,11 @@ from typing import Any, Protocol, TypeVar
 from ._budget import Budget
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
 from ._determinism import CallSequenceGuard
-from ._errors import WorkflowBudgetExceededError, WorkflowDeterminismError
+from ._errors import (
+    WorkflowBudgetExceededError,
+    WorkflowDeterminismError,
+    WorkflowNestingError,
+)
 from ._journal import JournalRecord, JournalStore, journal_key
 from ._pipeline import Stage, run_pipeline
 from ._progress import ProgressKind, ProgressLog
@@ -65,11 +69,42 @@ class LeafRunner(Protocol):
         ...
 
 
+class WorkflowResolver(Protocol):
+    """Resolves a workflow name to its orchestration callable.
+
+    Structurally satisfied by
+    :class:`~langchain_dynamic_workflow._workflows.WorkflowRegistry`; declared as a
+    Protocol here so the context never imports the concrete registry (which itself
+    depends on this module), keeping the dependency one-directional.
+    """
+
+    def resolve(self, name: str) -> Callable[[Ctx, dict[str, Any]], Awaitable[Any]]:
+        """Return the workflow callable registered under ``name``.
+
+        Raises:
+            KeyError: If ``name`` is not registered.
+        """
+        ...
+
+
 T = TypeVar("T")
 
 _FANOUT_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
     "langchain_dynamic_workflow_fanout_depth", default=0
 )
+
+_WORKFLOW_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "langchain_dynamic_workflow_workflow_depth", default=0
+)
+"""How many ``ctx.workflow()`` frames are currently on the stack.
+
+The top-level orchestration script runs at depth ``0``. A ``ctx.workflow(name)``
+call enters depth ``1`` (one level of nesting); attempting another
+``ctx.workflow()`` from inside that frame would push depth ``2``, which the engine
+refuses — only one level of inlining is allowed (decision D6: inner = ``@task`` /
+subgraph). The variable is a :class:`~contextvars.ContextVar` so the depth is
+isolated per asyncio task and restored on frame exit.
+"""
 """Per-task fan-out nesting depth.
 
 ``parallel`` / ``pipeline`` increment this for the duration of their body; an
@@ -98,6 +133,8 @@ class Ctx:
         budget: Shared token budget; an unbounded budget is created when omitted.
         progress: Replay-idempotent progress log backing ``phase``/``log``; a
             fresh log delivering to a no-op sink is created when omitted.
+        workflows: Optional resolver for ``ctx.workflow(name, args)`` inline
+            nesting; when omitted, any ``workflow()`` call raises ``LookupError``.
     """
 
     def __init__(
@@ -110,6 +147,7 @@ class Ctx:
         sequence_guard: CallSequenceGuard | None = None,
         budget: Budget | None = None,
         progress: ProgressLog | None = None,
+        workflows: WorkflowResolver | None = None,
     ) -> None:
         self._roster = roster
         self._journal = journal
@@ -126,6 +164,7 @@ class Ctx:
             if progress is not None
             else ProgressLog(delivered_count=0, sink=lambda _entry: None)
         )
+        self._workflows = workflows
 
     @property
     def observed_call_sequence(self) -> list[str]:
@@ -163,6 +202,49 @@ class Ctx:
             message: The narration text.
         """
         self._progress.emit(ProgressKind.LOG, message)
+
+    async def workflow(self, name: str, args: dict[str, Any] | None = None) -> Any:
+        """Inline another workflow by name, exactly one level deep.
+
+        Resolves ``name`` against the workflow registry and runs its orchestration
+        callable against *this* context, so the inner workflow shares the parent's
+        journal, budget, concurrency gate, and progress log — its leaves are
+        deduped and budgeted as if written inline. Nesting is allowed exactly one
+        level (decision D6: the inner workflow is a ``@task`` / subgraph in the
+        same durable-execution scope); a ``workflow()`` call from inside an
+        already-nested workflow fails loud rather than recursing without bound.
+
+        Args:
+            name: The workflow name to resolve in the registry.
+            args: Optional arguments passed to the inner orchestration callable;
+                an empty mapping is used when omitted.
+
+        Returns:
+            Whatever the inner workflow returns.
+
+        Raises:
+            LookupError: If no workflow registry is wired into this context.
+            KeyError: If ``name`` is not registered.
+            WorkflowNestingError: If called from inside an already-nested workflow
+                (a second level of inlining).
+        """
+        if self._workflows is None:
+            raise LookupError(
+                f"cannot resolve workflow {name!r}: no workflow registry was wired "
+                "into this run (pass workflows=... to run_workflow)"
+            )
+        if _WORKFLOW_DEPTH.get() >= 1:
+            raise WorkflowNestingError(
+                f"cannot nest workflow {name!r}: workflows may inline another workflow "
+                "exactly one level deep, and this call is already inside a nested "
+                "workflow (refusing a second nesting level)"
+            )
+        workflow_fn = self._workflows.resolve(name)  # KeyError on unknown name
+        token = _WORKFLOW_DEPTH.set(_WORKFLOW_DEPTH.get() + 1)
+        try:
+            return await workflow_fn(self, args or {})
+        finally:
+            _WORKFLOW_DEPTH.reset(token)
 
     async def agent(
         self,

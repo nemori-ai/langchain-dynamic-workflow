@@ -118,6 +118,9 @@ def create_workflow_tool(
                 thread_id=thread_id,
                 max_concurrency=max_concurrency,
                 budget=budget,
+                # Wire the same registry so a launched workflow may inline another
+                # via ctx.workflow(name) one level deep.
+                workflows=workflows,
             )
             return result if isinstance(result, str) else str(result)
 

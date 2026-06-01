@@ -12,7 +12,11 @@ from ._background import BgRunManager, BgStatus, ResultStore
 from ._budget import Budget
 from ._context import Ctx
 from ._engine import Orchestrator, run_workflow
-from ._errors import WorkflowBudgetExceededError, WorkflowDeterminismError
+from ._errors import (
+    WorkflowBudgetExceededError,
+    WorkflowDeterminismError,
+    WorkflowNestingError,
+)
 from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal_key
 from ._progress import ProgressEntry, ProgressKind, ProgressSink
 from ._result import fold_result
@@ -42,6 +46,7 @@ __all__ = [
     "SandboxManager",
     "WorkflowBudgetExceededError",
     "WorkflowDeterminismError",
+    "WorkflowNestingError",
     "WorkflowRegistry",
     "__version__",
     "create_workflow_middleware",
