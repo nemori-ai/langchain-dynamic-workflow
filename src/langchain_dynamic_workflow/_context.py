@@ -11,6 +11,7 @@ bounds the number of in-flight leaves across every fan-out path.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -43,6 +44,21 @@ LeafRunner = Callable[[str, str, "str | None"], Awaitable[LeafOutcome]]
 """Invokes a leaf: ``(agent_type, prompt, model) -> LeafOutcome`` (state + usage)."""
 
 T = TypeVar("T")
+
+_FANOUT_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "langchain_dynamic_workflow_fanout_depth", default=0
+)
+"""Per-task fan-out nesting depth.
+
+``parallel`` / ``pipeline`` increment this for the duration of their body; an
+``agent()`` call sees a non-zero depth exactly when it is dispatched from inside a
+fan-out frame. The variable is a :class:`~contextvars.ContextVar` so the depth set
+before a fan-out propagates into the child tasks that ``asyncio`` spawns for the
+thunks / stage workers (each copies the current context at creation), without any
+of those tasks observing a sibling's mutation. The determinism backstop records a
+call-key only at depth ``0`` — the sequential path, where positional cache
+misalignment is the genuine risk.
+"""
 
 
 class Ctx:
@@ -181,8 +197,14 @@ class Ctx:
         )
         # Determinism backstop: record this call-key (fresh run) or validate it
         # against the recorded sequence (replay). A divergence fails loud here,
-        # before any cache entry is served.
-        self._sequence_guard.observe(key)
+        # before any cache entry is served. Only the *sequential* agent() path
+        # (fan-out depth 0) is recorded: calls dispatched inside parallel() /
+        # pipeline() observe in wall-clock completion order, which varies run to
+        # run under real (variable-latency) leaves, so recording them would trip
+        # the backstop spuriously on a deterministic resume. The journal still
+        # guards fan-out leaves by content hash; only their *ordering* is excluded.
+        if _FANOUT_DEPTH.get() == 0:
+            self._sequence_guard.observe(key)
         cached = await self._journal.get(key)
         if cached is not None:
             # Resume re-counts the cached leaf's usage from the journal record, so
@@ -240,7 +262,14 @@ class Ctx:
 
         if not thunks:
             return []
-        return await asyncio.gather(*[_guarded(thunk) for thunk in thunks])
+        # Mark the fan-out frame: agent() calls inside the thunks must not record
+        # into the determinism backstop (their observe order is non-deterministic).
+        # The depth is set before the tasks are spawned so each child copies it.
+        token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
+        try:
+            return await asyncio.gather(*[_guarded(thunk) for thunk in thunks])
+        finally:
+            _FANOUT_DEPTH.reset(token)
 
     async def pipeline(self, items: Sequence[Any], *stages: Stage) -> list[Any | None]:
         """Stream ``items`` through ``stages`` without a barrier between stages.
@@ -266,4 +295,13 @@ class Ctx:
         Raises:
             ValueError: If no stages are supplied.
         """
-        return await run_pipeline(items, stages, gate=self._gate)
+        # Mark the fan-out frame so agent() calls inside the stages skip the
+        # determinism backstop: items interleave stages by per-leaf completion
+        # timing, so the observe order is wall-clock-dependent and would diverge
+        # run to run under real leaves. The depth is set before the stage workers
+        # are spawned (inside run_pipeline) so each worker task inherits it.
+        token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
+        try:
+            return await run_pipeline(items, stages, gate=self._gate)
+        finally:
+            _FANOUT_DEPTH.reset(token)

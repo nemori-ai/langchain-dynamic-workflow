@@ -65,3 +65,36 @@ async def test_replay_divergent_sequence_fails_loud(make_fake_leaf: FakeLeafFact
     branch["first"] = "y"
     with pytest.raises(WorkflowDeterminismError, match="diverged"):
         await run_workflow(orchestrate, roster=roster, journal=journal, thread_id="t2")
+
+
+async def test_replay_under_run_fails_loud(make_fake_leaf: FakeLeafFactory) -> None:
+    # The first run issues three sequential agent() calls; the resume branches to
+    # issue only one. observe() cannot catch this (the matched prefix is aligned and
+    # nothing is observed at the missing tail), so the end-of-run reconciliation must
+    # fail loud — an early-terminating replay is non-deterministic control flow, and
+    # silently overwriting the record with a shorter sequence would corrupt the guard.
+    leaf, _state = make_fake_leaf("answer")
+    roster = Roster().register("worker", leaf)
+    journal = InMemoryJournalStore()
+    branch = {"full": True}
+
+    async def orchestrate(ctx: Ctx) -> list[str]:
+        results = [await ctx.agent("a", agent_type="worker")]
+        if branch["full"]:
+            results.append(await ctx.agent("b", agent_type="worker"))
+            results.append(await ctx.agent("c", agent_type="worker"))
+        return results
+
+    first = await run_workflow(orchestrate, roster=roster, journal=journal, thread_id="t1")
+    assert first == ["answer", "answer", "answer"]
+    assert (await journal.get_sequence()) is not None
+    assert len(await journal.get_sequence() or []) == 3
+
+    # Branch to the short path on resume: only one call where three were recorded.
+    branch["full"] = False
+    with pytest.raises(WorkflowDeterminismError, match="early-terminating"):
+        await run_workflow(orchestrate, roster=roster, journal=journal, thread_id="t2")
+
+    # The divergent under-run must NOT have overwritten the record with a shorter
+    # sequence — finalize raises before put_sequence, so the original record stands.
+    assert len(await journal.get_sequence() or []) == 3

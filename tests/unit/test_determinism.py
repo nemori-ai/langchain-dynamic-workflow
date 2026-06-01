@@ -53,3 +53,34 @@ async def test_replay_extra_call_beyond_record_fails_loud() -> None:
     with pytest.raises(WorkflowDeterminismError) as excinfo:
         guard.observe("k1")
     assert "beyond" in str(excinfo.value).lower()
+
+
+async def test_finalize_under_run_replay_fails_loud() -> None:
+    # An early-terminating replay issues FEWER calls than were recorded. observe()
+    # cannot catch this (nothing is observed at the missing tail positions), so the
+    # backstop must catch it at finalize — otherwise an under-run silently overwrites
+    # the record with a shorter sequence and the determinism hole goes unguarded.
+    guard = CallSequenceGuard(recorded=["k0", "k1", "k2"])
+    guard.observe("k0")  # only one of the three recorded calls is reproduced
+    with pytest.raises(WorkflowDeterminismError) as excinfo:
+        guard.finalize()
+    message = str(excinfo.value)
+    assert "1" in message  # the observed count
+    assert "3" in message  # the recorded count
+
+
+async def test_finalize_exact_count_replay_passes() -> None:
+    # A replay reproducing the full recorded sequence finalizes silently.
+    guard = CallSequenceGuard(recorded=["k0", "k1"])
+    guard.observe("k0")
+    guard.observe("k1")
+    guard.finalize()  # exact match: no raise
+
+
+async def test_finalize_fresh_run_is_noop() -> None:
+    # A recording run has nothing to reconcile against; finalize must never raise
+    # regardless of how many (or how few) calls were observed.
+    guard = CallSequenceGuard(recorded=None)
+    guard.observe("k0")
+    guard.finalize()
+    assert guard.sequence == ["k0"]

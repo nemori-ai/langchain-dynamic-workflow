@@ -139,6 +139,13 @@ async def run_workflow(
             progress=progress,
         )
         result = await orchestrate(ctx)
+        # Reconcile call count on a clean return: observe() catches forward
+        # divergence (mismatched / extra calls) as it happens, but an
+        # early-terminating replay (fewer calls than recorded) is only detectable
+        # here, after the script has finished issuing calls. Runs before
+        # put_sequence so a divergent replay never overwrites the record with a
+        # shorter sequence.
+        sequence_guard.finalize()
         # Persist run-level state only after the script completes successfully. This
         # is deliberately asymmetric with the per-leaf journal: each completed leaf
         # is journaled the moment it finishes (inside agent()), but the call-key
