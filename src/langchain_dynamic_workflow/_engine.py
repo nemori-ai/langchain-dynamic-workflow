@@ -30,6 +30,7 @@ from ._determinism import CallSequenceGuard
 from ._journal import InMemoryJournalStore, JournalStore
 from ._progress import ProgressEntry, ProgressLog, ProgressSink
 from ._roster import Roster
+from ._sandbox import SandboxManager
 
 
 def _default_progress_sink(entry: ProgressEntry) -> None:
@@ -51,6 +52,7 @@ async def run_workflow(
     max_concurrency: int | None = None,
     budget: int | None = None,
     on_progress: ProgressSink | None = None,
+    sandbox_manager: SandboxManager | None = None,
 ) -> Any:
     """Run an orchestration script to completion and return its final result.
 
@@ -70,6 +72,12 @@ async def run_workflow(
         on_progress: Optional sink receiving each newly-delivered ``phase``/``log``
             entry; defaults to printing to stdout. Delivery is replay-idempotent —
             entries already delivered on a prior run are not re-emitted on resume.
+        sandbox_manager: Optional per-leaf sandbox lifecycle manager. When
+            supplied, a leaf whose roster entry is ``needs_execution`` is leased an
+            isolated execution backend (keyed by its derived, resume-stable
+            identity) that is threaded into the leaf config; a pure-reasoning leaf
+            allocates no sandbox. When omitted, leaves run without sandbox
+            admission, preserving Phase 1-3 behaviour exactly.
         max_concurrency: Optional explicit concurrency cap on in-flight leaves.
             LangGraph has no default (``None`` means unbounded at the substrate),
             so the engine always sets both layers explicitly. The shared
@@ -88,7 +96,14 @@ async def run_workflow(
     gate = ConcurrencyGate(limit=limit)
 
     @task
-    async def leaf_task(agent_type: str, prompt: str, model: str | None) -> LeafOutcome:
+    async def leaf_task(
+        agent_type: str,
+        prompt: str,
+        model: str | None,
+        *,
+        leaf_id: str,
+        needs_execution: bool,
+    ) -> LeafOutcome:
         entry = roster.resolve(agent_type)
         # Forward a usage callback into the leaf's config — the same callback
         # forwarding deepagents performs for its own subagents — so token usage
@@ -103,17 +118,45 @@ async def run_workflow(
             # runs its built-in model; the value still partitions the journal key,
             # so the override is a consistent cache-partitioning knob in either case.
             configurable["model"] = model
-        leaf_config: RunnableConfig = {"callbacks": [usage_handler], "configurable": configurable}
-        state: dict[str, Any] = await entry.runnable.ainvoke(
-            {"messages": [HumanMessage(content=prompt)]}, config=leaf_config
-        )
-        return LeafOutcome(state=state, usage=total_tokens_from_handler(usage_handler))
 
-    async def leaf_runner(agent_type: str, prompt: str, model: str | None) -> LeafOutcome:
+        async def _invoke() -> LeafOutcome:
+            leaf_config: RunnableConfig = {
+                "callbacks": [usage_handler],
+                "configurable": configurable,
+            }
+            state: dict[str, Any] = await entry.runnable.ainvoke(
+                {"messages": [HumanMessage(content=prompt)]}, config=leaf_config
+            )
+            return LeafOutcome(state=state, usage=total_tokens_from_handler(usage_handler))
+
+        if sandbox_manager is None:
+            # No sandbox admission configured: run exactly as Phase 1-3 did.
+            return await _invoke()
+        # Lease the leaf's backend for the duration of the invocation. Tiered
+        # admission lives in the manager: an execution leaf gets an isolated
+        # sandbox (find-or-created by its stable identity), a reasoning leaf a
+        # StateBackend with no allocation. The backend is threaded into the leaf
+        # config under a dedicated key so a backend-aware leaf can run against it.
+        async with sandbox_manager.lease(
+            leaf_id=leaf_id, needs_execution=needs_execution
+        ) as backend:
+            configurable["sandbox_backend"] = backend
+            return await _invoke()
+
+    async def leaf_runner(
+        agent_type: str,
+        prompt: str,
+        model: str | None,
+        *,
+        leaf_id: str = "",
+        needs_execution: bool = False,
+    ) -> LeafOutcome:
         # The single durable leaf path, shared by agent / parallel / pipeline.
         # The shared gate (applied inside Ctx) bounds how many of these run at
         # once across every fan-out path in this run.
-        return await leaf_task(agent_type, prompt, model)
+        return await leaf_task(
+            agent_type, prompt, model, leaf_id=leaf_id, needs_execution=needs_execution
+        )
 
     recorded_sequence = await journal_store.get_sequence()
     delivered_progress = await journal_store.get_progress_count()

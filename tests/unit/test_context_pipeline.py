@@ -17,7 +17,15 @@ class _CountingLeaf:
         self.calls = 0
         self.prefix = prefix
 
-    async def __call__(self, agent_type: str, prompt: str, model: str | None) -> LeafOutcome:
+    async def __call__(
+        self,
+        agent_type: str,
+        prompt: str,
+        model: str | None,
+        *,
+        leaf_id: str = "",
+        needs_execution: bool = False,
+    ) -> LeafOutcome:
         self.calls += 1
         return LeafOutcome(
             state={"messages": [AIMessage(content=f"{self.prefix}:{prompt}")]}, usage=0

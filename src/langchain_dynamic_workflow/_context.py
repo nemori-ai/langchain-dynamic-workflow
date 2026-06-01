@@ -14,7 +14,7 @@ import asyncio
 import contextvars
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from ._budget import Budget
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
@@ -25,6 +25,7 @@ from ._pipeline import Stage, run_pipeline
 from ._progress import ProgressKind, ProgressLog
 from ._result import fold_result
 from ._roster import Roster
+from ._sandbox import leaf_id_from_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,8 +42,28 @@ class LeafOutcome:
     usage: int
 
 
-LeafRunner = Callable[[str, str, "str | None"], Awaitable[LeafOutcome]]
-"""Invokes a leaf: ``(agent_type, prompt, model) -> LeafOutcome`` (state + usage)."""
+class LeafRunner(Protocol):
+    """Invokes a resolved leaf as a durable task and returns its outcome.
+
+    The runner receives the leaf's effective model plus the sandbox-admission
+    inputs the engine needs to lease the right backend: the derived per-leaf
+    identity and whether the leaf requires an isolated execution sandbox. Both
+    sandbox arguments are keyword-only with defaults so a runner that ignores
+    isolation (e.g. a unit-test fake) stays a valid implementation.
+    """
+
+    def __call__(
+        self,
+        agent_type: str,
+        prompt: str,
+        model: str | None,
+        *,
+        leaf_id: str = "",
+        needs_execution: bool = False,
+    ) -> Awaitable[LeafOutcome]:
+        """Run the leaf and return its ``LeafOutcome`` (raw state + token usage)."""
+        ...
+
 
 T = TypeVar("T")
 
@@ -216,11 +237,24 @@ class Ctx:
         # Cap is checked only before dispatching a *new* leaf: an exhausted pool
         # refuses fresh work while in-flight leaves finish and keep their results.
         self._budget.ensure_within_cap()
+        # Sandbox admission: derive the leaf's stable identity from its content-hash
+        # key and tell the runner whether this leaf needs an isolated execution
+        # sandbox. The runner (engine side) leases the right backend per leaf_id and
+        # threads it into the leaf config; reasoning leaves allocate nothing. The
+        # identity is the same key that dedups the journal, so it is stable across
+        # retry/resume by construction.
+        leaf_id = leaf_id_from_key(key)
         # The gate bounds the number of leaves actually in flight; a journal hit
         # above never consumes a slot, keeping resume cheap. The leaf runner
         # receives the *effective* model so the config it threads matches the key.
         outcome = await self._gate.run(
-            lambda: self._leaf_runner(agent_type, prompt, effective_model)
+            lambda: self._leaf_runner(
+                agent_type,
+                prompt,
+                effective_model,
+                leaf_id=leaf_id,
+                needs_execution=entry.needs_execution,
+            )
         )
         folded = fold_result(outcome.state)
         # success-only: unreachable if the leaf raised. Usage is journaled so the

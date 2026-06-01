@@ -25,7 +25,14 @@ def _noop_runnable() -> Runnable[Any, Any]:
 def _ctx() -> Ctx:
     """Build a Ctx with a no-op leaf runner (parallel tests drive thunks directly)."""
 
-    async def _leaf(agent_type: str, prompt: str, model: str | None) -> LeafOutcome:
+    async def _leaf(
+        agent_type: str,
+        prompt: str,
+        model: str | None,
+        *,
+        leaf_id: str = "",
+        needs_execution: bool = False,
+    ) -> LeafOutcome:
         return LeafOutcome(state={"messages": []}, usage=0)
 
     return Ctx(
@@ -83,7 +90,14 @@ async def test_parallel_respects_concurrency_gate() -> None:
     in_flight = 0
     peak = 0
 
-    async def _leaf(agent_type: str, prompt: str, model: str | None) -> LeafOutcome:
+    async def _leaf(
+        agent_type: str,
+        prompt: str,
+        model: str | None,
+        *,
+        leaf_id: str = "",
+        needs_execution: bool = False,
+    ) -> LeafOutcome:
         nonlocal in_flight, peak
         in_flight += 1
         peak = max(peak, in_flight)
