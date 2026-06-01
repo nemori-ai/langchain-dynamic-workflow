@@ -322,3 +322,59 @@ async def test_post_overshoot_dispatch_is_refused(make_usage_leaf: UsageLeafFact
             budget=10,
             on_progress=lambda _e: None,
         )
+
+
+async def test_budget_exceeded_inside_parallel_fails_loud(
+    make_usage_leaf: UsageLeafFactory,
+) -> None:
+    # Fail-loud invariant under fan-out: a WorkflowBudgetExceededError raised by an
+    # agent() call INSIDE parallel() must propagate, not be swallowed into a None
+    # slot by the thunk failure-isolation catch (the error is a RuntimeError
+    # subclass, which a broad `except Exception` would silently absorb). Two
+    # sequential calls in one thunk make the trip deterministic: the first spends
+    # the whole pool (total=10), the second trips the cap mid-fan-out.
+    leaf, _model = make_usage_leaf("ok", tokens_per_call=10)
+    roster = Roster().register("worker", leaf)
+
+    async def orchestrate(ctx: Ctx) -> list[Any]:
+        async def two_calls() -> str:
+            await ctx.agent("a", agent_type="worker")  # spends 10 -> pool exhausted
+            return await ctx.agent("b", agent_type="worker")  # cap trips here
+
+        return await ctx.parallel([two_calls])
+
+    with pytest.raises(WorkflowBudgetExceededError, match="exhausted"):
+        await run_workflow(
+            orchestrate, roster=roster, thread_id="t1", budget=10, on_progress=lambda _e: None
+        )
+
+
+async def test_budget_exceeded_inside_pipeline_fails_loud(
+    make_usage_leaf: UsageLeafFactory,
+) -> None:
+    # Same fail-loud contract for pipeline: a stage agent() that trips the budget
+    # cap must propagate out of pipeline(), not drop the item to None and silently
+    # drain the rest. Three items through one worker (max_concurrency=1): item 0
+    # spends the whole pool, item 1's pre-dispatch check trips the cap while item 2
+    # is still queued — the scheduler must drain without deadlocking and re-raise.
+    leaf, _model = make_usage_leaf("ok", tokens_per_call=10)
+    roster = Roster().register("worker", leaf)
+
+    async def orchestrate(ctx: Ctx) -> list[Any]:
+        async def stage(prev: Any, item: int, index: int) -> str:
+            return await ctx.agent(f"q{item}", agent_type="worker")
+
+        return await ctx.pipeline([0, 1, 2], stage)
+
+    with pytest.raises(WorkflowBudgetExceededError, match="exhausted"):
+        await asyncio.wait_for(
+            run_workflow(
+                orchestrate,
+                roster=roster,
+                thread_id="t1",
+                budget=10,
+                max_concurrency=1,
+                on_progress=lambda _e: None,
+            ),
+            timeout=5.0,
+        )

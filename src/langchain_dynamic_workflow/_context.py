@@ -19,6 +19,7 @@ from typing import Any, TypeVar
 from ._budget import Budget
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
 from ._determinism import CallSequenceGuard
+from ._errors import WorkflowBudgetExceededError, WorkflowDeterminismError
 from ._journal import JournalRecord, JournalStore, journal_key
 from ._pipeline import Stage, run_pipeline
 from ._progress import ProgressKind, ProgressLog
@@ -233,9 +234,13 @@ class Ctx:
 
         Each thunk is a zero-argument callable returning an awaitable (typically
         a closure over an ``agent()`` call). Results are returned in input order.
-        A thunk that raises lands as ``None`` at its position; the call as a whole
-        never raises, mirroring Claude Code's ``parallel`` semantics — filter the
-        ``None`` holes downstream.
+        A thunk whose leaf fails lands as ``None`` at its position and never aborts
+        the barrier, mirroring Claude Code's ``parallel`` semantics — filter the
+        ``None`` holes downstream. Engine control-flow signals are the deliberate
+        exception: a ``WorkflowBudgetExceededError`` or ``WorkflowDeterminismError``
+        raised inside a thunk is **not** masked as ``None`` but re-raised once the
+        barrier settles, so a budget breach or replay divergence inside fan-out
+        fails loud rather than corrupting the result with a quiet hole.
 
         Concurrency is bounded by the shared gate, which is acquired by the leaf
         ``agent()`` calls inside the thunks — not by this fan-out layer itself.
@@ -250,14 +255,24 @@ class Ctx:
 
         Returns:
             A list aligned to ``thunks`` input order; each entry is the thunk's
-            result, or ``None`` if it raised.
+            result, or ``None`` if its leaf failed.
+
+        Raises:
+            WorkflowBudgetExceededError: If a thunk's ``agent()`` call trips the
+                budget cap (re-raised after the barrier settles).
+            WorkflowDeterminismError: If a thunk's ``agent()`` call diverges from
+                the recorded replay sequence (re-raised after the barrier settles).
         """
 
         async def _guarded(thunk: Callable[[], Awaitable[T]]) -> T | None:
             try:
                 return await thunk()
+            except (WorkflowBudgetExceededError, WorkflowDeterminismError):
+                # Engine control-flow signals must fail loud, never be masked as a
+                # leaf failure: re-raise so the barrier surfaces them.
+                raise
             except Exception:
-                # Failure isolation: one bad thunk must not abort the barrier.
+                # Failure isolation: one bad leaf must not abort the barrier.
                 return None
 
         if not thunks:
@@ -267,9 +282,27 @@ class Ctx:
         # The depth is set before the tasks are spawned so each child copies it.
         token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
         try:
-            return await asyncio.gather(*[_guarded(thunk) for thunk in thunks])
+            # return_exceptions keeps the barrier intact (every thunk settles) even
+            # when one raises a control-flow signal, so in-flight leaves finish and
+            # journal before we fail loud.
+            settled = await asyncio.gather(
+                *[_guarded(thunk) for thunk in thunks], return_exceptions=True
+            )
         finally:
             _FANOUT_DEPTH.reset(token)
+        results: list[T | None] = []
+        control_flow_error: BaseException | None = None
+        for outcome in settled:
+            if isinstance(outcome, BaseException):
+                # Only re-raised control-flow signals reach here (leaf failures are
+                # already None via _guarded). Remember the first; fail loud below.
+                control_flow_error = control_flow_error or outcome
+                results.append(None)
+            else:
+                results.append(outcome)
+        if control_flow_error is not None:
+            raise control_flow_error
+        return results
 
     async def pipeline(self, items: Sequence[Any], *stages: Stage) -> list[Any | None]:
         """Stream ``items`` through ``stages`` without a barrier between stages.

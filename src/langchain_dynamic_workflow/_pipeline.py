@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ._concurrency import ConcurrencyGate
+from ._errors import WorkflowBudgetExceededError, WorkflowDeterminismError
 
 Stage = Callable[[Any, Any, int], Awaitable[Any]]
 """A pipeline stage: ``(prev_result, original_item, index) -> next_result``."""
@@ -95,6 +96,11 @@ async def run_pipeline(
     item_count = len(items)
     results: list[Any | None] = [None] * item_count
     worker_count = _workers_per_stage(gate, item_count)
+    # First engine control-flow signal (budget/determinism) raised by any stage.
+    # Once set, workers drain remaining items WITHOUT running their stages and the
+    # run re-raises it after a clean teardown — re-raising from inside a worker
+    # would hang the feeder's queue.join() and deadlock the drain.
+    aborted: list[BaseException] = []
 
     # One bounded queue per stage; envelopes enter stage 0's queue and graduate
     # to the next stage's queue after each stage succeeds.
@@ -113,10 +119,23 @@ async def run_pipeline(
             try:
                 if envelope is _POISON:
                     return
+                if aborted:
+                    # Fail-loud teardown in progress: drain queued items without
+                    # running their stages so the feeder's join() completes.
+                    drop(envelope)
+                    continue
                 try:
                     next_payload = await stage_fn(
                         envelope.payload, envelope.original, envelope.index
                     )
+                except (WorkflowBudgetExceededError, WorkflowDeterminismError) as exc:
+                    # Engine control-flow signal: do NOT mask as a leaf failure.
+                    # Record the first one, drop this item, and let the run drain
+                    # and re-raise after teardown (fail loud).
+                    if not aborted:
+                        aborted.append(exc)
+                    drop(envelope)
+                    continue
                 except Exception:
                     # Failure isolation: drop this item, skip remaining stages.
                     drop(envelope)
@@ -157,4 +176,8 @@ async def run_pipeline(
                 worker.cancel()
         if not feeder_task.done():
             feeder_task.cancel()
+    if aborted:
+        # A stage tripped an engine control-flow signal; surface it loud now that
+        # the pipeline has drained and torn down cleanly.
+        raise aborted[0]
     return results

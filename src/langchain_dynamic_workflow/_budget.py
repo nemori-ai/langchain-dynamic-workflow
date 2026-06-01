@@ -25,6 +25,15 @@ worth of work. The next ``agent()`` after the barrier settles sees the overshot
 results rather than being cancelled to claw back tokens, and ``remaining()``
 floors at zero so the overshoot never surfaces as a negative figure.
 
+A symmetric edge runs the other way for *concurrent identical* leaves: if two
+calls sharing one call-key are dispatched in the same fan-out window, both miss
+the journal, both run live, and both ``record()`` under that single key — so
+``spent()`` reflects one leaf's tokens though two were burned. Per-key recording
+is exactly what keeps spend reconstructable on resume and dedups cache-hit
+replays, so this under-count is the deliberate price of that property. Like the
+overshoot it is bounded to a single fan-out window; a workflow that fans out many
+identical calls should read the metered spend in that window as a lower bound.
+
 A budget with no ``total`` never trips the cap and reports an unbounded
 ``remaining()`` (the ``while budget.remaining() > THRESHOLD`` loop idiom).
 
