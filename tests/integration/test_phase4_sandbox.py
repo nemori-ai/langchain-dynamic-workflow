@@ -554,3 +554,39 @@ async def test_backpressure_through_run_workflow_caps_pool_without_deadlock() ->
     assert manager.peak_active_count == max_active
     # Lifecycle finale emptied the manager: no leaked live sandboxes after the run.
     assert manager.active_count == 0
+
+
+async def test_sandbox_leaves_through_pipeline_isolated_and_torn_down() -> None:
+    # testing.md requires pipeline among the core flows covered with the
+    # SandboxManager wired in. Drive needs_execution leaves through ctx.pipeline
+    # (bounded-queue workers, distinct from parallel's gather barrier) under a
+    # small max_active: per-leaf isolation must hold, the gate-then-lease
+    # composition must not deadlock, and the manager must be emptied at run end.
+    roster = Roster().register("writer", _writer_leaf("/out.txt", "x"), needs_execution=True)
+    manager = SandboxManager(max_active=2)
+
+    async def orchestrate(ctx: Ctx) -> list[Any | None]:
+        async def stage(prev: Any, item: int, index: int) -> str:
+            return await ctx.agent(f"write {item}", agent_type="writer")
+
+        return await ctx.pipeline([0, 1, 2, 3], stage)
+
+    results = await asyncio.wait_for(
+        run_workflow(
+            orchestrate,
+            roster=roster,
+            sandbox_manager=manager,
+            thread_id="t1",
+            max_concurrency=4,
+        ),
+        timeout=10.0,
+    )
+    assert results is not None and len(results) == 4
+    # Each pipeline item wrote and read back ITS OWN content at the same path
+    # /out.txt through an isolated backend — never colliding with a sibling.
+    assert all(r is not None and "read=x" in r for r in results)
+    # Distinct per-leaf sandbox identities (distinct journal keys per item).
+    ids = {r.split(";")[0] for r in results if r is not None}
+    assert len(ids) == 4
+    # Lifecycle finale ran: no leased sandbox remains live after the pipeline run.
+    assert manager.active_count == 0

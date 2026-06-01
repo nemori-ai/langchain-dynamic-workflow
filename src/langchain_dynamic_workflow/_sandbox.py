@@ -107,10 +107,15 @@ def normalize_within_route(path: str, *, route_prefix: str) -> str:
             targets ``route_prefix`` resolves outside it.
     """
     canonical = normalize_path(path)
-    bare_prefix = "/" + route_prefix.strip("/")
-    targets_route = path.lstrip("/").startswith(route_prefix.strip("/") + "/") or path.rstrip(
-        "/"
-    ).endswith(route_prefix.rstrip("/"))
+    normalized_route = route_prefix.strip("/")
+    bare_prefix = "/" + normalized_route
+    # A path "targets" the route only when it is the bare route exactly or sits
+    # under it ("shared" / "shared/..."). Matching the bare case by EXACT equality
+    # — not endswith — is what keeps a legitimate isolated path whose final segment
+    # merely happens to be the route name (e.g. /a/shared) from being misread as an
+    # escape: such a path does not target the route and is routed privately.
+    stripped = path.strip("/")
+    targets_route = stripped == normalized_route or stripped.startswith(normalized_route + "/")
     if targets_route and canonical != bare_prefix and not canonical.startswith(bare_prefix + "/"):
         raise ValueError(
             f"path {path!r} escapes root via '..' traversal out of route {route_prefix!r}"

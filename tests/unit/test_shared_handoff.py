@@ -14,10 +14,12 @@ import threading
 import pytest
 
 from langchain_dynamic_workflow._sandbox import (
+    SHARED_ROUTE_PREFIX,
     InMemorySandbox,
     SharedArtifactStore,
     build_leaf_backend,
     normalize_path,
+    normalize_within_route,
 )
 
 
@@ -35,6 +37,33 @@ def test_normalize_path_rejects_escape_above_root() -> None:
         normalize_path("/shared/../../etc/passwd")
     with pytest.raises(ValueError, match="escapes root"):
         normalize_path("/../escape")
+
+
+def test_normalize_within_route_allows_isolated_path_named_like_route() -> None:
+    # Regression: the bare-route guard must match the route EXACTLY, not by
+    # endswith. An isolated path whose final segment merely happens to be "shared"
+    # (/a/shared, /myproject/shared/notes.txt) is a legitimate private path the
+    # composite routes to the isolated backend — NOT an escape out of /shared/.
+    # The old endswith heuristic rejected these with a misleading "escapes root".
+    assert normalize_within_route("/a/shared", route_prefix=SHARED_ROUTE_PREFIX) == "/a/shared"
+    assert (
+        normalize_within_route("/myproject/shared/notes.txt", route_prefix=SHARED_ROUTE_PREFIX)
+        == "/myproject/shared/notes.txt"
+    )
+    # The genuine bare-route and under-route cases still pass through unchanged.
+    assert normalize_within_route("/shared", route_prefix=SHARED_ROUTE_PREFIX) == "/shared"
+    assert (
+        normalize_within_route("/shared/r.txt", route_prefix=SHARED_ROUTE_PREFIX) == "/shared/r.txt"
+    )
+
+
+def test_normalize_within_route_still_blocks_escape_out_of_route() -> None:
+    # The #2884 escape out of the shared route must remain blocked after the
+    # exact-match fix: "/shared/../secret" canonicalizes outside /shared/.
+    with pytest.raises(ValueError, match="escapes root"):
+        normalize_within_route("/shared/../secret", route_prefix=SHARED_ROUTE_PREFIX)
+    with pytest.raises(ValueError, match="escapes root"):
+        normalize_within_route("/shared/../../etc/passwd", route_prefix=SHARED_ROUTE_PREFIX)
 
 
 async def test_shared_handoff_producer_writes_consumer_reads() -> None:
@@ -191,6 +220,20 @@ async def test_guarded_backend_glob_reaches_composite_not_not_implemented() -> N
     assert result.error is None
     assert result.matches is not None
     assert [m["path"] for m in result.matches] == ["/a.py"]
+
+
+def test_guarded_backend_execute_delegates_to_isolated() -> None:
+    # execute() is not path-routable, so the guarded wrapper must delegate it
+    # straight to the isolated sandbox rather than shadow it with the protocol's
+    # bare NotImplementedError. This pins the execution-capability wiring for the
+    # needs_execution tier the whole phase exists to serve (offline echo backend).
+    store = SharedArtifactStore()
+    leaf = build_leaf_backend(
+        isolated=InMemorySandbox(identity="ex"), shared_store=store, producer="ex"
+    )
+    result = leaf.execute("echo build")
+    assert result.exit_code == 0
+    assert result.output == "echo build"
 
 
 async def test_guarded_backend_grep_on_shared_route_is_routable() -> None:
