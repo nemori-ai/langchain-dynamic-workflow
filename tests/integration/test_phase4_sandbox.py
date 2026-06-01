@@ -4,8 +4,10 @@ These tests drive the full ``run_workflow`` -> ``@entrypoint`` -> leaf path with
 fake leaves (no API keys), pinning the locked Phase 4 semantics: tiered admission
 (execution leaves get an isolated sandbox, reasoning leaves do not allocate one),
 journal-key-derived sandbox identity that is stable across resume, two parallel
-execution leaves writing the same path remaining mutually invisible, and the
-``/shared/`` hand-off with ``..`` traversal blocked.
+execution leaves writing the same path remaining mutually invisible, the
+``/shared/`` hand-off with ``..`` traversal blocked, and the gate-then-lease
+composition staying deadlock-free with the pool cap enforced when ``max_active``
+is smaller than the number of parallel execution leaves.
 
 The fake execution leaf reaches its acquired backend through
 ``config['configurable']['sandbox_backend']`` — the same seam a backend-aware
@@ -15,6 +17,9 @@ real sandbox infrastructure.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from deepagents.backends.protocol import BackendProtocol
@@ -30,6 +35,36 @@ from langchain_dynamic_workflow import (
     run_workflow,
 )
 from langchain_dynamic_workflow._sandbox import leaf_id_from_key
+
+
+class _SlotCreationSpyManager(SandboxManager):
+    """A :class:`SandboxManager` that records the peak live-slot count it ever saw.
+
+    The base manager exposes only the *current* ``active_count``; a create-then-
+    reclaim within one call could leave it back at zero and hide a transient
+    allocation. This spy samples ``active_count`` on entry to and exit from every
+    :meth:`lease` so a test can assert the *peak* number of slots that were ever
+    simultaneously live during a run — the property the pool-cap and tiered-
+    admission acceptance criteria actually constrain.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.peak_active_count = 0
+
+    def _sample(self) -> None:
+        self.peak_active_count = max(self.peak_active_count, self.active_count)
+
+    @asynccontextmanager
+    async def lease(
+        self, *, leaf_id: str, needs_execution: bool
+    ) -> AsyncGenerator[BackendProtocol]:
+        async with super().lease(leaf_id=leaf_id, needs_execution=needs_execution) as backend:
+            # Sample inside the body, where this leaf's slot (if any) is live and
+            # counted, so the peak reflects genuine simultaneous occupancy.
+            self._sample()
+            yield backend
+        self._sample()
 
 
 def _writer_leaf(path: str, content: str) -> Runnable[Any, Any]:
@@ -111,17 +146,24 @@ async def test_two_parallel_execution_leaves_are_mutually_invisible() -> None:
 
 
 async def test_reasoning_leaf_does_not_allocate_a_sandbox() -> None:
-    # Tiered admission end to end: a pure-reasoning leaf must run without the
-    # manager ever allocating a sandbox — N logical agents != N active sandboxes.
+    # Tiered admission end to end (acceptance #3 "assert the manager did not
+    # acquire"): a pure-reasoning leaf must run without the manager ever creating a
+    # sandbox slot — N logical agents != N active sandboxes. We assert the stronger
+    # did-not-acquire property directly: spy the manager so any slot creation at any
+    # instant during the run is recorded, not merely the post-run count (which a
+    # create-then-reclaim could mask). lease() IS invoked for a reasoning leaf, but
+    # it must yield a StateBackend without ever consuming a slot.
     roster = Roster().register("thinker", _reasoning_leaf("thought"), needs_execution=False)
-    manager = SandboxManager()
+    manager = _SlotCreationSpyManager()
 
     async def orchestrate(ctx: Ctx) -> str:
         return await ctx.agent("think", agent_type="thinker")
 
     result = await run_workflow(orchestrate, roster=roster, sandbox_manager=manager, thread_id="t1")
     assert result == "thought"
-    # The reasoning leaf was never allocated an isolated sandbox.
+    # No sandbox slot was ever created at any point during the run, and the pool is
+    # empty afterward.
+    assert manager.peak_active_count == 0
     assert manager.active_count == 0
 
 
@@ -394,3 +436,121 @@ async def test_isolation_mode_selects_a_distinct_sandbox() -> None:
     ids = {reply.split(";")[0] for reply in results if reply is not None}
     # Different isolation modes => two distinct sandbox identities.
     assert len(ids) == 2
+
+
+class _PoolRendezvous:
+    """Coordinates a batch of execution leaves to provably overlap inside the pool.
+
+    Each leaf that enters its sandbox lease registers, then blocks until exactly
+    ``batch_size`` leaves are simultaneously inside; the batch is then released
+    together. This forces the pool to genuinely fill to its cap (so a test can
+    assert the peak occupancy equals ``max_active``, not merely stays under it) and
+    drives successive batches through the same slots — exercising the real
+    gate-then-lease backpressure path rather than a single uncontended leaf.
+
+    A ``timeout`` bounds the wait so a *deadlock* (the genuine risk of composing the
+    ConcurrencyGate with the SandboxManager's max-active semaphore) surfaces as a
+    loud :class:`asyncio.TimeoutError` instead of hanging the suite.
+    """
+
+    def __init__(self, *, batch_size: int, timeout: float) -> None:
+        self._batch_size = batch_size
+        self._timeout = timeout
+        self._lock = asyncio.Lock()
+        self._inside = 0
+        self._batch_ready = asyncio.Event()
+
+    async def rendezvous(self) -> None:
+        async with self._lock:
+            self._inside += 1
+            if self._inside >= self._batch_size:
+                # This leaf completes a full batch: release everyone waiting.
+                self._batch_ready.set()
+        # Wait for the batch to fill. If backpressure ever admitted fewer than
+        # batch_size leaves at once (over-throttling) or deadlocked, this times out.
+        await asyncio.wait_for(self._batch_ready.wait(), timeout=self._timeout)
+        async with self._lock:
+            self._inside -= 1
+            if self._inside == 0:
+                # Reset for the next batch flowing through the same slots.
+                self._batch_ready = asyncio.Event()
+
+
+def _rendezvous_writer_leaf(
+    path: str, content: str, *, rendezvous: _PoolRendezvous
+) -> Runnable[Any, Any]:
+    """An execution leaf that holds its sandbox slot until its batch is full.
+
+    It writes through the leased backend (so a real slot is genuinely held), then
+    blocks on the shared rendezvous so a whole batch occupies the pool at once —
+    making the peak occupancy observable and pinning that the gate↔lease
+    composition admits a full batch without deadlocking.
+    """
+
+    async def _call(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        configurable = (config or {}).get("configurable", {})
+        backend: BackendProtocol = configurable["sandbox_backend"]
+        await backend.awrite(path, content)
+        await rendezvous.rendezvous()
+        return {"messages": [*inp["messages"], AIMessage(content=f"done:{backend.id}")]}  # type: ignore[attr-defined]
+
+    return RunnableLambda(_call)
+
+
+async def test_backpressure_through_run_workflow_caps_pool_without_deadlock() -> None:
+    # Acceptance #4 "池耗尽排队(背压)" driven end to end through run_workflow, the
+    # composition the unit test (manually-held leases) cannot pin: the wide
+    # ConcurrencyGate (acquired first in Ctx.agent) and the small SandboxManager
+    # max-active semaphore (which can block inside lease while a gate slot is held)
+    # are two independent semaphores whose lock ordering is the genuine deadlock
+    # risk for this async engine. We fan out 6 execution leaves through one parallel
+    # barrier with max_active=2: the leaves rendezvous in batches of 2 so the pool
+    # provably fills to its cap, and every batch must drain to admit the next.
+    #
+    # This regression-guards three properties at once: (1) no deadlock — all 6
+    # leaves complete within the bounded rendezvous timeout; (2) the pool cap is
+    # enforced end to end — peak simultaneous live slots never exceeds max_active;
+    # (3) the cap is reached, not over-throttled below — peak equals max_active; and
+    # (4) the lifecycle finale still empties the manager afterward.
+    max_active = 2
+    leaf_count = 6
+    rendezvous = _PoolRendezvous(batch_size=max_active, timeout=5.0)
+    roster = Roster()
+    for index in range(leaf_count):
+        roster = roster.register(
+            f"w{index}",
+            _rendezvous_writer_leaf(f"/out{index}.txt", f"c{index}", rendezvous=rendezvous),
+            needs_execution=True,
+        )
+    manager = _SlotCreationSpyManager(max_active=max_active)
+
+    async def orchestrate(ctx: Ctx) -> list[str | None]:
+        return await ctx.parallel(
+            [
+                (lambda agent_type=f"w{index}": ctx.agent("write", agent_type=agent_type))
+                for index in range(leaf_count)
+            ]
+        )
+
+    # A wide gate (high max_concurrency) lets all 6 leaves past the outer semaphore
+    # so the inner max-active backpressure is the binding constraint — the exact
+    # composition under test. asyncio.wait_for bounds the whole run so a deadlock
+    # fails loud rather than hanging the suite.
+    results = await asyncio.wait_for(
+        run_workflow(
+            orchestrate,
+            roster=roster,
+            sandbox_manager=manager,
+            max_concurrency=leaf_count,
+            thread_id="t1",
+        ),
+        timeout=10.0,
+    )
+    assert results is not None
+    # No deadlock: every leaf ran to completion.
+    assert len(results) == leaf_count
+    assert all(r is not None and r.startswith("done:") for r in results)
+    # The pool cap held end to end and was actually reached: peak == max_active.
+    assert manager.peak_active_count == max_active
+    # Lifecycle finale emptied the manager: no leaked live sandboxes after the run.
+    assert manager.active_count == 0

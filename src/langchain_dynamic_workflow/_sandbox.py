@@ -18,6 +18,7 @@ agents — a workflow with many reasoning leaves allocates zero of them.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import threading
 import time
 from collections.abc import AsyncGenerator, Callable
@@ -26,11 +27,18 @@ from dataclasses import dataclass, field
 
 from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.protocol import (
+    FILE_NOT_FOUND,
+    INVALID_PATH,
     BackendProtocol,
     EditResult,
     ExecuteResponse,
     FileData,
+    FileDownloadResponse,
     FileInfo,
+    FileUploadResponse,
+    GlobResult,
+    GrepMatch,
+    GrepResult,
     LsResult,
     ReadResult,
     SandboxBackendProtocol,
@@ -257,6 +265,100 @@ class InMemorySandbox(SandboxBackendProtocol):
         entries.sort(key=lambda entry: entry["path"])
         return LsResult(entries=entries)
 
+    def grep(self, pattern: str, path: str | None = None, glob: str | None = None) -> GrepResult:
+        """Search this sandbox's stored files for a literal substring.
+
+        Matching is literal (not regex), mirroring the protocol contract. ``path``
+        restricts the search to files at or under that directory; ``glob`` filters
+        which files are searched by filename pattern. Matches are returned in
+        deterministic (path, line) order.
+
+        Args:
+            pattern: Literal substring to search for in each line.
+            path: Optional directory to restrict the search to; ``None`` searches
+                every stored file.
+            glob: Optional filename glob filtering which files are searched.
+
+        Returns:
+            A :class:`GrepResult` listing one match per matching line.
+        """
+        prefix = None if path is None else (path if path.endswith("/") else f"{path}/")
+        matches: list[GrepMatch] = []
+        for stored, data in sorted(self._files.items()):
+            if prefix is not None and stored != path and not stored.startswith(prefix):
+                continue
+            if glob is not None and not fnmatch.fnmatch(stored, glob):
+                continue
+            for line_number, line in enumerate(data["content"].splitlines(), start=1):
+                if pattern in line:
+                    matches.append(GrepMatch(path=stored, line=line_number, text=line))
+        return GrepResult(matches=matches)
+
+    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+        """Find stored files matching ``pattern`` under ``path``.
+
+        Args:
+            pattern: Glob pattern matched against each stored file's full path.
+            path: Base directory the search is rooted at; only files at or under
+                it are considered.
+
+        Returns:
+            A :class:`GlobResult` of matching files in deterministic path order.
+        """
+        prefix = path if path.endswith("/") else f"{path}/"
+        matches: list[FileInfo] = [
+            FileInfo(path=stored, is_dir=False, size=len(data["content"]), modified_at="")
+            for stored, data in self._files.items()
+            if (stored == path or stored.startswith(prefix)) and fnmatch.fnmatch(stored, pattern)
+        ]
+        matches.sort(key=lambda entry: entry["path"])
+        return GlobResult(matches=matches)
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        """Store each ``(path, content)`` pair as a UTF-8 file (overwriting).
+
+        Upload deliberately overwrites (unlike :meth:`write`, which errors on an
+        existing path) so a batch upload is idempotent. Binary content that is not
+        valid UTF-8 is reported as that file's ``invalid_path`` error rather than
+        aborting the batch.
+
+        Args:
+            files: ``(destination_path, content_bytes)`` pairs to store.
+
+        Returns:
+            One :class:`FileUploadResponse` per input, in input order.
+        """
+        responses: list[FileUploadResponse] = []
+        for file_path, content in files:
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                responses.append(FileUploadResponse(path=file_path, error=INVALID_PATH))
+                continue
+            self._files[file_path] = FileData(content=text, encoding="utf-8")
+            responses.append(FileUploadResponse(path=file_path))
+        return responses
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        """Return the bytes of each requested path (partial success per entry).
+
+        Args:
+            paths: File paths to download.
+
+        Returns:
+            One :class:`FileDownloadResponse` per input path, in input order; a
+            missing path lands as that entry's ``file_not_found`` error.
+        """
+        responses: list[FileDownloadResponse] = []
+        for path in paths:
+            data = self._files.get(path)
+            if data is None:
+                responses.append(FileDownloadResponse(path=path, error=FILE_NOT_FOUND))
+                continue
+            content = data["content"].encode("utf-8")
+            responses.append(FileDownloadResponse(path=path, content=content))
+        return responses
+
 
 @dataclass(slots=True)
 class _SandboxSlot:
@@ -373,9 +475,15 @@ class SandboxManager:
     def acquire(self, *, leaf_id: str, needs_execution: bool) -> BackendProtocol:
         """Return the backend a leaf should run against (tiered admission).
 
-        This is the synchronous find-or-create primitive. It neither waits for a
-        slot nor reclaims TTL-expired sandboxes — :meth:`lease` wraps it with the
-        full lifecycle (reclamation + backpressure). Use :meth:`lease` from the
+        This is the synchronous find-or-create primitive that honors the same
+        max-active quota and TTL reclamation the manager guarantees, but without
+        blocking — that is the one capability reserved for the async :meth:`lease`.
+        Admitting a *new* execution sandbox past the quota first reclaims
+        TTL-expired idle sandboxes, then evicts the least-recently-used idle one;
+        a same-``leaf_id`` reuse always succeeds (it adds no new sandbox). Because
+        a sync primitive cannot park for a release, it raises when every live slot
+        is genuinely in use and no idle sandbox can be reclaimed or evicted —
+        :meth:`lease` is the path that waits instead. Use :meth:`lease` from the
         engine; ``acquire`` is exposed for direct, single-leaf use.
 
         Args:
@@ -388,6 +496,11 @@ class SandboxManager:
             An isolated :class:`InMemorySandbox` for execution leaves (the same
             instance on repeat acquisition of one ``leaf_id``), or a
             :class:`StateBackend` for reasoning leaves.
+
+        Raises:
+            RuntimeError: If admitting a new sandbox would breach ``max_active``
+                and no idle sandbox can be reclaimed or evicted to make room (the
+                synchronous path cannot wait for an in-use slot to free).
         """
         if not needs_execution:
             # Tiered admission: reasoning leaves are never allocated a sandbox.
@@ -395,6 +508,19 @@ class SandboxManager:
         existing = self._slots.get(leaf_id)
         if existing is not None:
             return existing.sandbox
+        # Enforce the quota the same way lease() does, minus the blocking step:
+        # reclaim TTL-expired idle sandboxes, then evict the LRU idle one. Only if
+        # the pool is full of in-use sandboxes (none reclaimable/evictable) do we
+        # fail loud rather than over-allocate past the cap — a sync caller cannot
+        # park for a release, so unbounded growth here is the bug to prevent.
+        if self._would_exceed_quota(leaf_id):
+            self.reclaim_idle()
+            if self._would_exceed_quota(leaf_id) and not self._evict_one_idle():
+                raise RuntimeError(
+                    f"sandbox pool exhausted: {self.active_count} active at max_active="
+                    f"{self._max_active}, every slot in use and none reclaimable; "
+                    "use lease() to wait for a slot to free"
+                )
         now = self._clock()
         sandbox = InMemorySandbox(identity=leaf_id)
         self._slots[leaf_id] = _SandboxSlot(sandbox=sandbox, created_at=now, last_used_at=now)
@@ -645,6 +771,52 @@ class _NamespacedSharedView(BackendProtocol):
         ]
         return LsResult(entries=entries)
 
+    def grep(self, pattern: str, path: str | None = None, glob: str | None = None) -> GrepResult:
+        """Search merged shared artifacts for a literal substring.
+
+        Searches across producer namespaces (merged view), so a consumer leaf can
+        grep an artifact a producer leaf wrote. ``path`` scopes the search to a
+        directory; ``glob`` filters which shared files are searched by filename.
+
+        Args:
+            pattern: Literal substring to match in each line.
+            path: Optional directory to scope the search to; ``None`` searches all
+                shared artifacts.
+            glob: Optional filename glob filtering which shared files are searched.
+
+        Returns:
+            A :class:`GrepResult` listing one match per matching line.
+        """
+        search_root = "/" if path is None else path
+        matches: list[GrepMatch] = []
+        for stored_path in self._store.stored_paths_under(search_root):
+            if glob is not None and not fnmatch.fnmatch(stored_path, glob):
+                continue
+            content = self._store.read_merged(stored_path)
+            if content is None:
+                continue
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if pattern in line:
+                    matches.append(GrepMatch(path=stored_path, line=line_number, text=line))
+        return GrepResult(matches=matches)
+
+    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+        """Find merged shared artifacts whose path matches ``pattern`` under ``path``.
+
+        Args:
+            pattern: Glob pattern matched against each shared file's full path.
+            path: Base directory the search is rooted at.
+
+        Returns:
+            A :class:`GlobResult` of matching shared files in path order.
+        """
+        matches: list[FileInfo] = [
+            FileInfo(path=stored_path, is_dir=False, size=0, modified_at="")
+            for stored_path in self._store.stored_paths_under(path)
+            if fnmatch.fnmatch(stored_path, pattern)
+        ]
+        return GlobResult(matches=matches)
+
 
 class _GuardedBackend(SandboxBackendProtocol):
     """Normalizes every path and blocks ``..`` traversal before delegating.
@@ -655,6 +827,15 @@ class _GuardedBackend(SandboxBackendProtocol):
     backend's namespace — the independent guard the #2884 route-isolation leak
     demands. A normalization error is returned as an operation error (rather than
     raised) so a leaf's file tool surfaces it as a recoverable failure.
+
+    Every file operation the composite can route is delegated, not only
+    ``write``/``read``/``edit``/``ls``: ``grep``/``glob`` and
+    ``upload_files``/``download_files`` are forwarded through the same traversal
+    guard so a backend-aware leaf reaches whatever the wrapped composite
+    implements rather than the protocol's bare ``NotImplementedError`` default.
+    The async ``a*`` variants are inherited from
+    [`BackendProtocol`][deepagents.backends.protocol.BackendProtocol], which
+    dispatches them to these guarded sync methods via ``asyncio.to_thread``.
 
     Args:
         inner: The composite backend to delegate normalized paths to.
@@ -724,6 +905,68 @@ class _GuardedBackend(SandboxBackendProtocol):
         except ValueError as exc:
             return LsResult(error=str(exc))
         return self._inner.ls(safe)
+
+    def grep(self, pattern: str, path: str | None = None, glob: str | None = None) -> GrepResult:
+        """Normalize ``path`` (when given) then delegate; block traversal escapes.
+
+        A ``None`` ``path`` means search every routed backend, so there is no
+        path to guard and the request is forwarded verbatim. The ``glob`` filter
+        matches filenames rather than directories, so it is not a traversal
+        vector and is forwarded unchanged.
+        """
+        if path is None:
+            return self._inner.grep(pattern, path, glob)
+        try:
+            safe = self._safe(path)
+        except ValueError as exc:
+            return GrepResult(error=str(exc))
+        return self._inner.grep(pattern, safe, glob)
+
+    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+        """Normalize the base ``path`` then delegate; block traversal escapes.
+
+        Only the base ``path`` is a directory the request is rooted at; the
+        ``pattern`` filters filenames under it and is forwarded unchanged.
+        """
+        try:
+            safe = self._safe(path)
+        except ValueError as exc:
+            return GlobResult(error=str(exc))
+        return self._inner.glob(pattern, safe)
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        """Normalize every destination path then delegate; block traversal escapes.
+
+        A single malformed destination fails only its own entry (the protocol
+        allows partial success in a batch), so a guard rejection is reported as
+        that file's ``invalid_path`` error rather than aborting the whole upload.
+        """
+        guarded: list[tuple[str, bytes]] = []
+        rejected: list[FileUploadResponse] = []
+        for file_path, content in files:
+            try:
+                guarded.append((self._safe(file_path), content))
+            except ValueError:
+                rejected.append(FileUploadResponse(path=file_path, error=INVALID_PATH))
+        delegated = self._inner.upload_files(guarded) if guarded else []
+        return [*delegated, *rejected]
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        """Normalize every source path then delegate; block traversal escapes.
+
+        A single malformed path fails only its own entry (the protocol allows
+        partial success in a batch), so a guard rejection is reported as that
+        path's ``invalid_path`` error rather than aborting the whole download.
+        """
+        guarded: list[str] = []
+        rejected: list[FileDownloadResponse] = []
+        for path in paths:
+            try:
+                guarded.append(self._safe(path))
+            except ValueError:
+                rejected.append(FileDownloadResponse(path=path, error=INVALID_PATH))
+        delegated = self._inner.download_files(guarded) if guarded else []
+        return [*delegated, *rejected]
 
 
 def build_leaf_backend(

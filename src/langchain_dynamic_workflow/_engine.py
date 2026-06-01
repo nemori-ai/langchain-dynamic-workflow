@@ -80,8 +80,8 @@ async def run_workflow(
             allocates no sandbox. After the script settles (clean return or raise)
             the engine stops every execution sandbox it leased this run, so the
             manager holds no live sandboxes once the run completes. When omitted,
-            leaves run without sandbox admission, preserving Phase 1-3 behaviour
-            exactly.
+            leaves run without sandbox admission: no backend is leased and none is
+            threaded into the leaf config.
         max_concurrency: Optional explicit concurrency cap on in-flight leaves.
             LangGraph has no default (``None`` means unbounded at the substrate),
             so the engine always sets both layers explicitly. The shared
@@ -144,7 +144,8 @@ async def run_workflow(
             return LeafOutcome(state=state, usage=total_tokens_from_handler(usage_handler))
 
         if sandbox_manager is None:
-            # No sandbox admission configured: run exactly as Phase 1-3 did.
+            # No sandbox admission configured: invoke the leaf directly without
+            # leasing or threading a backend into its config.
             return await _invoke()
         # Lease the leaf's backend for the duration of the invocation. Tiered
         # admission lives in the manager: an execution leaf gets an isolated

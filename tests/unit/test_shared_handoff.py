@@ -158,3 +158,86 @@ async def test_traversal_through_shared_route_is_blocked() -> None:
     res = await leaf.awrite("/shared/../escape.txt", "payload")
     assert res.error is not None
     assert "escapes root" in res.error
+
+
+async def test_guarded_backend_grep_reaches_composite_not_not_implemented() -> None:
+    # Regression guard: the guarded wrapper must DELEGATE grep to the wrapped
+    # composite, not shadow it with the protocol's bare NotImplementedError. A
+    # leaf's grep over its isolated workspace must reach the InMemorySandbox and
+    # return real matches.
+    store = SharedArtifactStore()
+    leaf = build_leaf_backend(
+        isolated=InMemorySandbox(identity="g"), shared_store=store, producer="g"
+    )
+    await leaf.awrite("/notes.txt", "alpha\nTODO: fix\nbeta")
+    result = await leaf.agrep("TODO", "/")
+    assert result.error is None
+    assert result.matches is not None
+    assert [(m["path"], m["line"], m["text"]) for m in result.matches] == [
+        ("/notes.txt", 2, "TODO: fix")
+    ]
+
+
+async def test_guarded_backend_glob_reaches_composite_not_not_implemented() -> None:
+    # The guarded wrapper must delegate glob to the composite too, so a leaf's
+    # file-pattern search reaches the isolated backend instead of raising.
+    store = SharedArtifactStore()
+    leaf = build_leaf_backend(
+        isolated=InMemorySandbox(identity="gl"), shared_store=store, producer="gl"
+    )
+    await leaf.awrite("/a.py", "x")
+    await leaf.awrite("/b.txt", "y")
+    result = await leaf.aglob("*.py", "/")
+    assert result.error is None
+    assert result.matches is not None
+    assert [m["path"] for m in result.matches] == ["/a.py"]
+
+
+async def test_guarded_backend_grep_on_shared_route_is_routable() -> None:
+    # The shared route the finding specifically calls out: a consumer leaf must be
+    # able to grep an artifact a producer wrote under /shared/, through the guarded
+    # composite — not hit NotImplementedError at the guard boundary.
+    store = SharedArtifactStore()
+    producer = build_leaf_backend(
+        isolated=InMemorySandbox(identity="p"), shared_store=store, producer="p"
+    )
+    consumer = build_leaf_backend(
+        isolated=InMemorySandbox(identity="c"), shared_store=store, producer="c"
+    )
+    await producer.awrite("/shared/report.txt", "intro\nFINDING: leak\nend")
+    result = await consumer.agrep("FINDING", "/shared/report.txt")
+    assert result.error is None
+    assert result.matches is not None
+    assert any(m["text"] == "FINDING: leak" for m in result.matches)
+
+
+async def test_guarded_backend_upload_download_round_trip() -> None:
+    # upload_files / download_files must delegate through the guard to the isolated
+    # backend (which now implements them), round-tripping bytes — not raise.
+    store = SharedArtifactStore()
+    leaf = build_leaf_backend(
+        isolated=InMemorySandbox(identity="u"), shared_store=store, producer="u"
+    )
+    uploaded = await leaf.aupload_files([("/data.bin", b"payload")])
+    assert [r.error for r in uploaded] == [None]
+    downloaded = await leaf.adownload_files(["/data.bin"])
+    assert downloaded[0].error is None
+    assert downloaded[0].content == b"payload"
+
+
+async def test_guarded_backend_blocks_traversal_on_grep_glob_and_transfer() -> None:
+    # The traversal guard must cover the newly-delegated surface too: a ".." escape
+    # out of the shared route on grep / glob / upload / download is rejected at the
+    # boundary, exactly as it is for write/read/edit/ls.
+    store = SharedArtifactStore()
+    leaf = build_leaf_backend(
+        isolated=InMemorySandbox(identity="t"), shared_store=store, producer="t"
+    )
+    grep_res = await leaf.agrep("x", "/shared/../escape")
+    assert grep_res.error is not None and "escapes root" in grep_res.error
+    glob_res = await leaf.aglob("*.txt", "/shared/../escape")
+    assert glob_res.error is not None and "escapes root" in glob_res.error
+    up = await leaf.aupload_files([("/shared/../escape.bin", b"x")])
+    assert up[0].error == "invalid_path"
+    down = await leaf.adownload_files(["/shared/../escape.bin"])
+    assert down[0].error == "invalid_path"

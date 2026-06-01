@@ -3,19 +3,25 @@
 These tests pin the locked Phase 4 mechanics without any real sandbox
 infrastructure: a leaf identity derived from the content-hash journal key (so it
 is stable across retry/resume), find-or-create acquisition, tiered admission,
-TTL/quota/backpressure lifecycle, and the ``/shared/`` hand-off backend with
-``..`` traversal blocked.
+TTL/quota/backpressure lifecycle, the offline ``InMemorySandbox`` file surface
+(grep/glob/upload/download), and the ``/shared/`` hand-off backend with ``..``
+traversal blocked.
 """
 
 from __future__ import annotations
 
 import asyncio
 
+import pytest
 from deepagents.backends.protocol import SandboxBackendProtocol
 from deepagents.backends.state import StateBackend
 
 from langchain_dynamic_workflow._journal import journal_key
-from langchain_dynamic_workflow._sandbox import SandboxManager, leaf_id_from_key
+from langchain_dynamic_workflow._sandbox import (
+    InMemorySandbox,
+    SandboxManager,
+    leaf_id_from_key,
+)
 
 
 class _FakeClock:
@@ -104,6 +110,73 @@ async def test_acquire_lazy_creates_distinct_backends_per_leaf_id() -> None:
     assert manager.active_count == 2
     await manager.stop("leaf-a")
     await manager.stop("leaf-b")
+
+
+async def test_acquire_honors_max_active_by_evicting_idle_not_over_allocating() -> None:
+    # The public acquire() primitive must carry the same max-active quota the
+    # manager guarantees, minus blocking: at quota, admitting a NEW leaf evicts the
+    # LRU idle sandbox rather than over-allocating past the cap. This pins that a
+    # caller following the documented public interface gets bounded allocation, not
+    # unbounded growth.
+    clock = _FakeClock()
+    manager = SandboxManager(max_active=2, clock=clock)
+    manager.acquire(leaf_id="leaf-a", needs_execution=True)
+    clock.advance(1.0)  # leaf-a now strictly less-recently-used than leaf-b
+    manager.acquire(leaf_id="leaf-b", needs_execution=True)
+    assert manager.active_count == 2
+    # leaf-c is new work at quota: it must evict the LRU idle one (leaf-a), staying
+    # at the cap rather than growing to 3.
+    manager.acquire(leaf_id="leaf-c", needs_execution=True)
+    assert manager.active_count == 2
+    live = {leaf_id for leaf_id in ("leaf-a", "leaf-b", "leaf-c") if _is_live(manager, leaf_id)}
+    assert live == {"leaf-b", "leaf-c"}
+    await manager.stop("leaf-b")
+    await manager.stop("leaf-c")
+
+
+async def test_acquire_same_leaf_id_reuse_never_breaches_quota() -> None:
+    # Reacquiring an already-live leaf_id at quota adds no new sandbox, so it must
+    # always succeed and return the same instance — never trip the cap.
+    manager = SandboxManager(max_active=1)
+    first = manager.acquire(leaf_id="leaf-a", needs_execution=True)
+    second = manager.acquire(leaf_id="leaf-a", needs_execution=True)
+    assert first is second
+    assert manager.active_count == 1
+    await manager.stop("leaf-a")
+
+
+async def test_acquire_reclaims_ttl_expired_idle_before_admitting_new_work() -> None:
+    # At quota, acquire() first reclaims TTL-expired idle sandboxes (the clean path)
+    # before resorting to eviction — so a new leaf reuses a freed slot rather than
+    # evicting a still-valid one.
+    clock = _FakeClock()
+    manager = SandboxManager(max_active=1, idle_ttl=10.0, clock=clock)
+    manager.acquire(leaf_id="leaf-a", needs_execution=True)
+    clock.advance(11.0)  # leaf-a is now idle past its TTL
+    manager.acquire(leaf_id="leaf-b", needs_execution=True)
+    # leaf-a was reclaimed (TTL), leaf-b took the freed slot; cap held at 1.
+    assert manager.active_count == 1
+    assert not _is_live(manager, "leaf-a")
+    assert _is_live(manager, "leaf-b")
+    await manager.stop("leaf-b")
+
+
+async def test_acquire_fails_loud_when_pool_full_of_in_use_sandboxes() -> None:
+    # The synchronous primitive cannot park for a release, so when the pool is at
+    # quota with every slot genuinely IN USE (an in-flight lease), acquire() must
+    # fail loud rather than over-allocate — directing the caller to lease(), which
+    # can wait. Mixing acquire with an in-flight lease is the only way to reach a
+    # non-evictable full pool.
+    manager = SandboxManager(max_active=1)
+
+    async with manager.lease(leaf_id="leaf-busy", needs_execution=True):
+        assert manager.active_count == 1
+        with pytest.raises(RuntimeError, match="sandbox pool exhausted"):
+            manager.acquire(leaf_id="leaf-new", needs_execution=True)
+    # The in-use slot was never over-allocated past; after the lease exits the pool
+    # holds only the original (now idle) sandbox.
+    assert manager.active_count == 1
+    await manager.stop("leaf-busy")
 
 
 async def test_reasoning_leaf_uses_state_backend_and_is_not_allocated() -> None:
@@ -261,3 +334,44 @@ async def test_max_active_quota_applies_backpressure_until_a_slot_frees() -> Non
     await asyncio.wait_for(third_task, timeout=2.0)
     assert third_entered.is_set()
     await manager.stop("leaf-c")
+
+
+def test_inmemory_sandbox_grep_finds_literal_matches_scoped_and_globbed() -> None:
+    # The offline sandbox must implement grep so a backend-aware leaf can search
+    # its isolated workspace — not hit the protocol's NotImplementedError. Matching
+    # is literal, scoped by path, and filtered by glob, returning (path, line, text).
+    sandbox = InMemorySandbox(identity="s")
+    sandbox.write("/src/a.py", "import os\nTODO: x\n")
+    sandbox.write("/src/b.txt", "TODO: y\n")
+    sandbox.write("/other/c.py", "TODO: z\n")
+    # Scoped to /src and filtered to *.py: only /src/a.py's TODO line matches.
+    result = sandbox.grep("TODO", "/src", "*.py")
+    assert result.error is None
+    assert result.matches is not None
+    found = [(m["path"], m["line"], m["text"]) for m in result.matches]
+    assert found == [("/src/a.py", 2, "TODO: x")]
+
+
+def test_inmemory_sandbox_glob_matches_paths_under_base() -> None:
+    sandbox = InMemorySandbox(identity="s")
+    sandbox.write("/a.py", "x")
+    sandbox.write("/sub/b.py", "y")
+    sandbox.write("/sub/c.txt", "z")
+    result = sandbox.glob("/sub/*.py", "/sub")
+    assert result.error is None
+    assert result.matches is not None
+    assert [m["path"] for m in result.matches] == ["/sub/b.py"]
+
+
+def test_inmemory_sandbox_upload_overwrites_and_download_round_trips() -> None:
+    # upload_files overwrites (idempotent batch) and download_files round-trips
+    # bytes; a missing download path is a per-entry file_not_found, not a raise.
+    sandbox = InMemorySandbox(identity="s")
+    first = sandbox.upload_files([("/data.txt", b"v1")])
+    assert [r.error for r in first] == [None]
+    # Re-upload overwrites without the write()-style "already exists" error.
+    second = sandbox.upload_files([("/data.txt", b"v2")])
+    assert [r.error for r in second] == [None]
+    downloaded = sandbox.download_files(["/data.txt", "/missing.txt"])
+    assert downloaded[0].error is None and downloaded[0].content == b"v2"
+    assert downloaded[1].error == "file_not_found" and downloaded[1].content is None
