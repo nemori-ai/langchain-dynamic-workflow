@@ -285,3 +285,36 @@ async def test_status_unknown_run_id_reports_unknown(
     out = await _ainvoke_command(tool, {"command": "status", "run_id": "ghost"}, runtime)
     assert isinstance(out, str)
     assert "ghost" in out
+
+
+async def test_run_refused_when_concurrent_run_quota_full(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # The run command surfaces the manager's concurrent-run quota as a clear,
+    # non-Command refusal string instead of fanning out unbounded.
+    leaf, _state = make_fake_leaf("out")
+    roster = Roster().register("researcher", leaf)
+    release = asyncio.Event()
+
+    async def slow_orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        await release.wait()
+        return await ctx.agent("Q", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("wf", slow_orchestrate)
+    manager = BgRunManager(max_concurrent_runs=1)
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+    runtime = _runtime(thread_id="host-1")
+
+    # First run is admitted (and held in flight by the closed gate).
+    first = await _ainvoke_command(tool, {"command": "run", "workflow": "wf"}, runtime)
+    assert isinstance(first, Command)
+    first_id = _launched_run_id(first)
+
+    # Second run is refused with a plain string (no Command, nothing launched).
+    refused = await _ainvoke_command(tool, {"command": "run", "workflow": "wf"}, runtime)
+    assert isinstance(refused, str)
+    assert "quota" in refused.lower()
+
+    release.set()
+    await manager.wait(first_id, thread_id="host-1")
+    assert manager.poll(first_id, thread_id="host-1") == BgStatus.DONE

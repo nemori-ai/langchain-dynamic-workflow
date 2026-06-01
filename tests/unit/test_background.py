@@ -15,6 +15,7 @@ import pytest
 
 from langchain_dynamic_workflow._background import (
     BgRunManager,
+    BgRunQuotaExceededError,
     BgStatus,
     ResultStore,
 )
@@ -164,3 +165,56 @@ async def test_idle_ttl_sweeps_completed_slots() -> None:
     assert "r1" in reclaimed
     # After reclamation the slot is gone (polls as unknown).
     assert manager.poll("r1") == BgStatus.UNKNOWN
+
+
+async def test_max_concurrent_runs_quota_refuses_when_full() -> None:
+    # Resource-exhaustion guard: with a quota of 2, a third in-flight run is
+    # refused loud rather than fanned out unbounded onto the event loop.
+    manager = BgRunManager(max_concurrent_runs=2)
+    release = asyncio.Event()
+
+    async def slow(value: str) -> str:
+        await release.wait()
+        return value
+
+    s1 = manager.start(slow("a"), run_id="r1", thread_id="t1")
+    s2 = manager.start(slow("b"), run_id="r2", thread_id="t1")
+    assert {s1.run_id, s2.run_id} == {"r1", "r2"}
+
+    # Both r1/r2 are still in flight (gated closed), so the quota is full.
+    with pytest.raises(BgRunQuotaExceededError) as excinfo:
+        manager.start(slow("c"), run_id="r3", thread_id="t1")
+    # The refusal names the quota so the host gets an actionable message.
+    assert "2" in str(excinfo.value)
+    # Nothing was launched for the refused run: it never created a slot.
+    assert manager.poll("r3", thread_id="t1") == BgStatus.UNKNOWN
+
+    # Drain a slot: once r1 settles, the quota frees up and a new run is admitted.
+    release.set()
+    await manager.wait("r1", thread_id="t1")
+    await manager.wait("r2", thread_id="t1")
+    assert manager.poll("r1", thread_id="t1") == BgStatus.DONE
+
+    # A settled run no longer counts against the quota — a fresh start succeeds.
+    s4 = manager.start(slow("d"), run_id="r4", thread_id="t1")
+    assert s4.run_id == "r4"
+    release.set()
+    await manager.wait("r4", thread_id="t1")
+
+
+async def test_unbounded_quota_is_the_default() -> None:
+    # The default keeps the existing behavior: no quota, many runs admitted.
+    manager = BgRunManager()
+    release = asyncio.Event()
+
+    async def slow() -> str:
+        await release.wait()
+        return "ok"
+
+    for i in range(5):
+        manager.start(slow(), run_id=f"r{i}", thread_id="t1")
+    # All five are in flight; none was refused.
+    assert all(manager.poll(f"r{i}", thread_id="t1") != BgStatus.UNKNOWN for i in range(5))
+    release.set()
+    for i in range(5):
+        await manager.wait(f"r{i}", thread_id="t1")

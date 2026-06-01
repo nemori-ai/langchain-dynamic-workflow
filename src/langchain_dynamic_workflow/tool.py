@@ -25,7 +25,7 @@ from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from ._background import BgRunManager, BgStatus
+from ._background import BgRunManager, BgRunQuotaExceededError, BgStatus
 
 # Journal-store types are imported from the engine's public core entry (not the
 # internal `_journal`) so the host-facing tool depends only on the `run_workflow`
@@ -167,12 +167,18 @@ def create_workflow_tool(
         if workflow not in workflows:
             return f"run: unknown workflow {workflow!r}; nothing was launched."
         thread_id = _host_thread_id(runtime)
-        run_id = _launch(
-            workflow_name=workflow,
-            args=args or {},
-            thread_id=thread_id,
-            journal=InMemoryJournalStore(),
-        )
+        try:
+            run_id = _launch(
+                workflow_name=workflow,
+                args=args or {},
+                thread_id=thread_id,
+                journal=InMemoryJournalStore(),
+            )
+        except BgRunQuotaExceededError as exc:
+            # The manager's concurrent-run quota is full: surface it as a clear
+            # refusal string (not a Command) so the host knows nothing was launched
+            # and can retry after a run finishes, rather than fanning out unbounded.
+            return f"run: {exc}"
         message = (
             f"Launched workflow {workflow!r} in the background. run_id: {run_id}. "
             "It is running now; you can continue, and a completion notification will "

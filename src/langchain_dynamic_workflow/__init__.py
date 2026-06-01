@@ -8,7 +8,7 @@ the caller.
 
 from importlib.metadata import version
 
-from ._background import BgRunManager, BgStatus, ResultStore
+from ._background import BgRunManager, BgRunQuotaExceededError, BgStatus, ResultStore
 from ._budget import Budget
 from ._context import Ctx
 from ._engine import Orchestrator, run_workflow
@@ -32,6 +32,7 @@ __version__ = version("langchain-dynamic-workflow")
 
 __all__ = [
     "BgRunManager",
+    "BgRunQuotaExceededError",
     "BgStatus",
     "Budget",
     "Ctx",

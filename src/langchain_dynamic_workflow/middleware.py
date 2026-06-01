@@ -163,6 +163,7 @@ def create_workflow_middleware(
     skills_dir: str | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     max_concurrency: int | None = None,
+    max_concurrent_runs: int | None = None,
     budget: int | None = None,
 ) -> WorkflowMiddleware:
     """Build the workflow middleware (tool + completion-notice injection).
@@ -177,6 +178,11 @@ def create_workflow_middleware(
             middleware for the host to pass to ``create_deep_agent(skills=[...])``.
         checkpointer: Optional checkpointer forwarded to launched runs.
         max_concurrency: Optional concurrency cap forwarded to launched runs.
+        max_concurrent_runs: Optional cap on concurrent host-initiated background
+            runs. Applied only when this factory builds the default manager (it is
+            ignored when an explicit ``manager`` is supplied — configure the quota
+            on that manager directly). When the quota is full the ``run`` command
+            refuses with a clear message rather than launching unbounded.
         budget: Optional shared token ceiling forwarded to launched runs.
 
     Returns:
@@ -186,7 +192,11 @@ def create_workflow_middleware(
     return WorkflowMiddleware(
         roster=roster,
         workflows=workflows,
-        manager=manager if manager is not None else BgRunManager(),
+        manager=(
+            manager
+            if manager is not None
+            else BgRunManager(max_concurrent_runs=max_concurrent_runs)
+        ),
         skills_dir=skills_dir,
         checkpointer=checkpointer,
         max_concurrency=max_concurrency,

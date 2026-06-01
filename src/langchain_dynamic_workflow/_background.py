@@ -57,6 +57,16 @@ _TERMINAL_STATUSES: frozenset[BgStatus] = frozenset(
 """Statuses at which a run has settled and its slot is eligible for TTL sweep."""
 
 
+class BgRunQuotaExceededError(RuntimeError):
+    """Raised when a new background run would exceed the concurrent-run quota.
+
+    The manager admits at most ``max_concurrent_runs`` in-flight (non-terminal)
+    runs. A host that asks to launch another while the quota is full is refused
+    loud rather than having its run fanned out onto the event loop unbounded — the
+    bounded-queue / resource-exhaustion guard for host-initiated background work.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class Notice:
     """A completion notice queued for delivery to a host thread.
@@ -196,6 +206,11 @@ class BgRunManager:
             store is created when omitted.
         idle_ttl_seconds: How long a settled slot is retained before ``sweep``
             may reclaim it. ``0`` makes a settled slot immediately reclaimable.
+        max_concurrent_runs: Cap on the number of in-flight (non-terminal) runs
+            the manager will admit at once. ``None`` (the default) leaves it
+            unbounded; a positive value makes ``start`` refuse a new run with
+            :class:`BgRunQuotaExceededError` once that many runs are in flight,
+            bounding host-initiated background fan-out against resource exhaustion.
     """
 
     def __init__(
@@ -203,9 +218,11 @@ class BgRunManager:
         *,
         result_store: ResultStore | None = None,
         idle_ttl_seconds: float = 3600.0,
+        max_concurrent_runs: int | None = None,
     ) -> None:
         self._result_store = result_store if result_store is not None else ResultStore()
         self._idle_ttl_seconds = idle_ttl_seconds
+        self._max_concurrent_runs = max_concurrent_runs
         self._slots: dict[tuple[str, str], BgRunSlot] = {}
         # Pending completion notices keyed by host thread, drained FIFO.
         self._notices: dict[str, list[Notice]] = {}
@@ -214,6 +231,15 @@ class BgRunManager:
     def result_store(self) -> ResultStore:
         """The store backing offloaded large results."""
         return self._result_store
+
+    @property
+    def max_concurrent_runs(self) -> int | None:
+        """The concurrent-run quota, or ``None`` when unbounded."""
+        return self._max_concurrent_runs
+
+    def active_run_count(self) -> int:
+        """Return how many runs are currently in flight (non-terminal)."""
+        return sum(1 for slot in self._slots.values() if slot.status not in _TERMINAL_STATUSES)
 
     def start(
         self,
@@ -238,7 +264,25 @@ class BgRunManager:
 
         Returns:
             The :class:`BgRunSlot` tracking the detached run.
+
+        Raises:
+            BgRunQuotaExceededError: If a ``max_concurrent_runs`` quota is set and
+                that many runs are already in flight. The passed coroutine is
+                closed (never scheduled) so a refused run leaks no task or warning.
         """
+        if (
+            self._max_concurrent_runs is not None
+            and self.active_run_count() >= self._max_concurrent_runs
+        ):
+            # Refuse loud before detaching anything: close the un-launched coroutine
+            # so the event loop does not warn about a coroutine that was never
+            # awaited, then raise so the caller (e.g. the run command) reports it.
+            coro.close()
+            raise BgRunQuotaExceededError(
+                f"background run quota exhausted: {self.active_run_count()} of "
+                f"{self._max_concurrent_runs} concurrent runs already in flight; "
+                "refusing to launch another (wait for a run to finish or cancel one)"
+            )
         resolved_run_id = run_id if run_id is not None else uuid.uuid4().hex
         key = _composite_key(thread_id, resolved_run_id)
         task: asyncio.Task[str] = asyncio.ensure_future(
