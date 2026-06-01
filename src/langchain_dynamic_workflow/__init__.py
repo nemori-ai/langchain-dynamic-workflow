@@ -8,6 +8,7 @@ the caller.
 
 from importlib.metadata import version
 
+from ._background import BgRunManager, BgStatus, ResultStore
 from ._budget import Budget
 from ._context import Ctx
 from ._engine import Orchestrator, run_workflow
@@ -17,10 +18,15 @@ from ._progress import ProgressEntry, ProgressKind, ProgressSink
 from ._result import fold_result
 from ._roster import Roster, RosterEntry
 from ._sandbox import SandboxManager
+from ._workflows import WorkflowRegistry
+from .middleware import create_workflow_middleware
+from .tool import create_workflow_tool
 
 __version__ = version("langchain-dynamic-workflow")
 
 __all__ = [
+    "BgRunManager",
+    "BgStatus",
     "Budget",
     "Ctx",
     "InMemoryJournalStore",
@@ -30,12 +36,16 @@ __all__ = [
     "ProgressEntry",
     "ProgressKind",
     "ProgressSink",
+    "ResultStore",
     "Roster",
     "RosterEntry",
     "SandboxManager",
     "WorkflowBudgetExceededError",
     "WorkflowDeterminismError",
+    "WorkflowRegistry",
     "__version__",
+    "create_workflow_middleware",
+    "create_workflow_tool",
     "fold_result",
     "journal_key",
     "run_workflow",
