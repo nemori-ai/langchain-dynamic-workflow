@@ -11,9 +11,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
+
+
+@dataclass(frozen=True, slots=True)
+class JournalRecord:
+    """A journaled leaf result paired with the token usage it consumed.
+
+    Storing usage alongside the result is what makes ``budget.spent()``
+    reconstructable on replay: a resumed run that serves a leaf from the journal
+    re-counts that leaf's usage from the record instead of re-invoking the model,
+    so the cumulative spend rebuilds to exactly the first run's value.
+
+    Attributes:
+        result: The leaf's folded final text.
+        usage: The total tokens consumed by the leaf invocation that produced
+            ``result``. ``0`` when usage was unavailable (e.g. a model that emits
+            no ``usage_metadata``).
+    """
+
+    result: str
+    usage: int
 
 
 def journal_key(
@@ -56,14 +77,15 @@ class JournalStore(Protocol):
     """Storage backend for journaled leaf results.
 
     Implementations must be safe for concurrent ``get``/``put`` from multiple
-    in-flight leaves within a single workflow run.
+    in-flight leaves within a single workflow run. Each value is a
+    :class:`JournalRecord` carrying the leaf's folded result and token usage.
     """
 
-    async def get(self, key: str) -> Any | None:
-        """Return the cached value for ``key``, or ``None`` on miss."""
+    async def get(self, key: str) -> JournalRecord | None:
+        """Return the cached record for ``key``, or ``None`` on miss."""
         ...
 
-    async def put(self, key: str, value: Any) -> None:
+    async def put(self, key: str, value: JournalRecord) -> None:
         """Persist ``value`` under ``key`` (success-only; caller-enforced)."""
         ...
 
@@ -72,12 +94,12 @@ class InMemoryJournalStore:
     """In-process journal store; the v1 default (same-session resume)."""
 
     def __init__(self) -> None:
-        self._data: dict[str, Any] = {}
+        self._data: dict[str, JournalRecord] = {}
 
-    async def get(self, key: str) -> Any | None:
-        """Return the cached value for ``key``, or ``None`` on miss."""
+    async def get(self, key: str) -> JournalRecord | None:
+        """Return the cached record for ``key``, or ``None`` on miss."""
         return self._data.get(key)
 
-    async def put(self, key: str, value: Any) -> None:
+    async def put(self, key: str, value: JournalRecord) -> None:
         """Persist ``value`` under ``key``."""
         self._data[key] = value

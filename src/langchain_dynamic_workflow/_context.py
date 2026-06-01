@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar
 
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
-from ._journal import JournalStore, journal_key
+from ._journal import JournalRecord, JournalStore, journal_key
 from ._pipeline import Stage, run_pipeline
 from ._result import fold_result
 from ._roster import Roster
@@ -87,12 +87,13 @@ class Ctx:
         )
         cached = await self._journal.get(key)
         if cached is not None:
-            return cached
+            return cached.result
         # The gate bounds the number of leaves actually in flight; a journal hit
         # above never consumes a slot, keeping resume cheap.
         raw = await self._gate.run(lambda: self._leaf_runner(agent_type, prompt))
         folded = fold_result(raw)
-        await self._journal.put(key, folded)  # success-only: unreachable if leaf raised
+        # success-only: unreachable if the leaf raised.
+        await self._journal.put(key, JournalRecord(result=folded, usage=0))
         return folded
 
     async def parallel(self, thunks: Sequence[Callable[[], Awaitable[T]]]) -> list[T | None]:

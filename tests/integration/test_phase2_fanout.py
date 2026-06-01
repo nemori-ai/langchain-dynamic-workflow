@@ -220,7 +220,9 @@ async def test_inflight_interrupt_then_resume_replays_completed_runs_unfinished_
     # mid-flight and never journaled (success-only persistence).
     assert fast_calls["n"] == 1
     assert slow_calls["n"] == 1
-    assert await journal.get(fast_key) == "fast-done"
+    fast_record = await journal.get(fast_key)
+    assert fast_record is not None
+    assert fast_record.result == "fast-done"
 
     # Resume on a fresh thread with the SAME journal; let the slow leaf complete.
     slow_release.set()
