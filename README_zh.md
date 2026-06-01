@@ -28,18 +28,83 @@
 
 完整设计依据见 [`docs/plans/`](docs/plans/)（设计基线；gitignored，不进版本控制）。
 
+## 快速上手
+
+```bash
+uv sync   # 安装依赖 + 创建 .venv
+```
+
+写一段编排脚本（`ctx` 暴露核心原语），把叶子 agent 注册进 roster，然后跑起来。叶子可以是任何状态里带 `messages` 键的 runnable —— 通常是一个 `deepagents.create_deep_agent(...)`：
+
+```python
+import asyncio
+
+from deepagents import create_deep_agent
+from langchain_dynamic_workflow import Ctx, Roster, run_workflow
+
+
+async def main() -> None:
+    # 1. 按名字注册叶子 agent（build-time 接线；agent 自己不做这件事）。
+    roster = Roster().register(
+        "researcher",
+        create_deep_agent(model="anthropic:claude-haiku-4-5"),
+        description="研究单个主题",
+    )
+
+    # 2. 编排脚本掌控控制流；只有叶子 agent() 调用才委派给 deepagent。
+    #    parallel() 是阻塞 barrier；失败的叶子落为 None（自行过滤），永不中断 barrier。
+    async def orchestrate(ctx: Ctx) -> str:
+        ctx.phase("research")
+        findings = await ctx.parallel(
+            [
+                lambda t=topic: ctx.agent(f"Research {t}", agent_type="researcher")
+                for topic in ("batteries", "solar", "wind")
+            ]
+        )
+        surviving = [f for f in findings if f is not None]
+        return f"synthesized {len(surviving)} findings: " + " | ".join(surviving)
+
+    # 3. 跑起来。只有最终结果回到你手里 —— 而不是整条执行轨迹。
+    result = await run_workflow(orchestrate, roster=roster)
+    print(result)
+
+
+asyncio.run(main())
+```
+
+跨多次调用传入**同一个** `journal=` 即可获得命中缓存的断点续跑（已完成的叶子以零模型成本重放）；`budget=` 设共享 token 上限；`on_span=` 接一个可观测性 trace。想让 **host agent** 在后台驱动 workflow，就把 `create_workflow_middleware(roster, workflows=...)` 挂到一个 host `create_deep_agent` 上 —— agent 通过单个 `workflow` 工具（`run` / `status` / `resume` / `cancel`）调度，并在 run 完成时收到通知。
+
+[`examples/`](examples/) 下的每个示例都**离线、无需 API key**（用 fake model）即可运行；设 `LDW_DEMO_REAL_MODEL=anthropic:claude-haiku-4-5`（并配好 key）即可驱动真实叶子。旗舰示例是 [`examples/06_capstone.py`](examples/06_capstone.py)：host agent 在后台驱动一条 `parallel` 研究 → `pipeline` 提炼 → 对抗式验证 → 综述的 workflow。
+
+```bash
+uv run python examples/06_capstone.py
+```
+
+## 公开 API
+
+稳定的公开面从包根导出，自 `0.1.0` 起遵循语义化版本：
+
+- **库 core**：`run_workflow` —— 开发者 / build-time 入口。
+- **注册表**：`Roster` / `RosterEntry`、`WorkflowRegistry`。
+- **host 面**：`create_workflow_tool`、`create_workflow_middleware`、`skills_path`。
+- **原语**：挂在传给脚本的 `Ctx` 上 —— `agent` / `parallel` / `pipeline` / `phase` / `log` / `budget` / `workflow`。
+- **类型与异常**：`Budget`、`JournalStore` / `InMemoryJournalStore` / `JournalRecord`、`SandboxManager`、`Span` / `SpanKind` / `SpanSink`、`BgRunManager` 家族，以及 `Workflow*Error` 系列异常。
+
+公开签名稳定；新增参数一律 keyword-only 带默认值。以 `_` 开头的模块和成员属于内部实现，可能随时变动。
+
 ## 状态
 
-**早期阶段 —— 架构已锁定，公开 API 正在构建中。** 尚未发布到 PyPI。
+**v0.1.0 —— 架构已锁定，公开 API 已稳定。** 尚未发布到 PyPI。详见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 开发
 
 ```bash
 uv sync                 # 安装依赖 + 创建 .venv
-uv run pytest           # 跑测试
+uv run pytest           # 跑测试（带覆盖率门，行覆盖 >= 85%）
 uv run ruff check .     # lint
 uv run ruff format .    # 格式化
 uv run pyright          # 类型检查（strict）
+uv run lint-imports     # 校验 Layer 0/1/2 架构边界
 ```
 
 Python 3.12+。依赖管理用 [uv](https://docs.astral.sh/uv/)。

@@ -28,18 +28,84 @@ Leaf `agent()` calls resolve a named deepagent from a **registry (roster)** and 
 
 The full design rationale lives in [`docs/plans/`](docs/plans/) (design baseline; gitignored, not version-controlled).
 
+## Quickstart
+
+```bash
+uv sync   # install dependencies + create .venv
+```
+
+Write an orchestration script (the `ctx` exposes the primitives), register your leaf agents in a roster, and run it. Leaves resolve to any runnable whose state has a `messages` key — typically a `deepagents.create_deep_agent(...)`:
+
+```python
+import asyncio
+
+from deepagents import create_deep_agent
+from langchain_dynamic_workflow import Ctx, Roster, run_workflow
+
+
+async def main() -> None:
+    # 1. Register leaf agents by name (build-time wiring; the agent never does this).
+    roster = Roster().register(
+        "researcher",
+        create_deep_agent(model="anthropic:claude-haiku-4-5"),
+        description="Researches one topic",
+    )
+
+    # 2. The orchestration script owns the control flow; only leaf agent() calls
+    #    delegate to deepagents. parallel() is a blocking barrier; a failed leaf
+    #    lands as None (filter the holes) and never aborts the barrier.
+    async def orchestrate(ctx: Ctx) -> str:
+        ctx.phase("research")
+        findings = await ctx.parallel(
+            [
+                lambda t=topic: ctx.agent(f"Research {t}", agent_type="researcher")
+                for topic in ("batteries", "solar", "wind")
+            ]
+        )
+        surviving = [f for f in findings if f is not None]
+        return f"synthesized {len(surviving)} findings: " + " | ".join(surviving)
+
+    # 3. Run it. Only the final result reaches you — not the whole trajectory.
+    result = await run_workflow(orchestrate, roster=roster)
+    print(result)
+
+
+asyncio.run(main())
+```
+
+Pass the **same** `journal=` across calls to get cached-result resume (completed leaves replay at zero model cost), `budget=` for a shared token ceiling, and `on_span=` for an observability trace. To let a **host agent** drive workflows in the background, attach `create_workflow_middleware(roster, workflows=...)` to a host `create_deep_agent` — the agent calls a single `workflow` tool (`run` / `status` / `resume` / `cancel`) and is notified when a run finishes.
+
+Every example under [`examples/`](examples/) runs **offline with no API key** (fake models); set `LDW_DEMO_REAL_MODEL=anthropic:claude-haiku-4-5` (and a key) to drive real leaves. The flagship is [`examples/06_capstone.py`](examples/06_capstone.py): a host agent driving a background `parallel`-research → `pipeline`-refine → adversarial-verify → synthesize workflow.
+
+```bash
+uv run python examples/06_capstone.py
+```
+
+## Public API
+
+The stable, public surface is exported from the package root and follows semantic versioning from `0.1.0`:
+
+- **Library core**: `run_workflow` — the developer / build-time entry.
+- **Registries**: `Roster` / `RosterEntry`, `WorkflowRegistry`.
+- **Host-facing**: `create_workflow_tool`, `create_workflow_middleware`, `skills_path`.
+- **Primitives**: exposed on the `Ctx` handed to your script — `agent` / `parallel` / `pipeline` / `phase` / `log` / `budget` / `workflow`.
+- **Types & errors**: `Budget`, `JournalStore` / `InMemoryJournalStore` / `JournalRecord`, `SandboxManager`, `Span` / `SpanKind` / `SpanSink`, the `BgRunManager` family, and the `Workflow*Error` exceptions.
+
+Public signatures are stable; new parameters are added keyword-only with defaults. Names prefixed with `_` (modules and members) are internal and may change without notice.
+
 ## Status
 
-**Early stage — architecture locked, public API being built out.** Not yet published to PyPI.
+**v0.1.0 — architecture locked, public API stable.** Not yet published to PyPI. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Development
 
 ```bash
 uv sync                 # install dependencies + create .venv
-uv run pytest           # run tests
+uv run pytest           # run tests (with coverage gate, line >= 85%)
 uv run ruff check .     # lint
 uv run ruff format .    # format
 uv run pyright          # type check (strict)
+uv run lint-imports     # check the Layer 0/1/2 architecture boundaries
 ```
 
 Python 3.12+. Dependency management via [uv](https://docs.astral.sh/uv/).
