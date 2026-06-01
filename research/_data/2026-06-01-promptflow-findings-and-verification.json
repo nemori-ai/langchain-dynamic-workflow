@@ -1,0 +1,953 @@
+{
+  "findings": [
+    {
+      "topic": "Microsoft promptflow flow-definition models (DAG flow / flex flow / prompty) — who owns control flow",
+      "summary": "Promptflow has exactly three flow-definition models, all subclassing one contract base (`FlowBase`) in `promptflow-core/promptflow/contracts/flow.py`, and they sit on OPPOSITE sides of the control-flow-ownership axis that matters to langchain-dynamic-workflow.\n\n(a) DAG flow (`flow.dag.yaml`) — control flow is a STATIC, DECLARED DAG. The YAML lists `nodes`, each with `inputs` that reference other nodes via `${node.output}` / flow inputs via `${inputs.x}`. The engine (NOT user code) derives the execution graph from those references and runs nodes by topology. Branching is also declarative: `activate: {when: ${n.output}, is: <value>}` (the conditional-flow-for-if-else and conditional-flow-for-switch examples implement if/else and switch entirely in YAML, never in Python). `node_variants` provide swappable node implementations selected by id, not by code. The contract dataclass `Flow(FlowBase)` carries `nodes: List[Node]`, `tools: List[Tool]`, `node_variants`. The runtime owner is `FlowNodesScheduler` + `DAGManager`: `DAGManager.pop_ready_nodes()` returns nodes whose NODE_REFERENCE deps are satisfied, `pop_bypassable_nodes()` deactivates nodes whose `activate` condition is unmet or whose deps were bypassed, and the scheduler fans them out across a thread pool. This is the static-DAG orchestration our engine is the OPPOSITE of.\n\n(b) flex flow (`flow.flex.yaml`) — control flow is OWNED BY CODE. The entire YAML is essentially one line: `entry: module:callable` (e.g. `programmer:write_simple_program`, `flow:ChatFlow`). There are NO nodes, no edges, no `${...}` references — the YAML declares only the entry pointer plus optional `inputs`/`outputs`/`init`/`sample`/`environment` metadata. The Python function or callable class IS the flow; all loops/branching/fan-out live in plain Python (chat-basic's `ChatFlow.__call__` has a real `while` token-trimming loop; chat-minimal's `chat()` has an `if`). The contract dataclass `FlexFlow(FlowBase)` has `init` (constructor kwargs for class entries) but deliberately NO `nodes`. There is no scheduler — `ScriptExecutor` imports `module:func` via `importlib`, instantiates the class with `init` kwargs if it is a class, and calls it directly. Signature is recovered by RUNTIME reflection (`inspect.signature` via `function_to_interface`), generated in an isolated subprocess (`entry_meta_generator.generate_flow_meta`) — there is no AST analysis of the body, the body is opaque. An optional `__aggregate__(self, line_results)` method is a map/reduce barrier convention for batch eval. promptflow's own docs name this the reason to pick flex: \"More advanced orchestration: Users can write complex flow with Python built-in control operators (if-else, foreach) or other 3rd party / open-source library.\" This is the same control-flow-inversion stance as our engine.\n\n(c) prompty (`.prompty`) — NOT an orchestration model at all; it is a single-LLM-call unit. A markdown file with YAML front-matter (model config, inputs, sample) + a templated (jinja2) prompt body after the `---`. `PromptyFlow(FlowBase)` has neither nodes nor entry. `Prompty.__call__` renders the template and makes ONE LLM request (with built-in retry). It owns no multi-step control flow; it is a leaf building block that flex code composes (chat-basic loads a `.prompty` and calls it inside its Python loop). Closest analogue to a single deepagent leaf call in our model.\n\nDiscrimination is by file/shape, not a mode flag: `is_prompty_flow` = `.prompty` extension; `is_flex_flow` = YAML dict contains key `\"entry\"`; else DAG. (`get_flow_type` in `_utils/flow_utils.py`.)\n\nNet for us: flex flow validates the OUTWARD form we want (a thin declarative manifest that names a code entry; code owns all control flow; metadata via reflection). DAG flow + its `activate`/`node_variants`/`DAGManager` is the precise anti-pattern to contrast against — declarative branching and engine-owned topology. Prompty maps to our leaf `agent()` call. Two divergences worth noting: promptflow recovers flex signatures by runtime reflection in a subprocess (no AST gate over the body — our Layer 2 AST gate is stricter/security-motivated), and its node cache (`CacheManager`) is hash-based per-tool-call (`hashlib` over args/kwargs), which is actually closer to our content-hash journal than to LangGraph's index-based cache.",
+      "mechanisms": [
+        {
+          "name": "DAG flow contract — Flow dataclass with nodes/edges-via-references",
+          "how_it_works": "The flow.dag.yaml is deserialized into `Flow(FlowBase)` carrying `nodes: List[Node]`, `tools: List[Tool]`, `node_variants`. Each `Node` has `inputs: Dict[str, InputAssignment]`. Edges are NOT a separate field — dependency is implicit: an InputAssignment of value_type NODE_REFERENCE (parsed from `${node.section.property}`) means node-to-node, FLOW_INPUT (`${inputs.x}`/`${flow.x}`) means flow input, else LITERAL. Control flow is fully declared in data; the engine reconstructs the DAG from these references. This is engine-owned static-DAG orchestration.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "@dataclass class Flow(FlowBase): nodes: List[Node]; tools: List[Tool]; node_variants: Dict[str, NodeVariants] = None  |  @dataclass class Node: name: str; inputs: Dict[str, InputAssignment]; activate: Optional[ActivateCondition]; use_variants: bool  |  class InputValueType(Enum): LITERAL/FLOW_INPUT/NODE_REFERENCE",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/contracts/flow.py",
+            "/tmp/promptflow-study/examples/flows/standard/web-classification/flow.dag.yaml"
+          ]
+        },
+        {
+          "name": "DAG flow runtime — FlowNodesScheduler + DAGManager (engine owns control flow)",
+          "how_it_works": "DAGManager holds pending/completed/bypassed node sets. `pop_ready_nodes()` returns nodes all of whose NODE_REFERENCE deps (plus `activate.condition`) are in completed-or-bypassed. `pop_bypassable_nodes()` deactivates nodes whose activate condition is unmet or whose deps were bypassed. FlowNodesScheduler loops: bypass, pop ready, submit to a ThreadPoolExecutor (concurrency up to DEFAULT_CONCURRENCY_FLOW=16), wait FIRST_COMPLETED, complete nodes, repeat until DAGManager.completed(). The SCRIPT/ENGINE decides next step from declared topology — the opposite of code-owned control flow. Includes line-timeout + SIGINT/SIGTERM handling.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class FlowNodesScheduler(tools_manager, inputs, nodes_from_invoker, node_concurrency, context).execute(line_timeout_sec) -> Tuple[dict, dict]  |  DAGManager.pop_ready_nodes() -> List[Node]; pop_bypassable_nodes() -> List[Node]; completed() -> bool",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_flow_nodes_scheduler.py",
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_dag_manager.py"
+          ]
+        },
+        {
+          "name": "DAG flow declarative branching — activate (when/is) if-else & switch",
+          "how_it_works": "A node may declare `activate: {when: ${other.output}, is: <value>}`. DAGManager._is_node_bypassable evaluates the condition at runtime and bypasses the node if `when != is`. if-else is two nodes with `is: true`/`is: false`; switch (chat-customer intent) is N nodes each with `is: <branch-label>`. ALL branching logic lives in YAML data, evaluated by the engine — no user Python decides which branch runs. ActivateCondition is a contract dataclass.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "@dataclass class ActivateCondition: condition: InputAssignment; condition_value: Any  |  DAGManager._is_condition_met(condition, condition_value) -> bool  |  YAML: activate:\\n  when: ${class_check.output}\\n  is: order_search",
+          "sources": [
+            "/tmp/promptflow-study/examples/flows/standard/conditional-flow-for-if-else/flow.dag.yaml",
+            "/tmp/promptflow-study/examples/flows/standard/conditional-flow-for-switch/flow.dag.yaml",
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_dag_manager.py"
+          ]
+        },
+        {
+          "name": "DAG node_variants — declarative swappable node implementations",
+          "how_it_works": "Top-level `node_variants` maps a node name to `{default_variant_id, variants: {id: {node: <full node def>}}}`. A node marked `use_variants: true` is a placeholder; `Flow._apply_default_node_variant` substitutes the variant body by id at load. Used for A/B prompt tuning without touching the graph wiring. Selection is by id/config, never by runtime code branching.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "@dataclass class NodeVariants: default_variant_id: str; variants: Dict[str, NodeVariant]  |  @dataclass class NodeVariant: node: Node; description: str  |  Flow._apply_default_node_variant(node, node_variants) -> Node",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/contracts/flow.py",
+            "/tmp/promptflow-study/examples/flows/standard/web-classification/flow.dag.yaml"
+          ]
+        },
+        {
+          "name": "flex flow contract — FlexFlow dataclass: entry pointer, NO nodes",
+          "how_it_works": "flow.flex.yaml deserializes to `FlexFlow(FlowBase)`, which has `init: Dict[str,FlowInitDefinition]` (constructor kwargs for class entries), `sample`, inputs/outputs — but deliberately NO `nodes` field. The YAML's load path (`FlexFlow._from_dict`) reads the `entry` key, resolves the python entry file, and generates meta. The declarative artifact names a code entry and nothing about control flow. This is the OUTWARD form our engine should emulate: thin manifest + code owns orchestration.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "@dataclass class FlexFlow(FlowBase): init: Dict[str, FlowInitDefinition] = None; sample: Dict[str, dict] = None  (no `nodes`)  |  FlexFlow._from_dict(flow_data, working_dir, name) reads flow_data.get('entry')  |  YAML: entry: programmer:write_simple_program",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/contracts/flow.py",
+            "/tmp/promptflow-study/examples/flex-flows/basic/flow.flex.yaml",
+            "/tmp/promptflow-study/examples/flex-flows/chat-basic/flow.flex.yaml"
+          ]
+        },
+        {
+          "name": "flex flow runtime — ScriptExecutor imports & calls entry (code owns control flow)",
+          "how_it_works": "ScriptExecutor parses `module:func`, `importlib.import_module(module_name)`, `getattr(module, func_name)`. If the entry is a class with `__call__`, it instantiates with resolved `init` kwargs and binds `obj.__call__`; if a plain function, uses it directly. Then it calls `self._func(**inputs)` per line — ONE direct call, no scheduler, no DAG. Loops/branches/fan-out are whatever the Python body does (chat-basic has a real `while` token-trim loop; chat-minimal has an `if`). This is the control-flow-inversion stance our engine takes.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class ScriptExecutor(FlowExecutor).__init__(flow_file: Union[Path,str,Callable], connections, working_dir, *, storage, init_kwargs)  |  _parse_entry_func() -> Callable  |  exec_line(inputs, index, run_id, allow_generator_output) -> LineResult  |  self._func(**inputs)",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_script_executor.py",
+            "/tmp/promptflow-study/examples/flex-flows/chat-basic/flow.py",
+            "/tmp/promptflow-study/examples/flex-flows/chat-minimal/flow.py"
+          ]
+        },
+        {
+          "name": "flex flow class entry — init kwargs as constructor, __call__ as flow body",
+          "how_it_works": "A flex entry can be a callable class: `entry: flow:ChatFlow`. The YAML `init:` (and `sample.init`) supplies __init__ args (e.g. model_config, max_total_token); FlowInitDefinition supports connection & model-config types. The executor does `obj = func(**resolved_init_kwargs)` then uses `obj.__call__` as the flow. Cleanly separates construction-time config (init) from per-invocation inputs (call args) — a useful split for our roster/agent config vs runtime inputs.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "@dataclass class FlexFlow.init: Dict[str, FlowInitDefinition]  |  class FlowInitDefinition(FlowParamDefinitionBase)  |  class ChatFlow.__init__(self, model_config: AzureOpenAIModelConfiguration, max_total_token=4096); __call__(self, question: str, chat_history: list=None) -> str",
+          "sources": [
+            "/tmp/promptflow-study/examples/flex-flows/chat-basic/flow.py",
+            "/tmp/promptflow-study/examples/flex-flows/chat-basic/flow.flex.yaml",
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/contracts/flow.py"
+          ]
+        },
+        {
+          "name": "flex flow signature via runtime reflection in subprocess (NO AST gate)",
+          "how_it_works": "Input/output signatures for a flex entry are recovered by importing the module and calling `inspect.signature` through `function_to_interface` (maps annotations to FlowInputDefinition). `entry_meta_generator.generate_flow_meta` runs this in a separate multiprocessing.Process with a timeout (FLOW_META_JSON_GEN_TIMEOUT) for path-isolation, dumping flow.json. The function BODY is never statically analyzed — it is trusted, opaque Python. Contrast with our Layer-2 AST gate which validates the authored orchestration script (no imports/dunders/banned names) before execution for security.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "function_to_interface(f: Callable, initialize_inputs=None, gen_custom_type_conn=False, skip_prompt_template=False, support_model_config=False) -> tuple  |  generate_flow_meta(flow_directory, source_path, data, dump=True, timeout=FLOW_META_JSON_GEN_TIMEOUT, load_in_subprocess=True) -> dict",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_utils/tool_utils.py",
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/entry_meta_generator.py"
+          ]
+        },
+        {
+          "name": "__aggregate__ — optional map/reduce barrier hook on class entries",
+          "how_it_works": "If a flex class entry defines `__aggregate__(self, line_results: list) -> dict`, ScriptExecutor discovers it via `getattr(obj, '__aggregate__')` and runs it once after all per-line calls (must take exactly 1 param). This is a code-side reduce/barrier convention — conceptually analogous to our parallel() barrier / a reduce step, but expressed as a method rather than an engine primitive. Used in eval flows to fold per-row metrics.",
+          "relevance": "neutral",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "def __aggregate__(self, line_results: list) -> dict  |  ScriptExecutor._initialize_aggr_function(flow_obj) checks aggr_func param count == 1",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_script_executor.py",
+            "/tmp/promptflow-study/examples/flex-flows/eval-checklist/check_list.py"
+          ]
+        },
+        {
+          "name": "prompty (.prompty) — single-LLM-call leaf, owns no control flow",
+          "how_it_works": "A .prompty file is markdown: YAML front-matter (name, model {api, configuration, parameters}, inputs, sample) between `---` fences, then a jinja2-templated chat prompt body. `Prompty.load(source)` parses it; `prompty(**inputs)` renders the template and issues ONE LLM request with built-in exponential-backoff retry. `PromptyFlow(FlowBase)` has neither nodes nor entry. It is a composable leaf unit (flex code loads and calls it inside its own loops). AsyncPrompty is the async variant.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class Prompty(FlowBase).load(source: Union[str,PathLike], **kwargs) -> 'Prompty'; __call__(self, **kwargs); render(**kwargs) -> str; estimate_token_count(**kwargs) -> int  |  class AsyncPrompty(Prompty).__call__ async  |  @dataclass class PromptyFlow(FlowBase) (no nodes, no entry)",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_flow.py",
+            "/tmp/promptflow-study/examples/prompty/basic/basic.prompty",
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/contracts/flow.py"
+          ]
+        },
+        {
+          "name": "Flow-type discrimination by file shape (extension / 'entry' key)",
+          "how_it_works": "No explicit mode flag. `get_flow_type` returns PROMPTY if `.prompty` extension; FLEX_FLOW if the YAML dict contains key `entry`; else DAG_FLOW. `resolve_flow_path` locates flow.dag.yaml vs flow.flex.yaml in a directory (errors if both present). The presence/absence of `entry` is the single bit separating code-owned (flex) from declared-DAG flows. Clean, low-ceremony way to let one loader accept multiple definition forms.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "get_flow_type(flow_path) -> str (FlowType.PROMPTY/FLEX_FLOW/DAG_FLOW)  |  is_flex_flow(*, flow_path=None, yaml_dict=None, working_dir=None, check_flow_exist=True) -> bool  (returns 'entry' in yaml_dict)  |  is_prompty_flow(file_path) -> bool",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_utils/flow_utils.py"
+          ]
+        },
+        {
+          "name": "Per-tool-call content-hash cache (CacheManager) on DAG nodes",
+          "how_it_works": "Promptflow caches node results by hashing the tool call: `CacheManager.calculate_cache_info(flow_id, tool_method, args, kwargs)` builds a cache string and `hashlib`-derives a `hash_id`; cached results are looked up by that hash. Cache is opt-in per tool via `@enable_cache(calculate_cache_func)` / PROMPTFLOW_HASH_ATTR. This is CONTENT-hash based (over args/kwargs), which is closer to our content-hash journal than to LangGraph's index-based native cache — a partial precedent rather than a contrast.",
+          "relevance": "neutral",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class CacheManager(AbstractCacheManager).calculate_cache_info(flow_id: str, tool_method: Callable, args, kwargs) -> CacheInfo  |  @dataclass class CacheInfo: hash_id: str; cache_string: str  |  enable_cache(calculate_cache_func)(func)",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/cache_manager.py"
+          ]
+        },
+        {
+          "name": "Official framing: flex chosen FOR code-owned control operators",
+          "how_it_works": "promptflow's own concept doc states the trade-off explicitly. DAG flow: tools 'connected via input/output dependencies and executed based on the topology by prompt flow executor' (engine owns control). Flex flow benefit: 'More advanced orchestration: Users can write complex flow with Python built-in control operators (if-else, foreach) or other 3rd party / open-source library' (code owns control). This is the same axis langchain-dynamic-workflow is built around, validating the outward dichotomy.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "N/A (documentation)",
+          "sources": [
+            "/tmp/promptflow-study/docs/concepts/concept-flows.md",
+            "https://microsoft.github.io/promptflow/concepts/concept-flows.html"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "promptflow-core flow contracts (Flow/FlexFlow/PromptyFlow dataclasses, Node, ActivateCondition, NodeVariants, InputAssignment)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/contracts/flow.py",
+          "type": "local-source"
+        },
+        {
+          "title": "promptflow-core public Flow/AsyncFlow/Prompty/AsyncPrompty classes (the load+call surface)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_flow.py",
+          "type": "local-source"
+        },
+        {
+          "title": "DAG runtime — FlowNodesScheduler (thread-pool topology executor)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_flow_nodes_scheduler.py",
+          "type": "local-source"
+        },
+        {
+          "title": "DAG runtime — DAGManager (ready/bypass/activate resolution)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_dag_manager.py",
+          "type": "local-source"
+        },
+        {
+          "title": "flex runtime — ScriptExecutor (entry import, class init, direct call, __aggregate__)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_script_executor.py",
+          "type": "local-source"
+        },
+        {
+          "title": "Flow-type discrimination + entry-file resolution (is_flex_flow / is_prompty_flow / get_flow_type / resolve_flow_path)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/_utils/flow_utils.py",
+          "type": "local-source"
+        },
+        {
+          "title": "flex signature reflection in subprocess (generate_flow_meta)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/entry_meta_generator.py",
+          "type": "local-source"
+        },
+        {
+          "title": "function_to_interface — annotation->FlowInputDefinition reflection",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/_utils/tool_utils.py",
+          "type": "local-source"
+        },
+        {
+          "title": "Per-node content-hash cache (CacheManager / enable_cache)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/cache_manager.py",
+          "type": "local-source"
+        },
+        {
+          "title": "Concept doc: Flows (DAG vs Flex vs flow types; the control-operator framing)",
+          "url_or_path": "/tmp/promptflow-study/docs/concepts/concept-flows.md",
+          "type": "official-docs"
+        },
+        {
+          "title": "DAG flow example — basic (2 nodes, ${node.output} refs)",
+          "url_or_path": "/tmp/promptflow-study/examples/flows/standard/basic/flow.dag.yaml",
+          "type": "example"
+        },
+        {
+          "title": "DAG flow example — web-classification (node_variants + use_variants)",
+          "url_or_path": "/tmp/promptflow-study/examples/flows/standard/web-classification/flow.dag.yaml",
+          "type": "example"
+        },
+        {
+          "title": "DAG flow example — conditional if-else (activate when/is)",
+          "url_or_path": "/tmp/promptflow-study/examples/flows/standard/conditional-flow-for-if-else/flow.dag.yaml",
+          "type": "example"
+        },
+        {
+          "title": "DAG flow example — conditional switch (multi-branch activate)",
+          "url_or_path": "/tmp/promptflow-study/examples/flows/standard/conditional-flow-for-switch/flow.dag.yaml",
+          "type": "example"
+        },
+        {
+          "title": "flex flow example — basic (function entry, one-line entry yaml)",
+          "url_or_path": "/tmp/promptflow-study/examples/flex-flows/basic/flow.flex.yaml",
+          "type": "example"
+        },
+        {
+          "title": "flex flow example — chat-basic (class entry ChatFlow with init + while loop)",
+          "url_or_path": "/tmp/promptflow-study/examples/flex-flows/chat-basic/flow.py",
+          "type": "example"
+        },
+        {
+          "title": "flex flow example — chat-minimal (function entry with if, loads prompty)",
+          "url_or_path": "/tmp/promptflow-study/examples/flex-flows/chat-minimal/flow.py",
+          "type": "example"
+        },
+        {
+          "title": "flex flow example — eval-checklist (__aggregate__ map/reduce hook)",
+          "url_or_path": "/tmp/promptflow-study/examples/flex-flows/eval-checklist/check_list.py",
+          "type": "example"
+        },
+        {
+          "title": "prompty example — basic.prompty (front-matter + jinja2 body, single LLM call)",
+          "url_or_path": "/tmp/promptflow-study/examples/prompty/basic/basic.prompty",
+          "type": "example"
+        },
+        {
+          "title": "promptflow official docs site (hosted concept-flows / develop-a-flex-flow)",
+          "url_or_path": "https://microsoft.github.io/promptflow",
+          "type": "official-docs"
+        }
+      ],
+      "open_questions": [
+        "Does promptflow have ANY durable-execution / resume-replay substrate for flex flows (analogous to our LangGraph @entrypoint+checkpointer), or is per-line re-execution the only recovery model? ScriptExecutor.exec_line appears stateless per line; no checkpointer observed in promptflow-core — devkit batch run (process pool) may add retry but not mid-flow resume. Worth confirming in promptflow-devkit if relevant.",
+        "Flex flow trusts the entry body entirely (no static gate). For our Layer-2 LLM-authored scripts we need the AST gate — promptflow offers no precedent for validating untrusted orchestration code, only subprocess isolation for meta generation. Confirm whether any sandboxing exists in promptflow-devkit batch execution that we could borrow vs. design fresh.",
+        "How does flex flow express parallel fan-out? Examples show only sequential code + the __aggregate__ batch reduce; promptflow seems to rely on the batch engine (line-level process pool in promptflow-devkit/_line_execution_process_pool.py) for parallelism ACROSS rows, not WITHIN a single flow invocation. Our parallel()/pipeline() primitives have no direct flex analogue — flex users would hand-roll asyncio/threads. (Likely a deliberate gap we improve on.)",
+        "node_variants is a DAG-only A/B mechanism with no flex equivalent. Is there demand for a config-selected-variant concept in a code-owned engine, or is that intentionally out of scope (handled by ordinary Python branching/config)?"
+      ]
+    },
+    {
+      "topic": "promptflow SDK and integration FORM",
+      "summary": "See mechanism records.",
+      "mechanisms": [
+        {
+          "name": "PFClient facade plus load_flow load_run plus pf CLI (borrow)",
+          "how_it_works": "Imperative facade: verbs run test stream get_details get_metrics plus lazy props runs flows connections tools traces; run accepts path, entry string, or callable.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-devkit/promptflow/_sdk/_pf_client.py"
+          ]
+        },
+        {
+          "name": "Flow-as-function plus static-DAG plus flex lifecycle (mixed)",
+          "how_it_works": "Borrow Flow call via FlowInvoker LineResult. Contrast classic static DAG and flex single entry, no loops or parallel. Flex class init call aggregate.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_flow.py"
+          ]
+        },
+        {
+          "name": "tool deferred discovery plus tracing (borrow)",
+          "how_it_works": "tool decorator stamps metadata and auto-traces, not import-time registered; discovered later. tracing thin pkg trace start_trace.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/tool.py"
+          ]
+        },
+        {
+          "name": "Deployment plus wheels (borrow); batch fan-out (contrast)",
+          "how_it_works": "serve create_app factory Flask v1 FastAPI v2 endpoint; build flows.build docker executable; wheels pkgutil. Contrast pf.run data fan-out engine-owned.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_serving/app.py"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "PFClient",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-devkit/promptflow/_sdk/_pf_client.py",
+          "type": "local-source"
+        },
+        {
+          "title": "Flow",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_flow.py",
+          "type": "local-source"
+        },
+        {
+          "title": "tool",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/tool.py",
+          "type": "local-source"
+        },
+        {
+          "title": "create_app",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_serving/app.py",
+          "type": "local-source"
+        }
+      ],
+      "open_questions": [
+        "Serving internals and Azure endpoint API not deep-read.",
+        "No AST-gate analog; compressed due to payload limit."
+      ]
+    },
+    {
+      "topic": "Microsoft promptflow executor/runtime architecture (promptflow-core FlowExecutor, schedulers, batch/process-pool, aggregation, promptflow-parallel) studied to inspire the outward software-architecture form of langchain-dynamic-workflow (a code-owns-control-flow engine on LangChain deepagents)",
+      "summary": "promptflow ships TWO orthogonal execution models, and the contrast between them is the single most relevant lesson for langchain-dynamic-workflow (LDW). (1) DAG flow — the historical core: a YAML graph of `Node`s referencing each other; `FlowExecutor` (executor/flow_executor.py) hands the non-aggregation nodes to a scheduler that owns control flow. Two schedulers exist: `FlowNodesScheduler` (sync, ThreadPoolExecutor) and `AsyncNodesScheduler` (asyncio + Semaphore + ThreadPoolExecutor for sync tools). Both drive a `DAGManager` (executor/_dag_manager.py) — a pull-based topological scheduler whose contract is `pop_ready_nodes()` / `pop_bypassable_nodes()` / `complete_nodes(outputs)` / `completed()`. Intermediate node outputs live in a plain dict `_completed_nodes_outputs: {node_name -> output}` inside the DAGManager (NOT in any LLM context); a node becomes ready when all its NODE_REFERENCE dependencies are in completed-or-bypassed sets. Conditional execution is `activate` conditions that 'bypass' nodes (graph-pruning, not code branching). This is exactly the static-DAG, framework-owns-control-flow model LDW deliberately INVERTS. (2) Flex/eager flow — `ScriptExecutor` (executor/_script_executor.py, subclasses FlowExecutor): the user's plain Python `_func` IS the control flow; there is NO DAGManager, NO scheduler, NO node graph — `_exec_line` just calls `output = self._func(**inputs)`. Official docs state flex flows let developers use 'Python built-in control operators (if-else, foreach)' to control execution themselves. This is the closest promptflow analogue to LDW's code-owns-control-flow thesis and validates the inversion direction. The run/line-record model is uniform across both: every execution produces a `LineResult(output, aggregation_inputs, run_info, node_run_infos)` (executor/_result.py); `RunTracker` (_core/run_tracker.py) holds `_flow_runs` and `_node_runs` dicts of `FlowRunInfo`/`RunInfo` records (run_id, parent_run_id, status enum, api_calls, inputs/output, cached_run_id) persisted via an `AbstractRunStorage`. Batch execution is a SEPARATE layer in promptflow-devkit (`BatchEngine`, batch/_batch_engine.py), not in core: it fans out lines either via asyncio (`_exec_batch` → `asyncio.Semaphore(worker_count)` + `asyncio.wait(FIRST_COMPLETED)`) or, for sync Python flows, via a multiprocessing `LineExecutionProcessPool` (executor/_line_execution_process_pool.py) using Manager().Queue() task/output queues, fork-vs-spawn handling, and a memory-based worker-count heuristic. Aggregation ('reduce') nodes are run ONCE after all lines, fed transposed per-line `aggregation_inputs` (scatter→gather/map-reduce). promptflow-parallel is the Azure ML Parallel-Run-Step adapter: minibatch → map rows → `executor.execute(row)` → serialize to JSONL → `finalize()`/`AggregationFinalizer` reduce — a distributed map-reduce over storage, NOT an in-process orchestrator. Caching is content-hash based (CacheManager._calculate_hash_id = sha1 of a cache_string the tool itself computes, qualified by flow_id+tool_name) — directly relevant to LDW's planned content-hash journal, though promptflow's default is DummyCacheManager (no-op) and the hash is opt-in per-tool, not automatic. No durable-execution/checkpoint substrate exists like LangGraph's @entrypoint/@task — resume in BatchEngine is coarse-grained (skip lines whose index already has a previous LineResult), not fine-grained replay.",
+      "mechanisms": [
+        {
+          "name": "DAGManager — pull-based topological scheduler with dict-stored intermediate outputs",
+          "how_it_works": "Holds _pending_nodes, _completed_nodes_outputs ({node_name->output}), _bypassed_nodes. `pop_ready_nodes()` scans pending nodes and returns those whose every dependency (node.inputs values + activate.condition, filtered to InputValueType.NODE_REFERENCE) is already in completed-or-bypassed sets; removes them from pending. `complete_nodes(outputs)` merges results back into the dict. `completed()` is True when every node is in completed-or-bypassed. The scheduler loops pop→submit→wait→complete until done. Intermediate results live entirely in this dict — the data-passing channel between steps is a script variable, not a context window. This is the canonical static-DAG topology scheduler that LDW's 'script owns the loops' model is the opposite of.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class DAGManager: def __init__(self, nodes: List[Node], flow_inputs: dict); def pop_ready_nodes(self) -> List[Node]; def pop_bypassable_nodes(self) -> List[Node]; def complete_nodes(self, nodes_outputs: Mapping[str, Any]); def completed(self) -> bool; def get_node_valid_inputs(self, node: Node, f: Callable) -> Mapping[str, Any]",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_dag_manager.py"
+          ]
+        },
+        {
+          "name": "FlowNodesScheduler — sync ThreadPoolExecutor scheduler with FIRST_COMPLETED wait loop",
+          "how_it_works": "Wraps a DAGManager. `execute()` creates a ThreadPoolExecutor(max_workers=min(node_concurrency, 16)), submits all currently-ready nodes (`_submit_nodes` → executor.submit(_exec_single_node_in_thread)), then loops: `futures.wait(tasks, return_when=FIRST_COMPLETED)` → collect outputs → `dag_manager.complete_nodes` → submit newly-ready nodes, until `dag_manager.completed()`. Per-node it resolves the tool via ToolsManager.get_tool(node.name), builds kwargs from DAGManager.get_node_valid_inputs, and runs sync tools directly or async tools via asyncio.run. Registers SIGINT/SIGTERM handlers (only on main thread) that os._exit after a delay to escape lingering ThreadPool worker threads. Concurrency constants: DEFAULT_CONCURRENCY_BULK=2, DEFAULT_CONCURRENCY_FLOW=16. The barrier-free, continuously-refilling submit loop is conceptually similar to LDW's pipeline() (no barrier), but here it is graph-driven, not code-driven.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class FlowNodesScheduler: def __init__(self, tools_manager, inputs: Dict, nodes_from_invoker: List[Node], node_concurrency: int, context: FlowExecutionContext); def execute(self, line_timeout_sec: Optional[int] = None) -> Tuple[dict, dict]",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_flow_nodes_scheduler.py"
+          ]
+        },
+        {
+          "name": "AsyncNodesScheduler — asyncio Semaphore + ThreadPoolExecutor hybrid",
+          "how_it_works": "Same DAGManager-driven pop/complete loop but async: creates asyncio.Semaphore(node_concurrency); for each ready node, async tools become coroutines wrapped in `run_task_with_semaphore` via asyncio.create_task(name=node.name), while sync tools are bridged to async via loop.run_in_executor(ThreadPoolExecutor, context.invoke_tool, ...). Drives with `asyncio.wait(tasks, return_when=FIRST_COMPLETED)` under asyncio.wait_for(remaining_timeout). Deliberately avoids `with ThreadPoolExecutor` (manual shutdown) so cancellation isn't blocked waiting on running threads. Includes a daemon monitor thread that walks asyncio.all_tasks and logs recursive coroutine stacks for long-running tasks, and a post-cancellation monitor that os._exit(0) once all tasks are done. FlowExecutor picks this scheduler when ANY tool is async (`_should_use_async`) or PF_USE_ASYNC=true. Shows a mature pattern for mixing async leaf calls with a bounded-concurrency barrier — relevant to how LDW's parallel()/agent() should bound concurrency.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class AsyncNodesScheduler: def __init__(self, tools_manager: ToolsManager, node_concurrency: int); async def execute(self, nodes: List[Node], inputs: Dict[str, Any], context: FlowExecutionContext, timeout_seconds: Optional[int] = None) -> Tuple[dict, dict]",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_async_nodes_scheduler.py"
+          ]
+        },
+        {
+          "name": "FlowExecutor — single-line executor entry class and scheduler dispatcher",
+          "how_it_works": "The primary entry class. `FlowExecutor.create(flow_file, connections, ...)` is a factory that dispatches to PromptyExecutor / ScriptExecutor (flex/eager) / DAG FlowExecutor based on file type. `exec_line(inputs, index, run_id, node_concurrency=16, line_timeout_sec)` (sync) and `exec_line_async(...)` are the per-line entry points; both delegate to `_exec` → `_exec_inner_with_trace` → `_traverse_nodes`. `_traverse_nodes` filters out aggregation nodes, calls `_submit_to_scheduler` (which builds a FlowNodesScheduler) or `_traverse_nodes_async` (builds AsyncNodesScheduler), then `_extract_outputs` maps flow.outputs (LITERAL / FLOW_INPUT / NODE_REFERENCE references) to a final dict. Each `_exec` constructs a fresh per-line RunTracker + FlowExecutionContext, wraps a tracing span, and returns a LineResult. This factory + per-line + extract-outputs shape is a clean reference for LDW's workflow() entry + final-result extraction, but note control flow is entirely in the scheduler, not here.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class FlowExecutor: @classmethod def create(cls, flow_file: Path, connections, working_dir=None, *, storage=None, raise_ex=True, line_timeout_sec=None, init_kwargs=None, **kwargs) -> 'FlowExecutor'; def exec_line(self, inputs, index=None, run_id=None, validate_inputs=True, node_concurrency=16, allow_generator_output=False, line_timeout_sec=None) -> LineResult; async def exec_line_async(...) -> LineResult",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/flow_executor.py"
+          ]
+        },
+        {
+          "name": "ScriptExecutor (flex/eager flow) — user Python function IS the control flow",
+          "how_it_works": "Subclass of FlowExecutor for flex flows. There is NO DAGManager, NO scheduler, NO node graph. `_initialize_function` loads the user entry callable into self._func (and self._func_async via sync/async bridging). `_exec_line` simply does `output = self._func(**inputs)` inside a tracing span and wraps it in a LineResult with empty node_run_infos. Aggregation is a user-defined `__aggregate__` method discovered via getattr, run once over the list of per-line outputs (`exec_aggregation`/`exec_aggregation_async`). The official docs explicitly frame this as developers using 'Python built-in control operators (if-else, foreach)' to control execution. This is promptflow's own admission that code-owns-control-flow is a first-class mode — and is the single closest existing analogue to LDW's thesis. The asymmetry to mine: promptflow's flex mode gives up ALL the batch/aggregation/run-record scaffolding INSIDE the function (the function is a black box to the runtime); LDW wants code-owns-control-flow WHILE KEEPING structured primitives (agent/parallel/pipeline/phase) and durable journaling — i.e. instrument the control flow rather than treat it as opaque.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class ScriptExecutor(FlowExecutor): def _exec_line(self, inputs, index=None, run_id=None, allow_generator_output=False) -> LineResult  # body: output = self._func(**inputs); def exec_aggregation(self, inputs, aggregation_inputs: List[Any], run_id=None) -> AggregationResult",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_script_executor.py"
+          ]
+        },
+        {
+          "name": "FlowExecutionContext.invoke_tool — per-node invocation, tracing, caching, run-record bracket",
+          "how_it_works": "The leaf-call wrapper the schedulers call per node. `invoke_tool(node, f, kwargs)` brackets a single tool call: _prepare_node_run (start_node_run → RunInfo with node_run_id, parent_run_id, index, inputs), optional cache lookup (calculate_cache_info → get_cache_result; sets cached_run_id on hit and skips f), Tracer.start/end_tracing, run_tracker.end_run(result/ex, traces), persist_node_run in finally. async variant invoke_tool_async mirrors it. bypass_node writes a Bypassed RunInfo without execution. This is the clean 'quarantine one unit of work + record it' boundary — directly analogous to what LDW's agent() @task wrapper needs (isolated context, record start/result/error, content-hash skip). The pattern of always persisting the run record in `finally` even on exception is worth borrowing for no-silent-failures.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class FlowExecutionContext(ThreadLocalSingleton): def invoke_tool(self, node: Node, f: Callable, kwargs); async def invoke_tool_async(self, node: Node, f: Callable, kwargs); def bypass_node(self, node: Node)",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/flow_execution_context.py"
+          ]
+        },
+        {
+          "name": "LineResult / AggregationResult / RunInfo — the run & line-record model",
+          "how_it_works": "Uniform result contracts across DAG and flex modes. `LineResult(output, aggregation_inputs, run_info: FlowRunInfo, node_run_infos: {node_name->RunInfo})` is the per-line record; `AggregationResult(output, metrics, node_run_infos)` is the reduce record. `RunInfo` (contracts/run_info.py) is the per-node record: node, flow_run_id, run_id (= flow_run_id:step_run_id), status: Status (Completed/Failed/Bypassed/Canceled/Running), parent_run_id, api_calls, inputs, output, cached_run_id/cached_flow_run_id. `RunTracker` keeps in-memory dicts `_flow_runs` and `_node_runs` and persists each via AbstractRunStorage. Intermediate state is therefore fully reified as plain dataclasses keyed by run_id with explicit parent links — a serializable journal. This dataclass-based, parent-linked, status-tagged record model is a strong reference for LDW's journal entries (esp. the content-hash and parent-run linkage), independent of whether control flow is graph- or code-driven.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "@dataclass class LineResult: output: Mapping[str, Any]; aggregation_inputs: Mapping[str, Any]; run_info: FlowRunInfo; node_run_infos: Mapping[str, RunInfo]. @dataclass class AggregationResult: output; metrics: Dict[str, Any]; node_run_infos: Mapping[str, RunInfo]. @dataclass class RunInfo: node: str; flow_run_id: str; run_id: str; status: Status; parent_run_id: str; api_calls; cached_run_id; cached_flow_run_id",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_result.py",
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/contracts/run_info.py",
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/run_tracker.py"
+          ]
+        },
+        {
+          "name": "BatchEngine — async fan-out of lines with Semaphore + FIRST_COMPLETED + line-skip resume",
+          "how_it_works": "Lives in promptflow-devkit (NOT core), sitting ABOVE FlowExecutor. `run()` → `_exec_in_task` wraps `_exec` in an asyncio.Task polled every 1s for cancel/timeout. `_exec_batch` fans out one asyncio.Task per line under `asyncio.Semaphore(worker_count)` (`_exec_line_under_semaphore` → executor_proxy.exec_line_async), drains via `asyncio.wait(FIRST_COMPLETED)`, persists each completed LineResult's node/flow run infos, logs progress. Resume is COARSE: previous_line_results' indices are skipped (`existing_results_line_numbers`), remaining inputs re-run — there is no fine-grained per-step replay or checkpointer. After all lines, runs aggregation once. For sync Python flows it instead delegates to a multiprocessing process pool (next mechanism). The semaphore-bounded create_task + FIRST_COMPLETED drain loop is a clean pattern for LDW's parallel() barrier; the coarse line-skip resume is the CONTRAST to LangGraph durable execution (and to what LDW wants from the LangGraph substrate).",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class BatchEngine: def run(self, input_dirs, inputs_mapping, output_dir, run_id=None, max_lines_count=None, raise_on_line_failure=False, resume_from_run_storage=None) -> BatchResult; async def _exec_batch(self, line_results: List[LineResult], batch_inputs, run_id=None); async def _exec_line_under_semaphore(self, semaphore, inputs, index=None, run_id=None)",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-devkit/promptflow/batch/_batch_engine.py"
+          ]
+        },
+        {
+          "name": "LineExecutionProcessPool — multiprocessing fan-out for sync Python flows",
+          "how_it_works": "For sync Python batch runs, lines are dispatched to worker PROCESSES (true parallelism, GIL escape). Uses Manager().Queue() for task/input/output queues (chosen over multiprocessing.Queue because SemLocks can't cross fork/spawn contexts). Honors PF_BATCH_METHOD (fork/forkserver/spawn); in fork mode it first spawns a clean process then forks workers to avoid deadlocks. Per worker, `_exec_line_for_queue` loops reading inputs and calls FlowExecutor.exec_line(node_concurrency=DEFAULT_CONCURRENCY_BULK=2) — so each line still runs its intra-line DAG scheduler with low concurrency, while inter-line parallelism comes from processes. Worker count via `_determine_worker_count` blends default(4), row_count, and a memory-based estimate (get_available_max_worker_count). A monitor ThreadPool watches worker health, line/batch timeouts, and restarts/terminates. This is heavyweight OS-process machinery LDW likely should AVOID building itself — LangGraph @task + async leaf agents on the durable substrate is the lighter path; useful mainly as a cautionary reference on fork/spawn pitfalls and queue-based IPC.",
+          "relevance": "avoid",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class LineExecutionProcessPool: def __init__(self, output_dir: Path, flow_executor: FlowExecutor, worker_count=None, line_timeout_sec=None, batch_timeout_sec=None, run_id=None, nlines=None, persist_multimedia_after_execution=False); async def run(self, batch_inputs) -> List[LineResult]; async def submit(self, run_id, line_number, inputs); _DEFAULT_WORKER_COUNT = 4",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_line_execution_process_pool.py"
+          ]
+        },
+        {
+          "name": "Aggregation nodes — scatter→gather reduce step run once after all lines",
+          "how_it_works": "Aggregation ('reduce') nodes are excluded from per-line traversal (`batch_nodes = [n for n in nodes if not n.aggregation]`) and run ONCE after the whole batch. FlowExecutor.exec_line returns `aggregation_inputs` per line (extract_aggregation_inputs(flow, nodes_outputs)). BatchEngine._get_aggregation_inputs TRANSPOSES per-line inputs into column lists (transpose + collect_lines, succeeded lines only), then `exec_aggregation_async(inputs, aggregation_inputs, run_id)` runs the aggregation nodes via the same scheduler with the columns bound as node inputs. Metrics are collected via a metric_logger. This is a textbook map(line)→reduce(aggregate) split with an explicit barrier between phases. Directly informs LDW's phase() + a final reduce/aggregate primitive: keep per-step outputs in script variables, then run a deterministic reduce — but LDW can do this in plain code rather than as special graph nodes.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "def exec_aggregation(self, aggregated_flow_inputs: Mapping, aggregation_inputs: Mapping, run_id=None, node_concurrency=16) -> AggregationResult; (BatchEngine) def _get_aggregation_inputs(self, batch_inputs, line_results: List[LineResult]); async def _exec_aggregation(self, batch_inputs, line_results, run_id=None) -> AggregationResult",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/flow_executor.py",
+            "/tmp/promptflow-study/src/promptflow-devkit/promptflow/batch/_batch_engine.py"
+          ]
+        },
+        {
+          "name": "promptflow-parallel — Azure ML Parallel-Run-Step adapter (distributed map-reduce over storage)",
+          "how_it_works": "NOT an in-process orchestrator; it adapts promptflow to Azure ML's Parallel Run Step. `AbstractParallelRunProcessor.process(mini_batch, context)` maps each row to `Result` via `self._executor.execute(row)`, serializes each to a JSONL line, and writes to an output dir; `finalize()` reads all temp JSONL output files back and runs reducers (`AggregationFinalizer` for aggregation nodes, plus a CompositeFinalizer chain). Concurrency/distribution is owned by the Azure ML PRS host (minibatches across nodes), not by promptflow. So the 'parallel' story here is scatter-to-files → gather-from-files map-reduce at cluster scale, decoupled via the storage layer. For LDW this is the CONTRAST/AVOID end of the spectrum: parallelism delegated to an external scheduler + filesystem handoff, versus LDW's in-process, code-driven fan-out via LangGraph @task. Useful only as evidence of how promptflow cleanly separates 'execute one row' from 'distribute many rows'.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class AbstractParallelRunProcessor(ParallelRunProcessor, ABC): def process(self, mini_batch: List[dict], context) -> List[str]; def _do_process(self, rows: Iterable[Row]) -> Iterable[Result]  # yield self._executor.execute(row); def finalize(self)",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-parallel/promptflow/parallel/_processor/base.py",
+            "/tmp/promptflow-study/src/promptflow-parallel/promptflow/parallel/_executor/base.py"
+          ]
+        },
+        {
+          "name": "CacheManager — opt-in content-hash result cache (sha1 of tool-computed cache_string)",
+          "how_it_works": "calculate_cache_info(flow_id, tool_method, args, kwargs): the TOOL itself supplies a cache function (registered via @enable_cache / PROMPTFLOW_HASH_ATTR); it computes a cache_string from the args, which is concatenated with json{flow_id, tool_name} and sha1-hashed to a hash_id. get_cache_result queries cache_storage by hash_id, returns the latest cached node run's result (sets hit_cache + cached_run_id). This is genuinely content-hash-based (not index-based), so it is the conceptual cousin of LDW's planned content-hash journal — but two caveats matter: (a) the default in core is DummyCacheManager (returns None, i.e. NO caching unless devkit wires a real one); (b) the hash is OPT-IN per tool and the tool must define how to hash its own inputs, rather than the runtime hashing call content automatically. LDW's content-hash journal should aim to be automatic and runtime-owned (the doc notes LangGraph's native cache is index-based — promptflow shows a content-hash alternative but with a manual, per-tool registration burden to avoid).",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class CacheManager(AbstractCacheManager): def calculate_cache_info(self, flow_id: str, tool_method: Callable, args, kwargs) -> CacheInfo; def get_cache_result(self, cache_info: CacheInfo) -> CacheResult; @staticmethod def _calculate_hash_id(cache_string: str)  # sha1; def enable_cache(calculate_cache_func)  # decorator",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/cache_manager.py"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "DAGManager — pull-based topological scheduler (intermediate outputs in a dict)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_dag_manager.py",
+          "type": "local-source"
+        },
+        {
+          "title": "FlowNodesScheduler — sync ThreadPoolExecutor scheduler",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_flow_nodes_scheduler.py",
+          "type": "local-source"
+        },
+        {
+          "title": "AsyncNodesScheduler — asyncio Semaphore + ThreadPoolExecutor hybrid scheduler",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_async_nodes_scheduler.py",
+          "type": "local-source"
+        },
+        {
+          "title": "FlowExecutor — entry class, factory, scheduler dispatch, output extraction",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/flow_executor.py",
+          "type": "local-source"
+        },
+        {
+          "title": "ScriptExecutor — flex/eager flow where user Python func IS the control flow",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_script_executor.py",
+          "type": "local-source"
+        },
+        {
+          "title": "FlowExecutionContext — per-node invoke/cache/trace/run-record bracket",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/flow_execution_context.py",
+          "type": "local-source"
+        },
+        {
+          "title": "LineResult / AggregationResult contracts",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_result.py",
+          "type": "local-source"
+        },
+        {
+          "title": "RunInfo / FlowRunInfo / Status contracts (run-record model)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/contracts/run_info.py",
+          "type": "local-source"
+        },
+        {
+          "title": "RunTracker — in-memory run-record dicts + storage persistence",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/run_tracker.py",
+          "type": "local-source"
+        },
+        {
+          "title": "CacheManager — opt-in content-hash (sha1) result cache",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/cache_manager.py",
+          "type": "local-source"
+        },
+        {
+          "title": "BatchEngine — async/multiprocess line fan-out, line-skip resume, aggregation orchestration",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-devkit/promptflow/batch/_batch_engine.py",
+          "type": "local-source"
+        },
+        {
+          "title": "LineExecutionProcessPool — multiprocessing worker pool (Manager queues, fork/spawn)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_line_execution_process_pool.py",
+          "type": "local-source"
+        },
+        {
+          "title": "AbstractParallelRunProcessor — Azure ML Parallel-Run-Step map-reduce adapter",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-parallel/promptflow/parallel/_processor/base.py",
+          "type": "local-source"
+        },
+        {
+          "title": "Concept: Flows (DAG vs Flex/eager; who controls execution order)",
+          "url_or_path": "https://microsoft.github.io/promptflow/concepts/concept-flows.html",
+          "type": "official-docs"
+        }
+      ],
+      "open_questions": [
+        "promptflow has NO durable-execution/checkpointer substrate analogous to LangGraph @entrypoint/@task — resume is coarse line-skip in BatchEngine, not per-step replay. Confirm LDW gets fine-grained replay/resume entirely from the LangGraph substrate and that promptflow offers no reusable pattern there beyond the run_id/parent_run_id record model.",
+        "promptflow's content-hash cache (CacheManager) is opt-in per-tool and disabled by default (DummyCacheManager). Open question for LDW: should the content-hash journal hash call inputs automatically at the runtime level (no per-leaf registration), and how to make that hash deterministic/stable for agent() calls whose inputs include large prompts and roster identity?",
+        "How does promptflow guarantee determinism for replay/cache reuse? It largely does NOT enforce it (cache is content-string-based and best-effort) — there is no fail-loud determinism guard like LDW plans. Confirm LDW's determinism guard has no promptflow precedent to borrow and must come from the LangGraph layer + AST gate.",
+        "The flex/eager ScriptExecutor treats the user function as an OPAQUE black box (no per-step run records inside it). LDW wants code-owns-control-flow WHILE instrumenting each agent()/parallel()/pipeline() step. Open design question: what is the minimal instrumentation boundary (decorator? primitive call sites?) that records per-step journal entries without the user writing graph nodes — i.e. how to get DAG-flow's rich node_run_infos with flex-flow's code-driven control flow.",
+        "Aggregation in promptflow is a special node type with transposed columnar inputs and an explicit barrier. For LDW, is a dedicated reduce/aggregate primitive needed, or is plain Python over script-held results sufficient given control flow is already code-owned? promptflow's transpose/collect_lines helpers are only needed because lines run in isolated processes — LDW's in-process model may not need them.",
+        "Did not deep-read promptflow-evals / promptflow-tracing internals; tracing (OpenTelemetry spans per node, Tracer.start/end_tracing) is woven through every executor and may be worth a separate study for how LDW should emit observability around agent() leaf calls."
+      ]
+    },
+    {
+      "topic": "promptflow tooling/connections/tracing/evals for langchain-dynamic-workflow",
+      "summary": "Verified-in-source study. Reusables for roster/registry, budget/observability, leaf-agent tracing captured per mechanism with file paths. Contrasts noted on monkey-patch instrumentation and meta-gen isolation.",
+      "mechanisms": [
+        {
+          "name": "tools: @tool + entry-point discovery + ToolsManager",
+          "how_it_works": "@tool metadata-only + auto-traces (no register); signature reflection to typed contract; entry-point group package_tools; ToolsManager dict registry. Our roster/registry.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/tools_manager.py"
+          ]
+        },
+        {
+          "name": "connections: ConnectionProvider ABC + typed injection",
+          "how_it_works": "configs/secrets split; ABC singleton backend-swap by env; name-referenced; resolver asserts resolved class matches declared param type. Template for roster + config/secret providers.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_connection_provider/_connection_provider.py"
+          ]
+        },
+        {
+          "name": "tracing: OperationContext + ThreadPoolExecutorWithContext + TokenCollector",
+          "how_it_works": "ContextVar propagation + tracking-keys allowlist; contextvar-copy pool so fan-out keeps span lineage; child-token rollup to parents as __computed__.cumulative_token_count.*. Leaf-agent tracing + budget rollup.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-tracing/promptflow/tracing/_trace.py"
+          ]
+        },
+        {
+          "name": "evals: evaluate() + QAEvaluator",
+          "how_it_works": "evaluate(evaluators=Dict[str,Callable]) code-owned deterministic orchestration + aggregation; QAEvaluator as_completed barrier fan-out. Cousin of our parallel().",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-evals/promptflow/evals/evaluators/_qa/_qa.py"
+          ]
+        },
+        {
+          "name": "contrasts: OpenAI monkey-patch + meta-gen subprocess isolation",
+          "how_it_works": "openai instrumentation via monkey-patch + primitive-allowlist headers (borrow header pattern); meta-gen exec-in-fresh-ModuleType + multiprocessing+timeout, weaker than our AST gate but complementary.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/tool_meta_generator.py"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "core tools + connections",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/tools_manager.py",
+          "type": "local-source"
+        },
+        {
+          "title": "tracing",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-tracing/promptflow/tracing/_trace.py",
+          "type": "local-source"
+        },
+        {
+          "title": "evals",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-evals/promptflow/evals/evaluate/_evaluate.py",
+          "type": "local-source"
+        }
+      ],
+      "open_questions": [
+        "Do cumulative_token_count span attrs survive OTLP export or are they in-process only?",
+        "connections have no TTL/budget/quota; build cost ceilings ourselves.",
+        "add subprocess+timeout atop our AST gate, or AST gate + determinism guard enough?"
+      ]
+    },
+    {
+      "topic": "Microsoft promptflow as outward-architecture inspiration for langchain-dynamic-workflow: packaging, API shape, tracing-first observability, serve/deploy, and the DAG-YAML→code-first \"flex\" pivot — concrete BORROW/AVOID/CONTRAST lessons for a code-owns-control-flow engine.",
+      "summary": "Promptflow is a monorepo of layered packages (promptflow-tracing → promptflow-core → promptflow-devkit → promptflow-azure, with the top-level `promptflow` being a thin deprecation-routing facade). Its outward form gives our three packaging options a tested template: (1) a tracing+core \"library core\" that is pip-installable alone, (2) a `PFClient` hub-and-spoke control-plane client with operation namespaces (`.runs/.flows/.connections/.traces`), and (3) flow-as-callable via `load_flow(source)()` and `pf.run(flow=callable, ...)`. Cross-package layering is ENFORCED, not just documented, via `import-linter` `forbidden` contracts in every package's pyproject — a concrete mechanism for our Layer 0/1/2 boundaries. Tracing is observability-first and decorator-driven: `@trace` (sync+async), `start_trace()` one-liner OpenAI auto-instrumentation, OpenTelemetry-native; `@tool` itself wraps `_traced` so every tool call is auto-spanned. Serve/deploy is a first-class story: `pf flow serve` boots a Flask/FastAPI app exposing `/score`, with Docker/K8s/executable variants and env-var connection override.\n\nThe single most important lesson is the PIVOT. Promptflow's original design (`docs/concepts/design-principles.md`) deliberately chose a static YAML DAG of tools for VISIBILITY (visualize the graph, run/debug single nodes) and DELIBERATELY refused to make Flow Turing-complete — explicitly redirecting \"fully dynamic, LLM-guided agents\" to Semantic Kernel (principle #3, line 51). They then introduced \"flex flows\" (code-first function/class entries via `flow.flex.yaml` `entry: module:func`) precisely because the static DAG could not express real control flow; `concept-flows.md` states flex's benefits verbatim as \"write complex flow with Python built-in control operators (if-else, foreach)\" and \"easy onboard from langchain/semantic kernel.\" The endgame: promptflow is now RETIRED (feature dev ended 2026-04-20) and migrated to Microsoft Agent Framework. WHY the pivot: static config DAGs cannot represent data-dependent loops, dynamic fan-out, or arbitrary branching without bolting on a half-baked control-flow DSL (`activate-when`), and config-as-control-flow fights the user's existing Python mental model and 3rd-party libraries. This validates our entire thesis — but note the CONTRAST: even MAF's \"code-first\" successor still expresses control flow as a graph builder (`WorkflowBuilder().add_edge(a,b,condition=fn)`, `add_fan_out_edges`/`add_fan_in_edges`), i.e. control flow remains in a graph DSL, not plain Python statements. Our engine goes one step further than promptflow's own successor by letting the orchestration script own real `if`/`for`/`await`, with `parallel()`/`pipeline()` as ordinary calls returning values rather than declared edges.",
+      "mechanisms": [
+        {
+          "name": "Monorepo package split with layered dependency direction (tracing→core→devkit→azure)",
+          "how_it_works": "Each capability is a separately pip-installable poetry package under src/. promptflow-tracing has only OTel+openai+tiktoken deps; promptflow-core depends on tracing; promptflow-devkit depends on core and adds the CLI/SDK/serving/storage; promptflow-azure sits on top of devkit. A user can `pip install promptflow-tracing` alone for just observability, or `pip install promptflow-core` for the runtime without the devkit's heavy deps (sqlalchemy, pandas, streamlit). Versions are lockstep (all 1.18.0).",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/pyproject.toml",
+            "/tmp/promptflow-study/src/promptflow-tracing/pyproject.toml",
+            "/tmp/promptflow-study/src/promptflow-devkit/pyproject.toml",
+            "/tmp/promptflow-study/src/promptflow-azure/pyproject.toml"
+          ]
+        },
+        {
+          "name": "import-linter `forbidden` contracts enforce layer boundaries at CI time",
+          "how_it_works": "Every package's pyproject.toml has a [tool.importlinter] block with `type = \"forbidden\"` contracts listing source_modules and forbidden_modules. E.g. promptflow-tracing forbids `promptflow.tracing` from importing promptflow.core/_sdk/azure/etc; promptflow-core forbids its public modules from importing _cli/_sdk/batch/client/azure. This turns architectural layering from documentation into a mechanically-checked invariant. api_signature: `[[tool.importlinter.contracts]] type = \"forbidden\"; source_modules=[...]; forbidden_modules=[...]`",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-tracing/pyproject.toml#L88-114",
+            "/tmp/promptflow-study/src/promptflow-core/pyproject.toml#L121-147",
+            "/tmp/promptflow-study/src/promptflow-devkit/pyproject.toml#L163-181"
+          ]
+        },
+        {
+          "name": "Thin meta-package facade with __getattr__ deprecation routing",
+          "how_it_works": "Top-level `promptflow/__init__.py` imports nothing eagerly beyond hidden aliases; it implements module `__getattr__(name)` that lazily resolves `PFClient`/`tool`/`load_flow` from the real sub-packages and emits a deprecation warning steering users to the canonical import path (`from promptflow.client import PFClient`). This lets the public namespace evolve while preserving old imports. api_signature: `def __getattr__(name) -> Any`",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow/promptflow/__init__.py"
+          ]
+        },
+        {
+          "name": "PFClient — hub-and-spoke control-plane client with operation namespaces",
+          "how_it_works": "A single `PFClient(**kwargs)` exposes lazily-built operation objects as properties: `.runs` (RunOperations), `.flows` (FlowOperations), `.connections` (ConnectionOperations, lazy to defer Azure credential), `.tools`, `.traces`. High-level verbs live on the client (`run`, `test`, `stream`, `get_details`, `get_metrics`, `visualize`) and delegate to the namespaces. Connection provider (local vs azureml) is pluggable via `_build_connection_operation`. api_signature: `PFClient(**kwargs)`; `client.run(flow: Union[str, PathLike, Callable], *, data=None, run=None, column_mapping=None, init=None, resume_from=None, ...) -> Run`; `client.test(flow, *, inputs=None, init=None, node=None) -> dict`",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-devkit/promptflow/_sdk/_pf_client.py",
+            "/tmp/promptflow-study/src/promptflow-devkit/promptflow/client/__init__.py"
+          ]
+        },
+        {
+          "name": "Flow-as-callable via load_flow(source) and FlowContext overrides",
+          "how_it_works": "`load_flow(source)` returns a Flow object that is directly callable with keyword args: `f = load_flow('path'); f(url='...')`. Positional args are rejected (keyword-only inputs). Before calling, `f.context = FlowContext(connections=..., overrides=..., streaming=True)` rewrites connections/inputs/streaming in-memory so the flow function can be reused across many calls without re-resolving connections. Flow.__call__ raises UserErrorException on invalid inputs. api_signature: `Flow.__call__(self, *args, **kwargs) -> Mapping[str, Any]` (kwargs only); `Flow.load(cls, source: Union[str, PathLike], **kwargs) -> Flow`; `FlowContext(connections=..., overrides=..., streaming=...)`",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_flow.py#L109-219",
+            "/tmp/promptflow-study/docs/how-to-guides/execute-flow-as-a-function.md"
+          ]
+        },
+        {
+          "name": "@trace decorator — sync/async-transparent, OpenTelemetry-native function tracing",
+          "how_it_works": "`@trace` wraps any callable (auto-detecting coroutine vs sync) to record function name, inputs, outputs, start/end time, and errors as OTel spans. Used bare (`@trace`) on plain Python functions inside flex flows. Span enrichment is pluggable (LLMSpanEnricher/EmbeddingSpanEnricher registered per TraceType for token counting). api_signature: `def trace(func: Callable = None) -> Callable` (delegates to `_traced(func, trace_type=TraceType.FUNCTION)`)",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-tracing/promptflow/tracing/_trace.py#L577-613",
+            "/tmp/promptflow-study/examples/flex-flows/basic/programmer.py"
+          ]
+        },
+        {
+          "name": "start_trace() — one-line opt-in observability with auto-instrumentation",
+          "how_it_works": "A single keyword-only call `start_trace()` injects/instruments the OpenAI client (`inject_openai_api()`), sets an OTel TracerProvider with service/collection resource attributes, and — if promptflow-devkit is installed — wires up the local trace UI/exporter. Tracing is layered so the core works without the devkit's UI. The collection is auto-derived from cwd unless user-specified (then 'protected'). api_signature: `def start_trace(*, resource_attributes: Optional[dict]=None, collection: Optional[str]=None, **kwargs)`",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-tracing/promptflow/tracing/_start_trace.py#L27-86",
+            "/tmp/promptflow-study/docs/how-to-guides/tracing/index.md"
+          ]
+        },
+        {
+          "name": "@tool decorator auto-wraps tracing (observability-by-default at the leaf)",
+          "how_it_works": "`@tool` registers a function as a flow tool AND unconditionally wraps it with `_traced(func, trace_type=TraceType.FUNCTION)` so every tool invocation produces a span without the author opting in. It stashes metadata (__name/__description/__type/__input_settings) on the wrapped function for later tool-definition generation. api_signature: `def tool(func=None, *, name: str=None, description: str=None, type: str=None, input_settings=None, streaming_option_parameter: Optional[str]=None, **kwargs) -> Callable`",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/tool.py#L55-102"
+          ]
+        },
+        {
+          "name": "Serve/deploy story: `pf flow serve` → HTTP /score endpoint, with Docker/K8s/executable variants",
+          "how_it_works": "`pf flow serve --source <flow-folder> --port 8080 --host localhost` boots a Flask app (FastAPI server also present in core) exposing POST /score plus a built-in test page; connections are overridden at serve time via env vars `{CONNECTION_NAME}_{KEY_NAME}`. The same flow artifact deploys unchanged to dev-server, Docker, Kubernetes, Azure App Service, or a PyInstaller executable. Serving code lives in promptflow-core/_serving (app.py, app_base.py, flow_invoker.py, monitor/).",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/docs/how-to-guides/deploy-a-flow/deploy-using-dev-server.md",
+            "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_serving/app.py",
+            "/tmp/promptflow-study/docs/how-to-guides/deploy-a-flow/index.md"
+          ]
+        },
+        {
+          "name": "Flex code-first pivot: flow.flex.yaml `entry: module:callable` over function/class entries",
+          "how_it_works": "A flex flow is plain Python (a `@trace`-decorated function, or a callable class with `__init__` for persisted state like connections, `__call__` for execution, and optional `__aggregate__` for batch metrics). The only YAML is a 3-line `flow.flex.yaml` pointing `entry: programmer:write_simple_program` plus environment/sample. The same class can be run as a bare script (`if __name__=='__main__'`), via `pf flow test --flow module:Class --init init.json`, or `pf.run(flow=Class, init={...}, data='data.jsonl')`. FlexFlow.__call__ raises — the class entry, not the wrapper, is invoked. api_signature: yaml `entry: <module>:<func_or_Class>`; `pf.run(flow='path.to.module:ClassName', init=..., data=...)`; class contract `__init__(self, model_config, ...)`, `__call__(self, question: str) -> Reply`, `__aggregate__(self, line_results: list) -> dict`",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-devkit/promptflow/_sdk/entities/_flows/flex.py",
+            "/tmp/promptflow-study/docs/how-to-guides/develop-a-flex-flow/class-based-flow.md",
+            "/tmp/promptflow-study/examples/flex-flows/basic/flow.flex.yaml",
+            "/tmp/promptflow-study/docs/concepts/concept-flows.md"
+          ]
+        },
+        {
+          "name": "Static YAML DAG as the original orchestration model (control-flow-in-config)",
+          "how_it_works": "The original flow.dag.yaml declares tool nodes wired by input/output dependencies into a DAG; the executor runs nodes by topology. Branching is bolted on via `activate_config`/'activate-when' (e.g. `${classify.output} == \"safe\"`) rather than real control flow. Chosen explicitly for VISIBILITY (graph visualization, per-node run/debug, low-code drag-drop UI) and by design NOT Turing-complete — the docs redirect fully-dynamic LLM-guided agents to Semantic Kernel. This is the rigidity our engine exists to escape: config cannot express data-dependent loops, dynamic fan-out width, or arbitrary branching without inventing a DSL.",
+          "relevance": "avoid",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/docs/concepts/design-principles.md#L37-51",
+            "/tmp/promptflow-study/docs/concepts/concept-flows.md#L11-32"
+          ]
+        },
+        {
+          "name": "WHY promptflow pivoted DAG→flex (and then retired into Microsoft Agent Framework)",
+          "how_it_works": "The static DAG could only model acyclic tool-to-tool data dependencies; real apps need if-else/foreach, dynamic fan-out, and reuse of existing langchain/semantic-kernel code. Promptflow added flex flows so users 'write complex flow with Python built-in control operators (if-else, foreach) or 3rd-party libraries' and 'easily onboard from langchain/semantic kernel with a few code changes' (concept-flows.md). The trajectory completed: promptflow feature development ended 2026-04-20 and is being migrated to Microsoft Agent Framework (WorkflowBuilder/Executor). The lesson: a visibility-first static DAG is a local optimum that collapses once orchestration must be dynamic — exactly the regime our engine targets. Borrow the conclusion (code owns control flow), keep promptflow's visibility wins via tracing rather than via a config graph.",
+          "relevance": "borrow",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/docs/concepts/concept-flows.md#L23-32",
+            "/tmp/promptflow-study/migration-guide/PromptFlow-to-MAF/README.md",
+            "/tmp/promptflow-study/docs/concepts/design-principles.md#L51"
+          ]
+        },
+        {
+          "name": "MAF successor still expresses control flow as a graph builder (control-flow-in-DSL, not statements)",
+          "how_it_works": "The post-pivot 'code-first' successor (Microsoft Agent Framework) still routes control flow through a graph DSL: `WorkflowBuilder(start_executor=...).add_edge(a, b, condition=fn).build()` for branching, and `add_fan_out_edges(src, [a,b])` / `add_fan_in_edges([a,b], merge)` for barrier parallel. Logic lives in Executor classes with `@handler async def(...)` passing messages via `ctx.send_message`/`ctx.yield_output`. Control flow is declared as edges+condition callables, NOT written as plain `if`/`for`/`await` in a script. CONTRAST: our engine puts control flow in actual Python statements with `parallel()`/`pipeline()` as ordinary value-returning calls — strictly more direct than even promptflow's own replacement, so we should position against this graph-builder ceremony, not copy it.",
+          "relevance": "contrast",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/migration-guide/PromptFlow-to-MAF/phase-2-rebuild/03_conditional_flow.py",
+            "/tmp/promptflow-study/migration-guide/PromptFlow-to-MAF/phase-2-rebuild/04_parallel_flow.py"
+          ]
+        },
+        {
+          "name": "FlowContext in-memory override coupling (overrides do raw YAML string replacement)",
+          "how_it_works": "FlowContext `overrides` are documented to do literal YAML content replacement on flow.dag.yaml at execution time (`overrides={'nodes.X.inputs.url': sample_url}`), and combining `connections` + `overrides` on the same node yields explicitly 'undefined behavior'. This is a leaky abstraction born of the config-DAG model: the override path is string-keyed into YAML structure rather than typed. For our code-first engine, parameterization should be ordinary function arguments / script variables, not string-path patches into a config document — avoid replicating this override mechanism.",
+          "relevance": "avoid",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/docs/how-to-guides/execute-flow-as-a-function.md#L46-98"
+          ]
+        },
+        {
+          "name": "CLI as a single `pf` entry shelling into a private _cli package",
+          "how_it_works": "The `pf` console-script (declared in promptflow-devkit pyproject `[tool.poetry.scripts] pf = 'promptflow._cli.pf:main'`) is a 15-line shim that sets PF_INSTALLER and delegates to `promptflow._cli._pf.entry:main`. The CLI lives entirely in the devkit layer (forbidden from being imported by core/tracing per import-linter), keeping the runtime CLI-free. Verbs: `pf flow test`, `pf flow serve`, `pf run create`, `pf connection ...`. api_signature: console_script `pf = promptflow._cli.pf:main`",
+          "relevance": "neutral",
+          "evidence_basis": "verified-in-source",
+          "sources": [
+            "/tmp/promptflow-study/src/promptflow-devkit/promptflow/_cli/pf.py",
+            "/tmp/promptflow-study/src/promptflow-devkit/pyproject.toml#L124-125"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "promptflow-core pyproject.toml (layering, import-linter contracts, packaging)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/pyproject.toml",
+          "type": "github"
+        },
+        {
+          "title": "promptflow-tracing pyproject.toml (minimal-dep observability package + forbidden contracts)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-tracing/pyproject.toml",
+          "type": "github"
+        },
+        {
+          "title": "promptflow-devkit pyproject.toml (CLI/SDK/serving layer, pf console-script)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-devkit/pyproject.toml",
+          "type": "github"
+        },
+        {
+          "title": "promptflow-azure pyproject.toml (top-of-stack layer)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-azure/pyproject.toml",
+          "type": "github"
+        },
+        {
+          "title": "Top-level promptflow meta-package facade (__getattr__ deprecation routing)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow/promptflow/__init__.py",
+          "type": "github"
+        },
+        {
+          "title": "PFClient — hub-and-spoke control-plane client",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-devkit/promptflow/_sdk/_pf_client.py",
+          "type": "github"
+        },
+        {
+          "title": "client/__init__.py public surface (PFClient, load_flow, load_run)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-devkit/promptflow/client/__init__.py",
+          "type": "github"
+        },
+        {
+          "title": "Flow class — flow-as-callable __call__/load/invoke",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_flow.py",
+          "type": "github"
+        },
+        {
+          "title": "FlexFlow entity — 'defined with codes directly, no DAG' (code-first pivot)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-devkit/promptflow/_sdk/entities/_flows/flex.py",
+          "type": "github"
+        },
+        {
+          "title": "@trace decorator (sync/async OTel tracing)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-tracing/promptflow/tracing/_trace.py",
+          "type": "github"
+        },
+        {
+          "title": "start_trace() one-line auto-instrumentation",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-tracing/promptflow/tracing/_start_trace.py",
+          "type": "github"
+        },
+        {
+          "title": "@tool decorator (auto-wraps _traced)",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/tool.py",
+          "type": "github"
+        },
+        {
+          "title": "Design principles — DAG-for-visibility + deliberate non-Turing-completeness",
+          "url_or_path": "/tmp/promptflow-study/docs/concepts/design-principles.md",
+          "type": "official-docs"
+        },
+        {
+          "title": "Flow concepts — flex vs DAG, the verbatim 'why flex' rationale",
+          "url_or_path": "/tmp/promptflow-study/docs/concepts/concept-flows.md",
+          "type": "official-docs"
+        },
+        {
+          "title": "Class-based flex flow API (entry syntax, __init__/__call__/__aggregate__)",
+          "url_or_path": "/tmp/promptflow-study/docs/how-to-guides/develop-a-flex-flow/class-based-flow.md",
+          "type": "official-docs"
+        },
+        {
+          "title": "Execute flow as a function (load_flow callable + FlowContext overrides)",
+          "url_or_path": "/tmp/promptflow-study/docs/how-to-guides/execute-flow-as-a-function.md",
+          "type": "official-docs"
+        },
+        {
+          "title": "Deploy via dev server — pf flow serve → /score endpoint",
+          "url_or_path": "/tmp/promptflow-study/docs/how-to-guides/deploy-a-flow/deploy-using-dev-server.md",
+          "type": "official-docs"
+        },
+        {
+          "title": "Tracing overview — observability-first, OTel-native",
+          "url_or_path": "/tmp/promptflow-study/docs/how-to-guides/tracing/index.md",
+          "type": "official-docs"
+        },
+        {
+          "title": "PromptFlow→Microsoft Agent Framework migration guide (retirement + WorkflowBuilder successor)",
+          "url_or_path": "/tmp/promptflow-study/migration-guide/PromptFlow-to-MAF/README.md",
+          "type": "github"
+        },
+        {
+          "title": "MAF conditional-flow rebuild (control-flow-as-graph-edges, contrast)",
+          "url_or_path": "/tmp/promptflow-study/migration-guide/PromptFlow-to-MAF/phase-2-rebuild/03_conditional_flow.py",
+          "type": "example"
+        },
+        {
+          "title": "MAF parallel-flow rebuild (fan-out/fan-in edges, contrast vs our parallel())",
+          "url_or_path": "/tmp/promptflow-study/migration-guide/PromptFlow-to-MAF/phase-2-rebuild/04_parallel_flow.py",
+          "type": "example"
+        },
+        {
+          "title": "flex flow basic example (programmer.py + flow.flex.yaml entry syntax)",
+          "url_or_path": "/tmp/promptflow-study/examples/flex-flows/basic/programmer.py",
+          "type": "example"
+        },
+        {
+          "title": "pf CLI shim console-script",
+          "url_or_path": "/tmp/promptflow-study/src/promptflow-devkit/promptflow/_cli/pf.py",
+          "type": "github"
+        }
+      ],
+      "open_questions": [
+        "Three-form decision: promptflow shipped ALL THREE shapes simultaneously (PFClient control-plane client, flow-as-callable via load_flow()(...), and code-first flex entries) layered across packages — does our engine want the same breadth, or is that surface-area sprawl a cost we should avoid given we are not selling an evaluation/experimentation product? Concretely: is `create_workflow_tool()` (attach to deepagent) the analogue of flex's class-entry, and `run_workflow()` the analogue of PFClient.run()?",
+        "Tracing coupling: promptflow makes tracing observability-first by baking _traced INTO @tool so every leaf is auto-spanned. Should our agent()/parallel()/pipeline() primitives auto-emit spans/journal entries the same way (observability-by-default), and should that live in a minimal-dep `langchain-dynamic-workflow-tracing` sub-package mirroring promptflow-tracing?",
+        "import-linter adoption: should we adopt import-linter `forbidden` contracts to mechanically enforce our Layer 0 (substrate) / Layer 1 (runtime) / Layer 2 (meta/AST-gate) boundaries — e.g. forbid the AST gate and roster layers from importing LangGraph internals directly — given we are a single package today, not yet a monorepo?",
+        "Serve/deploy ambition: promptflow's `pf flow serve`→/score is a heavy investment (Flask/FastAPI, Docker, K8s, monitoring). Is an HTTP serve story in scope for our engine at all, or does running inside a deepagent host make a standalone server redundant?",
+        "Override mechanism: promptflow's FlowContext string-path YAML overrides are a documented footgun ('undefined behavior'). We should confirm our parameterization is purely Python kwargs/script variables — is there ANY place we'd be tempted to introduce string-keyed config patching (e.g. roster/agent overrides) that would reintroduce this anti-pattern?",
+        "Positioning vs MAF: since promptflow is retired into Microsoft Agent Framework whose 'code-first' form is STILL a graph builder (WorkflowBuilder.add_edge/add_fan_out_edges), our differentiator is 'control flow in real Python statements, not graph DSL.' Is there a doc/example we should write that explicitly contrasts our `parallel([...])` value-returning call against MAF's edge-declaration ceremony?"
+      ]
+    }
+  ],
+  "verification": {
+    "verified_claims": [
+      {
+        "claim": "DAG flow control flow is a STATIC declared graph (flow.dag.yaml), not code",
+        "verdict": "confirmed-in-source",
+        "evidence": "examples/flows/standard/basic/flow.dag.yaml declares `nodes:` each with `inputs` referencing other nodes via ${node.output} (e.g. `prompt: ${hello_prompt.output}`) and flow inputs via ${inputs.text}. contracts/flow.py: InputValueType enum has LITERAL/FLOW_INPUT/NODE_REFERENCE (lines 26-31); InputAssignment.deserialize parses ${...} strings into NODE_REFERENCE (lines 100-116). @dataclass Flow(FlowBase) carries `nodes: List[Node]` and `node_variants` (lines 641-643). The engine (DAGManager) — not user code — derives execution order from these references (_dag_manager.py line 99-100, 134: dependencies filtered to InputValueType.NODE_REFERENCE). Declarative branching confirmed in conditional-flow-for-if-else/flow.dag.yaml: nodes use `activate:\\n  when: ${content_safety_check.output}\\n  is: true/false`. design-principles.md line 51 confirms control flow features like 'activate-when' exist but Flow is deliberately NOT Turing-complete.",
+        "best_source": "/tmp/promptflow-study/src/promptflow-core/promptflow/contracts/flow.py + /tmp/promptflow-study/examples/flows/standard/basic/flow.dag.yaml + /tmp/promptflow-study/examples/flows/standard/conditional-flow-for-if-else/flow.dag.yaml"
+      },
+      {
+        "claim": "Flex flow is a code-first entry function/callable, and promptflow added it as a pivot from DAG-yaml",
+        "verdict": "partially-confirmed",
+        "evidence": "Code-first entry: CONFIRMED IN SOURCE. examples/flex-flows/basic/flow.flex.yaml is essentially `entry: programmer:write_simple_program` (no nodes/edges); chat-basic/flow.flex.yaml is `entry: flow:ChatFlow` with `init:` kwargs. contracts/flow.py: @dataclass FlexFlow(FlowBase) has `init` and `sample` but deliberately NO `nodes` field (lines 974-1000); FlexFlow._from_dict reads `flow_data.get('entry')` and resolves the python entry file (lines 1026-1046). docs/concepts/concept-flows.md line 31 states flex's benefit verbatim: 'More advanced orchestration: Users can write complex flow with Python built-in control operators (if-else, foreach) or other 3rd party / open-source library.' The PIVOT framing is an inference: the source confirms flex is code-first and that docs frame DAG-vs-flex tradeoffs (design-principles.md redirects dynamic LLM agents to Semantic Kernel; concept-flows.md contrasts the two), but the cloned source does NOT contain an explicit narrative that promptflow historically 'pivoted away from' DAG-yaml. NOTE: minor discrepancy — findings say FlexFlow.init type is Dict[str,FlowInitDefinition], but the dataclass annotation is actually Dict[str,FlowInputDefinition] (line 995); deserialization however does use FlowInitDefinition.deserialize (line 1020).",
+        "best_source": "/tmp/promptflow-study/src/promptflow-core/promptflow/contracts/flow.py + /tmp/promptflow-study/examples/flex-flows/basic/flow.flex.yaml + /tmp/promptflow-study/docs/concepts/concept-flows.md"
+      },
+      {
+        "claim": "PFClient is the primary devkit SDK entry",
+        "verdict": "confirmed-in-source",
+        "evidence": "_sdk/_pf_client.py: class PFClient (line 39) builds operation namespaces in __init__ — self._runs=RunOperations, self._flows=FlowOperations, self._connections (lazy), self._traces=TraceOperations (lines 53-63), exposed as properties .runs/.flows/.connections/.traces (lines 370-486). High-level verbs on the client: run (line 228), test (line 435), stream (line 318), get_details (line 330), get_metrics (line 351). client/__init__.py: `from .._sdk._pf_client import PFClient` and `__all__ = ['PFClient', 'load_run', 'load_flow']` — PFClient listed first as the public surface.",
+        "best_source": "/tmp/promptflow-study/src/promptflow-devkit/promptflow/_sdk/_pf_client.py + /tmp/promptflow-study/src/promptflow-devkit/promptflow/client/__init__.py"
+      },
+      {
+        "claim": "A flow can be invoked as a plain Python callable (flow-as-function)",
+        "verdict": "confirmed-in-source",
+        "evidence": "core/_flow.py: class Flow(FlowBase) defines __call__(self, *args, **kwargs) -> Mapping[str, Any] (line 125) which raises UserErrorException if positional args are passed ('Flow can only be called with keyword arguments', lines 136-137), then calls self.invoke(inputs=kwargs) and returns result.output (lines 139-140). invoke() delegates to FlowInvoker (lines 142-164). AsyncFlow has an async __call__ (line 184). load_flow is exported from client/__init__.py, so `f = load_flow(source); f(url=...)` works. Note: for flex flows, Flow._invoke raises 'Please call entry directly for flex flow' (line 154) — flow-as-function via Flow.__call__ applies to DAG/prompty; flex entries are called directly by ScriptExecutor.",
+        "best_source": "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_flow.py"
+      },
+      {
+        "claim": "FlowExecutor schedules DAG nodes (static dependency-driven), with thread-based concurrency",
+        "verdict": "confirmed-in-source",
+        "evidence": "_dag_manager.py: DAGManager.pop_ready_nodes() returns nodes whose dependencies (filtered to InputValueType.NODE_REFERENCE, lines 99-100/134) are satisfied; pop_bypassable_nodes() handles activate-condition bypass; complete_nodes() merges outputs into _completed_nodes_outputs dict (node name -> output, line 14); completed() checks all nodes done. _flow_nodes_scheduler.py: class FlowNodesScheduler uses concurrent.futures ThreadPoolExecutor (line 13), DEFAULT_CONCURRENCY_FLOW=16 (line 27), node_concurrency=min(node_concurrency, 16) (line 68), execute() loops submitting ready nodes and waiting with futures.FIRST_COMPLETED (line 111). This is engine-owned static-DAG, thread-based scheduling. Contrast confirmed: ScriptExecutor (flex) has NO scheduler — _exec_line just calls `output = self._func(**inputs)` (_script_executor.py line 182).",
+        "best_source": "/tmp/promptflow-study/src/promptflow-core/promptflow/executor/_dag_manager.py + /tmp/promptflow-study/src/promptflow-core/promptflow/executor/_flow_nodes_scheduler.py"
+      },
+      {
+        "claim": "Tracing is OpenTelemetry-based via promptflow-tracing with a @trace decorator",
+        "verdict": "confirmed-in-source",
+        "evidence": "promptflow-tracing is a distinct package (pyproject.toml: name = 'promptflow-tracing', version 1.18.0). _trace.py imports `import opentelemetry.trace as otel_trace` and OTel Span/Status (lines 16-20); def trace(func) (line 577) is the public decorator delegating to _traced(func, trace_type=TraceType.FUNCTION) (line 613); _traced_sync/_traced_async use otel_trace.get_tracer('promptflow') and start_as_current_span (lines 482-483, 551-552). Verified in real usage: examples/flex-flows/basic/programmer.py does `from promptflow.tracing import trace` and `from promptflow.tracing import start_trace`, with @trace on write_simple_program (lines 7, 16, 26-27, 39). Serving also auto-instruments via opentelemetry.instrumentation.flask/fastapi (_serving/app.py lines 24-26, 43-45).",
+        "best_source": "/tmp/promptflow-study/src/promptflow-tracing/promptflow/tracing/_trace.py + /tmp/promptflow-study/examples/flex-flows/basic/programmer.py"
+      },
+      {
+        "claim": "The @tool decorator declares tools that flows reference",
+        "verdict": "confirmed-in-source",
+        "evidence": "_core/tool.py: def tool(func=None, *, name, description, type, input_settings, streaming_option_parameter, **kwargs) (lines 55-64). The inner tool_decorator wraps the function with _traced(func, trace_type=TraceType.FUNCTION) so every tool call is auto-spanned (lines 85-86), then stamps metadata attributes __tool/__name/__description/__type/__input_settings on the wrapped function for later tool-definition generation (lines 88-93). Validates `type` against ToolType enum (line 82). Supports bare @tool usage (lines 99-102). DAG nodes of type 'python' reference these tool functions via source.path (seen in basic/flow.dag.yaml node 'llm' -> hello.py).",
+        "best_source": "/tmp/promptflow-study/src/promptflow-core/promptflow/_core/tool.py"
+      },
+      {
+        "claim": "Flows can be served/deployed as an endpoint",
+        "verdict": "confirmed-in-source",
+        "evidence": "_serving/ directory contains app.py, app_base.py, flow_invoker.py, monitor/, v1/ (Flask), v2/ (FastAPI). _serving/app.py: def create_app(**kwargs) factory (line 8) instrumenting Flask or FastAPI via OTel. The /score endpoint is concretely defined: v1/app.py line 58 `@app.route('/score', methods=['POST'])` with def score() (line 60); v2 mounts a score router (v2/app.py line 25, v2/routers/score.py line 25 `@router.post('/score')`). CLI: _cli/_pf/_flow.py adds a 'serve' subaction (lines 66, 77-78, 176-207) calling serve_flow (line 595) -> start_flow_service; help text documents `pf flow serve --source <path_to_flow> --port 8080 --host localhost` (lines 182-186) and an --engine flag for flask or fastapi (line 204).",
+        "best_source": "/tmp/promptflow-study/src/promptflow-core/promptflow/core/_serving/v1/app.py + /tmp/promptflow-study/src/promptflow-devkit/promptflow/_cli/_pf/_flow.py"
+      }
+    ],
+    "overall_reliability_note": "The study agents' findings are highly accurate. 7 of 8 high-stakes claims are confirmed-in-source by independent re-reading of the actual cloned code at /tmp/promptflow-study; all cited file paths exist and the cited mechanisms (DAGManager NODE_REFERENCE resolution, ThreadPoolExecutor with DEFAULT_CONCURRENCY_FLOW=16, ScriptExecutor importlib+getattr+direct self._func call, PFClient operation namespaces, Flow.__call__ keyword-only flow-as-function, @trace->_traced->OpenTelemetry, @tool->_traced metadata stamping, /score serving endpoint with Flask v1/FastAPI v2) match the source exactly. Only Claim 2 is downgraded to partially-confirmed: the code-first flex entry model is fully confirmed in source, but the 'pivot from DAG-yaml' is an interpretive framing — the source confirms flex is code-first and the docs contrast DAG vs flex, but the cloned repo contains no explicit historical 'pivot away from DAG' narrative (the migration-guide/ dir documents the later retirement into Microsoft Agent Framework, which supports the trajectory but is a different claim). Two minor inaccuracies in the findings, neither material to the claims: (a) FlexFlow.init dataclass field is annotated Dict[str,FlowInputDefinition] not Dict[str,FlowInitDefinition], though deserialization does use FlowInitDefinition.deserialize; (b) flow-as-function via Flow.__call__ raises for flex flows specifically ('call entry directly for flex flow') — it applies to DAG/prompty flows, while flex entries are invoked directly by ScriptExecutor. The study correctly noted both of these nuances elsewhere in its mechanism records."
+  }
+}

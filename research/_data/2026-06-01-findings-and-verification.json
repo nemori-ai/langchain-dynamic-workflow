@@ -1,0 +1,1246 @@
+{
+  "findings": [
+    {
+      "topic": "Claude Code \"Dynamic Workflows\" — official Anthropic definition, architecture, and execution model",
+      "summary": "Dynamic Workflows are a Claude Code feature that launched in research preview on 2026-05-28 (alongside Claude Opus 4.8), requiring Claude Code v2.1.154+. Anthropic's official definition: \"A dynamic workflow is a JavaScript script that orchestrates subagents at scale. Claude writes the script for the task you describe, and a runtime executes it in the background while your session stays responsive.\"\n\nThe core idea is control-flow inversion. With normal subagents/skills, CLAUDE is the orchestrator and decides turn-by-turn what to spawn, and every intermediate result lands in Claude's context window. With a workflow, the SCRIPT holds the loop, the branching, and the intermediate results, so Claude's context window receives only the final, verified answer. Anthropic's own comparison table makes this explicit: \"Who decides what runs next\" = \"Claude, turn by turn\" (subagents/skills) vs \"The script\" (workflows); \"Where intermediate results live\" = \"Claude's context window\" vs \"Script variables.\" Anthropic's phrasing: \"A workflow moves the plan into code.\"\n\nValue proposition (blog): tasks \"you'd normally plan in quarters now finish in days.\" Claude \"dynamically writes orchestration scripts that run tens to hundreds of parallel subagents in a single session, checking its work before anything reaches you.\" Use cases: codebase-wide bug sweeps, 500-file migrations, cross-checked research, drafting a hard plan from several independent angles. A bundled workflow, /deep-research, ships in the product.\n\nProblem solved vs. a normal agent: a single conversation cannot coordinate enough agents and drowns in intermediate context. Workflows scale to \"dozens to hundreds of agents per run\" (vs \"a few delegated tasks per turn\"), keep intermediate exhaust out of the context window, are \"resumable in the same session\" (vs subagents/skills that \"restart the turn\"), and can apply a repeatable quality pattern — adversarial cross-review of findings, or drafting a plan from several angles and weighing them — for a more trustworthy result than a single pass.\n\nExecution model (official): \"The workflow runtime executes the script in an isolated environment, separate from your conversation. Intermediate results stay in script variables instead of landing in Claude's context.\" \"The runtime tracks each agent's result as the run progresses, which is what makes a run resumable\" — on resume, completed agents return cached results and the rest run live. Hard limits: up to 16 concurrent agents (fewer on low-core machines, \"Bounds local resource use\") and 1,000 agents total per run (\"Prevents runaway loops\"). The workflow script itself has no direct filesystem/shell access — only the agents read/write/run commands; the script coordinates them. No mid-run user input; only agent permission prompts can pause a run. Spawned subagents always run in acceptEdits mode and inherit the user's tool allowlist regardless of session permission mode.\n\nIMPORTANT triangulation note for this repo: the OFFICIAL orchestration language is JavaScript, executed by a background runtime inside Claude Code. The named primitive API (agent(), parallel() barrier, pipeline() no-barrier, phase(), log(), budget, workflow() nesting, schema-validated agent output, isolation:\"worktree\", a content-hash/agent-call journal, and a fail-loud determinism guard that bans Date.now()/Math.random()/new Date()) is COMMUNITY-REVERSE-ENGINEERED (chiefly alexop.dev), NOT documented by Anthropic. Anthropic's docs describe the BEHAVIOR (resumability via per-agent result tracking, no non-deterministic mid-run input, script-variable state) but never publish a primitive-by-primitive API reference. This Python repo (langchain-dynamic-workflow) is a community PORT to the LangChain/deepagents ecosystem, so its primitive names mirror the reverse-engineered JS surface, not an official Python API.",
+      "mechanisms": [
+        {
+          "name": "Definition: a JavaScript script that orchestrates subagents at scale",
+          "how_it_works": "Anthropic docs: 'A dynamic workflow is a JavaScript script that orchestrates subagents at scale. Claude writes the script for the task you describe, and a runtime executes it in the background while your session stays responsive.' The orchestration language is explicitly JavaScript (not Python).",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Control-flow inversion: the script owns loops/branching/fan-out, not the LLM",
+          "how_it_works": "Official comparison table: 'Who decides what runs next' = 'Claude, turn by turn' for subagents/skills vs 'The script' for workflows. 'Where intermediate results live' = 'Claude's context window' vs 'Script variables.' Docs: 'With subagents and skills, Claude is the orchestrator: it decides turn by turn what to spawn next, and every result lands in Claude's context. A workflow script holds the loop, the branching, and the intermediate results itself, so Claude's context holds only the final answer.' 'A workflow moves the plan into code.'",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Problem solved vs a normal agent: scale + clean context + resumability + repeatable quality pattern",
+          "how_it_works": "A single conversation cannot coordinate enough agents and accumulates intermediate context. Workflows scale to 'dozens to hundreds of agents per run' (vs 'a few delegated tasks per turn'), keep intermediate exhaust out of Claude's context, are 'resumable in the same session' (subagents/skills 'restart the turn'), and 'can have independent agents adversarially review each other's findings before they're reported, or draft a plan from several angles and weigh them against each other, so you get a more trustworthy result than a single pass.'",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code"
+          ]
+        },
+        {
+          "name": "Value proposition and parallel fan-out / adversarial verification / convergence",
+          "how_it_works": "Blog: 'Work you'd normally plan in quarters now finishes in days. Claude dynamically writes orchestration scripts that run tens to hundreds of parallel subagents in a single session, checking its work before anything reaches you.' 'Claude plans dynamically based on your prompt, breaks it into subtasks, and fans the work out across subagents running in parallel.' 'Agents address the problem from independent angles, other agents try to refute what they found, and the run keeps iterating until the answers converge.' 'Results are checked before they're folded in, and you come back to a single, coordinated answer.'",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code"
+          ]
+        },
+        {
+          "name": "Execution model: isolated background runtime, script-variable state, per-agent result tracking",
+          "how_it_works": "Docs: 'The workflow runtime executes the script in an isolated environment, separate from your conversation. Intermediate results stay in script variables instead of landing in Claude's context. The runtime tracks each agent's result as the run progresses, which is what makes a run resumable within the same session.' Background execution keeps the session responsive; progress view via /workflows.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Resumability via cached agent results",
+          "how_it_works": "Docs: 'If you stop a run, you can resume it: agents that already completed return their cached results, and the rest run live.' Blog: 'Progress is saved as the run goes, so a job that's interrupted picks up where it left off instead of starting over.' Resume works only within the same Claude Code session; exiting Claude Code restarts the workflow fresh next session.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code"
+          ]
+        },
+        {
+          "name": "Hard limits: 16 concurrent agents, 1,000 agents total per run",
+          "how_it_works": "Docs constraint table: 'Up to 16 concurrent agents, fewer on machines with limited CPU cores' (rationale: 'Bounds local resource use') and '1,000 agents total per run' (rationale: 'Prevents runaway loops').",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://www.marktechpost.com/2026/05/28/anthropic-ships-claude-opus-4-8-alongside-dynamic-workflows-and-cheaper-fast-mode-with-workflows-capped-at-1000-subagents/"
+          ]
+        },
+        {
+          "name": "Script has no direct filesystem/shell access; only agents act, script coordinates",
+          "how_it_works": "Docs constraint: 'No direct filesystem or shell access from the workflow itself' — 'Agents read, write, and run commands. The script coordinates the agents.' Also 'No mid-run user input' — 'Only agent permission prompts can pause a run.'",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Subagent permissions: always acceptEdits, inherit allowlist",
+          "how_it_works": "Docs: 'The subagents the workflow spawns always run in acceptEdits mode and inherit your tool allowlist, regardless of your session's mode. File edits are auto-approved.' Shell/web/MCP tools outside the allowlist can still prompt mid-run; the launch-time permission prompt is governed by permission mode (Default/accept-edits prompt per run; Auto prompts first launch; Bypass/-p/Agent SDK never prompt).",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Triggering: 'workflow' keyword, /effort ultracode, bundled /deep-research, saved commands",
+          "how_it_works": "Including the word 'workflow' in a prompt makes Claude write a workflow for that one task. '/effort ultracode' combines xhigh reasoning with automatic workflow orchestration for every substantive task in the session. Bundled workflow /deep-research ships in-product (fans out web searches, cross-checks sources, votes on each claim, returns a cited report). Saved workflows live in .claude/workflows/ (project) or ~/.claude/workflows/ (personal) and run as /<name>.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Availability and version: research preview, v2.1.154+, paid plans + API + cloud providers",
+          "how_it_works": "Docs Note: 'Dynamic workflows are in research preview. They require Claude Code v2.1.154 or later and are available on all paid plans, with Anthropic API access, and on Amazon Bedrock, Google Cloud Vertex AI, and Microsoft Foundry. On Pro, turn them on from the Dynamic workflows row in /config.' Launched 2026-05-28 alongside Claude Opus 4.8. Disable via /config toggle, disableWorkflows in settings.json, or CLAUDE_CODE_DISABLE_WORKFLOWS=1.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://www.anthropic.com/news/claude-opus-4-8"
+          ]
+        },
+        {
+          "name": "Named primitive API: agent(), parallel() barrier, pipeline() no-barrier, phase(), log(), budget, workflow() nesting",
+          "how_it_works": "Reverse-engineered from observed workflow scripts: agent(prompt, opts?) spawns one subagent (returns text, or schema-validated JSON when a schema is supplied, with retry-on-mismatch at the tool-call layer); parallel(thunks) is a BARRIER that waits for all tasks, turning thrown errors into null, concurrency capped near core count; pipeline(items, ...stages) has NO barrier, each item flows independently through stages called as (prevResult, originalItem, index); workflow(nameOrRef, args?) invokes another workflow inline with one-level nesting only; phase(title), log(msg), args, budget handle progress grouping, logging, argument passing, and token tracking. Anthropic docs do NOT publish this primitive-by-primitive API; only behavior is documented. This is the surface the Python repo ports.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+            "https://kenhuangus.substack.com/p/claude-code-orchestration-dynamic"
+          ]
+        },
+        {
+          "name": "Content-hash/agent-call journal + fail-loud determinism guard",
+          "how_it_works": "Reverse-engineered: workflows journal every agent() call so a run can resume from cached results; non-determinism would invalidate that cache, so Date.now(), Math.random(), and new Date() throw inside workflow scripts, and timestamps must be passed in via args rather than generated at runtime. Scripts are 'plain JavaScript: no imports, no filesystem access, inputs via args, results via return' using ES6 'export const meta = {...}'. Anthropic docs confirm the behavior (resumability via per-agent result tracking, no non-deterministic mid-run input) but do not describe a journal or determinism-guard mechanism by name.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        },
+        {
+          "name": "Worktree isolation for parallel-writing agents (isolation:\"worktree\", agentType routing)",
+          "how_it_works": "Reverse-engineered: an isolation:'worktree' option runs agents in separate git worktrees to prevent parallel write conflicts, and an agentType option swaps the subagent type per call. Not documented officially by Anthropic; inferred from observed script options.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        },
+        {
+          "name": "LangGraph-style durable-execution substrate underlying the runtime",
+          "how_it_works": "This repo's design treats the runtime as a LangGraph @entrypoint/@task + checkpointer substrate providing resume/replay/cached-skip, layered with a content-hash journal and determinism guard. Anthropic has NOT disclosed the internal runtime implementation (whether it uses any LangGraph-like durable-execution engine, a custom JS VM, etc.); the official docs only describe an 'isolated runtime' that tracks per-agent results. Any specific substrate mapping is speculative.",
+          "confidence": "speculative",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "Orchestrate subagents at scale with dynamic workflows — Claude Code Docs (PRIMARY)",
+          "url": "https://code.claude.com/docs/en/workflows",
+          "type": "official"
+        },
+        {
+          "title": "Introducing dynamic workflows in Claude Code — Anthropic blog (PRIMARY)",
+          "url": "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code",
+          "type": "official"
+        },
+        {
+          "title": "Introducing Claude Opus 4.8 — Anthropic news (launch context, 2026-05-28)",
+          "url": "https://www.anthropic.com/news/claude-opus-4-8",
+          "type": "official"
+        },
+        {
+          "title": "Claude Code Workflows: Deterministic Multi-Agent Orchestration — alexop.dev (best community reverse-engineering of the primitive API and determinism guard)",
+          "url": "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+          "type": "community-reverse"
+        },
+        {
+          "title": "Claude Code Orchestration: Dynamic Workflows — Ken Huang (Substack)",
+          "url": "https://kenhuangus.substack.com/p/claude-code-orchestration-dynamic",
+          "type": "community-reverse"
+        },
+        {
+          "title": "Dynamic Workflows in Claude Code: Research Preview with Up to 1,000 Subagents — Pasquale Pillitteri",
+          "url": "https://pasqualepillitteri.it/en/news/3663/claude-code-dynamic-workflows-anthropic-research-preview",
+          "type": "blog"
+        },
+        {
+          "title": "Anthropic Ships Claude Opus 4.8 Alongside Dynamic Workflows... Capped at 1,000 Subagents — MarkTechPost",
+          "url": "https://www.marktechpost.com/2026/05/28/anthropic-ships-claude-opus-4-8-alongside-dynamic-workflows-and-cheaper-fast-mode-with-workflows-capped-at-1000-subagents/",
+          "type": "blog"
+        },
+        {
+          "title": "Anthropic launches dynamic workflows for Claude Code — TestingCatalog",
+          "url": "https://www.testingcatalog.com/anthropic-launches-dynamic-workflows-for-claude-code/",
+          "type": "blog"
+        },
+        {
+          "title": "Claude Code Dynamic Workflows: Scripts Replace Context Windows, Ultracode Automates Orchestration — TechTimes",
+          "url": "https://www.techtimes.com/articles/317363/20260529/claude-code-dynamic-workflows-scripts-replace-context-windows-ultracode-automates-orchestration.htm",
+          "type": "blog"
+        },
+        {
+          "title": "Anthropic Rolls Out Dynamic Workflows Across Claude Code Tools — Reworked",
+          "url": "https://www.reworked.co/digital-workplace/anthropic-announces-dynamic-workflows-in-claude-code/",
+          "type": "blog"
+        }
+      ],
+      "open_questions": [
+        "Official language is JavaScript, but this repo is a Python port targeting LangChain/deepagents. Is there ANY official Python surface for dynamic workflows, or is Python purely a community re-implementation? (Evidence: docs say JS only; no official Python API found.)",
+        "Anthropic never publishes a primitive-by-primitive API reference (agent/parallel/pipeline/phase/budget/workflow). Are these exact primitive names and signatures stable, or did the reverse-engineering community standardize names Anthropic does not actually use internally?",
+        "What is the actual internal runtime? Docs say 'isolated runtime' tracking per-agent results, but the implementation (custom JS VM, durable-execution engine, content-hash vs index-based cache) is undisclosed. The repo assumes a LangGraph-style substrate — this is a design choice, not a confirmed mirror of Anthropic's runtime.",
+        "Official docs confirm 'no non-deterministic mid-run input' behavior, but the specific determinism-guard mechanism (banning Date.now()/Math.random()/new Date() with a fail-loud error) is only attested by community reverse-engineering. Is the guard fail-loud or silently coerced?",
+        "How exactly does the official journal key cached agent results — by call index or by content hash of the prompt/args? The repo claims LangGraph's native cache is index-based and adds a content-hash journal; whether Anthropic's runtime is index- or content-based is not officially documented.",
+        "Concurrency cap is '16, fewer on low-core machines' for the local CLI; is the cap different on cloud-hosted execution (Bedrock/Vertex/Foundry/Agent SDK)?",
+        "isolation:'worktree' and agentType options are community-inferred; are they real official options or speculative naming?"
+      ]
+    },
+    {
+      "topic": "Claude Code Dynamic Workflows — exact semantics of orchestration primitives (agent / parallel / pipeline / phase / log / budget / workflow)",
+      "summary": "Claude Code Dynamic Workflows (research preview, launched 2026-05-28 alongside Opus 4.8) invert agent control flow: instead of the LLM deciding the next step turn-by-turn, Claude writes a JavaScript orchestration script that the runtime executes in a determinism sandbox. Loops, branching, and fan-out are plain JS; only leaf agent() calls spend tokens, each in a fresh discarded context. Intermediate results live in script variables; only the final value reaches the caller. The script runs as a background task, is resumable within the same session via a content-hash journal, and is bounded by a 1000-agent lifetime cap and ~16 concurrent agents.\n\nCONFIDENCE SPLIT IS CRITICAL. The official Anthropic blog and Claude Code docs (code.claude.com/docs/en/workflows) confirm ONLY the user-facing model: that it is JavaScript, that the script holds the loop/branching/intermediate state, dozens-to-hundreds of agents, the 1000-agent cap, \"up to 16 concurrent agents,\" resumability with cached results within a session, per-stage model routing, the determinism/no-host-access constraint (\"no direct filesystem or shell access from the workflow itself\"), background execution, and the bundled /deep-research workflow. The official sources NEVER name agent(), parallel(), pipeline(), phase(), log(), budget, or workflow(), and document none of their signatures, options, or failure semantics.\n\nALL exact API-level facts below — function names, signatures, the (label/phase/schema/model/isolation/agentType/stallMs) option set, barrier-vs-no-barrier behaviour, \"throwing thunk → null, never rejects\" / \"throwing pipeline stage → that item drops to null\", AJV-backed StructuredOutput tool with up-to-2-extra-nudge + retry-on-mismatch, the shared budget pool with spent()/remaining(), the resume cache key, and the specific caps — come from a single community reverse-engineering source: ray-amjad/claude-code-workflow-creator, a Claude Code skill whose author states the details were \"checked directly against the Claude Code binary, not guessed.\" This is one unverified-by-Anthropic source; the numeric caps (1000, ~16) corroborate the official docs, but the fine-grained API semantics are community-inferred and could drift before/after GA. Triangulation against a second independent reverse-engineering source was not possible — no other repo documents this API surface at this fidelity.",
+      "mechanisms": [
+        {
+          "name": "Control-flow inversion (script owns the plan, not the LLM)",
+          "how_it_works": "A workflow is a JavaScript script the runtime executes in an isolated environment. Loops, conditionals, fan-out, and intermediate results live in script variables; the model's context window receives only the final answer. Officially confirmed: docs table 'Who decides what runs next: The script' and 'Where intermediate results live: Script variables'. Each agent() call gets a fresh, empty context that is discarded after returning, so the orchestrator never sees scratch work and agents cannot contaminate each other.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code"
+          ]
+        },
+        {
+          "name": "agent(prompt, opts?) — leaf subagent spawn",
+          "how_it_works": "Signature: agent(prompt, opts?) → Promise<string|object>. Spawns one fresh-context subagent. Without schema returns the subagent's final text verbatim as a string; with schema returns a validated object. If the user skips the agent from /workflows it returns null (hence the pervasive .filter(Boolean) idiom). Options: label (string; display name, defaults to first 60 chars of prompt; NOT part of resume cache key), phase (string; assigns the agent to a named progress group, used inside pipeline/parallel stages so concurrent calls land in the right group; NOT a cache key), schema (JSON Schema object; forces structured output), model ('haiku'|'sonnet'|'opus'|'inherit'|full model ID; omit to inherit session model; NO validation — a typo passes through and fails at API call time), isolation ('worktree' only — runs the agent in a fresh git worktree, ~200-500ms+disk, auto-removed if unchanged; 'remote' exists in the binary but is disabled in this build), agentType (registered subagent type from the live registry, e.g. built-in 'workflow-subagent'/'workflow-remote-agent' or anything from .claude/agents/ or a plugin; an unknown value THROWS with the list of available agents — unlike model it IS validated), and stallMs (number; overrides the per-agent 180000ms/3min stall timeout — real but undocumented in the tool's own schema). The four cache-key options are schema/model/isolation/agentType; changing any re-runs that call. label/phase are cosmetic and never invalidate cache.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/SKILL.md"
+          ]
+        },
+        {
+          "name": "parallel(thunks) — barrier fan-out",
+          "how_it_works": "Signature: parallel(thunks) → Promise<any[]>. Takes an ARRAY OF THUNKS [() => agent(...), () => agent(...)], NOT an array of promises (bare calls would start immediately and defeat the concurrency limiter). It is a BARRIER: it waits for every thunk before returning. FAILURE SEMANTICS (exactly as asked): a thunk that throws resolves to null in the result array, and the call itself NEVER rejects — so you must .filter(Boolean) before use. The result array has holes by design (null for thrown, skipped, or budget-dropped items). Use parallel only when a downstream stage genuinely needs the entire previous result set at once (dedup/merge across the full set, count-based early-exit, or a prompt that compares one item against all others); otherwise prefer pipeline.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/SKILL.md",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/patterns.md"
+          ]
+        },
+        {
+          "name": "pipeline(items, ...stages) — no-barrier streaming",
+          "how_it_works": "Signature: pipeline(items, stage1, stage2, …) → Promise<any[]>. Runs each item through ALL stages independently with NO BARRIER between stages — item A can be in stage 3 while item B is still in stage 1. Wall-clock equals the slowest single item's whole chain, not the sum of the slowest stage at each step. This is the documented DEFAULT for multi-stage work. Every stage callback receives (prevResult, originalItem, index), letting later stages label work without threading context through earlier returns. FAILURE SEMANTICS (exactly as asked): a stage that THROWS drops that item to null and SKIPS its remaining stages (the item's slot in the result array is null). Always .filter(Boolean). pipeline and parallel compose — a pipeline stage commonly returns a parallel(...) over a previous stage's findings.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/SKILL.md",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/patterns.md"
+          ]
+        },
+        {
+          "name": "phase(title) and log(message) — progress narration",
+          "how_it_works": "phase(title) → void starts a progress group; agents spawned after it join that group in the /workflows live tree. meta.phases[].title is matched EXACTLY against phase() calls. log(message) → void emits a narrator line above the progress tree. A related injected console (console.log/.error) routes its output into the workflow log — real but undocumented in the tool schema. Inside concurrent pipeline/parallel stages, prefer the per-agent phase option over the global phase() to avoid races on which group concurrent agents land in. The official docs confirm the user-visible concept: '/workflows shows each phase with its agent count, token total, and elapsed time' — but never the phase()/log() function API.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Structured output via schema (AJV + hidden StructuredOutput tool + retry)",
+          "how_it_works": "Passing opts.schema (a plain JSON Schema object) forces the subagent to return a validated object — no JSON.parse needed. Mechanism (binary-probed): the runtime compiles the schema with AJV, synthesises a hidden StructuredOutput tool whose input IS that schema, and instructs the subagent to call it exactly once. The call is AJV-validated; ON A MISMATCH the agent is handed the validation error and tries again. If the subagent finishes WITHOUT calling the tool, the runtime nudges it up to twice more before failing. agent() returns the validated tool input. A skipped/failed agent returns null even with a schema. schema composes with agentType (StructuredOutput is added on top of the custom agent's own tools). Schemas must be defined as const in the body, never inside meta. Officially the docs only say outputs are 'verified/checked before they're folded in' — the AJV/StructuredOutput/retry detail is community-inferred.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/SKILL.md"
+          ]
+        },
+        {
+          "name": "budget — shared token pool with total / spent() / remaining()",
+          "how_it_works": "budget is an injected object { total, spent(), remaining() } reflecting a token target the user sets via a '+500k'-style directive in their message. budget.total = the target or null if none set. budget.spent() = OUTPUT tokens spent this turn across the main loop AND all workflows — the pool is SHARED, not per-workflow. budget.remaining() = max(0, total − spent()), or Infinity if no target. The target is a HARD CEILING: once spent() reaches total, further agent() calls throw (WorkflowBudgetExceededError); in-flight agents finish and their results are kept, but no new agents start. Budget loops must guard on budget.total (e.g. `while (budget.total && budget.remaining() > 50_000)`) because with no target remaining() is Infinity and an unguarded loop sprints into the 1000-agent cap. Entirely community-inferred — the official docs only mention generic plan-usage/rate-limit accounting, never a budget object or spent()/remaining().",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/patterns.md"
+          ]
+        },
+        {
+          "name": "workflow(nameOrRef, args?) — one-level inline nesting",
+          "how_it_works": "Signature: workflow(nameOrRef, args?) → Promise<any>. Runs another workflow inline as a sub-step and returns whatever it returns; pass a saved-workflow name or { scriptPath } for a file. The child SHARES this run's concurrency cap, agent counter, abort signal, and token budget; its agents appear under a nested group in /workflows. NESTING IS ONE LEVEL ONLY — calling workflow() inside a child throws. It also throws on an unknown name, an unreadable path, or a child syntax error (catch to degrade gracefully). Community-inferred; not in official docs.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/patterns.md"
+          ]
+        },
+        {
+          "name": "meta block, args serialization, and the AST/parser gate",
+          "how_it_works": "Every script's FIRST statement must be `export const meta = {…}`, a PURE LITERAL (no variables, calls, spreads, template interpolation; reserved keys __proto__/constructor/prototype rejected). Fields: name (required), description (required, shown in permission dialog), whenToUse (optional), phases (optional array of {title, detail?, model?} — and meta.phases[].model is DISPLAY-ONLY, no code reads it to choose a model; the model is set solely by the agent() model option). The body runs inside an async function (top-level await allowed); globals are injected (no imports). args global: the tool input-schema types it unknown, but EMPIRICALLY (probed 2026-05-29) the runtime SERIALIZES args to a STRING before the script runs — a JSON object/array arrives as JSON text, a plain string stays a string, nothing passed is undefined; scripts must normalize (typeof === 'string' guard + try/parse). The community linter (validate-workflow.mjs) enforces the parser's hard rules: meta first+literal, name/description present, banned non-deterministic calls, host-API misuse, and parallel()-with-bare-promises. Official docs confirm the user-facing equivalents only (a 'raw script' you can view/approve, save to .claude/workflows/).",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/SKILL.md",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/scripts/validate-workflow.mjs"
+          ]
+        },
+        {
+          "name": "Determinism sandbox (banned non-reproducible calls, no host access)",
+          "how_it_works": "The orchestrator runs in a hardened sandbox. Banned (they THROW, to keep resume reproducible): Math.random(), Date.now(), and argless new Date()/Date() — note new Date(specificValue) still works. No host access: no require/fs/process/network in the orchestrator; all file/shell/Bash work belongs INSIDE an agent() (the subagent has the normal Read/Write/Bash tools). Standard JS built-ins (JSON, Math, Array, Map, Set) remain. Officially corroborated at a coarse level: the docs list 'No direct filesystem or shell access from the workflow itself — Agents read, write, and run commands. The script coordinates the agents.' The specific banned-call list and throw-on-use behaviour are community-inferred.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Caps and limits",
+          "how_it_works": "Lifetime agent() calls per run: 1000 → throws WorkflowAgentCapError (runaway-loop backstop). [Officially confirmed: '1,000 agents total per run — Prevents runaway loops'.] Concurrent agents: min(16, max(2, cores−2)) — NOT an error; excess agent() calls queue and run as slots free (pass 100 items to parallel(), ~10-16 run at once, all finish). [Officially confirmed coarsely: 'Up to 16 concurrent agents, fewer on machines with limited CPU cores'.] Script size: 524288 bytes (512 KB) → rejected before parsing. Per-agent stall: 180000ms (3 min), per-agent override via stallMs — a stalled agent is aborted and retried up to 5×, then abandoned (its agent() call resolves so the workflow continues). VM synchronous timeout: 30000ms — bounds synchronous execution only (catches an infinite sync loop), NOT a wall-clock cap (the async body can run for many minutes). The two numeric caps match the official docs; the byte/stall/retry/VM details are community-inferred.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Execution model, content-hash journal, and resume",
+          "how_it_works": "Workflow runs as a BACKGROUND task: the Workflow tool returns immediately with a run ID (wf_…) and the persisted script path; on completion a <task-notification> with summary/agent-count/run-id is delivered into the conversation. JOURNAL: while running, every agent() call is recorded keyed by a HASH OF ITS (prompt, opts) together with its result (subagent transcripts saved as agent-<id>.jsonl). RESUME: relaunch with Workflow({ scriptPath, resumeFromRunId }) — a call whose hash key matches a completed journal entry returns the cached result instantly (no model call); the first new/changed call and everything after it runs live. Same script + same args = 100% cache hit; an edited script replays unchanged calls from cache. Resume works ONLY within the session that created the run (if you exit Claude Code mid-run, the next session starts fresh). Officially corroborated coarsely: the docs say workflows are 'Resumable in the same session', 'agents that already completed return their cached results, and the rest run live', and 'If you exit Claude Code while a workflow is running, the next session starts the workflow fresh.' The content-hash keying (vs LangGraph-style index-based caching) and the wf_/jsonl/journal internals are community-inferred.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Subagent permission/model inheritance and enablement gate",
+          "how_it_works": "OFFICIALLY CONFIRMED: subagents a workflow spawns always run in acceptEdits mode and inherit the user's tool allowlist regardless of the session's permission mode (file edits auto-approved; un-allowlisted shell/web/MCP tools can still prompt mid-run). Every agent uses the session's model unless the script routes a stage to a different one. Requires Claude Code v2.1.154+; on Pro enable via the Dynamic workflows row in /config; disable via /config toggle, \"disableWorkflows\": true in settings.json, or CLAUDE_CODE_DISABLE_WORKFLOWS=1. NOTE A DISCREPANCY: the community repo (pre-GA) says the tool is gated behind CLAUDE_CODE_WORKFLOWS=1 and was 'unreleased and unannounced'; the now-published official docs instead describe a /config toggle and a CLAUDE_CODE_DISABLE_WORKFLOWS opt-OUT. The enablement mechanism evidently changed between the binary-probe and GA — treat the env-var-enable detail as stale.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/README.md"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "Orchestrate subagents at scale with dynamic workflows — Claude Code Docs (PRIMARY/official; confirms JS, script-holds-plan, 1000-agent cap, up-to-16 concurrent, resumability, acceptEdits inheritance, per-stage model routing, /deep-research, no-fs/shell-in-orchestrator, v2.1.154+, /config + disableWorkflows). Does NOT name or document the agent/parallel/pipeline/phase/budget/workflow API.)",
+          "url": "https://code.claude.com/docs/en/workflows",
+          "type": "official"
+        },
+        {
+          "title": "Introducing dynamic workflows in Claude Code — Claude blog (PRIMARY/official; high-level: hundreds of parallel subagents, verification before folding in, adversarial cross-check, ultracode trigger. No API signatures.)",
+          "url": "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code",
+          "type": "official"
+        },
+        {
+          "title": "Introducing Claude Opus 4.8 — Anthropic news (PRIMARY/official; launch context 2026-05-28; one-line workflow mention only, no primitives.)",
+          "url": "https://www.anthropic.com/news/claude-opus-4-8",
+          "type": "official"
+        },
+        {
+          "title": "ray-amjad/claude-code-workflow-creator — README (community reverse-engineering skill; 'checked directly against the Claude Code binary'; states tool was pre-release, gated behind CLAUDE_CODE_WORKFLOWS=1)",
+          "url": "https://github.com/ray-amjad/claude-code-workflow-creator",
+          "type": "community-reverse"
+        },
+        {
+          "title": "ray-amjad/claude-code-workflow-creator — references/api-reference.md (THE primary source for all API-level semantics: full signatures, label/phase/schema/model/isolation/agentType/stallMs options, parallel barrier + throw→null-never-reject, pipeline no-barrier + throwing-stage-drops-item-to-null, AJV StructuredOutput + retry, budget shared-pool/spent()/remaining()/hard-ceiling, workflow() one-level nesting, caps, determinism sandbox, content-hash journal & resume)",
+          "url": "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/api-reference.md",
+          "type": "community-reverse"
+        },
+        {
+          "title": "ray-amjad/claude-code-workflow-creator — SKILL.md (authoring procedure; corroborates pipeline-vs-parallel default, args string-serialization probed 2026-05-29, schema/model tuning, .filter(Boolean) gotchas)",
+          "url": "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/SKILL.md",
+          "type": "community-reverse"
+        },
+        {
+          "title": "ray-amjad/claude-code-workflow-creator — references/patterns.md (runnable fan-out/pipeline/loop-until-budget/adversarial-verify/judge-panel/nested-workflow patterns; demonstrates budget.total guard, parallel barrier dedup, workflow() nesting)",
+          "url": "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/references/patterns.md",
+          "type": "community-reverse"
+        },
+        {
+          "title": "ray-amjad/claude-code-workflow-creator — scripts/validate-workflow.mjs (the community linter encoding the parser's hard rules: 512KB cap, meta-first-pure-literal, banned Date.now/Math.random/argless-new-Date, no require/import/process, parallel-thunks-not-promises)",
+          "url": "https://github.com/ray-amjad/claude-code-workflow-creator/blob/main/scripts/validate-workflow.mjs",
+          "type": "repo"
+        },
+        {
+          "title": "Anthropic ships Claude Opus 4.8 alongside Dynamic Workflows, capped at 1,000 subagents — MarkTechPost (secondary corroboration of 1000-agent cap and 2026-05-28 launch)",
+          "url": "https://www.marktechpost.com/2026/05/28/anthropic-ships-claude-opus-4-8-alongside-dynamic-workflows-and-cheaper-fast-mode-with-workflows-capped-at-1000-subagents/",
+          "type": "blog"
+        }
+      ],
+      "open_questions": [
+        "Single-source risk: ALL fine-grained API semantics (function names, option set, throw→null behaviour, AJV/StructuredOutput retry, budget pool, content-hash journal) come from one reverse-engineering author (ray-amjad) probing the pre-GA binary. No second independent reverse-engineering source documents this API at comparable fidelity, so triangulation of the exact semantics was not achievable — they are plausible and internally consistent but unverified by Anthropic.",
+        "Enablement mechanism changed between probe and GA: the repo says the tool was gated behind CLAUDE_CODE_WORKFLOWS=1 (opt-IN); the published official docs describe a /config toggle + CLAUDE_CODE_DISABLE_WORKFLOWS opt-OUT (v2.1.154+). Other behaviours documented from the same pre-GA binary probe may have similarly drifted at/after GA and should be re-verified against a current build.",
+        "args string-serialization is explicitly flagged by the author as empirically observed on 2026-05-29 and as CONTRADICTING the tool's own inline schema description — Anthropic may have intended (or since shipped) live-object passthrough; needs re-confirmation on a current release.",
+        "Exact error/exception class names (WorkflowAgentCapError, WorkflowBudgetExceededError) are reported from the binary but unconfirmed in any official reference; their stability across versions is unknown.",
+        "Whether budget.spent() counts output tokens only (as the repo states) vs total tokens, and the precise '+500k'-style user directive syntax, are community-inferred and not in any official doc.",
+        "'remote' isolation and the 'workflow-remote-agent' agentType are present-but-disabled in the probed build — their eventual GA behaviour (and whether 'isolation: remote' becomes a supported value) is unknown.",
+        "Relationship to the host project (langchain-dynamic-workflow): the repo I researched is the JS/Claude-Code original being ported to Python/deepagents; semantics confirmed here are for the ORIGINAL, and the Python port may deliberately diverge (e.g. content-hash journal vs LangGraph index-based cache) — the design doc in docs/plans/ is the authority for the port's intended behaviour, not this research."
+      ]
+    },
+    {
+      "topic": "Claude Code Dynamic Workflows: resume/replay and determinism implementation",
+      "summary": "Claude Code Dynamic Workflows (research preview, launched 2026-05-28 alongside Claude Opus 4.8) move orchestration out of the LLM's turn-by-turn control and into a JavaScript script that a background runtime executes. The official docs (code.claude.com/docs/en/workflows) confirm the resume model directly: the runtime \"tracks each agent's result as the run progresses,\" and on resume \"agents that already completed return their cached results, and the rest run live.\" Resume is explicitly SAME-SESSION-ONLY — \"Resume works within the same Claude Code session. If you exit Claude Code while a workflow is running, the next session starts the workflow fresh.\" The script runs in \"an isolated environment, separate from your conversation,\" with no direct filesystem/shell access. Anthropic's Claude Code creator Boris Cherny (HN user bcherny) confirmed the runtime is \"JavaScript, running locally or in the cloud\" and that the feature is built on the shared Claude Agent SDK.\n\nThe more specific mechanisms in the research brief are NOT in official docs and come from community analysis — principally Alex Op (alexop.dev) and yage.ai. The determinism guard is the strongest community claim: alexop.dev states that \"Date.now(), Math.random(), and an argless new Date() all throw inside a workflow. Workflows journal every agent() call so a run can resume, and non-determinism would invalidate that cache.\" This is presented as the author's own hands-on observation, not an Anthropic citation. The \"content-hash journal keyed by (prompt, opts),\" \"runId-based resume,\" and \"replay re-runs the script from the top, returning cached results for unchanged agent() calls while re-running edited/new ones\" are reasonable reconstructions consistent with the official cached-results behavior and the journaling claim, but no primary source states the cache-key formula, a runId identifier, or top-of-script replay semantics verbatim. The \"V8 isolate substrate\" specifically belongs to a DIFFERENT product — Cloudflare's \"Claude Managed Agents\" (blog.cloudflare.com/claude-managed-agents), where V8 isolates vs microVMs are the agent code-execution sandbox backend, NOT the dynamic-workflow orchestration-script runtime. Conflating the two is a common error; for the orchestration script itself, only \"isolated environment\" + \"JavaScript, locally or in the cloud\" is officially confirmed, so a literal V8 isolate substrate for the script is speculative. bcherny noted \"more docs + technical details coming soon,\" so deeper internals remain officially undocumented as of the research-preview launch. No source has reverse-engineered the dynamic-workflow journal internals out of the minified cli.js.",
+      "mechanisms": [
+        {
+          "name": "Cached agent results on resume (completed agents return cached, rest run live)",
+          "how_it_works": "The workflow runtime records each agent() result as the run progresses. When a paused/stopped run is resumed (via /workflows then 'p', or by asking Claude to relaunch with the same script), agents that already completed return their stored results without re-executing, while not-yet-run agents execute live. Official wording: 'If you stop a run, you can resume it: agents that already completed return their cached results, and the rest run live.' and 'The runtime tracks each agent's result as the run progresses, which is what makes a run resumable within the same session.'",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Same-session-only resume scope",
+          "how_it_works": "Resume state lives only inside the active Claude Code session/process; it is not durably persisted across application restarts. Exiting Claude Code while a workflow is running discards in-flight resume state and the workflow starts over next session. Official wording: 'Resume works within the same Claude Code session. If you exit Claude Code while a workflow is running, the next session starts the workflow fresh.' Note: the comparison table also lists workflows as 'Resumable in the same session' for the Interruption row.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Isolated JavaScript orchestration runtime, executed locally or in the cloud",
+          "how_it_works": "A dynamic workflow is a JavaScript script that Claude writes; a background runtime executes it 'in an isolated environment, separate from your conversation,' with intermediate results held in script variables rather than the model's context. The script has no direct filesystem or shell access — only the agents it spawns do I/O. Anthropic's Boris Cherny (Claude Code creator, HN user bcherny) confirmed the execution stack is 'JavaScript, running locally or in the cloud' and that the feature is built into the shared Claude Agent SDK used by CLI, Desktop, VSCode and cloud.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://news.ycombinator.com/item?id=48311705"
+          ]
+        },
+        {
+          "name": "agent() call with an options object (e.g. { model: 'haiku' }, permissionMode)",
+          "how_it_works": "Leaf delegation uses agent(prompt, opts), where opts can route a stage to a specific model (sonnet/opus/haiku/inherit) and control permission behavior. Community deep-dives show usage like agent('Simple classification task', { model: 'haiku' }). This (prompt, opts) tuple is what community sources argue is content-hashed to form the journal/cache key. The official docs corroborate the capability indirectly: 'Every agent in a workflow uses your session's model unless the script routes a stage to a different one.' The exact full signature is not published in the official docs.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://agentpedia.codes/blog/claude-opus-4-8-claude-code-workflows",
+            "https://www.agentupdate.ai/blog/claude-code-dynamic-workflows-best-practices/"
+          ]
+        },
+        {
+          "name": "Determinism guard: Date.now(), Math.random(), and argument-less new Date() throw inside a workflow",
+          "how_it_works": "Because the runtime journals every agent() call so the run can resume, any non-determinism in the script would invalidate that journal/cache. The three classic JS non-deterministic sources are therefore blocked and throw at runtime: the wall-clock time call (Date.now()), the PRNG (Math.random()), and the argless date constructor (new Date()). Recommended workarounds: pass a timestamp via args; to vary agents, vary the prompt or a per-index label rather than randomizing. Verbatim community source: 'Date.now(), Math.random(), and an argless new Date() all throw inside a workflow. Workflows journal every agent() call so a run can resume, and non-determinism would invalidate that cache.' Presented as the author's hands-on observation, not an Anthropic citation; the official docs do not mention these throws.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+            "https://yage.ai/share/claude-code-workflow-determinism-en-20260528.html"
+          ]
+        },
+        {
+          "name": "Content-hash journal keyed by (prompt, opts)",
+          "how_it_works": "Community inference for HOW completed-agent results are matched on resume/replay: each agent() invocation is journaled under a key derived from its inputs (the prompt string plus the opts object), so an identical call resolves to a cached result and a changed call misses the cache. This is consistent with the officially confirmed 'completed agents return cached results' behavior and with the journaling/determinism-invalidation reasoning, but no primary source states the key is a content hash of (prompt, opts) specifically. The closest official anchor is the generic 'Workflows journal every agent() call so a run can resume' framing.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Replay re-runs the script from the top, reusing cached results for unchanged agent() calls and re-running edited/new ones",
+          "how_it_works": "Inferred replay model: on resume/relaunch with the same script, the deterministic orchestrator is executed again from the start; because it is deterministic and agent() results are journaled by content, unchanged calls short-circuit to their cached results while edited prompts/opts or newly added calls miss the journal and execute live. This explains why the determinism guard is necessary (a non-deterministic script would take a different path on replay and break cache matching). The official docs confirm the outcome (cached vs live) and that you 'ask Claude to relaunch the workflow with the same script,' but do not explicitly describe top-of-script re-execution or per-call diffing of edited vs new calls.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        },
+        {
+          "name": "runId-based resume (a run identifier as the journal/resume key)",
+          "how_it_works": "The brief posits a runId that scopes the journal and identifies which run to resume. The official UI does let you select a specific run in /workflows and resume it, implying some per-run identifier exists internally, but no primary or community source names a 'runId' field or shows it keying the cache. This is the least-corroborated of the requested mechanisms — plausible engineering, but not documented or reverse-engineered.",
+          "confidence": "speculative",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "V8 isolate as the substrate for the orchestration script",
+          "how_it_works": "The brief frames a V8 isolate substrate under the dynamic-workflow script. CAUTION: the explicit 'V8 isolate vs microVM' language in the ecosystem comes from a DIFFERENT product — Cloudflare's 'Claude Managed Agents,' where isolates are the sandbox backend for executing AGENT code/tool-calls (Codemode), not the dynamic-workflow orchestration runtime. For the Claude Code dynamic-workflow script itself, official sources confirm only an 'isolated environment' and 'JavaScript, running locally or in the cloud' (which is consistent with a V8 isolate but does not name one). A literal V8-isolate substrate for the orchestration script is plausible given the JS+isolation profile but is not officially stated and risks conflation with the Cloudflare sandbox product.",
+          "confidence": "speculative",
+          "sources": [
+            "https://blog.cloudflare.com/claude-managed-agents/",
+            "https://code.claude.com/docs/en/workflows",
+            "https://news.ycombinator.com/item?id=48311705"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "Orchestrate subagents at scale with dynamic workflows — Claude Code Docs (official)",
+          "url": "https://code.claude.com/docs/en/workflows",
+          "type": "official"
+        },
+        {
+          "title": "Introducing dynamic workflows in Claude Code — Anthropic/Claude blog (official, 2026-05-28)",
+          "url": "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code",
+          "type": "official"
+        },
+        {
+          "title": "Introducing Claude Opus 4.8 — Anthropic news (official launch context)",
+          "url": "https://www.anthropic.com/news/claude-opus-4-8",
+          "type": "official"
+        },
+        {
+          "title": "Dynamic Workflows in Claude Code — Hacker News thread (contains verified comments from Anthropic's Boris Cherny / bcherny)",
+          "url": "https://news.ycombinator.com/item?id=48311705",
+          "type": "community-reverse"
+        },
+        {
+          "title": "Claude Code Workflows: Deterministic Multi-Agent Orchestration — alexop.dev (source of the Date.now/Math.random/new Date throw claim and journaling-cache framing; author's hands-on observation)",
+          "url": "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+          "type": "blog"
+        },
+        {
+          "title": "Claude Code Dynamic Workflow: Where the Determinism Boundary Lies — yage.ai (process vs result determinism analysis, cites official docs/blog)",
+          "url": "https://yage.ai/share/claude-code-workflow-determinism-en-20260528.html",
+          "type": "blog"
+        },
+        {
+          "title": "Announcing Claude Managed Agents on Cloudflare — Cloudflare blog (source of V8-isolate-vs-microVM language; SEPARATE product, the agent sandbox backend, not the workflow orchestration runtime)",
+          "url": "https://blog.cloudflare.com/claude-managed-agents/",
+          "type": "official"
+        },
+        {
+          "title": "Claude Code Dynamic Workflows: Official Step-by-Step Guide — agentpedia.codes (shows agent() opts usage, paraphrases official docs)",
+          "url": "https://agentpedia.codes/blog/claude-opus-4-8-claude-code-workflows",
+          "type": "blog"
+        },
+        {
+          "title": "Claude Code Dynamic Workflows: A Deep Dive and Best Practices — AgentUpdate.ai (agent('...', { model: 'haiku' }) example, cache/resume paraphrase)",
+          "url": "https://www.agentupdate.ai/blog/claude-code-dynamic-workflows-best-practices/",
+          "type": "blog"
+        },
+        {
+          "title": "Claude Code provides no in-session determinism mechanism (Issue #58933) — anthropics/claude-code (community user CaliViking; no maintainer confirmation; context on the determinism gap, NOT a confirmation of the journal/cache internals)",
+          "url": "https://github.com/anthropics/claude-code/issues/58933",
+          "type": "repo"
+        },
+        {
+          "title": "Dynamic Workflows & ultracode — Developer Toolkit (paraphrases official 'isolated environment' + cached-results-on-resume wording)",
+          "url": "https://developertoolkit.ai/en/claude-code/advanced-techniques/dynamic-workflows/",
+          "type": "blog"
+        }
+      ],
+      "open_questions": [
+        "Is the resume/replay cache key literally a content hash of (prompt, opts)? No primary or reverse-engineered source states the key derivation; it is community inference consistent with observed cached-vs-live behavior.",
+        "Does a named 'runId' exist and serve as the journal/resume key? The /workflows UI implies a per-run identifier, but no source names runId or shows it keying the cache — currently speculative.",
+        "Does replay actually re-execute the orchestration script from the top each time (vs. resuming from a saved execution checkpoint)? Official docs confirm 'relaunch with the same script' and cached-vs-live outcomes, but not top-of-script re-run semantics or how edited vs new agent() calls are diffed.",
+        "Is the orchestration script substrate specifically a V8 isolate? Official sources confirm only 'isolated environment' + 'JavaScript, locally or in the cloud.' The explicit V8-isolate language belongs to Cloudflare's separate Claude Managed Agents sandbox-backend product and should not be assumed for the workflow runtime.",
+        "What is the exact, complete agent() signature and the full set of opts fields (beyond model and permissionMode)? Not published in official docs as of the research preview.",
+        "What error type/message do Date.now()/Math.random()/new Date() throw, and is the guard implemented by shadowing globals, an AST/transform gate, or a restricted runtime? Only the existence of the throw is reported (by one hands-on community author); the mechanism is undocumented.",
+        "Are completed-agent results persisted anywhere durable (e.g. on disk) or purely in-memory for the session? Same-session-only behavior suggests in-memory/session-scoped, but this is not explicitly stated.",
+        "Anthropic's Boris Cherny said 'more docs + technical details coming soon' — an authoritative spec of the journal/determinism guard had not been published as of this research (June 2026)."
+      ]
+    },
+    {
+      "topic": "The META layer of Claude Code Dynamic Workflows: how an LLM authors the JavaScript orchestration script, the export const meta pure-literal block, pre-execution validation/AST gating, the DSL/determinism guidance, and one-pass vs iterative codegen",
+      "summary": "Claude Code Dynamic Workflows (research preview, launched ~2026-05-28 alongside Opus 4.8) invert agent control flow: instead of the LLM picking the next step turn-by-turn, Claude authors a JavaScript orchestration script up front; a sandboxed runtime executes it in the background; only the final return value reaches the conversation. The script is triggered by the word \"workflow\" in a prompt or by `/effort ultracode`. Every script begins with a mandatory `export const meta = {…}` block (fields: name, description required; whenToUse, phases optional) that MUST be a pure literal — no variables, function calls, spreads, or template strings — because the parser walks the syntax tree, rejects anything non-literal plus reserved keys (__proto__/constructor/prototype), and the literal is read statically to render the approval dialog (showing the planned phases) before any code runs. Two distinct provenance tiers exist. OFFICIAL (code.claude.com/docs/en/workflows + claude.com blog): the script-holds-the-plan architecture, phases surfaced in a permission/approval gate with a \"View raw script\"/Ctrl+G option, background execution, resumability, the persist-then-edit-then-resume iteration loop, no filesystem/shell from the orchestrator (agents do that), and caps of 1000 agents total / 16 concurrent. The official docs do NOT publish the `export const meta` literal syntax, the banned-construct list, or the DSL signatures. COMMUNITY-REVERSE (ray-amjad/claude-code-workflow-creator skill, which claims its format/rules/caps were \"checked directly against the Claude Code binary\" while the feature was still env-var-gated and unannounced, partially corroborated by alexop.dev and yage.ai): the pure-literal `meta` rule and its AST enforcement; the full injected-global DSL — agent(prompt, opts?), pipeline(items, ...stages) (no barrier, the default), parallel(thunks) (a barrier; takes thunks not promises), phase(title), log(msg), console, budget {total, spent(), remaining()}, args (runtime-serialized to a string), workflow(name, args?) (one level of nesting); the determinism sandbox that BANS Math.random(), Date.now(), and argless new Date() (they THROW) plus removes require/import/fs/process/network, because a content-hash journal of (prompt, opts)→result enables 100%-cache-hit resume that non-determinism would break; AJV-backed schema validation forcing structured agent output; and a bundled validate-workflow.mjs linter that flags missing/non-first/non-literal meta, banned non-deterministic calls, host APIs, and oversized scripts. Codegen is best described as ONE-PASS authoring with an APPROVAL GATE, then ITERATIVE refinement via edit-and-resume (edit the saved .js, re-invoke with resumeFromRunId; unchanged agent() calls replay from cache, the first changed call onward re-runs) — there is no evidence of an automatic self-correcting codegen loop before the first run. Skepticism flags: niche, pre-release-reversed topic; single-source constants (512 KB script cap, 180 s stall, 30 s VM sync timeout, 5× retry, stallMs/setTimeout globals) are from the one repo and should be treated as lower-confidence; the args-serialized-to-string behavior was empirically probed (2026-05-29) and may change.",
+      "mechanisms": [
+        {
+          "name": "LLM authors the orchestration script from a described task (trigger + codegen entry)",
+          "how_it_works": "The user describes a task and includes the word 'workflow' anywhere in the prompt (Claude Code highlights it; alt+w cancels the trigger), OR sets /effort ultracode so Claude auto-plans a workflow for every substantive task. Claude then writes a single self-contained JavaScript orchestration script for the task instead of working turn-by-turn. The control-flow inversion is the core idea: with normal subagents/skills Claude is the orchestrator and every intermediate result lands in its context window; with a workflow the script holds the loop/branching/fan-out and intermediate results live in script variables, so Claude's context receives only the final return value. The script is then handed to the Workflow tool (input fields: script | name | scriptPath, plus optional args and resumeFromRunId).",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code"
+          ]
+        },
+        {
+          "name": "The mandatory `export const meta = {…}` pure-literal block",
+          "how_it_works": "Every workflow file's VERY FIRST statement must be `export const meta = {…}`. Fields: name (required, non-empty string — this, not the filename, is the workflow's name), description (required, one line, shown in the permission/approval dialog), whenToUse (optional, shown in the workflow list), phases (optional, array of {title, detail?, model?} — title is matched exactly against phase() calls). meta MUST be a PURE LITERAL: no variables, no function calls, no spreads (...), no template-string interpolation; all dynamic values must be built in the body, never in meta. Note: phases[].model is display-only (it labels the approval dialog and does nothing at runtime; the real model is set solely by the model option on each agent() call). Schemas and other consts are defined in the body after meta, never inside it.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator (SKILL.md, references/api-reference.md)",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        },
+        {
+          "name": "Why meta must be a pure literal (static-extraction rationale + AST gating)",
+          "how_it_works": "The parser walks the syntax tree and rejects anything that is not a literal, and also rejects reserved keys (__proto__, constructor, prototype). The reason it must be statically analyzable: meta is read BEFORE the body executes — its name/description/phases populate the approval/permission dialog (and Desktop approval card) that the user sees before consenting to a run. Officially the docs confirm the per-run prompt 'shows the planned phases' and offers 'View raw script' (Ctrl+G to open in editor) — which requires the metadata to be extractable without running untrusted body code. A non-literal meta could execute arbitrary code or depend on runtime state at the exact moment the tool needs a safe, deterministic description of the run, so it is banned.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator (references/api-reference.md, scripts/validate-workflow.mjs)",
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Pre-execution validation: AST gate + linter for banned constructs",
+          "how_it_works": "Before a run, the parser enforces hard rules: meta must exist, be the first statement, and be a pure literal (reserved keys rejected); name and description are required. The bundled validate-workflow.mjs linter mirrors the parser: it strips comments/strings, then errors on missing/non-first/non-literal meta (detecting spreads, template literals, function-call patterns, reserved keys), missing name/description, banned non-deterministic calls (Date.now, Math.random, argless new Date), and an oversized script (>512 KB / 524288 bytes, which is rejected before parsing). It warns on host APIs (require(), import…from, process.*) and on parallel([agent(...)]) bare-promise misuse. This is regex/AST-style static gating, not eval — the orchestrator runs in a hardened sandbox, not a normal Node process. Note the linter is a community reimplementation of the binary's rules, not Anthropic's actual validator code.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator (scripts/validate-workflow.mjs, SKILL.md Step 5)",
+            "https://yage.ai/share/claude-code-workflow-determinism-en-20260528.html"
+          ]
+        },
+        {
+          "name": "The injected-global DSL (agent / pipeline / parallel / phase / log / budget / args / workflow / console)",
+          "how_it_works": "The body runs inside an async function (top-level await) with these globals injected — nothing is imported. agent(prompt, opts?) → Promise<string|object>: spawns one fresh-context subagent, returns final text or, with opts.schema, an AJV-validated object; returns null if skipped. opts: label, phase, schema, model ('haiku'|'sonnet'|'opus'|'inherit'|full ID; no validation, typos pass through), isolation:'worktree', agentType (validated against the registry; throws on unknown), stallMs. pipeline(items, ...stages) → runs each item through all stages with NO barrier (the default for multi-stage work; stage callback gets (prevResult, originalItem, index)). parallel(thunks) → a BARRIER; takes an array of FUNCTIONS [() => agent(…)], waits for all, puts null in the slot of any that threw. phase(title) groups subsequent agents in /workflows. log(msg) emits a narrator line. budget {total, spent(), remaining()} for token-aware loops (hard ceiling; agent() throws once spent>=total). args is the tool input but the runtime SERIALIZES it to a string before the script sees it (a JSON object/array arrives as JSON text — must JSON.parse). workflow(name, args?) runs another workflow inline, ONE level of nesting only. console routes into the workflow log. setTimeout/clearTimeout are injected and abort-aware (undocumented). Recommended default is pipeline(); reach for the parallel() barrier only when a stage needs the entire prior result set (dedup/merge/count-based early-exit).",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator (references/api-reference.md sections 5-9, references/patterns.md)",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        },
+        {
+          "name": "The determinism sandbox and its rules (the contract that makes resume work)",
+          "how_it_works": "The orchestrator is intentionally pure control flow. Non-reproducible calls are BANNED and THROW: Math.random(), Date.now(), and argless new Date()/Date() (new Date(specificValue) still works). Guidance: vary 'randomness' by loop index, pass timestamps via args and stamp results after the workflow returns. No host access: no require, no fs, no process, no network — standard JS built-ins (JSON, Math, Array, Map, Set…) remain. Any file/shell/web work must happen INSIDE an agent() (the subagent has Read/Write/Bash tools; the orchestrator does not). The determinism boundary is process-deterministic control flow (the JS dictates order/branching/parallelism, identical every run) vs result-deterministic leaf work (each agent() call's model output). The rationale: the runtime keeps a content-hash journal keyed by a hash of each agent() call's (prompt, opts)→result; deterministic re-execution reproduces the same call sequence with the same keys, so completed calls replay from cache instantly (same script + same args = 100% cache hit) and a crashed/edited run resumes from where it changed. Non-determinism would invalidate that journal, which is why those calls are banned rather than merely discouraged. (This is the 'content-hash journal' the design contrasts with LangGraph's index-based cache.)",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator (references/api-reference.md sections 11-12)",
+            "https://yage.ai/share/claude-code-workflow-determinism-en-20260528.html",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        },
+        {
+          "name": "Structured-output validation (AJV-backed schema enforcement)",
+          "how_it_works": "When an agent() call passes a JSON Schema via opts.schema, the runtime compiles the schema with AJV, synthesizes a hidden StructuredOutput tool whose input IS that schema, and forces the subagent to call it exactly once. The call is AJV-validated; on mismatch the agent is handed the validation error and retries; if it finishes without calling the tool, the runtime nudges it up to twice more before failing. agent() returns the validated object directly (no JSON.parse). schema is one of the four options (with model, isolation, agentType) baked into the resume cache key; label and phase are cosmetic and never invalidate a cached result.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator (references/api-reference.md section 6)"
+          ]
+        },
+        {
+          "name": "The teaching/guidance layer (SKILL.md authoring procedure that encodes the DSL, determinism rules, and orchestration patterns)",
+          "how_it_works": "The community skill encodes the guidance an LLM needs to author a correct script: a 6-step procedure — (0) confirm the tool is enabled (CLAUDE_CODE_WORKFLOWS env var), (1) decide if a workflow is even right (vs a single Agent or a Skill), (2) find the shape of the job (unit of work, known vs unknown count, topology, barrier-needed?, schema-needed?), (3) the pipeline-vs-parallel decision (default pipeline; parallel only as a true barrier), (4) write the file (pure-literal meta first, then async body using injected globals), (5) validate with the linter, (6) run/watch/iterate. It ships copy-paste patterns (fan-out+synthesize, pipeline review→verify, barrier-dedup, loop-until-count, loop-until-budget, adversarial-skeptic-vote, judge-panel, loop-until-dry, nested workflow) and a gotchas list (determinism bans, no Node APIs, parallel takes thunks not promises, always .filter(Boolean), open-ended loops need a hard stop). This is a community-authored teaching artifact reverse-engineered from the binary, NOT Anthropic's actual internal system prompt — Anthropic's own codegen system prompt is not public.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator (SKILL.md, references/patterns.md)"
+          ]
+        },
+        {
+          "name": "Codegen mode: one-pass authoring + approval gate, then iterative edit-and-resume refinement",
+          "how_it_works": "Initial codegen is effectively ONE-PASS: Claude writes the full script for the task, the runtime parses/checks/persists it to a file in the session directory, and an approval gate runs (CLI options: Yes run it / Yes don't ask again for <name> in <path> / View raw script (Ctrl+G to edit, Tab to tweak the prompt) / No; Desktop card shows name + phase list + token caution with Once/Always/Deny). There is NO evidence of an automatic self-correcting LLM loop that re-generates the script before the first run. REFINEMENT is iterative via the persist-and-edit-resume loop: run once → edit the saved .js with Write/Edit → re-invoke with {scriptPath, resumeFromRunId}. Every agent() call before the first edit replays instantly from the journal cache; only the changed call and everything after it re-runs. Resume works only within the session that created the run; exiting Claude Code restarts the workflow fresh next session.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://github.com/ray-amjad/claude-code-workflow-creator (references/api-reference.md sections 3,12; SKILL.md Step 6)"
+          ]
+        },
+        {
+          "name": "Single-source runtime constants (lower-confidence specifics)",
+          "how_it_works": "From one community source claiming binary verification: script size cap 524288 bytes (512 KB, rejected before parsing); lifetime cap 1000 agent() calls per run (throws WorkflowAgentCapError — officially confirmed as 1000 total); concurrency min(16, max(2, cores-2)) with excess calls queueing (officially confirmed cap of 16 concurrent); per-agent stall timeout 180000 ms (3 min) with up to 5× retry, overridable via stallMs; a 30000 ms VM SYNCHRONOUS timeout (catches infinite sync loops only, not a wall-clock cap); token budget settable via a '+500k'-style directive; isolation:'worktree' costing ~200-500 ms + disk per agent; a disabled 'remote' isolation value present in the binary. The agent-count and concurrency caps are corroborated by official docs; the precise timeout/retry/size numbers and the stallMs/setTimeout/console undocumented globals are single-source and should be treated as speculative until independently confirmed.",
+          "confidence": "speculative",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator (references/api-reference.md section 10)",
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "Orchestrate subagents at scale with dynamic workflows — Claude Code Docs (official)",
+          "url": "https://code.claude.com/docs/en/workflows",
+          "type": "official"
+        },
+        {
+          "title": "Introducing dynamic workflows in Claude Code — Anthropic blog (official)",
+          "url": "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code",
+          "type": "official"
+        },
+        {
+          "title": "Introducing Claude Opus 4.8 — Anthropic news (official)",
+          "url": "https://www.anthropic.com/news/claude-opus-4-8",
+          "type": "official"
+        },
+        {
+          "title": "ray-amjad/claude-code-workflow-creator — Claude Code skill for authoring Workflow scripts; format/rules/caps reverse-engineered and 'checked directly against the Claude Code binary' (SKILL.md, references/api-reference.md, references/patterns.md, scripts/validate-workflow.mjs)",
+          "url": "https://github.com/ray-amjad/claude-code-workflow-creator",
+          "type": "repo"
+        },
+        {
+          "title": "Claude Code Dynamic Workflow: Where the Determinism Boundary Lies — yage.ai (community-reverse, claims binary-checked)",
+          "url": "https://yage.ai/share/claude-code-workflow-determinism-en-20260528.html",
+          "type": "community-reverse"
+        },
+        {
+          "title": "Claude Code Workflows: Deterministic Multi-Agent Orchestration — alexop.dev (community, inference; independently corroborates pure-literal meta + determinism bans)",
+          "url": "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+          "type": "blog"
+        },
+        {
+          "title": "Claude Code Dynamic Workflows: Official Step-by-Step Guide — agentpedia.codes (community guide aggregating official sources; confirms approval gate + View raw script)",
+          "url": "https://agentpedia.codes/blog/claude-opus-4-8-claude-code-workflows",
+          "type": "blog"
+        },
+        {
+          "title": "Anthropic Ships Claude Opus 4.8 Alongside Dynamic Workflows … Capped at 1,000 Subagents — MarkTechPost (community news, launch + caps)",
+          "url": "https://www.marktechpost.com/2026/05/28/anthropic-ships-claude-opus-4-8-alongside-dynamic-workflows-and-cheaper-fast-mode-with-workflows-capped-at-1000-subagents/",
+          "type": "other"
+        },
+        {
+          "title": "Trying Dynamic Workflow in Claude Code — azukiazusa.dev (community hands-on, meta block + phases example)",
+          "url": "https://azukiazusa.dev/en/blog/claude-code-dynamic-workflow/",
+          "type": "blog"
+        }
+      ],
+      "open_questions": [
+        "Anthropic's actual internal system prompt / codegen guidance that teaches the DSL to the authoring model is NOT public — all DSL/pattern teaching material found is community-reverse-engineered (ray-amjad skill). How closely does it match Anthropic's real prompt?",
+        "Is the pure-literal meta requirement and its AST-walk enforcement officially documented anywhere, or only inferred from the binary? Official docs confirm phases appear in the approval dialog but do not publish the meta literal syntax or the rejection of reserved keys (__proto__/constructor/prototype).",
+        "Exact runtime constants (512 KB script cap, 180 s stall, 30 s VM sync timeout, 5× retry, stallMs/setTimeout/console globals) are single-source (one repo). Independent confirmation is missing; the agent caps (1000 total / 16 concurrent) ARE officially confirmed but the rest are not.",
+        "Whether codegen ever uses an automatic pre-run self-correction loop (LLM regenerates after a validation failure) before the human approval gate, or whether all iteration is strictly the manual edit-and-resume loop. No source shows an automatic regenerate-on-lint-failure loop.",
+        "The 'args is serialized to a string' behavior was empirically probed on 2026-05-29 and the source notes it contradicts the tool's own inline schema description — this may be a pre-release quirk that changes after GA.",
+        "How the official runtime's validator is actually implemented (true AST/ESTree walk vs. tokenizer) — the community linter (validate-workflow.mjs) is an approximation using comment/string-stripping + regex, explicitly a heuristic reimplementation, not Anthropic's code.",
+        "Relationship/accuracy drift: the ray-amjad repo was written while the feature was env-var-gated and unannounced ('not released yet'); the feature then launched ~2026-05-28. Some behaviors may have shifted between the reverse-engineering and GA."
+      ]
+    },
+    {
+      "topic": "Execution substrate and limits of Claude Code Dynamic Workflows (V8/JS isolate script execution, script-vs-agent I/O split, concurrency cap, 1000-agent cap, worktree isolation, background/notifications, MCP/session tool access)",
+      "summary": "Claude Code Dynamic Workflows (research preview, launched 2026-05-28, requires Claude Code v2.1.154+, Opus 4.8 era) invert control flow: instead of the LLM deciding each step, Claude writes a JavaScript orchestration script that a background runtime executes deterministically. Intermediate results live in script variables; only the final result reaches the conversation. The defining substrate rule is confirmed by Anthropic's official docs verbatim: \"No direct filesystem or shell access from the workflow itself — Agents read, write, and run commands. The script coordinates the agents.\" Leaf `agent()` calls each run a fresh-context subagent that does all I/O (file, shell, web, MCP) and is the only thing that spends model tokens.\n\nHard limits are the strongest area of confirmation, but with an important split. Two caps are OFFICIAL-CONFIRMED in Anthropic docs: \"Up to 16 concurrent agents, fewer on machines with limited CPU cores\" (bounds local resource use) and \"1,000 agents total per run\" (prevents runaway loops). The precise concurrency FORMULA `min(16, max(2, cores − 2))` is NOT in official docs — it is documented only in a community-reverse source (the `ray-amjad/claude-code-workflow-creator` skill repo, billed as a \"Preview of an unreleased feature\" with an api-reference extracted from the actual runtime), which also gives the 1000-cap error name `WorkflowAgentCapError`, a 512 KB script-size cap, a 3-minute per-agent stall timeout (retried up to 5×), a 30 s \"VM sync timeout\", and a fail-loud determinism guard banning `Math.random()`, `Date.now()`, argless `new Date()`, `require`, `fs`, `process`, and network calls. Worktree isolation is OFFICIAL-CONFIRMED as a subagent capability (`isolation: worktree` frontmatter / `isolation: \"worktree\"` Agent-tool option giving a temporary git worktree auto-cleaned if no changes); its COST (~200–500 ms + disk per agent) is community-reverse only. Background execution and the in-conversation completion `<task-notification>` are confirmed (docs + a GitHub issue). Agents reach MCP/session tools by INHERITING the main conversation's internal + MCP tools by default, filtered by the session tool allowlist, scoped via `tools`/`disallowedTools`/`mcpServers` frontmatter, always running in `acceptEdits` mode.\n\nCRITICAL CAVEAT on the brief's framing: the phrase \"V8 isolate\" is NOT used by Anthropic or any source found. Official docs say only \"JavaScript script\" in an \"isolated environment\"; the community runtime reference says \"VM sync timeout\" and \"no Node.js APIs in the orchestrator,\" which points to a vm-module-style in-process sandbox rather than a separately provisioned V8 isolate. Treat \"V8 isolate\" as speculative/unconfirmed terminology. The orchestration primitives `agent()`, `parallel()` (barrier), `pipeline()` (no barrier), `phase()`, `log()`, `workflow()` (one-level nesting), and `budget` are documented only in community-reverse sources, not official Anthropic pages.",
+      "mechanisms": [
+        {
+          "name": "JavaScript orchestration script, runtime-executed in an isolated environment (NOT confirmed as a 'V8 isolate')",
+          "how_it_works": "Anthropic docs: 'A dynamic workflow is a JavaScript script that orchestrates subagents at scale. Claude writes the script for the task you describe, and a runtime executes it in the background while your session stays responsive.' And: 'The workflow runtime executes the script in an isolated environment, separate from your conversation. Intermediate results stay in script variables instead of landing in Claude's context.' The runtime is the orchestrator; control flow (loops, branching, fan-out) is ordinary code, and only leaf agent() calls spend tokens. NO official or community source uses the term 'V8 isolate'. The community runtime reference instead lists a '30000 ms VM sync timeout' that 'catches infinite sync loops only' and states 'No filesystem or Node.js APIs in the orchestrator', which is consistent with a vm-module-style in-process sandbox, not a separately provisioned V8 isolate. The 'V8 isolate' framing in the question is therefore unconfirmed.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/SKILL.md"
+          ]
+        },
+        {
+          "name": "Script-vs-agent I/O split: the script has NO filesystem/shell/web/MCP access; only leaf agents do I/O",
+          "how_it_works": "Official docs state this verbatim in the 'Behavior and limits' table: constraint 'No direct filesystem or shell access from the workflow itself', reason 'Agents read, write, and run commands. The script coordinates the agents.' The community runtime reference reinforces it: banned from the orchestrator are require(), fs, process, and network calls — 'any file read/write/Bash work belongs inside an agent() call — the subagent has the normal tools; the orchestrator does not.' This is the core control-flow-inversion property: the script is a pure deterministic coordinator; all side-effecting work is delegated to discarded-context subagents whose only the final result returns.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/SKILL.md"
+          ]
+        },
+        {
+          "name": "Concurrency cap: up to 16 concurrent agents, fewer on low-core machines (formula min(16, max(2, cores−2)))",
+          "how_it_works": "Official docs (Behavior and limits table): 'Up to 16 concurrent agents, fewer on machines with limited CPU cores' — purpose 'Bounds local resource use.' Excess agent() calls QUEUE rather than error (passing 100 items to parallel() queues gracefully). The exact formula — min(16, max(2, cores − 2)) — is NOT in official docs; it appears only in the community-reverse api-reference, which also notes '~10 run concurrently on a typical machine.' So the official-confirmed part is the 16 ceiling + per-core reduction + queueing; the precise cores−2 arithmetic and the floor of 2 are community-inferred.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+          ]
+        },
+        {
+          "name": "1000-agent total lifetime cap per run (throws WorkflowAgentCapError)",
+          "how_it_works": "Official docs (Behavior and limits table): '1,000 agents total per run' — purpose 'Prevents runaway loops.' This is a per-run lifetime ceiling on the number of agent() calls, distinct from the concurrency cap. The community runtime reference adds the error type — exceeding it 'Throws WorkflowAgentCapError' — and notes an unguarded loop will 'sprint into the 1000-agent lifetime cap and throw.' Child workflows invoked via workflow() share the parent's agent counter (and concurrency cap and token budget), so nesting does not multiply the budget.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+          ]
+        },
+        {
+          "name": "Per-agent worktree isolation (isolation: 'worktree') and its cost",
+          "how_it_works": "Subagent-level capability: set isolation: worktree in custom-subagent frontmatter, or pass isolation: \"worktree\" via the Agent tool, to run the agent in a temporary git worktree — 'an isolated copy of the repository branched by default from your default branch rather than the parent session's HEAD. The worktree is automatically cleaned up if the subagent makes no changes.' In workflow scripts the agent() option is isolation: 'worktree'. COST: the community runtime reference quantifies it as '~200–500 ms + disk per agent' and warns 'use it only when parallel agents mutate files and would otherwise collide.' Cleanup: auto-removed once older than cleanupPeriodDays if no uncommitted changes / untracked files / unpushed commits; gitignored files like .env are copied in only via a .worktreeinclude file (gitignore syntax). The cost figure is community-reverse; the existence, frontmatter syntax, default-branch base, and cleanup rules are official.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/worktrees",
+            "https://code.claude.com/docs/en/sub-agents",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/SKILL.md"
+          ]
+        },
+        {
+          "name": "Background/async execution with in-conversation completion notification",
+          "how_it_works": "Official docs: 'Workflows run in the background, so the session stays responsive while agents work.' The run is launched as a background task that returns a run ID immediately; progress streams to the /workflows view (phases with agent counts, token totals, elapsed time) and a one-line summary in the task panel. The community runtime reference: 'Body launches as a background task; returns run ID (wf_…) instantly ... completion triggers a <task-notification>.' Completion notifications are injected into the conversation at the system level (confirmed by GitHub issue #18544: 'when a background command completes, Claude Code automatically injects a notification into the conversation' with the completed command and exit code; injected at the conversation level, bypassing the hooks pipeline). No mid-run user input is possible — only agent permission prompts can pause a run; for sign-off between stages, run each stage as its own workflow.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://github.com/anthropics/claude-code/issues/18544",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+          ]
+        },
+        {
+          "name": "Resume / durable execution via content-cached agent results",
+          "how_it_works": "Official docs: 'The runtime tracks each agent's result as the run progresses, which is what makes a run resumable.' On resume, 'agents that already completed return their cached results, and the rest run live.' Resume works only within the same Claude Code session — exiting Claude Code restarts the workflow fresh next session. Community runtime reference: relaunch with Workflow({ scriptPath, resumeFromRunId }); 'same script + same args = 100% cache hit'; the cache key includes schema, model, isolation, and agentType, so changing any of those re-runs the call. This is why the determinism guard exists — non-deterministic calls would break the cache-keyed resume.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+          ]
+        },
+        {
+          "name": "Fail-loud determinism guard (banned non-deterministic / I/O calls throw)",
+          "how_it_works": "Community runtime reference: the orchestrator BANS (throws on) Math.random() ('vary agent prompts by loop index instead'), Date.now() and argless new Date()/Date() ('pass timestamps via args'), and require()/fs/process/network ('belong inside agent() calls'). Available: standard JS built-ins (JSON, Math, Array, Map, Set). Rationale: these would break cache-keyed resume by making re-runs diverge; throwing rather than silently allowing them is a fail-loud guard. Not in official docs — official docs describe the no-filesystem/no-shell rule but not the specific banned identifiers. Aligns with the project's design of a determinism guard as an invariant rather than convention.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md",
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/SKILL.md"
+          ]
+        },
+        {
+          "name": "Agents reach MCP/session tools by inheritance + allowlist + per-agent scoping",
+          "how_it_works": "Official sub-agents docs: 'Subagents inherit the internal tools and MCP tools available in the main conversation by default.' Scoping: tools (allowlist) / disallowedTools (denylist) / mcpServers frontmatter; mcpServers entries are either a string referencing an already-configured server (shares the parent's connection) or an inline definition (connected when the subagent starts, disconnected when it finishes). UI/session-dependent tools (Agent, AskUserQuestion, EnterPlanMode, ScheduleWakeup, WaitForMcpServers) are NOT available to subagents even if listed. For workflows specifically, official workflow docs: 'The subagents the workflow spawns always run in acceptEdits mode and inherit your tool allowlist, regardless of your session's mode. File edits are auto-approved. Shell commands, web fetches, and MCP tools that aren't in your allowlist can still prompt you mid-run' — so pre-adding needed commands to the allowlist avoids mid-run prompts. As of v2.1.153, managed-MCP restrictions (--strict-mcp-config, enterprise managed config, allow/deny policies) also cover subagent-frontmatter-declared servers.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/sub-agents",
+            "https://code.claude.com/docs/en/workflows"
+          ]
+        },
+        {
+          "name": "Orchestration primitives: agent(), parallel() barrier, pipeline() no-barrier, phase(), log(), workflow(), budget",
+          "how_it_works": "Documented only in the community-reverse api-reference (the workflow-creator skill). Signatures: agent(prompt, opts?) → Promise<string|object> spawns a fresh-context subagent (string by default; validated object with schema; null if skipped). parallel(thunks) → Promise<any[]> runs functions concurrently as a synchronization BARRIER (waits for all; throwing thunks resolve to null). pipeline(items, ...stages) → Promise<any[]> streams items through stages with NO barrier; each stage receives (prevResult, originalItem, index). phase(title) starts a progress group. log(message) emits a narrator line. workflow(nameOrRef, args?) runs another workflow inline, ONE LEVEL ONLY (nesting within nesting throws); the child shares the parent's concurrency cap, agent counter, and token budget. budget object: budget.total, budget.spent(), budget.remaining(); a token budget is a hard ceiling — once spent reaches total, further agent() calls throw WorkflowBudgetExceededError. agent() options: label, phase, schema, model ('haiku'/'sonnet'/'opus'/'inherit'/full ID; default inherits session model), isolation ('worktree'), agentType (registered subagent type; throws on unknown), stallMs (default 180000 ms). These names/signatures are NOT on any official Anthropic page.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        },
+        {
+          "name": "Other runtime caps: 512 KB script size, 3-min per-agent stall (retry 5×), 30 s VM sync timeout, token budget",
+          "how_it_works": "Community runtime reference caps table: script size 524288 bytes (512 KB), 'Rejected before parsing'; per-agent stall 180000 ms (3 min), 'Aborted and retried up to 5×, then abandoned' (overridable per-agent via stallMs); 'VM sync timeout' 30000 ms, 'Catches infinite sync loops only'; token budget is user-set and throws WorkflowBudgetExceededError when spent reaches total. None of these appear in official Anthropic docs (which list only the 16-concurrent and 1000-total caps). The 'VM sync timeout' label is notable evidence the substrate is a VM-style sandbox rather than a named V8 isolate.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "Orchestrate subagents at scale with dynamic workflows — Claude Code Docs (official, authoritative)",
+          "url": "https://code.claude.com/docs/en/workflows",
+          "type": "official"
+        },
+        {
+          "title": "Introducing dynamic workflows in Claude Code — Anthropic/Claude blog (launch announcement, 2026-05-28)",
+          "url": "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code",
+          "type": "official"
+        },
+        {
+          "title": "Run parallel sessions with worktrees — Claude Code Docs (worktree isolation, isolation: worktree, cleanup)",
+          "url": "https://code.claude.com/docs/en/worktrees",
+          "type": "official"
+        },
+        {
+          "title": "Create custom subagents — Claude Code Docs (frontmatter fields, tools/MCP inheritance, isolation, background)",
+          "url": "https://code.claude.com/docs/en/sub-agents",
+          "type": "official"
+        },
+        {
+          "title": "Run agents in parallel — Claude Code Docs (subagents vs agent view vs teams vs workflows)",
+          "url": "https://code.claude.com/docs/en/agents",
+          "type": "official"
+        },
+        {
+          "title": "claude-code-workflow-creator — references/api-reference.md (community-reverse: exact API, caps, formula, sandbox bans)",
+          "url": "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md",
+          "type": "community-reverse"
+        },
+        {
+          "title": "claude-code-workflow-creator — SKILL.md (community-reverse: no-FS orchestrator rule, worktree cost, determinism guard)",
+          "url": "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/SKILL.md",
+          "type": "community-reverse"
+        },
+        {
+          "title": "claude-code-workflow-creator — repo root (skill for authoring Workflow scripts; 'Preview of an unreleased feature')",
+          "url": "https://github.com/ray-amjad/claude-code-workflow-creator",
+          "type": "repo"
+        },
+        {
+          "title": "Claude Code Workflows: Deterministic Multi-Agent Orchestration — alexop.dev (community analysis of primitives, journal, concurrency)",
+          "url": "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+          "type": "community-reverse"
+        },
+        {
+          "title": "[FEATURE] disable automatic background task completion notifications — anthropics/claude-code issue #18544 (notification injection mechanism)",
+          "url": "https://github.com/anthropics/claude-code/issues/18544",
+          "type": "repo"
+        },
+        {
+          "title": "Dynamic Workflows & ultracode — developertoolkit.ai (community guide corroborating no-FS-from-script, 16 concurrent, 1000 cap)",
+          "url": "https://developertoolkit.ai/en/claude-code/advanced-techniques/dynamic-workflows/",
+          "type": "blog"
+        },
+        {
+          "title": "CLAUDE CODE ORCHESTRATION — Ken Huang, Agentic AI substack (community corroboration: 16 concurrent, 1000-per-run, background)",
+          "url": "https://kenhuangus.substack.com/p/claude-code-orchestration-dynamic",
+          "type": "blog"
+        },
+        {
+          "title": "Dynamic Workflows in Claude Code: research preview with up to 1,000 subagents — Pasquale Pillitteri (community summary)",
+          "url": "https://pasqualepillitteri.it/en/news/3663/claude-code-dynamic-workflows-anthropic-research-preview",
+          "type": "blog"
+        }
+      ],
+      "open_questions": [
+        "Is the orchestrator actually a V8 isolate? No source confirms this term. Official docs say 'JavaScript script' in an 'isolated environment'; the community runtime reference says 'VM sync timeout' and 'no Node.js APIs in the orchestrator', which points to a vm-module / VM-context sandbox rather than a separately provisioned V8 isolate. The exact engine (Node's vm module, a QuickJS-style embed, or a true isolated-vm V8 isolate) is unverified.",
+        "The concurrency formula min(16, max(2, cores−2)) comes only from one community-reverse source (the workflow-creator skill). Official docs say only 'up to 16, fewer on limited cores.' The exact arithmetic, the floor of 2, and whether it counts physical vs logical cores are unconfirmed against Anthropic.",
+        "Is there an AST/static-analysis gate (no imports / no dunders / banned names) enforced before execution, or are the banned calls (Math.random, Date.now, require, fs, process, network) caught only at runtime by throwing? The community reference describes them as throwing; whether validation is pre-parse static AST gating or runtime trap is not definitively stated for the official product.",
+        "Does the worktree-isolation cost (~200–500 ms + disk per agent) scale with repo size, and what exactly is copied in (only .worktreeinclude gitignored files, plus the git checkout)? The 200–500 ms figure is a single community estimate, not benchmarked across repo sizes.",
+        "Are completion notifications ever surfaced as OS-level / push notifications for long (hours/days) background workflows, or only as in-conversation <task-notification> injection? Sources confirm in-conversation injection (issue #18544) but the OS/desktop notification path for workflows specifically is not documented.",
+        "How do the documented WorkflowAgentCapError / WorkflowBudgetExceededError error types and the wf_… run-ID scheme appear in the official product? These names are from a community-reverse reference and could differ from shipped internals.",
+        "The token 'budget' object (budget.total/spent()/remaining()) and the workflow() one-level-nesting rule are community-reverse only — whether they are exactly the shipped public surface, or an authoring-skill abstraction, is unconfirmed.",
+        "Whether subagents spawned by a workflow can themselves spawn further subagents — official sub-agents docs state 'Subagents cannot spawn other subagents,' but it is unverified whether workflow-spawned agents are a special case."
+      ]
+    },
+    {
+      "topic": "Claude Code Dynamic Workflows — community analyses, usage patterns, orchestration patterns, framework comparisons, and documented limitations (launched ~2026-05-28, research preview)",
+      "summary": "Claude Code Dynamic Workflows (research preview, shipped 2026-05-28 alongside Claude Opus 4.8, requires Claude Code v2.1.154+) invert control flow: instead of the LLM deciding the next step turn-by-turn, Claude WRITES a JavaScript orchestration script that a separate runtime executes in the background. The script owns loops/branching/fan-out and holds intermediate results in script variables; only the final verified answer reaches the conversation context. Leaf agent() calls spend tokens and each runs in an isolated, discarded context window. Official primitives/limits are confirmed by docs (16 concurrent agents, 1000 total per run, resumable within a session, /deep-research bundled, /workflows monitor, /effort ultracode, save to .claude/workflows/). The deepest API-level details (exact signatures for agent/parallel/pipeline/phase/log/budget/workflow, schema-forced structured output, determinism guard that THROWS on Math.random()/Date.now(), the agent()-call journal enabling resume) come from a community-authored skill repo (ray-amjad/claude-code-workflow-creator) and the alexop.dev deep-dive — these are community-inferred / reverse-engineered, not in the public docs, though they align with official behavior statements. IMPORTANT TRIANGULATION NOTE for this project: the official runtime is JavaScript; the named pattern catalog (fan-out, pipeline-by-default, loop-until-budget, loop-until-dry, adversarial verify, judge panel, diverse-lens verify, nested workflow) is canonical from the community skill repo. \"Completeness critic\" and \"multi-modal sweep\" are looser community framings (MindStudio), not in the canonical catalog. Real usage is real but early: Jarred Sumner (Bun) used it for a Zig-to-Rust port (do-work then adversarial-review-then-apply, two reviewers per file, hundreds of parallel agents), and Klarna found dead code static analysis missed. The dominant documented critique on Hacker News is token cost (\"tokenmaxxing\" — users hit Max caps fast: 90 agents, or 62 Opus agents burning a 5-hour cap in 18 min), plus \"slop debt\", weak human-in-the-loop control mid-run, and skepticism that mechanical refactors prove the feature. Versus LangGraph/CrewAI/AutoGen: workflows are dev-time, model-authored, script-as-orchestrator with runtime-decided fan-out; LangGraph is a production, human-authored, explicitly-typed DAG with persistent cross-session state — so workflows trade auditability/strict determinism for emergent decomposition.",
+      "mechanisms": [
+        {
+          "name": "Control-flow inversion: script-as-orchestrator (not LLM turn-by-turn)",
+          "how_it_works": "Claude writes a JavaScript orchestration script from the natural-language request; a separate runtime executes it in the background while the session stays responsive. The script owns the loop, branching, and fan-out; intermediate results live in script variables instead of Claude's context window. Only the final verified answer lands in the conversation. Official docs table: 'Who decides what runs next' = 'The script' (vs Claude turn-by-turn for subagents/skills); 'Where intermediate results live' = 'Script variables'.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code"
+          ]
+        },
+        {
+          "name": "Leaf agent() calls in isolated, discarded contexts",
+          "how_it_works": "Only leaf agent() calls spend model tokens; each subagent runs in its own clean context window, receives a specific task, returns a result to the script, and its context is discarded. Subagents do not communicate or share state with each other (unlike Agent Teams). They always run in acceptEdits mode and inherit the session tool allowlist regardless of session permission mode.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://github.com/ray-amjad/claude-code-workflow-creator"
+          ]
+        },
+        {
+          "name": "Concurrency and agent caps (16 concurrent / 1000 total)",
+          "how_it_works": "Up to 16 concurrent agents (fewer on low-core machines — community skill states min(16, max(2, cores-2))), to bound local resource use. Hard cap of 1000 agent() calls per run to prevent runaway loops (community skill: throws WorkflowAgentCapError). Excess concurrent calls queue until slots free.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://www.marktechpost.com/2026/05/28/anthropic-ships-claude-opus-4-8-alongside-dynamic-workflows-and-cheaper-fast-mode-with-workflows-capped-at-1000-subagents/",
+            "https://github.com/ray-amjad/claude-code-workflow-creator"
+          ]
+        },
+        {
+          "name": "Resume via per-agent result journal (content-cached)",
+          "how_it_works": "The runtime tracks/journals each agent's result as the run progresses; on stop-and-resume, already-completed agents return cached results and the rest run live. Resume works only within the same Claude Code session — exiting Claude Code mid-run restarts the workflow fresh next session. Community analysis frames this as the workflow journaling every agent() call so a run can resume.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://yage.ai/share/claude-code-workflow-determinism-en-20260528.html",
+            "https://github.com/ray-amjad/claude-code-workflow-creator"
+          ]
+        },
+        {
+          "name": "Determinism guard: non-deterministic calls THROW",
+          "how_it_works": "Because the run is journaled for resume, non-determinism would invalidate the cache, so the runtime makes Math.random(), Date.now(), and argless new Date() throw inside a workflow. Host access (require, fs, process, network) is also blocked. Workarounds: pass timestamps via args; vary prompts/labels by loop index; new Date(specificValue) is allowed. This is the community-reverse 'fail-loud determinism guard' framing; official docs confirm the no-filesystem/no-shell-from-script constraint but the specific throwing-functions list is from the community skill and alexop.dev.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+            "https://yage.ai/share/claude-code-workflow-determinism-en-20260528.html"
+          ]
+        },
+        {
+          "name": "Orchestration primitives: agent / parallel / pipeline / phase / log / workflow / budget / args",
+          "how_it_works": "Community-documented signatures (skill repo + alexop.dev): agent(prompt, opts?) with opts {schema (JSON Schema forcing validated structured output, retries on mismatch), label, phase, model ('haiku'|'sonnet'|'opus'|'inherit'|id), isolation:'worktree', agentType, stallMs}. parallel(thunks) = barrier; expects [() => agent(...)], throwing thunks resolve to null (never rejects). pipeline(items, ...stages) = NO barrier; items stream stage-to-stage, each stage gets (prevResult, originalItem, index); throwing stage -> that item becomes null. workflow(nameOrRef, args?) = inline subworkflow, ONE level deep only. phase(title)/log(msg) = progress UI. budget.total / budget.spent() / budget.remaining() for token-target introspection. args = serialized tool input. These signatures are NOT in the public docs.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        },
+        {
+          "name": "Pipeline-by-default (parallel only as an explicit barrier)",
+          "how_it_works": "Community guidance: default to pipeline() because items advance the moment each is ready (no head-of-line blocking). Use parallel() barriers ONLY when the next stage needs the entire prior result set — to dedup/merge, early-exit on a total, or reference 'the other findings'. Anti-pattern flagged: parallel -> transform-with-no-cross-item-dependency -> parallel should have been a pipeline. Not flattening/filtering (do that inside a pipeline stage).",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+            "https://github.com/ray-amjad/claude-code-workflow-creator"
+          ]
+        },
+        {
+          "name": "Adversarial verification pattern",
+          "how_it_works": "For each finding, spawn N independent skeptic agents prompted to REFUTE it; keep the finding only if a majority survive (e.g. 3 votes/claim, survives if fewer than 2 refutations). Officially described in docs/blog as 'independent agents adversarially review each other's findings' and 'other agents try to refute what they found, and the run keeps iterating until the answers converge.' The N-skeptic / majority-vote implementation detail is community-documented. Diverse-lens variant: give each verifier a distinct lens (correctness/security/performance/reproducibility) instead of N identical ones.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code",
+            "https://code.claude.com/docs/en/workflows",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+            "https://github.com/ray-amjad/claude-code-workflow-creator"
+          ]
+        },
+        {
+          "name": "Judge panel pattern",
+          "how_it_works": "When the solution space is wide and single-attempt-iterated is weak: generate N independent attempts from different angles, score them with parallel judge agents, then synthesize from the winner while optionally grafting the best parts of runners-up. Officially gestured at by 'draft a plan from several angles and weigh them against each other.' Named/structured form is from the community pattern catalog.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        },
+        {
+          "name": "Loop-until-budget / loop-until-dry / loop-until-target patterns",
+          "how_it_works": "Loop-until-target: counter loop, e.g. while(bugs.length < 10). Loop-until-budget: while(budget.total && budget.remaining() > 50_000) to scale depth to the user's token target. Loop-until-dry: keep spawning finders until K consecutive rounds surface nothing new (dryRounds counter + round cap); critical gotcha — dedupe against everything SEEN, not just confirmed results, or the loop never terminates. All loops must carry a hard stop (counter/budget). Example in skill: dead-code-sweep.js.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://github.com/ray-amjad/claude-code-workflow-creator",
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+          ]
+        },
+        {
+          "name": "Completeness-critic loop",
+          "how_it_works": "A critic agent reads artifacts and emits harsh findings; a fixer implements exactly what the critic found; they loop until the critic says APPROVED or a hard cap (e.g. 5 rounds) is hit. Catches errors single-pass review misses. This is a community framing (MindStudio / general agentic-pattern writeups) layered on top of the adversarial-verify idea; it is NOT a named primitive in the canonical pattern catalog and the '5 rounds max' is illustrative, not an official constant. Skill repo's implement-and-review.js shows the do/while + MAX_ROUNDS shape.",
+          "confidence": "speculative",
+          "sources": [
+            "https://www.mindstudio.ai/blog/claude-code-agentic-workflow-patterns",
+            "https://github.com/ray-amjad/claude-code-workflow-creator"
+          ]
+        },
+        {
+          "name": "Multi-modal / comprehensive-sweep fan-out",
+          "how_it_works": "Decompose a comprehensive job so every part is covered in parallel (e.g. 'review every file in this diff', 'audit all 40 dependencies', 'audit every endpoint under src/routes/ for missing auth'). Officially these are the headline use cases (codebase-wide bug sweep, 500-file migration, security/auth audits). 'Multi-modal sweep' as a discrete named pattern is a loose community label, not in the canonical catalog — the underlying mechanic is fan-out-then-synthesize / pipeline.",
+          "confidence": "speculative",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code",
+            "https://www.mindstudio.ai/blog/claude-code-agentic-workflow-patterns"
+          ]
+        },
+        {
+          "name": "Schema-forced structured output as the reliable data path",
+          "how_it_works": "Passing opts.schema (a JSON Schema) forces the subagent to call a structured-output tool; validation happens at the tool-call layer so the model retries on mismatch. Community guidance: every result field you later read off should be backed by a schema const. Schema/model/isolation/agentType changes invalidate the journal cache (force re-run); label/phase are cosmetic.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+            "https://github.com/ray-amjad/claude-code-workflow-creator"
+          ]
+        },
+        {
+          "name": "Triggering, monitoring, saving, and ultracode",
+          "how_it_works": "Trigger by including the word 'workflow' in a prompt (alt+w or backspace to dismiss the highlight; can be disabled in /config), running a bundled command (/deep-research), or /effort ultracode (combines xhigh reasoning + automatic workflow orchestration for every substantive task; session-scoped, resets next session). Monitor with /workflows (phases show agent count, token total, elapsed; p=pause, x=stop, r=restart agent, s=save). Save a run's script to .claude/workflows/ (project, shared) or ~/.claude/workflows/ (personal); project wins on name collision. Disable via /config toggle, settings.json disableWorkflows:true, CLAUDE_CODE_DISABLE_WORKFLOWS=1, or org managed settings.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://code.claude.com/docs/en/workflows",
+            "https://developertoolkit.ai/en/claude-code/advanced-techniques/dynamic-workflows/"
+          ]
+        },
+        {
+          "name": "Documented limitations and failure modes",
+          "how_it_works": "(1) Token cost is the #1 critique — 'tokenmaxxing'; HN users hit Max caps fast (one hit cap first-time on a small package review with 90 agents; another burned a 5-hour cap in 18 min with 62 Opus agents). (2) No mid-run user input except agent permission prompts — for stage sign-off, run each stage as its own workflow; users want nudge/correction injection mid-run. (3) Resume only within the same session. (4) 'Slop debt' / noise accumulation — LLM-cleaning-up-after-LLM; users add deterministic gates (cyclomatic complexity grading). (5) Not for strict determinism (fan-out decided at runtime) or precise audit logs of which agents ran when — hand-orchestrate or use custom multi-agent systems for those. (6) Permission UX: without Auto mode, permission prompts can stall parallelism; subagents force acceptEdits. (7) Enterprise ships OFF by default (admin enable). (8) Naming concern: 'workflow' collides with Temporal/existing orchestration terms and is a domain-standard word, causing false keyword triggers.",
+          "confidence": "official-confirmed",
+          "sources": [
+            "https://news.ycombinator.com/item?id=48311705",
+            "https://code.claude.com/docs/en/workflows",
+            "https://claudefa.st/blog/guide/development/dynamic-workflows"
+          ]
+        },
+        {
+          "name": "Real-world usage anecdotes (Bun port, Klarna)",
+          "how_it_works": "Jarred Sumner (Bun creator) used dynamic workflows + adversarial code review to port Bun from Zig to Rust: one workflow mapped the correct Rust lifetime for every struct field, the next wrote each .rs file as a behavior-identical port; hundreds of agents in parallel with two reviewers per file; he banned slow commands (git, cargo) inside the agent loop for throughput; per-unit pattern = do-work, adversarial-review, apply. ~750K lines Rust, 99.8% of the existing test suite passing — but canary-only / not yet in production. HN skeptics noted mechanical refactors are agent-friendly anyway, one called a generated test the worst test-repeats-implementation they'd seen, and one flagged team difficulty navigating ~1M lines of generated Rust. Klarna reportedly found dead code that traditional static analysis missed.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code",
+            "https://digg.com/ai/rb5xj3bt",
+            "https://news.ycombinator.com/item?id=48311705",
+            "https://claudefa.st/blog/guide/development/dynamic-workflows"
+          ]
+        },
+        {
+          "name": "Comparison vs LangGraph / CrewAI / AutoGen",
+          "how_it_works": "Workflows: model-AUTHORED JS script as orchestrator, dev-time, runtime-decided fan-out, results in script variables, resumable within-session, optimized for emergent decomposition + adversarial verification at 10s-100s of agents. LangGraph: human-authored, explicit typed DAG (TypedDict/Pydantic), production runtime, persistent cross-session state, conditional edges, hard human-in-the-loop checkpoints — chosen when you need strict determinism, auditability, or hot-swappable agents. CrewAI = role/crew metaphor (sequential specialist handoff), reportedly ~3x LangGraph token cost; AutoGen = conversation/critique metaphor. Common community take: not mutually exclusive — use Claude Code/workflows to BUILD the LangGraph/CrewAI app, or use workflows for breadth+verification and a framework for stateful production orchestration.",
+          "confidence": "community-inferred",
+          "sources": [
+            "https://www.lowcode.agency/blog/claude-code-vs-langgraph",
+            "https://www.developersdigest.tech/guides/ai-agent-frameworks-compared",
+            "https://news.ycombinator.com/item?id=48311705"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "Orchestrate subagents at scale with dynamic workflows — Claude Code Docs (PRIMARY)",
+          "url": "https://code.claude.com/docs/en/workflows",
+          "type": "official"
+        },
+        {
+          "title": "Introducing dynamic workflows in Claude Code — Anthropic/Claude blog (PRIMARY)",
+          "url": "https://claude.com/blog/introducing-dynamic-workflows-in-claude-code",
+          "type": "official"
+        },
+        {
+          "title": "Introducing Claude Opus 4.8 — Anthropic news (PRIMARY)",
+          "url": "https://www.anthropic.com/news/claude-opus-4-8",
+          "type": "official"
+        },
+        {
+          "title": "claude-code-workflow-creator — community skill that authors Workflow scripts (api-reference.md, patterns.md, 6 example workflows) — richest reverse-engineered API source",
+          "url": "https://github.com/ray-amjad/claude-code-workflow-creator",
+          "type": "repo"
+        },
+        {
+          "title": "Claude Code Workflows: Deterministic Multi-Agent Orchestration — alexop.dev (deepest community deep-dive: primitives, patterns, gotchas)",
+          "url": "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/",
+          "type": "community-reverse"
+        },
+        {
+          "title": "Claude Code Dynamic Workflow: Where the Determinism Boundary Lies — yage.ai",
+          "url": "https://yage.ai/share/claude-code-workflow-determinism-en-20260528.html",
+          "type": "community-reverse"
+        },
+        {
+          "title": "Dynamic Workflows in Claude Code — Hacker News thread (#48311705): token-cost/slop/control critiques, Bun-rewrite debate",
+          "url": "https://news.ycombinator.com/item?id=48311705",
+          "type": "community-reverse"
+        },
+        {
+          "title": "Trying Dynamic Workflow in Claude Code — azukiazusa.dev (hands-on /deep-research + migration workflow, code snippets)",
+          "url": "https://azukiazusa.dev/en/blog/claude-code-dynamic-workflow/",
+          "type": "blog"
+        },
+        {
+          "title": "CLAUDE CODE ORCHESTRATION: Dynamic Workflows — Ken Huang (Agentic AI substack)",
+          "url": "https://kenhuangus.substack.com/p/claude-code-orchestration-dynamic",
+          "type": "blog"
+        },
+        {
+          "title": "Dynamic Workflows in Claude Code: Complete Guide 2026 — claudefa.st (when-not-to-use, failure modes, Bun/Klarna examples)",
+          "url": "https://claudefa.st/blog/guide/development/dynamic-workflows",
+          "type": "blog"
+        },
+        {
+          "title": "Dynamic Workflows & ultracode — developertoolkit.ai (primitives table, constraints, disable settings)",
+          "url": "https://developertoolkit.ai/en/claude-code/advanced-techniques/dynamic-workflows/",
+          "type": "blog"
+        },
+        {
+          "title": "5 Claude Code Workflow Patterns Explained — MindStudio (sequential/operator/split-merge/teams/headless; completeness-critic framing)",
+          "url": "https://www.mindstudio.ai/blog/claude-code-agentic-workflow-patterns",
+          "type": "blog"
+        },
+        {
+          "title": "Claude Code vs LangGraph: Coding Agent vs Workflow Orchestration — lowcode.agency",
+          "url": "https://www.lowcode.agency/blog/claude-code-vs-langgraph",
+          "type": "blog"
+        },
+        {
+          "title": "AI Agent Frameworks Compared: CrewAI vs LangGraph vs AutoGen vs Claude Code — Developers Digest",
+          "url": "https://www.developersdigest.tech/guides/ai-agent-frameworks-compared",
+          "type": "blog"
+        },
+        {
+          "title": "Anthropic Ships Claude Opus 4.8 Alongside Dynamic Workflows... Capped at 1,000 Subagents — MarkTechPost",
+          "url": "https://www.marktechpost.com/2026/05/28/anthropic-ships-claude-opus-4-8-alongside-dynamic-workflows-and-cheaper-fast-mode-with-workflows-capped-at-1000-subagents/",
+          "type": "blog"
+        },
+        {
+          "title": "Jarred Sumner rewrote Bun in Rust using Claude Code dynamic workflows — Digg",
+          "url": "https://digg.com/ai/rb5xj3bt",
+          "type": "blog"
+        },
+        {
+          "title": "Dynamic Workflows in Claude Code: Anthropic Opens Research Preview with Up to 1,000 Subagents — Pasquale Pillitteri",
+          "url": "https://pasqualepillitteri.it/en/news/3663/claude-code-dynamic-workflows-anthropic-research-preview",
+          "type": "blog"
+        },
+        {
+          "title": "Anthropic launches dynamic workflows for Claude Code — TestingCatalog",
+          "url": "https://www.testingcatalog.com/anthropic-launches-dynamic-workflows-for-claude-code/",
+          "type": "blog"
+        }
+      ],
+      "open_questions": [
+        "LANGUAGE MISMATCH for this project: official docs and every community source describe the workflow runtime as JavaScript. The langchain-dynamic-workflow project is a Python port to deepagents — the JS-vs-Python boundary, idioms (thunks, Date.now throwing), and any semantic gaps were not found documented anywhere; the Python port's design choices are this repo's own, not Anthropic's.",
+        "Exact agent()/parallel()/pipeline()/budget signatures, the constants (min(16,max(2,cores-2)), 512KB script cap, 180s stall x5 retries, 30s VM sync timeout, WorkflowAgentCapError/WorkflowBudgetExceededError), and the throwing-determinism list come ONLY from a community-authored skill (ray-amjad) and alexop.dev — NOT from official docs. They align with official behavior statements but should be treated as reverse-engineered until Anthropic publishes an API reference. The ray-amjad README itself called the Workflow tool 'unreleased and unannounced' at authoring time.",
+        "Whether the journal is genuinely content-hash-based (as the langchain port's design assumes) vs index/position-based is not stated in official docs; community sources describe per-agent result caching keyed on schema/model/isolation/agentType changes but do not confirm a content hash of the prompt.",
+        "Bun-port timeline is inconsistent across sources: 'six days' (alexop.dev, claudefa.st headline, Digg title) vs 'eleven days from first commit to merge' (MarkTechPost / Sumner's own numbers). Likely six days of active rewrite vs eleven to merge, but not reconciled by a primary Sumner statement we located.",
+        "'Completeness critic' and 'multi-modal sweep' as discrete named patterns appear only in looser community writeups (MindStudio), not in the canonical pattern catalog (which uses fan-out, pipeline, loop-until-*, adversarial-verify, judge-panel, diverse-lens-verify, nested-workflow). Whether the engine treats them as first-class patterns or just compositions is unconfirmed.",
+        "Convergence criteria for adversarial verification ('iterate until answers converge') are described qualitatively in official docs; the concrete majority-vote / N-skeptic thresholds are community implementation choices, and the actual built-in /deep-research voting threshold (e.g. '3-vote per claim, survives if <2 refutations') is community-reported from inspecting a run, not officially specified.",
+        "No independent, quantitative benchmark of dynamic-workflow output QUALITY (vs single-agent or vs LangGraph/CrewAI pipelines) was found — all framework comparisons are qualitative or about token efficiency in general, not head-to-head on workflow results. The 99.8% Bun test-pass figure is self-reported and the build was canary-only/not in production at time of writing."
+      ]
+    }
+  ],
+  "verification": {
+    "verified_claims": [
+      {
+        "claim": "A dynamic workflow is a JavaScript script (NOT Python) that a runtime executes in the background; the script owns loops/branching/fan-out and intermediate results live in script variables, so only the final answer reaches the conversation context.",
+        "verdict": "confirmed",
+        "evidence": "Official docs state verbatim: 'A dynamic workflow is a JavaScript script that orchestrates subagents at scale. Claude writes the script for the task you describe, and a runtime executes it in the background while your session stays responsive.' The comparison table confirms 'Who decides what runs next: The script' and 'Where intermediate results live: Script variables.' Anthropic's Boris Cherny (HN bcherny) further confirmed the runtime is 'JavaScript, running locally or in the cloud' and 'built into the Claude Agent SDK.' IMPLEMENTER NOTE: the official language is JavaScript; this repo's Python/deepagents surface is a community port, not an official Python API.",
+        "best_source": "https://code.claude.com/docs/en/workflows"
+      },
+      {
+        "claim": "Concurrency cap is 'up to 16 concurrent agents, fewer on machines with limited CPU cores'; the precise formula min(16, max(2, cores-2)) is the exact arithmetic.",
+        "verdict": "partially-confirmed",
+        "evidence": "The 16-ceiling + per-core reduction is OFFICIAL, verbatim: 'Up to 16 concurrent agents, fewer on machines with limited CPU cores' (rationale 'Bounds local resource use'). The specific formula min(16, max(2, cores-2)) is NOT in official docs — it appears only in the ray-amjad api-reference limits table ('Concurrent agents | min(16, max(2, cores - 2))'). So the cap value is confirmed; the exact cores-2 arithmetic and floor-of-2 are single-source community-reverse and should be treated as plausible-but-unconfirmed.",
+        "best_source": "https://code.claude.com/docs/en/workflows"
+      },
+      {
+        "claim": "Hard cap of 1,000 agents total per run, to prevent runaway loops (community: throws WorkflowAgentCapError).",
+        "verdict": "confirmed",
+        "evidence": "Official docs limits table: '1,000 agents total per run' with rationale 'Prevents runaway loops.' Independently corroborated by multiple third-party outlets (MarkTechPost, Pasquale Pillitteri, Ken Huang). The specific error class name WorkflowAgentCapError is community-only (ray-amjad: 'Lifetime agent() calls per run | 1000 | Throws WorkflowAgentCapError') and unconfirmed by Anthropic — the cap NUMBER is confirmed, the error-class name is not.",
+        "best_source": "https://code.claude.com/docs/en/workflows"
+      },
+      {
+        "claim": "The workflow script itself has NO direct filesystem or shell access; only the leaf agents read/write/run commands, and the script merely coordinates them.",
+        "verdict": "confirmed",
+        "evidence": "Official docs limits table verbatim: constraint 'No direct filesystem or shell access from the workflow itself', reason 'Agents read, write, and run commands. The script coordinates the agents.' This is the core control-flow-inversion / I-O-split property and is unambiguously official.",
+        "best_source": "https://code.claude.com/docs/en/workflows"
+      },
+      {
+        "claim": "Resume is same-session-only: completed agents return cached results and the rest run live, but exiting Claude Code mid-run restarts the workflow fresh next session.",
+        "verdict": "confirmed",
+        "evidence": "Official docs verbatim: 'If you stop a run, you can resume it: agents that already completed return their cached results, and the rest run live.' and 'Resume works within the same Claude Code session. If you exit Claude Code while a workflow is running, the next session starts the workflow fresh.' The comparison table also lists workflows as 'Resumable in the same session.' Fully official. (Implication: completed-agent results are session/in-memory scoped, not durably persisted across restarts — the durability detail itself is inferred, but the same-session-only behavior is explicit.)",
+        "best_source": "https://code.claude.com/docs/en/workflows"
+      },
+      {
+        "claim": "The runtime tracks each agent's result to enable resume, and the resume cache key is a content hash of each agent() call's (prompt, opts) — with schema/model/isolation/agentType baked into the key (changing any re-runs the call; label/phase are cosmetic).",
+        "verdict": "partially-confirmed",
+        "evidence": "OFFICIAL (behavior only): 'The runtime tracks each agent's result as the run progresses, which is what makes a run resumable.' The specific MECHANISM — a content hash of (prompt, opts) as the key — is community-only. ray-amjad states the journal is 'keyed by a hash of its (prompt, opts)' and that 'schema, model, isolation, and agentType are the four options baked into the resume cache key.' Notably, alexop.dev does NOT state the key is a content hash of (prompt, opts) — it only says 'Workflows journal every agent() call so a run can resume.' So the content-hash-of-(prompt,opts) keying rests on a SINGLE reverse-engineering source (ray-amjad); Anthropic never publishes the key derivation. Whether it is content-hash vs index/position-based is officially undocumented.",
+        "best_source": "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+      },
+      {
+        "claim": "A fail-loud determinism guard makes Date.now(), Math.random(), and an argument-less new Date()/Date() THROW inside a workflow (new Date(specificValue) still works); host access (require/fs/process/network) is also blocked.",
+        "verdict": "partially-confirmed",
+        "evidence": "This is the single highest-stakes community claim and is NOT in official docs. It is attested by two independent community sources. alexop.dev (hands-on observation, not citing Anthropic): 'Date.now(), Math.random(), and an argless new Date() all throw inside a workflow. Workflows journal every agent() call so a run can resume, and non-determinism would invalidate that cache.' ray-amjad confirms the same banned list and that 'only what time is it now is blocked' (i.e. new Date(specificValue) works) and that the orchestrator has 'no filesystem and no Node.js APIs — no require, fs, process, network.' Official docs corroborate ONLY the coarse no-filesystem/no-shell-from-script rule, never the specific banned-identifier list or that they throw. Two independent community sources agree, raising confidence, but Anthropic has not confirmed; whether the guard is a pre-execution AST gate vs a runtime throw is undocumented.",
+        "best_source": "https://alexop.dev/posts/claude-code-workflows-deterministic-orchestration/"
+      },
+      {
+        "claim": "parallel(thunks) is a BARRIER (waits for all) and NEVER rejects: a thunk that throws resolves to null in the result array (hence the .filter(Boolean) idiom); it takes an array of thunks [() => agent(...)], not promises.",
+        "verdict": "partially-confirmed",
+        "evidence": "Community-only, but consistently attested by TWO independent sources. ray-amjad: parallel 'waits for all of them — it is a barrier... A thunk that throws resolves to null in the result array; the call itself never rejects, so .filter(Boolean) before use.' alexop.dev independently: 'It is a barrier' and 'A thunk that throws resolves to null rather than rejecting the whole call, so always .filter(Boolean) the results.' Official docs never name parallel() or document this failure semantic. Internally consistent and dual-sourced, but unverified by Anthropic.",
+        "best_source": "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+      },
+      {
+        "claim": "pipeline(items, ...stages) has NO barrier between stages (items stream independently); each stage callback receives (prevResult, originalItem, index); a stage that throws drops that item to null and skips its remaining stages.",
+        "verdict": "partially-confirmed",
+        "evidence": "Community-only, dual-sourced. ray-amjad: 'There is no barrier between stages... Every stage callback receives (prevResult, originalItem, index)... A stage that throws drops that item to null and skips its remaining stages.' alexop.dev independently: 'pipeline() streams items through stages independently, with no barrier between stages.' Official docs never name pipeline() or document the (prevResult, originalItem, index) signature. Internally consistent and corroborated across two sources, but not Anthropic-confirmed.",
+        "best_source": "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+      },
+      {
+        "claim": "Every script's first statement must be export const meta = {...}, a PURE LITERAL — no variables, calls, spreads, or template interpolation — and reserved keys __proto__/constructor/prototype are rejected; meta is read statically (before the body runs) to populate the approval dialog.",
+        "verdict": "partially-confirmed",
+        "evidence": "Community-only but dual-sourced for the pure-literal rule. ray-amjad: 'the object must be a pure literal: no variables, no function calls, no spreads, no template interpolation... Reserved keys (__proto__, constructor, prototype) are also rejected.' alexop.dev independently: 'Every script starts with a meta block that must be a pure literal.' The static-extraction rationale is reinforced by the OFFICIAL docs, which confirm the per-run prompt 'shows the planned phases' and offers 'View raw script' (Ctrl+G) — consistent with metadata being extractable without executing the body. But the meta literal syntax, the reserved-key rejection, and the AST-gating enforcement are NOT in official docs.",
+        "best_source": "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+      },
+      {
+        "claim": "No mid-run user input is possible — only agent permission prompts can pause a run.",
+        "verdict": "confirmed",
+        "evidence": "Official docs limits table verbatim: constraint 'No mid-run user input', reason 'Only agent permission prompts can pause a run. For sign-off between stages, run each stage as its own workflow.' Fully official.",
+        "best_source": "https://code.claude.com/docs/en/workflows"
+      },
+      {
+        "claim": "Subagents a workflow spawns ALWAYS run in acceptEdits mode and inherit the user's tool allowlist regardless of the session's permission mode (file edits auto-approved); un-allowlisted shell/web/MCP tools can still prompt mid-run.",
+        "verdict": "confirmed",
+        "evidence": "Official docs verbatim: 'The subagents the workflow spawns always run in acceptEdits mode and inherit your tool allowlist, regardless of your session's mode. File edits are auto-approved. Shell commands, web fetches, and MCP tools that aren't in your allowlist can still prompt you mid-run.' Fully official.",
+        "best_source": "https://code.claude.com/docs/en/workflows"
+      },
+      {
+        "claim": "workflow(nameOrRef, args?) runs another workflow inline with ONE level of nesting only — calling workflow() inside a child throws; the child shares the parent's concurrency cap, agent counter, and token budget.",
+        "verdict": "unconfirmed",
+        "evidence": "Community-SINGLE-source. ray-amjad: 'Nesting is one level only — calling workflow() inside a child throws.' alexop.dev mentions workflow() exists ('runs another workflow inline') but does NOT corroborate the one-level-only limit or the shared-counter/cap/budget detail. Official docs never name workflow(). So the one-level-nesting rule rests on a single reverse-engineering source and is unverified by any second source or by Anthropic.",
+        "best_source": "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+      },
+      {
+        "claim": "budget is an injected object {total, spent(), remaining()} representing a shared token target; once spent reaches total, further agent() calls throw (WorkflowBudgetExceededError), and unguarded budget loops with no target sprint into the 1000-agent cap.",
+        "verdict": "unconfirmed",
+        "evidence": "Community-SINGLE-source (ray-amjad) for the precise surface. Official docs mention only generic plan-usage/rate-limit accounting ('Runs count toward your plan's usage and rate limits'), never a budget object, spent()/remaining() methods, the WorkflowBudgetExceededError class, or a '+500k'-style directive. alexop.dev mentions budget 'exposes the token target' but not the spent()/remaining()/hard-ceiling/error-class detail. The shared-pool semantics and error class are plausible but unverified by any second source or by Anthropic.",
+        "best_source": "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+      },
+      {
+        "claim": "Additional runtime constants: script size cap 524288 bytes (512 KB, rejected before parsing), per-agent stall timeout 180000 ms (3 min, retried up to 5x), and a 30000 ms VM synchronous timeout.",
+        "verdict": "unconfirmed",
+        "evidence": "All community-SINGLE-source (ray-amjad limits table): 'Script size | 524288 bytes (512 KB)', 'Per-agent stall | 180000 ms (3 min)', 'VM synchronous timeout | 30000 ms.' None appear in official docs, which publish ONLY the 16-concurrent and 1000-total caps. No second source corroborates these numbers. Notably the 'VM synchronous timeout' label is itself the strongest evidence the substrate is a vm-module-style in-process sandbox rather than the 'V8 isolate' the report's framing assumes — Anthropic uses neither term, saying only 'isolated environment.' Treat all three numbers as lower-confidence single-source.",
+        "best_source": "https://raw.githubusercontent.com/ray-amjad/claude-code-workflow-creator/main/references/api-reference.md"
+      },
+      {
+        "claim": "The orchestration runtime is a V8 isolate / LangGraph-style durable-execution substrate.",
+        "verdict": "contradicted",
+        "evidence": "The 'V8 isolate' framing is NOT supported by any source and is partly contradicted. Official docs say only 'isolated environment' and (via Boris Cherny) 'JavaScript, running locally or in the cloud' — never 'V8 isolate.' The explicit 'V8 isolate vs microVM' language belongs to a DIFFERENT product (Cloudflare's 'Claude Managed Agents' agent-sandbox backend), not the workflow orchestration runtime — conflating them is a known error. The community 'VM synchronous timeout' evidence points to a vm-module in-process sandbox, not a separately provisioned V8 isolate. Separately, the LangGraph @entrypoint/@task/checkpointer substrate is THIS REPO'S design choice for the Python port, NOT a confirmed mirror of Anthropic's runtime (Anthropic has not disclosed the internal implementation). Any literal V8-isolate or LangGraph-substrate claim about Anthropic's runtime is speculative-to-contradicted.",
+        "best_source": "https://blog.cloudflare.com/claude-managed-agents/"
+      },
+      {
+        "claim": "Workflows require Claude Code v2.1.154+, launched 2026-05-28 in research preview alongside Opus 4.8, on all paid plans plus API/Bedrock/Vertex/Foundry; disabled via /config toggle, disableWorkflows in settings.json, or CLAUDE_CODE_DISABLE_WORKFLOWS=1 (opt-OUT).",
+        "verdict": "confirmed",
+        "evidence": "Official docs Note verbatim: 'Dynamic workflows are in research preview. They require Claude Code v2.1.154 or later and are available on all paid plans, with Anthropic API access, and on Amazon Bedrock, Google Cloud Vertex AI, and Microsoft Foundry.' Disable mechanisms confirmed verbatim: '/config' toggle, '\"disableWorkflows\": true', and 'CLAUDE_CODE_DISABLE_WORKFLOWS=1'. IMPLEMENTER NOTE: this is an opt-OUT env var on GA; the pre-GA community repo's CLAUDE_CODE_WORKFLOWS=1 opt-IN gate is now stale.",
+        "best_source": "https://code.claude.com/docs/en/workflows"
+      }
+    ],
+    "overall_reliability_note": "There is a clean, exploitable split between official-confirmed BEHAVIOR and community-reverse-engineered MECHANISM, and an implementer should treat them very differently. OFFICIAL-CONFIRMED (verified verbatim against code.claude.com/docs/en/workflows, the authoritative primary source): JavaScript script + runtime, control-flow inversion, the 16-concurrent and 1000-total caps, no-filesystem/shell-from-script, same-session-only resume with cached completed-agent results, no-mid-run-user-input, acceptEdits + allowlist inheritance, v2.1.154+ / research-preview / disable settings. Boris Cherny (HN bcherny, verified Anthropic) independently confirms 'JavaScript, running locally or in the cloud' on the Claude Agent SDK and notes 'more docs + technical details coming soon' — so deeper internals are officially undocumented.\\n\\nThe entire fine-grained API surface a future implementer would most want — exact primitive signatures (agent/parallel/pipeline/phase/log/budget/workflow), the content-hash-of-(prompt,opts) journal key, the determinism guard's banned-identifier list, the meta pure-literal/reserved-key rule, the 512KB/180s/30s constants, and the WorkflowAgentCapError/WorkflowBudgetExceededError class names — is COMMUNITY-REVERSE-ENGINEERED, not Anthropic-documented. Crucially, triangulation depth varies: parallel-never-rejects, pipeline-no-barrier, the meta pure-literal rule, and the determinism-bans are each attested by TWO independent sources (ray-amjad + alexop.dev) and are internally consistent (raise to partially-confirmed). But the content-hash cache-key formula, workflow() one-level-nesting, the budget object surface, and the numeric runtime constants rest on a SINGLE source (ray-amjad, probing a pre-GA binary) with no second corroboration (unconfirmed). The report's 'V8 isolate' and 'LangGraph substrate' framings are contradicted/speculative — V8-isolate language actually comes from an unrelated Cloudflare product, and the LangGraph mapping is this repo's own port-design choice, not a confirmed mirror of Anthropic's runtime. Skepticism flag: ray-amjad's probe predates GA and the enablement gate already drifted (opt-IN env var -> opt-OUT), so other single-source binary-probed constants may have shifted at GA and should be re-verified against a current build before being hard-coded."
+  }
+}

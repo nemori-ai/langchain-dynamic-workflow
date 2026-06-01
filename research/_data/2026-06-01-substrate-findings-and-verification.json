@@ -1,0 +1,1029 @@
+{
+  "findings": [
+    {
+      "topic": "LangGraph 1.2.2 Functional API (entrypoint/task) Layer-0 substrate",
+      "summary": "Verified against installed langgraph 1.2.2 source.",
+      "mechanisms": [
+        {
+          "name": "entrypoint to Pregel graph",
+          "what_it_provides": "single-input body to one-node Pregel graph; control-flow inversion",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "entrypoint(checkpointer, store, cache, context_schema, cache_policy, retry_policy, timeout)",
+          "sources": [
+            "func 262-620"
+          ]
+        },
+        {
+          "name": "task + SyncAsyncFuture",
+          "what_it_provides": "call returns awaitable Future; checkpointed skippable leaf",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "task(func, name, retry_policy, cache_policy, timeout)",
+          "sources": [
+            "func 59-251",
+            "_call 253-298"
+          ]
+        },
+        {
+          "name": "RESUME/REPLAY skip",
+          "what_it_provides": "cached RETURN returned without re-exec; failed/interrupted re-run",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "next_task.writes non-empty -> set_result(cached RETURN)",
+          "sources": [
+            "_runner 745-756",
+            "_loop 724-737"
+          ]
+        },
+        {
+          "name": "Barrier at result/gather",
+          "what_it_provides": "futures pipeline; result()/gather is parallel barrier",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "wait(FIRST_COMPLETED); SyncAsyncFuture awaitable Future",
+          "sources": [
+            "_runner 282-328",
+            "_call 253-256"
+          ]
+        },
+        {
+          "name": "Checkpointer + thread_id",
+          "what_it_provides": "thread_id primary key; needed for replay/skip and interrupt",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "configurable thread_id; entrypoint.final(value, save)",
+          "sources": [
+            "func 382-514",
+            "_loop 408-456"
+          ]
+        },
+        {
+          "name": "Durability sync/async/exit",
+          "what_it_provides": "sync before step, async during step (default), exit at exit",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "Durability=Literal[sync,async,exit]; default async at main 2574",
+          "sources": [
+            "main 2573-2682",
+            "_loop 459"
+          ]
+        },
+        {
+          "name": "interrupt + Command resume",
+          "what_it_provides": "GraphInterrupt + Command(resume); resume by positional index; tasks cached",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "interrupt(value); Command(graph, update, resume, goto)",
+          "sources": [
+            "types",
+            "func 319-380"
+          ]
+        },
+        {
+          "name": "Retry/Cache/Timeout policies",
+          "what_it_provides": "native cache call-site+args keyed (not content journal); timeout async-only",
+          "support_level": "partial",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "RetryPolicy(max_attempts=3); CachePolicy(key_func, ttl)",
+          "sources": [
+            "types",
+            "_algo 667-687"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "langgraph 1.2.2 source",
+          "url": "https://github.com/langchain-ai/langgraph/tree/main/libs/langgraph/langgraph",
+          "type": "github-source"
+        },
+        {
+          "title": "LangGraph docs",
+          "url": "https://docs.langchain.com/oss/python/langgraph/functional-api",
+          "type": "official-docs"
+        }
+      ],
+      "open_questions": [
+        "Default durability async (main.py 2574) not on docs page; native cache call-site+args keyed not a content journal; replay determinism convention-only so fail-loud guard unmet; resume re-runs whole body so side effects must be in tasks; timeout async-only."
+      ]
+    },
+    {
+      "topic": "LangGraph 1.2.2 persistence, native caching, determinism, concurrency — ground-truth audit vs langchain-dynamic-workflow two-patch rationale",
+      "summary": "All five questions answered from installed source (versions verified: langgraph 1.2.2, langgraph-checkpoint 4.1.1, langchain 1.3.2, langchain-core 1.4.0, deepagents 0.6.7, langchain-anthropic 1.4.4, Python 3.12). (a) TWO DISTINCT KEYING MECHANISMS. (1) CachePolicy result cache (opt-in; needs a BaseCache via entrypoint(cache=...)): keyed by CONTENT, not call index. In pregel/_algo.py: args_key = cache_policy.key_func(*call.input[0], **call.input[1]); CacheKey(ns=(CACHE_NS_WRITES, identifier(func)), key=xxh3_128_hexdigest(args_key), ttl). Default key_func = default_cache_key (_internal/_cache.py) = pickle.dumps((_freeze(args), _freeze(kwargs)), protocol=5) — recursively frozen, sorted dict keys, then 128-bit xxh3. ns namespaced by identifier(func)='module.qualname' (function identity), NOT position. Lookup (match_cached_writes, _loop.py) matches purely on (ns, key). (2) task_id (drives checkpoint/resume replay-skip, the cached-result-skip that works WITHOUT any CachePolicy): POSITIONAL — task_id_func(checkpoint_id_bytes, checkpoint_ns, str(step), name, PUSH, task_path_str(...), str(idx)) (xxh3 for checkpoint v>1 else uuid5). Includes step number + node name + push/write index, NOT input content. On resume, saved writes match tasks by task_id alone (_reapply_writes_to_succeeded_nodes); runner re-executes only tasks where not t.writes. This index/position keying is exactly what the engine content-hash journal patch targets. (b) ONLY InMemorySaver (alias MemorySaver) installed via langgraph-checkpoint 4.1.1. Sqlite/Postgres checkpointers are in separate, uninstalled packages (ModuleNotFoundError confirmed). BaseStore (langgraph/store/base) fully available and reusable as journal substrate: get/put/delete/search/list_namespaces (+async+batch), namespace=tuple[str,...], key=str, value=dict, optional TTL+vector index. (c) Determinism is CONVENTION ONLY. No interception of user time/random/IO; the sole time.monotonic use (_runner.py) is LangGraph's own timeout bookkeeping. Resume matches saved writes to tasks by task_id with NO input/output comparison and NO violation detection. _replay.py is checkpoint/namespace-based, not value-based. v1.x durable-execution docs carry no explicit determinism/side-effects warning section. Validates the engine fail-loud determinism guard as filling a real gap. (d) max_concurrency defaults to None and is NOT auto-derived from CPU cores by LangGraph. Async (pregel/_executor.py): if max_concurrency := config.get('max_concurrency') else self.semaphore=None => UNBOUNDED. Sync (langchain_core get_executor_for_config): max_workers=config.get('max_concurrency') => None => stdlib ThreadPoolExecutor default min(32, os.cpu_count()+4). CPU-core derivation is only the stdlib thread-pool fallback, never LangGraph itself. (e) Send(node, arg, *, timeout=None) spawns PUSH fan-out tasks (map-reduce), processed by prepare_push_task (_algo.py). Functional-API parallel = launch multiple @task futures concurrently inside @entrypoint and await. @entrypoint returns a Pregel instance; deepagents.create_deep_agent is the leaf-agent factory the engine wraps as a @task.",
+      "mechanisms": [
+        {
+          "name": "CachePolicy native result cache — content-based keying",
+          "what_it_provides": "Opt-in per-task/node result cache. CacheKey(ns=(CACHE_NS_WRITES, identifier(func)), key=xxh3_128_hexdigest(key_func(*args,**kwargs)), ttl). Default key_func pickles recursively-frozen, sorted-dict args. NOT keyed by call index/position. Requires a BaseCache (InMemoryCache/RedisCache) via entrypoint(cache=...). Lookup matches on (ns, key) only.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "@dataclass class CachePolicy(Generic[KeyFuncT]): key_func: KeyFuncT = default_cache_key; ttl: int|None = None  # default_cache_key(*args,**kwargs)->pickle.dumps((_freeze(args),_freeze(kwargs)),protocol=5); CacheKey=NamedTuple(ns: tuple[str,...], key: str, ttl: int|None)",
+          "sources": [
+            "langgraph/types.py:508-517 (CachePolicy), 605-613 (CacheKey)",
+            "langgraph/_internal/_cache.py:7-31 (default_cache_key,_freeze)",
+            "langgraph/pregel/_algo.py:858-870 (functional-API key derivation), 1020-1032, 670-684",
+            "langgraph/pregel/_loop.py:1526-1539 (match_cached_writes on (ns,key)), 1586-1600 (cache.set)"
+          ]
+        },
+        {
+          "name": "task_id derivation — index/position-based (governs resume replay-skip)",
+          "what_it_provides": "Identifier driving durable-execution resume (cached-result-skip WITHOUT CachePolicy). Positional: checkpoint_id, checkpoint_ns, step number, node name, PUSH marker, task-path/write index. NOT content-based. On resume, saved pending_writes match tasks by task_id alone; matched tasks skipped, others re-run. This is the index-based limitation the engine content-hash journal patch addresses.",
+          "support_level": "partial",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "task_id = task_id_func(checkpoint_id_bytes, checkpoint_ns, str(step), name, PUSH, task_path_str(task_path[1]), str(task_path[2]))  # task_id_func = _xxhash_str if checkpoint['v']>1 else _uuid5_str",
+          "sources": [
+            "langgraph/pregel/_algo.py:550 (task_id_func selection), 834-842 (push-task id), 990-997, 616-626",
+            "langgraph/pregel/_loop.py:724-737 (_reapply_writes_to_succeeded_nodes — matches by tid only), 655-672"
+          ]
+        },
+        {
+          "name": "Checkpointers — InMemorySaver (only one installed) + BaseCheckpointSaver API",
+          "what_it_provides": "Durable-execution substrate. langgraph-checkpoint 4.1.1 ships ONLY InMemorySaver (alias MemorySaver). Sqlite/Postgres savers are separate uninstalled packages. BaseCheckpointSaver: put/aput, put_writes/aput_writes, get_tuple/aget_tuple, list/alist, get_next_version. get_next_version default integer increment (current+1, None->1, str raises NotImplementedError) — monotonic versions, basis of replay ordering.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "InMemorySaver(*, serde: SerializerProtocol|None=None, factory: type[defaultdict]=defaultdict); BaseCheckpointSaver.put(self, config, checkpoint, metadata, new_versions)->RunnableConfig; put_writes(self, config, writes: Sequence[tuple[str,Any]], task_id: str, task_path: str='')->None; get_tuple(self, config)->CheckpointTuple|None; list(self, config, *, filter=None, before=None, limit=None)->Iterator[CheckpointTuple]; get_next_version(self, current: V|None, channel: None)->V",
+          "sources": [
+            "langgraph/checkpoint/memory/__init__.py (InMemorySaver, MemorySaver alias)",
+            "langgraph/checkpoint/base/__init__.py:692-714 (get_next_version)",
+            "Probe: import langgraph.checkpoint.sqlite/.postgres -> ModuleNotFoundError (both absent)"
+          ]
+        },
+        {
+          "name": "BaseStore — reusable cross-thread KV/journal substrate",
+          "what_it_provides": "Namespace+key store reusable for the engine journal. get/aget, put/aput (optional TTL + vector index list[str]|False), delete/adelete, search/asearch (query+filter+limit+offset, semantic if embeddings configured), list_namespaces/alist_namespaces, batch/abatch over Op lists. namespace=tuple[str,...], key=str, value=dict[str,Any]. InMemoryStore available; @entrypoint(store=...) injects it.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "BaseStore.put(self, namespace: tuple[str,...], key: str, value: dict[str,Any], index: Literal[False]|list[str]|None=None, *, ttl: float|None|NotProvided=NOT_GIVEN)->None; get(self, namespace, key, *, refresh_ttl=None)->Item|None; search(self, namespace_prefix, /, *, query=None, filter=None, limit=10, offset=0, refresh_ttl=None)->list[SearchItem]; list_namespaces(self, *, prefix=None, suffix=None, max_depth=None, limit=100, offset=0)->list[tuple[str,...]]; batch(self, ops: Iterable[Op])->list[Result]",
+          "sources": [
+            "langgraph/store/base/__init__.py (BaseStore), batch.py, memory/__init__.py (InMemoryStore)"
+          ]
+        },
+        {
+          "name": "Determinism — convention only, NOT enforced (no time/random/IO interception)",
+          "what_it_provides": "LangGraph does NOT enforce determinism. No wrapping/interception of user time/random/IO. Resume matches saved writes to tasks by task_id with zero input/output comparison and zero violation detection; a re-run producing the same task_id reuses stale saved writes regardless of would-be-different side effects. ReplayState (_replay.py) is checkpoint/namespace-based. Only time.monotonic use is LangGraph's own timeout accounting. v1.x durable-execution docs omit the older determinism warning. Confirms the engine fail-loud determinism guard fills a real gap.",
+          "support_level": "gap",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "No determinism-guard API. Resume restore: for tid,k,v in self.checkpoint_pending_writes: ... if task := tasks.get(tid): task.writes.append((k,v))  # match by task_id only, no determinism check",
+          "sources": [
+            "langgraph/pregel/_loop.py:724-737 (_reapply_writes_to_succeeded_nodes — task_id match, no comparison)",
+            "langgraph/_internal/_replay.py:14-91 (ReplayState — checkpoint-based)",
+            "langgraph/pregel/_runner.py:280-338 (time.monotonic only for engine timeout)",
+            "grep langgraph/func, pregel/_call.py, pregel/_runner.py: no time/random/datetime/uuid interception of user funcs",
+            "docs.langchain.com/oss/python/langgraph/durable-execution — no determinism/side-effects warning section in v1.x docs"
+          ]
+        },
+        {
+          "name": "max_concurrency — default None, NOT auto-derived from CPU cores by LangGraph",
+          "what_it_provides": "RunnableConfig.max_concurrency defaults to None. LangGraph async executor: when None/falsy, no asyncio.Semaphore created => UNBOUNDED concurrency. langchain-core sync get_executor_for_config passes max_workers=None to ThreadPoolExecutor (stdlib default min(32, os.cpu_count()+4)). CPU-core derivation is only the stdlib thread-pool fallback, never LangGraph deriving it. Engine must set max_concurrency explicitly to bound fan-out.",
+          "support_level": "partial",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "RunnableConfig.max_concurrency: int|None  # docstring 'If not provided, defaults to ThreadPoolExecutor default.' Async: if max_concurrency := config.get('max_concurrency'): self.semaphore=asyncio.Semaphore(max_concurrency) else: self.semaphore=None. Sync: ContextThreadPoolExecutor(max_workers=config.get('max_concurrency'))",
+          "sources": [
+            "langchain_core/runnables/config.py:95-99 (TypedDict+docstring), 632-634 (get_executor_for_config)",
+            "langgraph/pregel/_executor.py:135-140 (async semaphore; None=>unbounded)",
+            "langgraph/_internal/_config.py:159-188 (ensure_config plumbing)"
+          ]
+        },
+        {
+          "name": "Send API / Pregel PUSH fan-out + functional-API parallelism",
+          "what_it_provides": "Send(node, arg, timeout=None) spawns dynamic PUSH fan-out tasks (map-reduce); each becomes a Pregel task in next BSP superstep. Functional-API parallel = launch multiple @task futures concurrently inside @entrypoint and await (each @task -> a Pregel call task). @entrypoint compiles to a Pregel instance. Command(goto=Send|Sequence[Send]) also drives fan-out. deepagents.create_deep_agent is the leaf-agent factory the engine wraps as a @task.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "Send(node: str, arg: Any, *, timeout: float|timedelta|TimeoutPolicy|None=None); Command(*, graph=None, update=None, resume=None, goto: Send|Sequence[Send|N]|N=()); task(__func_or_none__=None, *, name=None, retry_policy=None, cache_policy=None, timeout=None); entrypoint(checkpointer=None, store=None, cache=None, context_schema=None, cache_policy=None, retry_policy=None, timeout=None)->Pregel; entrypoint.final(*, value: R, save: S)",
+          "sources": [
+            "langgraph/types.py:654-713 (Send), Command",
+            "langgraph/pregel/_algo.py:806-935 (prepare_push_task), 938+ (prepare_push_task_send)",
+            "langgraph/func/__init__.py:56 (__all__), 262 (entrypoint), 516 (__call__ -> Pregel), 576",
+            "deepagents/__init__.py (create_deep_agent, SubAgent, CompiledSubAgent)"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "langgraph 1.2.2 — types.py (CachePolicy, CacheKey, Send, Command, Durability)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/types.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — _internal/_cache.py (default_cache_key, _freeze)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/_internal/_cache.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — pregel/_algo.py (cache key + task_id derivation, prepare_push_task)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/_algo.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — pregel/_loop.py (match_cached_writes, _reapply_writes_to_succeeded_nodes)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/_loop.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — _internal/_replay.py (ReplayState — checkpoint-based replay)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/_internal/_replay.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — pregel/_executor.py (async max_concurrency semaphore)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/_executor.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — pregel/_runner.py (time.monotonic only for engine timeout)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/_runner.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — func/__init__.py (task, entrypoint -> Pregel, entrypoint.final)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/func/__init__.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph-checkpoint 4.1.1 — checkpoint/base + memory (BaseCheckpointSaver, get_next_version, InMemorySaver)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/checkpoint/base/__init__.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — store/base (BaseStore API)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/store/base/__init__.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langchain-core 1.4.0 — runnables/config.py (RunnableConfig.max_concurrency, get_executor_for_config)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain_core/runnables/config.py",
+          "type": "reference-api"
+        },
+        {
+          "title": "deepagents 0.6.7 — public API (create_deep_agent, SubAgent, CompiledSubAgent)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/__init__.py",
+          "type": "github-source"
+        },
+        {
+          "title": "LangGraph Durable Execution (official docs, v1.x) — no explicit determinism/side-effects warning section",
+          "url": "https://docs.langchain.com/oss/python/langgraph/durable-execution",
+          "type": "official-docs"
+        },
+        {
+          "title": "LangGraph Pregel / BSP model (official docs)",
+          "url": "https://docs.langchain.com/oss/python/langgraph/pregel",
+          "type": "official-docs"
+        }
+      ],
+      "open_questions": [
+        "Native CachePolicy result cache needs an explicit BaseCache (InMemoryCache or RedisCache via langgraph.cache) wired into entrypoint(cache=...); only in-memory and redis backends ship — confirm whether the engine wants a persistent/shared cache (redis is the only durable shipped option) or relies on its own content-hash journal over BaseStore.",
+        "Index/position-based task_id means resume-skip correctness depends on the script producing tasks in stable order/step; verify the deterministic script yields identical task ordering across resume so task_ids match — else saved writes silently fail to match and tasks re-run (the gap the content-hash journal patch closes). Add an integration test of resume after a script edit.",
+        "Sqlite/Postgres checkpointers are NOT installed (separate packages langgraph-checkpoint-sqlite / -postgres). If durable cross-process checkpointing beyond InMemorySaver is needed, add them as deps and re-verify get_next_version / put_writes semantics against 1.2.2.",
+        "max_concurrency gates the async superstep executor via one loop-level asyncio.Semaphore; confirm whether nested @task fan-out (agent() leaf calls) shares that semaphore or whether deepagents sub-invocations open their own unbounded executor — relevant to the engine's bounded-queue / resource-exhaustion guard."
+      ]
+    },
+    {
+      "topic": "deepagents 0.6.7 — invoking a deep agent as a leaf @task and reclaiming its result (bypassing the LLM-driven `task` tool)",
+      "summary": "Ground-truth verified against the installed .venv (deepagents 0.6.7, langchain 1.3.2, langchain-core 1.4.0, langgraph 1.2.2, langgraph-checkpoint 4.1.1, langchain-anthropic 1.4.4, Python 3.12). All target package versions match the pinned set exactly.\n\nTHE CORE FINDING for the engine: a compiled deep agent (or any subagent) is just a LangGraph `CompiledStateGraph` returned by `create_deep_agent(...)` / `create_agent(...)`. The engine does NOT need deepagents' LLM-driven `task` tool at all — it can call the compiled runnable directly as a `@task` via `.ainvoke(input, config, *, context=...)`. The exact contract is fully reconstructable from source.\n\nINPUT shape (verified empirically + against `_InputAgentState`): `{\"messages\": [HumanMessage(content=\"...\")]}`. The input `messages` is `Required[Annotated[list[AnyMessage | dict[str, Any]], add_messages]]`, so dict form `{\"role\":\"user\",\"content\":\"...\"}` is also accepted (docs confirm). With `StateBackend`, an optional `\"files\": {...}` key is accepted. `config` is an optional `RunnableConfig`; `context` is the keyword-only static run-scoped context (added in langgraph 0.6).\n\nOUTPUT shape (verified empirically + against `_OutputAgentState`): `{\"messages\": list[AnyMessage], \"structured_response\"?: ResponseT}`. `messages` always present (full internal trajectory — Human + AI + any Tool messages); `structured_response` present ONLY when the agent/subagent was built with `response_format=`. Empirically: a no-`response_format` agent returns `{\"messages\":[Human, AI]}` and no `structured_response`; with `response_format` the output JSON-schema exposes both `messages` and `structured_response`.\n\nRESULT RECLAMATION (the \"only final result reaches caller\" rule): deepagents' own `task` tool implements this in `_return_command_with_state_update` (subagents.py:494). The engine must replicate this extraction: if `structured_response is not None` → serialize it (`model_dump_json()` for pydantic, `json.dumps(dataclasses.asdict(...))` for dataclass, else `json.dumps(...)`); ELSE walk `result[\"messages\"]` in REVERSE and take the FIRST `AIMessage` whose `.text.rstrip()` is non-empty (skips Anthropic's trailing empty `end_turn` AIMessage). `AIMessage.text` is verified to handle both str content and content-block lists, returning \"\" for empty. That extracted string is the ONLY thing the parent's context sees — this IS the context-quarantine boundary.\n\nCONTEXT QUARANTINE mechanics (verified in `_validate_and_prepare_state` + `_EXCLUDED_STATE_KEYS`, subagents.py:534/240): deepagents' task tool passes parent state to the child MINUS keys `{messages, todos, structured_response, skills_metadata, skills_load_errors, memory_contents}`, then sets `messages=[HumanMessage(content=description)]`. On return it strips those same keys from the child's state update, forwarding only the single `ToolMessage`. The engine, calling the runnable directly, controls exactly what it passes in (just `{\"messages\":[HumanMessage(...)]}`) and reads back, so quarantine is inherent — the child's intermediate tool calls never enter the orchestrator's variables unless the engine chooses to read `result[\"messages\"]`.\n\nDOCS↔SOURCE drift: none material. Official docs match source. Minor: docs describe `task(name=..., task=...)` ergonomically, but the actual tool input schema is `TaskToolSchema(description: str, subagent_type: str)` (subagents.py:267) — irrelevant to the engine since it bypasses the tool.",
+      "mechanisms": [
+        {
+          "name": "create_deep_agent — leaf agent factory",
+          "what_it_provides": "Builds a CompiledStateGraph[AgentState[ResponseT], ContextT, _InputAgentState, _OutputAgentState[ResponseT]]. The engine calls this once per roster entry, holds the compiled runnable, and invokes it directly as a @task — reusing deepagents' filesystem/subagent/summarization middleware stack and backend without the LLM deciding control flow. Key args for leaf use: model, tools, system_prompt, subagents, backend, response_format, state_schema, context_schema, checkpointer, store, name. Returns the graph wrapped with .with_config({recursion_limit: 9999, metadata:{...}}).",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "create_deep_agent(model: str | BaseChatModel | None = None, tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None, *, system_prompt: str | SystemMessage | None = None, middleware: Sequence[AgentMiddleware] = (), subagents: Sequence[SubAgent | CompiledSubAgent | AsyncSubAgent] | None = None, skills: list[str] | None = None, memory: list[str] | None = None, permissions: list[FilesystemPermission] | None = None, backend: BackendProtocol | BackendFactory | None = None, interrupt_on: dict[str, bool | InterruptOnConfig] | None = None, response_format: ResponseFormat[ResponseT] | type[ResponseT] | dict[str, Any] | None = None, state_schema: type[DeepAgentState] | None = None, context_schema: type[ContextT] | None = None, checkpointer: Checkpointer | None = None, store: BaseStore | None = None, debug: bool = False, name: str | None = None, cache: BaseCache | None = None) -> CompiledStateGraph[AgentState[ResponseT], ContextT, _InputAgentState, _OutputAgentState[ResponseT]]",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/graph.py:217-829"
+          ]
+        },
+        {
+          "name": "create_agent — underlying agent factory",
+          "what_it_provides": "create_deep_agent delegates to this (graph.py:806). The engine can also use it directly for a thinner leaf. Same compiled-graph return type and same invoke/ainvoke I/O contract. Accepts response_format, state_schema, context_schema, checkpointer, store, name, transformers.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "create_agent(model: str | BaseChatModel, tools: Sequence[BaseTool | Callable[..., Any] | dict[str, Any]] | None = None, *, system_prompt: str | SystemMessage | None = None, middleware: Sequence[AgentMiddleware[StateT_co, ContextT]] = (), response_format: ResponseFormat[ResponseT] | type[ResponseT] | dict[str, Any] | None = None, state_schema: type[AgentState[ResponseT]] | None = None, context_schema: type[ContextT] | None = None, checkpointer: Checkpointer | None = None, store: BaseStore | None = None, interrupt_before: list[str] | None = None, interrupt_after: list[str] | None = None, debug: bool = False, name: str | None = None, cache: BaseCache[Any] | None = None, transformers: Sequence[TransformerFactory] | None = None) -> CompiledStateGraph[AgentState[ResponseT], ContextT, _InputAgentState, _OutputAgentState[ResponseT]]",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langchain/agents/factory.py"
+          ]
+        },
+        {
+          "name": "Direct ainvoke/invoke — the leaf call (bypassing the task tool)",
+          "what_it_provides": "The compiled agent is a Pregel/CompiledStateGraph. The engine invokes it as a @task with `await runnable.ainvoke({'messages':[HumanMessage(content=instruction)]}, config=..., context=...)`. `context` (keyword-only, langgraph >=0.6) carries static run-scoped context; deepagents docs confirm the same context propagates to subagents. `config` carries RunnableConfig (thread_id, callbacks, tags). This is the exact call the engine makes per leaf — no LLM, deterministic.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "async def ainvoke(self, input: InputT | Command | None, config: RunnableConfig | None = None, *, context: ContextT | None = None, stream_mode: StreamMode = 'values', output_keys: str | Sequence[str] | None = None, durability: Durability | None = None, version: Literal['v1','v2'] = 'v1', **kwargs: Any) -> dict[str, Any] | Any",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langgraph/pregel/main.py:3980",
+            ".venv/lib/python3.12/site-packages/langgraph/graph/state.py"
+          ]
+        },
+        {
+          "name": "INPUT state schema (_InputAgentState)",
+          "what_it_provides": "Defines exactly what the engine must pass: a `messages` list. add_messages reducer accepts AnyMessage OR dict (role/content) form. Optional `files` key recognized by StateBackend. This is the canonical leaf-call input shape: {'messages': [HumanMessage(content='...')]}.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class _InputAgentState(TypedDict): messages: Required[Annotated[list[AnyMessage | dict[str, Any]], add_messages]]",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langchain/agents/middleware/types.py (AgentState/_InputAgentState)"
+          ]
+        },
+        {
+          "name": "OUTPUT state schema (_OutputAgentState) — what the leaf returns",
+          "what_it_provides": "Empirically verified: ainvoke returns dict with `messages` always present (full internal Human+AI+Tool trajectory) and `structured_response` present only when response_format was set. The engine reads ONE of these to reclaim the result; everything else stays quarantined in the discarded sub-context.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class _OutputAgentState(TypedDict, Generic[ResponseT]): messages: Required[Annotated[list[AnyMessage], add_messages]]; structured_response: NotRequired[ResponseT]",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langchain/agents/middleware/types.py (_OutputAgentState)",
+            "empirical: create_agent(...).ainvoke returns OUTPUT KEYS ['messages']; with response_format output schema exposes ['messages','structured_response']"
+          ]
+        },
+        {
+          "name": "Result reclamation logic (_return_command_with_state_update) — engine must replicate",
+          "what_it_provides": "The exact algorithm deepagents uses to collapse a subagent's full state into the single value the parent sees. The engine should mirror this when reclaiming a leaf result: (1) if result['structured_response'] is not None → serialize via model_dump_json() (pydantic) / json.dumps(dataclasses.asdict()) (dataclass) / json.dumps() (else); (2) else walk result['messages'] in reverse, take first AIMessage whose .text.rstrip() is non-empty (defends against Anthropic trailing empty end_turn AIMessage). Also raises ValueError if 'messages' key missing from a CompiledSubAgent result.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "def _return_command_with_state_update(result: dict, tool_call_id: str) -> Command  # structured = result.get('structured_response'); else last non-empty AIMessage.text (reversed walk)",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py:494-532"
+          ]
+        },
+        {
+          "name": "Context quarantine — exactly what a subagent receives & returns",
+          "what_it_provides": "deepagents' task tool defines _EXCLUDED_STATE_KEYS = {messages, todos, structured_response, skills_metadata, skills_load_errors, memory_contents}. On invoke (_validate_and_prepare_state) it copies parent state minus these keys, then overwrites messages=[HumanMessage(content=description)] — so the child sees only the instruction, not parent conversation. On return it strips the same keys, forwarding only the single ToolMessage. When the engine calls the runnable DIRECTLY it fully controls both sides: pass only {'messages':[HumanMessage(...)]} and read only the extracted final string — quarantine is inherent and stronger (engine never auto-forwards intermediate messages into orchestrator variables). Per docs, runtime `context` does propagate to subagents/tools.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "_EXCLUDED_STATE_KEYS = {'messages','todos','structured_response','skills_metadata','skills_load_errors','memory_contents'}; subagent_state = {k:v for k,v in runtime.state.items() if k not in _EXCLUDED_STATE_KEYS}; subagent_state['messages'] = [HumanMessage(content=description)]",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py:240-264,534-540"
+          ]
+        },
+        {
+          "name": "SubAgent config shape (registry/roster entry)",
+          "what_it_provides": "TypedDict the engine's roster maps to for declarative subagents. Required: name, description, system_prompt. Optional (NotRequired): tools, model, middleware, interrupt_on, skills, permissions, response_format. system_prompt does NOT inherit from main agent; tools inherit unless overridden. response_format makes the subagent emit structured_response (JSON-serialized into the ToolMessage). SubAgentMiddleware validates that 'model' and 'tools' are present before compiling via create_agent.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class SubAgent(TypedDict): name: str; description: str; system_prompt: str; tools: NotRequired[Sequence[BaseTool | Callable | dict[str, Any]]]; model: NotRequired[str | BaseChatModel]; middleware: NotRequired[list[AgentMiddleware]]; interrupt_on: NotRequired[dict[str, bool | InterruptOnConfig]]; skills: NotRequired[list[str]]; permissions: NotRequired[list[FilesystemPermission]]; response_format: NotRequired[ResponseFormat[Any] | type | dict[str, Any]]",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py:27-152"
+          ]
+        },
+        {
+          "name": "CompiledSubAgent shape — pre-built runnable in roster",
+          "what_it_provides": "Lets the engine register an already-compiled runnable (from create_agent, create_deep_agent, or a raw LangGraph graph) under a name. Required: name, description, runnable. HARD REQUIREMENT: the runnable's state schema MUST include a 'messages' key, else _return_command_with_state_update raises ValueError. Does NOT inherit create_deep_agent(state_schema=...). This is the cleanest registry mechanism for the engine: build the graph however it wants, wrap as CompiledSubAgent, then invoke .ainvoke directly.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class CompiledSubAgent(TypedDict): name: str; description: str; runnable: Runnable  # runnable state MUST include 'messages'; structured_response read if non-None, else last AIMessage text",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py:155-232"
+          ]
+        },
+        {
+          "name": "SubAgentMiddleware._get_subagents — compiled-runnable extraction path",
+          "what_it_provides": "If the engine wants to reuse deepagents' subagent compilation, SubAgentMiddleware compiles each SubAgent spec into a runnable via create_agent(model, system_prompt=..., tools=..., middleware=..., name=..., response_format=..., [state_schema=...]) and exposes them as _SubagentSpec={name, description, runnable}. Public attribute `subagent_names: frozenset[str]` lists declared names. The middleware's `tools` attribute holds the single built `task` BaseTool. NOTE: _get_subagents and _SubagentSpec are private (underscore) — the supported public path for the engine is to build/own its own runnables (CompiledSubAgent) rather than reaching into middleware internals.",
+          "support_level": "partial",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "SubAgentMiddleware(*, backend, subagents, system_prompt=TASK_SYSTEM_PROMPT, task_description=None, state_schema=None); .subagent_names: frozenset[str]; ._get_subagents() -> list[_SubagentSpec{name,description,runnable}]  # private",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py:622-767"
+          ]
+        },
+        {
+          "name": "Built-in LLM-driven `task` tool (what the engine bypasses)",
+          "what_it_provides": "The deepagents-native delegation path the engine intentionally does NOT use for control flow: a StructuredTool('task') with args_schema TaskToolSchema(description: str, subagent_type: str), the LLM picking subagent_type at runtime. Internally calls subagent.invoke/ainvoke(subagent_state, subagent_config) where subagent_config forwards ONLY callbacks/tags/configurable from the parent (recursion_limit and metadata intentionally NOT forwarded so the subagent's bound config wins). Understanding this confirms the engine's direct-call approach is equivalent but deterministic. The tool returns a langgraph Command updating parent messages with one ToolMessage.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "task(description: str, subagent_type: str, runtime: ToolRuntime) -> str | Command; atask(...) async; StructuredTool.from_function(name='task', func=task, coroutine=atask, infer_schema=False, args_schema=TaskToolSchema)",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py:467-619"
+          ]
+        },
+        {
+          "name": "DeepAgentState — default state schema",
+          "what_it_provides": "create_deep_agent uses DeepAgentState (subclass of langchain AgentState) by default, which overrides `messages` with a DeltaChannel reducer (_messages_delta_reducer, snapshot_frequency=50) to keep checkpoint growth O(N) instead of O(N²). Relevant to the engine if it persists leaf state via checkpointer (Layer 0). Custom state_schema must subclass DeepAgentState to preserve this reducer.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class DeepAgentState(AgentState): messages: Required[Annotated[list[AnyMessage], DeltaChannel(_messages_delta_reducer, snapshot_frequency=50)]]",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/graph.py:63-66"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "deepagents 0.6.7 — graph.py (create_deep_agent, DeepAgentState, BASE_AGENT_PROMPT, middleware assembly)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/graph.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 — middleware/subagents.py (SubAgent, CompiledSubAgent, _build_task_tool, _return_command_with_state_update, _EXCLUDED_STATE_KEYS, SubAgentMiddleware)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 — middleware/async_subagents.py (AsyncSubAgent shape)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/middleware/async_subagents.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langchain 1.3.2 — agents/factory.py (create_agent) and middleware/types.py (AgentState, _InputAgentState, _OutputAgentState)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain/agents/factory.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — pregel/main.py (ainvoke/invoke signature with context param) and graph/state.py (CompiledStateGraph)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/main.py",
+          "type": "github-source"
+        },
+        {
+          "title": "Official docs — deepagents subagents (SubAgent/CompiledSubAgent fields, task tool return, context quarantine)",
+          "url": "https://docs.langchain.com/oss/python/deepagents/subagents",
+          "type": "official-docs"
+        },
+        {
+          "title": "Official docs — deepagents customization (subagents param, invoke/ainvoke input shape, response_format)",
+          "url": "https://docs.langchain.com/oss/python/deepagents/customization",
+          "type": "official-docs"
+        },
+        {
+          "title": "Official reference — deepagents Python API",
+          "url": "https://reference.langchain.com/python/deepagents",
+          "type": "reference-api"
+        }
+      ],
+      "open_questions": [
+        "The cleanest public registry path: the engine should prefer building/owning compiled runnables (via create_agent/create_deep_agent) and registering them as CompiledSubAgent (a public TypedDict), then calling .ainvoke directly — rather than reaching into SubAgentMiddleware._get_subagents/_SubagentSpec, which are private (underscore-prefixed) and could change. Confirm whether the engine wants deepagents' full middleware stack (filesystem/summarization/prompt-caching) on each leaf (use create_deep_agent) or a thinner leaf (use create_agent).",
+        "Determinism/journal interaction: the compiled graph is wrapped with .with_config({recursion_limit: 9999, metadata:{...}}). When the engine invokes it inside its own @task with a checkpointer for the content-hash journal, verify how the leaf's bound metadata vs the engine's per-task config interact (deepagents' task tool deliberately does NOT forward metadata/recursion_limit so the subagent's bound config wins — the engine calling ainvoke directly will instead pass its own config; confirm this does not clobber lc_agent_name/recursion_limit in a way that breaks tracing or deep recursion).",
+        "structured_response serialization for non-pydantic schemas: _return_command_with_state_update handles pydantic (model_dump_json), dataclass (json.dumps(asdict)), and falls through to json.dumps(structured) for TypedDict/dict. If the engine relies on structured_response, confirm the json.dumps fallback path is acceptable for all response_format strategies (ToolStrategy/ProviderStrategy/AutoStrategy) — strategy choice affects whether structured_response is a pydantic instance or a plain dict.",
+        "Streaming vs values: ainvoke defaults to stream_mode='values' returning the final state dict. If the engine wants to surface intermediate progress (log()) from a leaf, it would use astream — out of scope for the basic call/return contract but relevant to phase()/log() primitives.",
+        "AsyncSubAgent (graph_id-based remote subagents) is a separate path routed through AsyncSubAgentMiddleware and the LangGraph SDK — not relevant to the direct-invoke leaf contract, but flagged in case the engine later wants remote leaves."
+      ]
+    },
+    {
+      "topic": "deepagents 0.6.7 backends & sandbox — verification of langchain-dynamic-workflow D13 design assumptions (BackendFactory typing, per-tool-call invocation, ToolRuntime fields/thread_id, backend lifecycle methods, backend routing/signatures, thread_id-memoized factory feasibility) against installed source + official docs. Pinned: deepagents 0.6.7, langgraph 1.2.2, langchain 1.3.2, langchain-core 1.4.0, Python 3.12.",
+      "summary": "All six D13 sub-claims were checked against the installed deepagents 0.6.7 source under .venv and cross-checked with the matching official docs.\n\n(a) CONFIRMED. `BackendFactory: TypeAlias = Callable[[ToolRuntime], BackendProtocol]` is declared verbatim at deepagents/backends/protocol.py:851. The factory IS invoked on every file/exec tool call: each filesystem tool wrapper (sync_ls/async_ls and the analogous read/write/edit/glob/grep/execute closures) calls `resolved_backend = self._get_backend(runtime)` as its first statement, and `FilesystemMiddleware._get_backend` (filesystem.py:727-749) does `if callable(self.backend): ... return self.backend(runtime)`. The same resolve-per-call pattern repeats in MemoryMiddleware (memory.py:265), SkillsMiddleware (skills.py:855), and SummarizationMiddleware (summarization.py:1388/1579/1613). IMPORTANT DRIFT/CAVEAT: passing a callable factory is DEPRECATED since 0.5.0 (removal 0.7.0) and emits a LangChainDeprecationWarning on every resolution (filesystem.py:736-747). Docs confirm: \"The backend factory pattern is deprecated as of deepagents 0.5.0... The factory pattern still works at runtime and emits a deprecation warning.\"\n\n(b) CONFIRMED with nuance. ToolRuntime (a dataclass in langgraph/prebuilt/tool_node.py:1663) carries: state, context, config:RunnableConfig, stream_writer, tool_call_id:str|None, store:BaseStore|None, tools:list[BaseTool], execution_info, server_info. There is NO direct `thread_id` attribute (hasattr==False). thread_id is reachable ONLY via `runtime.config[\"configurable\"][\"thread_id\"]` — LangGraph interns the key as CONFIG_KEY_THREAD_ID=\"thread_id\" (_internal/_constants.py:52) and stores it under config[\"configurable\"] (CONF), e.g. pregel/main.py:1209. ToolNode constructs each per-call ToolRuntime with config=cfg (the live per-call RunnableConfig) at tool_node.py:806-816 / 841+, so thread_id is reachable at the factory call site. Note the graph-node `Runtime` (langgraph.runtime) has NO `config` field at all, so thread_id is NOT reachable from a bare Runtime — only from ToolRuntime.config.\n\n(c) CONFIRMED — NONE. BackendProtocol (protocol.py:319) exposes only file ops (ls/read/grep/glob/write/edit + async variants + upload/download_files) and deprecated aliases. SandboxBackendProtocol (protocol.py:770) adds only `id` property and execute/aexecute. A repo-wide grep for def (close|start|stop|create|setup|teardown|shutdown|connect|disconnect|__enter__|__exit__|__aenter__|__aexit__|cleanup|dispose|release) across deepagents/backends/ returned ZERO matches. Backends are constructed via __init__ only; cleanup is implicit (GC). Docs corroborate: \"the backend object itself has no create/start/stop/close methods\"; sandbox lifecycle is the caller's responsibility (e.g. sandbox.stop()).\n\n(d) CONFIRMED routing + signatures. CompositeBackend(default, routes, *, artifacts_root=\"/\") routes file ops by longest-prefix match (_route_for_path strips prefix, remaps result paths); root ls/grep/glob aggregate default+all routes; execute() is NOT path-routable — always delegates to self.default and raises NotImplementedError if default is not a SandboxBackendProtocol (composite.py:537-573). StateBackend(runtime=None ignored+deprecated, *, file_format=\"v2\") stores files in LangGraph state via get_config()+CONFIG_KEY_READ/SEND; thread-scoped, ephemeral. FilesystemBackend(root_dir=None, virtual_mode=None, max_file_size_mb=10) reads/writes the real FS (virtual_mode for path guardrails, not isolation). BaseSandbox (abstract: execute, id, upload_files, download_files) derives all file ops from execute(). LocalShellBackend(root_dir, *, virtual_mode, timeout=120, max_output_bytes=100000, env, inherit_env) = FilesystemBackend+SandboxBackendProtocol via subprocess. LangSmithSandbox(sandbox: langsmith.sandbox.Sandbox) WRAPS an externally-created Sandbox; id==sandbox.name. Method signatures are all in api_signature fields below.\n\n(e) FEASIBLE but with a hard caveat. A thread_id-memoized factory is mechanically feasible: the factory receives ToolRuntime, reads runtime.config[\"configurable\"][\"thread_id\"], and can memoize a backend per thread_id (e.g. dict keyed on thread_id). BUT: (1) the factory path is deprecated (removal 0.7.0) and warns on EVERY tool call — so a memoizing factory still pays a per-call deprecation warning; (2) because no backend exposes lifecycle/close methods, a memoized sandbox backend has NO deepagents-driven teardown hook — resource cleanup (sandbox.stop()) is entirely the caller's responsibility and must be wired outside the factory. The official, non-deprecated alternative the docs recommend is to construct the agent per-thread (read thread_id from RunnableConfig, find-or-create an external sandbox labeled by thread_id, wrap it in a backend instance, pass that instance — not a factory — to create_deep_agent). For langchain-dynamic-workflow this means: a memoized BackendFactory works today and reaches thread_id, but is on a deprecation clock and gives no lifecycle hook; the durable design is per-thread instance construction + caller-owned sandbox lifecycle keyed on thread_id.",
+      "mechanisms": [
+        {
+          "name": "BackendFactory type alias",
+          "what_it_provides": "Type alias declaring the factory signature: a callable taking a ToolRuntime and returning a BackendProtocol. Confirms assumption (a) typing exactly.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "BackendFactory: TypeAlias = Callable[[ToolRuntime], BackendProtocol]  # protocol.py:851; BACKEND_TYPES = BackendProtocol | BackendFactory  # protocol.py:852",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/backends/protocol.py:851-852"
+          ]
+        },
+        {
+          "name": "Factory invocation on every file/exec tool call (call site)",
+          "what_it_provides": "Proves the factory is invoked per tool call. Every filesystem tool closure first calls self._get_backend(runtime); _get_backend invokes self.backend(runtime) when callable. Same pattern in memory/skills/summarization middleware. NOTE: callable backend is DEPRECATED (removal 0.7.0) and warns each call.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "def _get_backend(self, runtime: ToolRuntime[Any, Any]) -> BackendProtocol:  # filesystem.py:727 -> if callable(self.backend): warn_deprecated(...); return self.backend(runtime)  # line 748 ; called as `resolved_backend = self._get_backend(runtime)` at filesystem.py:760,799,949,... (every tool)",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/filesystem.py:727-749",
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/filesystem.py:760",
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/memory.py:255-266",
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/skills.py:855",
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/summarization.py:1387-1388"
+          ]
+        },
+        {
+          "name": "ToolRuntime fields and thread_id reachability",
+          "what_it_provides": "ToolRuntime is a dataclass with config:RunnableConfig but no direct thread_id attribute. thread_id is reachable via runtime.config['configurable']['thread_id']. ToolNode populates config per call, so thread_id is available at the factory call site. Bare graph-node Runtime has no config field (thread_id NOT reachable there).",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class ToolRuntime(Generic[ContextT, StateT]): state; context; config: RunnableConfig; stream_writer: StreamWriter; tool_call_id: str | None; store: BaseStore | None; tools: list[BaseTool]; execution_info; server_info  # tool_node.py:1663-1730 ; thread_id via config['configurable']['thread_id'] (CONFIG_KEY_THREAD_ID='thread_id', _constants.py:52)",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langgraph/prebuilt/tool_node.py:1663-1730",
+            ".venv/lib/python3.12/site-packages/langgraph/prebuilt/tool_node.py:806-816",
+            ".venv/lib/python3.12/site-packages/langgraph/_internal/_constants.py:52",
+            ".venv/lib/python3.12/site-packages/langgraph/pregel/main.py:1209"
+          ]
+        },
+        {
+          "name": "BackendProtocol / SandboxBackendProtocol lifecycle methods",
+          "what_it_provides": "Confirms NO lifecycle methods exist (create/start/stop/close/setup/teardown/__enter__/__exit__). BackendProtocol = file ops only; SandboxBackendProtocol adds only id property + execute/aexecute. Repo-wide grep over deepagents/backends found zero lifecycle method defs.",
+          "support_level": "gap",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class BackendProtocol(abc.ABC): ls/read/grep/glob/write/edit (+a* async) + upload_files/download_files  # protocol.py:319 ; class SandboxBackendProtocol(BackendProtocol): @property id -> str (protocol.py:782); execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse (protocol.py:787); aexecute(...) (protocol.py:812) — NO close/start/stop",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/backends/protocol.py:319-748",
+            ".venv/lib/python3.12/site-packages/deepagents/backends/protocol.py:770-825"
+          ]
+        },
+        {
+          "name": "CompositeBackend routing and signatures",
+          "what_it_provides": "Path-prefix routing (longest-first) for file ops; root ls/grep/glob aggregate default + all routes and remap paths; execute() is NOT routable — always delegates to default and requires default to be a SandboxBackendProtocol else NotImplementedError.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class CompositeBackend(BackendProtocol): def __init__(self, default: BackendProtocol | StateBackend, routes: dict[str, BackendProtocol], *, artifacts_root: str = '/') -> None  # composite.py:140 ; def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse  # composite.py:537 (delegates to self.default; raises NotImplementedError if default not SandboxBackendProtocol)",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/backends/composite.py:118-573",
+            ".venv/lib/python3.12/site-packages/deepagents/backends/composite.py:86-115"
+          ]
+        },
+        {
+          "name": "StateBackend signature and thread scoping",
+          "what_it_provides": "Stores files in LangGraph agent state (ephemeral, thread-scoped) via get_config() + CONFIG_KEY_READ/CONFIG_KEY_SEND. The constructor's runtime arg is deprecated and ignored. Implicitly thread-scoped because state is per-thread checkpointed.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class StateBackend(BackendProtocol): def __init__(self, runtime: object = None, *, file_format: FileFormat = 'v2') -> None  # state.py:50 ; reads/writes via get_config()['configurable'][CONFIG_KEY_READ|CONFIG_KEY_SEND]",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/backends/state.py:38-147"
+          ]
+        },
+        {
+          "name": "FilesystemBackend signature and routing",
+          "what_it_provides": "Reads/writes the real filesystem; virtual_mode anchors paths under root_dir with traversal guards (path semantics + optional guardrails, NOT isolation). Used as a routed/default backend, often wrapped in CompositeBackend. No lifecycle methods.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class FilesystemBackend(BackendProtocol): def __init__(self, root_dir: str | Path | None = None, virtual_mode: bool | None = None, max_file_size_mb: int = 10) -> None  # filesystem.py:114",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/backends/filesystem.py:66-216"
+          ]
+        },
+        {
+          "name": "Sandbox backends (BaseSandbox / LocalShellBackend / LangSmithSandbox)",
+          "what_it_provides": "BaseSandbox derives all file ops from abstract execute()/upload_files()/download_files()/id. LocalShellBackend runs host subprocess (no isolation). LangSmithSandbox WRAPS an externally-created langsmith.sandbox.Sandbox — the deepagents backend has no lifecycle; the wrapped Sandbox owns create/stop. This is the crux for thread-scoping: lifecycle lives on the external sandbox object, not the backend.",
+          "support_level": "partial",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class BaseSandbox(SandboxBackendProtocol, ABC): @abstractmethod def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse (sandbox.py:416); @property @abstractmethod id -> str (sandbox.py:870); @abstractmethod upload_files/download_files . class LocalShellBackend(FilesystemBackend, SandboxBackendProtocol): __init__(self, root_dir=None, *, virtual_mode=None, timeout=120, max_output_bytes=100000, env=None, inherit_env=False) (local_shell.py:104). class LangSmithSandbox(BaseSandbox): def __init__(self, sandbox: Sandbox) -> None (langsmith.py:51); id == sandbox.name",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/backends/sandbox.py:394-893",
+            ".venv/lib/python3.12/site-packages/deepagents/backends/local_shell.py:27-219",
+            ".venv/lib/python3.12/site-packages/deepagents/backends/langsmith.py:48-91"
+          ]
+        },
+        {
+          "name": "create_deep_agent backend parameter",
+          "what_it_provides": "Public entry point accepting either a BackendProtocol instance or a (deprecated) BackendFactory. Backend classes are NOT in top-level deepagents.__all__ — import from deepagents.backends.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "def create_deep_agent(..., backend: BackendProtocol | BackendFactory | None = None, ..., checkpointer: Checkpointer | None = None, store: BaseStore | None = None, ...) -> CompiledStateGraph[...]  # graph.py:217-237",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/graph.py:217-251",
+            ".venv/lib/python3.12/site-packages/deepagents/__init__.py:26-43"
+          ]
+        },
+        {
+          "name": "thread_id-memoized factory feasibility",
+          "what_it_provides": "Mechanically feasible: factory reads runtime.config['configurable']['thread_id'] and can memoize per thread. Caveats: factory path deprecated (removal 0.7.0, warns every call); no lifecycle hook means sandbox teardown is caller-owned. Docs recommend per-thread agent construction (find-or-create external sandbox by thread_id label, pass a backend INSTANCE) over a memoized factory.",
+          "support_level": "partial",
+          "evidence_basis": "official-docs",
+          "api_signature": "Recommended pattern (docs): async def agent(config: RunnableConfig): thread_id = config['configurable']['thread_id']; sandbox = await client.find_one(labels={'thread_id': thread_id}) or await client.create(...labels={'thread_id': thread_id}...); return create_deep_agent(..., backend=DaytonaSandbox(sandbox=sandbox))",
+          "sources": [
+            "https://docs.langchain.com/oss/python/deepagents/sandboxes",
+            "https://docs.langchain.com/oss/python/deepagents/backends",
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/filesystem.py:736-748"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "deepagents 0.6.7 backends/protocol.py (installed source) — BackendFactory, BackendProtocol, SandboxBackendProtocol, ExecuteResponse",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/backends/protocol.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 middleware/filesystem.py (installed source) — _get_backend factory call site + per-tool resolution + deprecation warning",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/middleware/filesystem.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 backends/composite.py (installed source) — CompositeBackend routing + execute delegation",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/backends/composite.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 backends/state.py (installed source) — StateBackend (deprecated runtime arg, get_config based)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/backends/state.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 backends/filesystem.py (installed source) — FilesystemBackend signature",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/backends/filesystem.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 backends/sandbox.py (installed source) — BaseSandbox abstract execute/id/upload/download, no lifecycle",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/backends/sandbox.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 backends/local_shell.py & langsmith.py (installed source) — LocalShellBackend, LangSmithSandbox(sandbox) wrapper",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/backends/langsmith.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 prebuilt/tool_node.py (installed source) — ToolRuntime dataclass + per-call config population",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/prebuilt/tool_node.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 _internal/_constants.py & pregel/main.py (installed source) — CONFIG_KEY_THREAD_ID='thread_id' under config['configurable']",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/_internal/_constants.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 graph.py (installed source) — create_deep_agent backend param typing",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/graph.py",
+          "type": "github-source"
+        },
+        {
+          "title": "Official docs — deepagents Backends (factory deprecation, BackendProtocol, Composite/State/Filesystem routing)",
+          "url": "https://docs.langchain.com/oss/python/deepagents/backends",
+          "type": "official-docs"
+        },
+        {
+          "title": "Official docs — deepagents Sandboxes (backend wraps external sandbox, no lifecycle methods, caller owns shutdown, per-thread pattern via RunnableConfig thread_id)",
+          "url": "https://docs.langchain.com/oss/python/deepagents/sandboxes",
+          "type": "official-docs"
+        }
+      ],
+      "open_questions": [
+        "Factory backend path is deprecated since 0.5.0 with removal scheduled for deepagents 0.7.0 — a thread_id-memoized BackendFactory will keep working but warns on every tool call and breaks at 0.7.0. Decide whether langchain-dynamic-workflow's D13 should rely on BackendFactory at all, or adopt the non-deprecated per-thread instance-construction pattern (build the agent per thread, read thread_id from RunnableConfig, find-or-create an external sandbox labeled by thread_id, pass a backend INSTANCE).",
+        "No backend exposes a teardown/close hook, so a memoized sandbox per thread has no deepagents-driven cleanup. The engine must own sandbox lifecycle externally (e.g., explicit sandbox.stop() keyed on thread_id, plus a TTL/auto-delete like Daytona's auto_delete_interval). Where in the engine's layer-1 runtime should this lifecycle bookkeeping live (budget/phase teardown vs. a dedicated registry)?",
+        "StateBackend reads/writes via langgraph._internal._constants CONFIG_KEY_READ/CONFIG_KEY_SEND and langgraph._internal._constants CONFIG_KEY_THREAD_ID — these are private (_internal) symbols. If the engine reads thread_id directly, prefer the public config['configurable']['thread_id'] string key rather than importing the interned constant, to avoid coupling to langgraph internals across version bumps.",
+        "The bare graph-node Runtime (langgraph.runtime) has no `config` attribute, so thread_id is reachable only inside tool execution via ToolRuntime.config — not in before_agent/middleware hooks that receive a plain Runtime. If D13 needs thread_id outside tool calls, confirm an alternate source (the middleware's own node receives RunnableConfig separately).",
+        "Was not asked to inspect StoreBackend/ContextHubBackend routing in depth; if D13 routes /memories or persistent namespaces, verify StoreBackend(namespace=...) and NamespaceFactory signatures separately."
+      ]
+    },
+    {
+      "topic": "LangChain v1 (langchain 1.3.2 / langchain-core 1.4.0) middleware system, structured output, and token accounting — verified against installed source for the langchain-dynamic-workflow engine (pinned: langgraph 1.2.2, langchain 1.3.2, langchain-core 1.4.0, deepagents 0.6.7, langchain-anthropic 1.4.4, Python 3.12)",
+      "summary": "The langchain v1 middleware system lives in `langchain/agents/middleware/`. `AgentMiddleware` (in `types.py`) exposes lifecycle hooks (`before_agent`/`after_agent`, `before_model`/`after_model`) and two wrap hooks (`wrap_model_call`, `wrap_tool_call`), each with sync + async (`a`-prefixed) variants, plus standalone decorator forms (`@before_model`, `@wrap_tool_call`, etc.). CRITICAL FINDING — confirmed in source: `wrap_tool_call(self, request: ToolCallRequest, handler) -> ToolMessage | Command` operates on EXACTLY ONE tool call. The granularity is enforced at the LangGraph `ToolNode` layer: `ToolNode._afunc` iterates `for call in tool_calls: coros.append(self._arun_one(call, ...))` then `asyncio.gather(*coros)` (sync path uses `executor.map(self._run_one, ...)`). Each `_arun_one`/`_run_one` constructs ONE `ToolCallRequest` and invokes the wrapper once. Therefore a single `wrap_tool_call` hook CANNOT fan out N concurrent subagents — the fan-out is owned by ToolNode, not the hook. This forces the engine's `parallel()` to live at the `@task` layer. Corroborating evidence: deepagents subagents are compiled into `subagent_graphs: dict[str, Runnable]` (each a `create_agent` graph), invoked directly via `.invoke(state, config)`; the LLM-facing `task` tool is just a wrapper that runs through the same single-call `wrap_tool_call` path. Our engine can invoke these `Runnable`s directly and gather them, bypassing the hook granularity. For budget fallback, `ModelCallLimitMiddleware(*, thread_limit, run_limit, exit_behavior='end'|'error')` tracks model-call counts via `before_model`/`after_model` and either jumps to end or raises `ModelCallLimitExceededError`. Structured output: `with_structured_output`-style `response_format` accepts `ToolStrategy` (emulated tool call, validated + retried in-loop via `handle_errors` emitting a corrective `ToolMessage`), `ProviderStrategy` (native provider `response_format` JSON schema, parsed from AIMessage text), or `AutoStrategy` (picks one based on model capability; defaults to ToolStrategy for setup). Validation raises `StructuredOutputValidationError` / `MultipleStructuredOutputsError`. Token accounting: `AIMessage.usage_metadata: UsageMetadata | None` (`input_tokens`/`output_tokens`/`total_tokens` + optional detail dicts); `langchain_core.callbacks.UsageMetadataCallbackHandler` + `get_usage_metadata_callback()` context manager aggregate usage per model name across calls, with `add_usage`/`subtract_usage` helpers. Because deepagents forwards parent `callbacks` into subagent configs (`_build_subagent_config`), a single callback handler on the parent config aggregates usage across subagents too — directly usable to drive a shared budget. No doc-vs-source drift found (official overview page defers specifics to subpages; all claims verified in installed source, the preferred channel).",
+      "mechanisms": [
+        {
+          "name": "AgentMiddleware base class + lifecycle hooks (before/after_agent, before/after_model)",
+          "what_it_provides": "Base class `AgentMiddleware(Generic[StateT, ContextT, ResponseT])` in langchain/agents/middleware/types.py. State-mutation hooks `before_agent`/`after_agent`/`before_model`/`after_model(self, state: StateT, runtime: Runtime[ContextT]) -> dict[str, Any] | None` (+ async `abefore_*`/`aafter_*` variants). Return value is a state-update dict merged via graph reducers (e.g. add_messages). `@hook_config(can_jump_to=[...])` enables short-circuit jumps ('tools'/'model'/'end') via a returned `jump_to` key. Also exposes `state_schema`, `tools`, `transformers` class attrs and a `name` property. Standalone decorator forms exist (`@before_model`, `@after_model`, etc.) that build a middleware from a plain function.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class AgentMiddleware(Generic[StateT, ContextT, ResponseT]); def before_model(self, state: StateT, runtime: Runtime[ContextT]) -> dict[str, Any] | None; def after_model(self, state: StateT, runtime: Runtime[ContextT]) -> dict[str, Any] | None (also abefore_model/aafter_model/before_agent/after_agent)",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langchain/agents/middleware/types.py:383-489",
+            ".venv/lib/python3.12/site-packages/langchain/agents/middleware/__init__.py:29-83"
+          ]
+        },
+        {
+          "name": "wrap_model_call hook (intercepts ONE model invocation; usable for per-call budget accounting)",
+          "what_it_provides": "`wrap_model_call(self, request: ModelRequest[ContextT], handler) -> ModelResponse[ResponseT] | AIMessage | ExtendedModelResponse[ResponseT]` (async: `awrap_model_call`). Wraps exactly one `model.invoke(messages)` / `ainvoke` call in factory's `_execute_model_sync`/`_execute_model_async`. The handler may be called multiple times (retry), skipped (short-circuit/cache), or its response rewritten. `ModelResponse.result` is a `list[BaseMessage]` whose first element is the `AIMessage` carrying `usage_metadata` — so a middleware can read token usage per call here. `ModelRequest` is immutable-ish (use `.override(...)`); supports overriding model/messages/tools/response_format/model_settings. `ExtendedModelResponse` lets the hook attach a `Command` for extra state updates. Composition: first middleware in list is OUTERMOST.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "def wrap_model_call(self, request: ModelRequest[ContextT], handler: Callable[[ModelRequest[ContextT]], ModelResponse[ResponseT]]) -> ModelResponse[ResponseT] | AIMessage | ExtendedModelResponse[ResponseT]",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langchain/agents/middleware/types.py:491-636",
+            ".venv/lib/python3.12/site-packages/langchain/agents/factory.py:1289-1334"
+          ]
+        },
+        {
+          "name": "wrap_tool_call GRANULARITY — operates on a SINGLE tool call, CANNOT fan out N subagents",
+          "what_it_provides": "`wrap_tool_call(self, request: ToolCallRequest, handler) -> ToolMessage | Command[Any]` (async: `awrap_tool_call`). `ToolCallRequest` is a dataclass with a SINGLE `tool_call: ToolCall`, `tool: BaseTool | None`, `state`, `runtime`. The hook returns ONE `ToolMessage | Command`. DEFINITIVE: fan-out across multiple tool calls is owned by LangGraph `ToolNode`, NOT the hook — `ToolNode._afunc` does `for call in tool_calls: coros.append(self._arun_one(call, ...))` then `asyncio.gather(*coros)` (sync: `executor.map(self._run_one, tool_calls, ...)`). Each `_arun_one`/`_run_one` builds one `ToolCallRequest` and calls the wrapper once (with a per-call `execute` callable that may be retried). The handler is stateless/independent per call. Conclusion: one `wrap_tool_call` invocation sees exactly one tool call; concurrent N-way subagent fan-out within a single hook is impossible — it must live at the @task/ToolNode-orchestration layer. Decorator form `@wrap_tool_call` has identical single-call granularity.",
+          "support_level": "gap",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "def wrap_tool_call(self, request: ToolCallRequest, handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]]) -> ToolMessage | Command[Any]  # ToolCallRequest carries ONE tool_call: ToolCall",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langchain/agents/middleware/types.py:662-811",
+            ".venv/lib/python3.12/site-packages/langgraph/prebuilt/tool_node.py:132-149 (ToolCallRequest)",
+            ".venv/lib/python3.12/site-packages/langgraph/prebuilt/tool_node.py:793-860 (_func/_afunc fan-out)",
+            ".venv/lib/python3.12/site-packages/langgraph/prebuilt/tool_node.py:1014-1067 (_run_one calls wrapper once per call)"
+          ]
+        },
+        {
+          "name": "deepagents subagent dispatch as directly-invokable Runnables (enables @task-layer parallel())",
+          "what_it_provides": "deepagents builds on `langchain.agents.create_agent` + a middleware stack including `SubAgentMiddleware`, which backs the LLM-facing `task` tool. In `_build_task_tool`, subagents are compiled into `subagent_graphs: dict[str, Runnable]` — each subagent is a `create_agent`-produced `Runnable` graph (or user `CompiledSubAgent`). They are invoked directly: state `{messages: [HumanMessage(description)], ...}`, result must contain `messages` + optional `structured_response`. The `task` tool runs subagent invocation through the SAME single-call `wrap_tool_call` path (one task tool call = one subagent), so LLM-driven parallelism is N separate tool calls fanned out by ToolNode. The engine can instead invoke these `Runnable`s directly and `asyncio.gather` them at the @task layer, owning the loop/fan-out deterministically. Note: `_build_subagent_config` forwards parent `callbacks`, `tags`, `configurable` into subagents (but NOT recursion_limit/metadata).",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "subagent_graphs: dict[str, Runnable]  # each subagent invoked as runnable.invoke({'messages': [HumanMessage(...)], ...}, config) -> {'messages': [...], 'structured_response': ...}",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py:467-563 (_build_task_tool, subagent_graphs, _build_subagent_config)",
+            ".venv/lib/python3.12/site-packages/deepagents/graph.py:12-53,189-197,217-319 (create_deep_agent middleware stack)"
+          ]
+        },
+        {
+          "name": "ModelCallLimitMiddleware (budget fallback / early termination)",
+          "what_it_provides": "`ModelCallLimitMiddleware(*, thread_limit: int | None = None, run_limit: int | None = None, exit_behavior: Literal['end','error'] = 'end')`. Tracks model-call counts in state (`thread_model_call_count` persisted across runs; `run_model_call_count` per-run, UntrackedValue). `before_model` (with `@hook_config(can_jump_to=['end'])`) checks limits: if exceeded, either returns `{'jump_to': 'end', 'messages': [AIMessage(limit_msg)]}` (exit_behavior='end') or raises `ModelCallLimitExceededError` (exit_behavior='error'). `after_model` increments both counters. Counts MODEL CALLS, not tokens — a coarse budget guard. For token budgets, pair with usage_metadata accounting. Sibling `ToolCallLimitMiddleware(*, tool_name=None, thread_limit=None, run_limit=None, exit_behavior='continue')` limits tool calls similarly.",
+          "support_level": "partial",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "ModelCallLimitMiddleware(*, thread_limit: int | None = None, run_limit: int | None = None, exit_behavior: Literal['end', 'error'] = 'end') -> None",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langchain/agents/middleware/model_call_limit.py:94-267",
+            ".venv/lib/python3.12/site-packages/langchain/agents/middleware/tool_call_limit.py (ToolCallLimitMiddleware)"
+          ]
+        },
+        {
+          "name": "Structured output: ToolStrategy vs ProviderStrategy (+ AutoStrategy), validation & retry",
+          "what_it_provides": "`response_format` (on create_agent / ModelRequest) accepts: (1) `ToolStrategy(schema, *, tool_message_content=None, handle_errors=True)` — model emits an artificial structured-output tool call; parsed via `OutputToolBinding.parse(tool_call['args'])` using pydantic TypeAdapter; supports Union/oneOf multi-schema. (2) `ProviderStrategy(schema, *, strict=None)` — binds native provider `response_format` JSON schema via `to_model_kwargs()`; parsed from AIMessage text JSON via `ProviderStrategyBinding.parse(ai_message)`. (3) `AutoStrategy(schema)` — wraps raw schema, converted to ToolStrategy for tool setup, may be swapped to ProviderStrategy based on model capability. Schema kinds: pydantic/dataclass/typeddict/json_schema. VALIDATION + RETRY (in factory `_handle_model_output` + `_handle_structured_output_error`): ToolStrategy `handle_errors` (bool/str/exc-type/tuple/Callable) decides retry; on failure emits a corrective `ToolMessage` back into messages and loops to the model (no hard fail when retry enabled). Errors: `StructuredOutputValidationError`, `MultipleStructuredOutputsError`. ProviderStrategy parse failure always raises `StructuredOutputValidationError` (no in-loop retry path). Result lands in state `structured_response` and `ModelResponse.structured_response`.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "ToolStrategy(schema, *, tool_message_content: str | None = None, handle_errors: bool | str | type[Exception] | tuple[type[Exception], ...] | Callable[[Exception], str] = True); ProviderStrategy(schema, *, strict: bool | None = None); ProviderStrategy.to_model_kwargs() -> dict (returns {'response_format': {'type': 'json_schema', ...}})",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langchain/agents/structured_output.py:194-463",
+            ".venv/lib/python3.12/site-packages/langchain/agents/factory.py:1056-1158 (_handle_model_output)",
+            ".venv/lib/python3.12/site-packages/langchain/agents/factory.py:554-581 (_handle_structured_output_error)"
+          ]
+        },
+        {
+          "name": "Token-usage accounting: AIMessage.usage_metadata + UsageMetadataCallbackHandler (shared-budget driver)",
+          "what_it_provides": "`AIMessage.usage_metadata: UsageMetadata | None` where `UsageMetadata(TypedDict)` = `input_tokens: int`, `output_tokens: int`, `total_tokens: int`, optional `input_token_details`/`output_token_details` (audio/reasoning/cache_read/cache_creation). Aggregation helpers `add_usage(left, right)` / `subtract_usage(left, right)` in langchain_core.messages.ai. Cross-call accounting: `UsageMetadataCallbackHandler` (BaseCallbackHandler, thread-safe via lock) accumulates usage into `.usage_metadata: dict[str, UsageMetadata]` keyed by model name on `on_llm_end`; context-manager form `get_usage_metadata_callback(name='usage_metadata_callback')` registers an inheritable ContextVar so it auto-propagates to nested calls. Because deepagents forwards parent `callbacks` to subagents, ONE handler on the parent config aggregates usage across all subagent invocations — directly usable to drive the engine's shared budget. Per-call alternative: read `ModelResponse.result[0].usage_metadata` inside a `wrap_model_call` middleware.",
+          "support_level": "provided",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class UsageMetadata(TypedDict): input_tokens: int; output_tokens: int; total_tokens: int; input_token_details: NotRequired[...]; output_token_details: NotRequired[...]  ||  class UsageMetadataCallbackHandler(BaseCallbackHandler): usage_metadata: dict[str, UsageMetadata]  ||  @contextmanager get_usage_metadata_callback(name: str = 'usage_metadata_callback') -> Generator[UsageMetadataCallbackHandler, None, None]",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langchain_core/messages/ai.py:104-157 (UsageMetadata)",
+            ".venv/lib/python3.12/site-packages/langchain_core/messages/ai.py:176 (AIMessage.usage_metadata)",
+            ".venv/lib/python3.12/site-packages/langchain_core/messages/ai.py:721-783 (add_usage/subtract_usage)",
+            ".venv/lib/python3.12/site-packages/langchain_core/callbacks/usage.py:18-150"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "langchain/agents/middleware/types.py (AgentMiddleware, all hooks, ModelRequest/ModelResponse, decorators)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain/agents/middleware/types.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph/prebuilt/tool_node.py (ToolCallRequest, ToolNode _func/_afunc fan-out, _run_one/_arun_one single-call wrapper)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/prebuilt/tool_node.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langchain/agents/structured_output.py (ToolStrategy, ProviderStrategy, AutoStrategy, bindings, errors)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain/agents/structured_output.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langchain/agents/factory.py (model node, _handle_model_output, _handle_structured_output_error, retry wiring)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain/agents/factory.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langchain/agents/middleware/model_call_limit.py (ModelCallLimitMiddleware)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain/agents/middleware/model_call_limit.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langchain_core/messages/ai.py (UsageMetadata TypedDict, AIMessage.usage_metadata, add_usage/subtract_usage)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain_core/messages/ai.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langchain_core/callbacks/usage.py (UsageMetadataCallbackHandler, get_usage_metadata_callback)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain_core/callbacks/usage.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents/middleware/subagents.py (_build_task_tool, subagent_graphs dict[str, Runnable], _build_subagent_config callback forwarding)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents/graph.py (create_deep_agent, middleware stack ordering, SubAgentMiddleware)",
+          "url": "file:///Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/graph.py",
+          "type": "github-source"
+        },
+        {
+          "title": "LangChain middleware overview (official docs — overview only, defers specifics to API reference subpages)",
+          "url": "https://docs.langchain.com/oss/python/langchain/middleware",
+          "type": "official-docs"
+        }
+      ],
+      "open_questions": [
+        "ProviderStrategy structured-output parse failure raises StructuredOutputValidationError with NO in-loop retry path (only ToolStrategy honors handle_errors and emits a corrective ToolMessage to retry). If the engine wants retry-on-invalid for native/provider structured output, it must implement that itself (e.g. in a wrap_model_call middleware) — confirm whether langchain-anthropic 1.4.4 ProviderStrategy is even selected by AutoStrategy for Anthropic models, or whether ToolStrategy is the effective default.",
+        "UsageMetadataCallbackHandler keys aggregation by response_metadata['model_name']; verify langchain-anthropic 1.4.4 populates response_metadata.model_name and usage_metadata.input_token_details.cache_creation/cache_read so cache-aware budget accounting works (the handler example shows Anthropic cache fields, but confirm against the installed langchain-anthropic version).",
+        "_build_subagent_config forwards parent `callbacks` into subagents (so a parent UsageMetadataCallbackHandler aggregates nested usage) but does NOT forward recursion_limit/metadata. Confirm the engine's own @task-layer direct subagent invocation replicates this callback forwarding (and decide whether to also forward a per-task budget context) so shared-budget accounting holds when bypassing the LLM-driven `task` tool.",
+        "ModelCallLimitMiddleware counts model CALLS, not tokens — it is only a coarse budget fallback. A true token budget requires the engine to combine usage_metadata accounting (callback or wrap_model_call) with its own enforcement; confirm whether enforcement should short-circuit via a before_model jump_to='end' (middleware) or be owned entirely at the @task orchestration layer.",
+        "Determinism guard / content-hash journal: these are engine-level patches the substrate does not provide. LangGraph's native cache is index-based (per the design doc) — not re-verified in this pass; confirm against langgraph 1.2.2 @task cache_policy semantics when implementing the journal."
+      ]
+    },
+    {
+      "topic": "Build-vs-buy gaps and integration constraints: what the LangGraph 1.2.2 / LangChain 1.3.2 / deepagents 0.6.7 stack does NOT provide for the langchain-dynamic-workflow engine",
+      "summary": "Verified against installed .venv source (langgraph 1.2.2, langgraph-checkpoint 4.1.1, langchain 1.3.2, langchain-core 1.4.0, deepagents 0.6.7, langchain-anthropic 1.4.4; all dependency pins mutually satisfied). Findings per mechanism: (a) CONTENT-HASH JOURNAL — PARTIAL substrate support, but with an important correction to the design premise. LangGraph's @task/@entrypoint result cache is ALREADY content-addressed, not index-based: default_cache_key (langgraph/_internal/_cache.py) pickles frozen args/kwargs, and the CacheKey is ns=(CACHE_NS_WRITES, module.qualname) + key=xxh3_128_hexdigest(pickled-args) (_algo.py L860-870). The INDEX/positional keying lives in TASK IDENTITY (task_id = hash(checkpoint_id, ns, step, name, PUSH, parent_path, write_idx), _algo.py L834-842), which governs replay/resume — a separate concern from caching. So an engine content-hash journal is still justified, but for different reasons than stated: (1) the native cache is opt-in per-call via CachePolicy and is keyed by function qualname (cross-call-site collisions / no per-workflow-node scoping by content alone), (2) confirmed bug #7589 — sync SyncPregelLoop.put_writes (_loop.py L1586) caches results with NO INTERRUPT/ERROR guard (async path has one), so a failed/interrupted task can be cached and replayed as success; an engine journal needs explicit success-only semantics, (3) #6265 cached results drop custom stream data. (b) DETERMINISM ENFORCEMENT — GAP confirmed. The ONLY determinism check in the substrate is a bare Python `assert task_id == task_id_checksum` (_algo.py L662, L855), stripped under python -O / PYTHONOPTIMIZE; task_id_checksum is non-None only on narrow re-derivation paths. No determinism-specific error class exists (errors.py has only InvalidUpdateError for concurrent channel writes). LangGraph treats deterministic replay as convention; a fail-loud guard must be engine-built. (c) STREAMING PIPELINE w/ BOUNDED QUEUES — GAP confirmed. langgraph.func exports ONLY {task, entrypoint}. No pipeline / no-barrier / per-item streaming / as_completed / bounded-queue / semaphore primitive anywhere in the package. Fan-out is barrier-style: collect SyncAsyncFuture results via .result()/asyncio.gather. StateGraph Send is map-reduce with a reduce barrier at the superstep boundary. A no-barrier per-item scheduler with backpressure must be self-built atop @task futures. (d) SANDBOX LIFECYCLE — GAP confirmed. BaseSandbox abstractmethods are ONLY {execute, upload_files, download_files, id}; SandboxBackendProtocol adds nothing lifecycle-related. No create/start/stop/close/destroy/__aenter__/__aexit__/ttl/pool/quota anywhere. lazy-create / TTL / pool / quota are entirely the engine's responsibility. (e) PER-LEAF SANDBOX IDENTITY — GAP confirmed. Identity hook is only the `id` property. deepagents binds backend once at create_deep_agent(backend=...) and re-resolves it on EVERY tool call via _get_backend(runtime) (filesystem.py L727) without caching, so no per-invocation instance management. The BackendFactory (callable[[ToolRuntime], BackendProtocol]) path that could derive per-leaf identity is DEPRECATED since 0.5.0, removal in 0.7.0 (filesystem.py L737) — the engine must pass concrete BackendProtocol instances and derive/route per-leaf identity itself. Version note: all pins form a coherent lock; deepagents 0.6.7 requires langchain>=1.3.2, langchain-core>=1.4.0, langchain-anthropic>=1.4.3 — exactly satisfied.",
+      "mechanisms": [
+        {
+          "name": "(a) Content-hash journal (cached-result-skip)",
+          "what_it_provides": "Substrate gives a content-ADDRESSED result cache (not index-based as the design premise states): @task/@entrypoint accept cache_policy=CachePolicy(key_func, ttl); default key_func=default_cache_key pickles frozen (args,kwargs); CacheKey = ns(CACHE_NS_WRITES, module.qualname) + xxh3_128 hexdigest of pickled args. Cache lookup/skip is keyed by (ns,key) in match_cached_writes (_loop.py L1526). What is genuinely missing/risky: (1) cache namespace is function-qualname-scoped, not per-workflow-node content scoped — risk of cross-call-site reuse and no built-in per-node journaling; (2) CONFIRMED BUG #7589: sync put_writes (_loop.py L1586) caches results with no INTERRUPT/ERROR guard, so failures/interrupts get cached and replayed as success; (3) #6265 custom stream data lost on cache hit. Engine must build its own success-only, content-hashed, per-node journal. Index-based keying that DOES exist is task IDENTITY (task_id from step+write_idx, _algo.py L834), governing resume/replay, not result caching.",
+          "support_level": "partial",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "CachePolicy(key_func: Callable[..., str|bytes] = default_cache_key, ttl: int|None = None); default_cache_key(*args, **kwargs) -> str|bytes [pickle.dumps((_freeze(args),_freeze(kwargs)),protocol=5)]; CacheKey(ns: tuple[str,...], key: str, ttl: int|None); BaseCache.{get,aget,set,aset,clear,aclear}",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langgraph/_internal/_cache.py",
+            ".venv/lib/python3.12/site-packages/langgraph/types.py (CachePolicy L508, CacheKey L605)",
+            ".venv/lib/python3.12/site-packages/langgraph/pregel/_algo.py (L860-870 task cache_key, L834-842 task_id)",
+            ".venv/lib/python3.12/site-packages/langgraph/pregel/_loop.py (match_cached_writes L1526, put_writes L1586)",
+            "https://github.com/langchain-ai/langgraph/issues/7589",
+            "https://github.com/langchain-ai/langgraph/issues/6265"
+          ]
+        },
+        {
+          "name": "(b) Determinism enforcement / fail-loud guard",
+          "what_it_provides": "No real enforcement. The substrate's only determinism check is a bare `assert task_id == task_id_checksum` at _algo.py L662 and L855, removed under python -O / PYTHONOPTIMIZE; task_id_checksum is non-None only on specific re-derivation/replay paths. No determinism-specific exception type exists (errors.py defines GraphRecursionError, InvalidUpdateError [concurrent channel writes], GraphInterrupt, NodeError, NodeTimeoutError — none for nondeterministic replay/order drift). Resume relies on tasks being re-issued in the same order to regenerate identical positional task_ids; divergence is silent. A fail-loud determinism guard (detect & raise on order/content drift between recorded and replayed leaf calls) must be engine-built.",
+          "support_level": "gap",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "assert task_id == task_id_checksum, f\"{task_id} != {task_id_checksum}\"  # langgraph/pregel/_algo.py L662, L855 (bare assert, -O strippable)",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langgraph/pregel/_algo.py (L661-662, L854-855)",
+            ".venv/lib/python3.12/site-packages/langgraph/errors.py (ErrorCode enum + exception classes; no determinism error)",
+            ".venv/lib/python3.12/site-packages/langgraph/_internal/_replay.py (ReplayState — checkpoint selection only, no validation)"
+          ]
+        },
+        {
+          "name": "(c) No-barrier streaming pipeline scheduler with bounded queues",
+          "what_it_provides": "Absent. langgraph.func.__all__ == ('task','entrypoint') — no pipeline, no parallel, no as_completed, no bounded-queue/semaphore/backpressure primitive exists anywhere in langgraph. Fan-out is barrier-style: @task returns SyncAsyncFuture (concurrent.futures.Future subclass), consumed via .result() / asyncio.gather (collect-all barrier). StateGraph Send (types.py L654) is map-reduce — parallel fan-out but with a reduce barrier at the superstep boundary, not per-item streaming. A no-barrier, per-item streaming pipeline with bounded queues / backpressure must be self-built over @task futures.",
+          "support_level": "gap",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "langgraph.func.__all__ == ('task','entrypoint'); class SyncAsyncFuture(Generic[T], concurrent.futures.Future[T]); Send(node: str, arg: Any, timeout: TimeoutPolicy|None)  # map-reduce barrier, not streaming pipeline",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/langgraph/func/__init__.py (__all__ L56)",
+            ".venv/lib/python3.12/site-packages/langgraph/pregel/_call.py (SyncAsyncFuture L253)",
+            ".venv/lib/python3.12/site-packages/langgraph/types.py (Send L654, public exports — no pipeline/parallel)"
+          ]
+        },
+        {
+          "name": "(d) Sandbox lifecycle management (lazy-create / TTL / pool / quota)",
+          "what_it_provides": "Absent. SandboxBackendProtocol / BaseSandbox expose ONLY: id (property), execute/aexecute, upload_files, download_files, plus derived file ops (ls/read/grep/glob/write/edit). BaseSandbox.__abstractmethods__ == {download_files, execute, id, upload_files}. No create/start/stop/close/destroy/__enter__/__exit__/__aenter__/__aexit__, no ttl/pool/quota/idle-eviction anywhere. Backends are assumed already-provisioned. lazy-create, TTL expiry, pooling, and quota/resource-exhaustion guards are entirely the engine's responsibility. (deepagents issues #2882/#3128/#3103 show first-party sandbox backends are still being ADDED, none with lifecycle management.)",
+          "support_level": "gap",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "class SandboxBackendProtocol(BackendProtocol): @property id->str; execute(command:str,*,timeout:int|None=None)->ExecuteResponse; aexecute(...); upload_files(list[tuple[str,bytes]])->list[FileUploadResponse]; download_files(list[str])->list[FileDownloadResponse]  # NO lifecycle methods",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/backends/protocol.py (SandboxBackendProtocol L770-825)",
+            ".venv/lib/python3.12/site-packages/deepagents/backends/sandbox.py (BaseSandbox abstract: execute L416, id L870, upload_files L876, download_files L886)",
+            "https://github.com/langchain-ai/deepagents/issues/2882",
+            "https://github.com/langchain-ai/deepagents/issues/3128"
+          ]
+        },
+        {
+          "name": "(e) Per-leaf sandbox identity derivation",
+          "what_it_provides": "Only hook is the `id` property; no per-call/per-leaf identity derivation. deepagents binds a single backend at create_deep_agent(backend=...) and re-resolves it on every tool invocation via FilesystemMiddleware._get_backend(runtime) (filesystem.py L727) with NO instance caching — so identity/reuse across leaf calls is not managed by deepagents. The BackendFactory = Callable[[ToolRuntime], BackendProtocol] path (which could derive a per-runtime/per-leaf backend) is DEPRECATED since deepagents 0.5.0 with removal in 0.7.0 — passing a callable backend now emits a deprecation warning. The engine must therefore derive stable per-leaf identity (e.g. from roster name + workflow node + content hash) and own routing/isolation itself. (deepagents #2884: CompositeBackend route isolation leaks across shared storage backends — isolation is not guaranteed by the substrate.)",
+          "support_level": "gap",
+          "evidence_basis": "verified-in-source",
+          "api_signature": "BackendFactory: TypeAlias = Callable[[ToolRuntime], BackendProtocol] (DEPRECATED 0.5.0, removal 0.7.0); FilesystemMiddleware._get_backend(runtime: ToolRuntime) -> BackendProtocol; SandboxBackendProtocol.id (property) -> str",
+          "sources": [
+            ".venv/lib/python3.12/site-packages/deepagents/backends/protocol.py (BackendFactory L851)",
+            ".venv/lib/python3.12/site-packages/deepagents/middleware/filesystem.py (_get_backend L727, factory-deprecation warn L737-748)",
+            ".venv/lib/python3.12/site-packages/deepagents/graph.py (create_deep_agent backend param L227)",
+            "https://github.com/langchain-ai/deepagents/issues/2884"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "title": "langgraph 1.2.2 — _internal/_cache.py (default_cache_key, content-based pickle hashing)",
+          "url": ".venv/lib/python3.12/site-packages/langgraph/_internal/_cache.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — types.py (CachePolicy L508, CacheKey L605, Send L654)",
+          "url": ".venv/lib/python3.12/site-packages/langgraph/types.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — pregel/_algo.py (cache_key derivation L860, task_id positional derivation L834, determinism assert L662/L855)",
+          "url": ".venv/lib/python3.12/site-packages/langgraph/pregel/_algo.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — pregel/_loop.py (match_cached_writes L1526, sync put_writes cache-set L1586, INTERRUPT/ERROR guard region L1394)",
+          "url": ".venv/lib/python3.12/site-packages/langgraph/pregel/_loop.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — func/__init__.py (__all__=('task','entrypoint'); no pipeline primitive)",
+          "url": ".venv/lib/python3.12/site-packages/langgraph/func/__init__.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — errors.py (no determinism error class)",
+          "url": ".venv/lib/python3.12/site-packages/langgraph/errors.py",
+          "type": "github-source"
+        },
+        {
+          "title": "langgraph 1.2.2 — cache/base/__init__.py (BaseCache: get/aget/set/aset/clear/aclear)",
+          "url": ".venv/lib/python3.12/site-packages/langgraph/cache/base/__init__.py",
+          "type": "reference-api"
+        },
+        {
+          "title": "deepagents 0.6.7 — backends/protocol.py (SandboxBackendProtocol: only id/execute/upload/download; BackendFactory typealias)",
+          "url": ".venv/lib/python3.12/site-packages/deepagents/backends/protocol.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 — backends/sandbox.py (BaseSandbox abstractmethods: execute/id/upload_files/download_files; no lifecycle)",
+          "url": ".venv/lib/python3.12/site-packages/deepagents/backends/sandbox.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 — middleware/filesystem.py (_get_backend per-call resolution L727; BackendFactory deprecation L737)",
+          "url": ".venv/lib/python3.12/site-packages/deepagents/middleware/filesystem.py",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents 0.6.7 — graph.py (create_deep_agent backend param)",
+          "url": ".venv/lib/python3.12/site-packages/deepagents/graph.py",
+          "type": "github-source"
+        },
+        {
+          "title": "Issue #7589 — sync SyncPregelLoop.put_writes caches INTERRUPT/ERROR writes (no guard); failed task replayed as success",
+          "url": "https://github.com/langchain-ai/langgraph/issues/7589",
+          "type": "github-source"
+        },
+        {
+          "title": "Issue #6265 — cached results drop custom stream_mode data",
+          "url": "https://github.com/langchain-ai/langgraph/issues/6265",
+          "type": "github-source"
+        },
+        {
+          "title": "Issue #6491 — invalid state saved to checkpoint without validation (corruption)",
+          "url": "https://github.com/langchain-ai/langgraph/issues/6491",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents Issue #2884 — CompositeBackend route isolation leaks across shared storage backends",
+          "url": "https://github.com/langchain-ai/deepagents/issues/2884",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents Issue #2882 — Native local sandbox backend (no lifecycle mgmt; first-party sandboxes still being added)",
+          "url": "https://github.com/langchain-ai/deepagents/issues/2882",
+          "type": "github-source"
+        },
+        {
+          "title": "deepagents Issue #3128 — Add Docker sandbox",
+          "url": "https://github.com/langchain-ai/deepagents/issues/3128",
+          "type": "github-source"
+        },
+        {
+          "title": "CachePolicy | LangChain reference (docs confirm key_func defaults to pickle-hashing input — content-based)",
+          "url": "https://reference.langchain.com/python/langgraph/types/CachePolicy",
+          "type": "reference-api"
+        },
+        {
+          "title": "Functional API entrypoint reference",
+          "url": "https://langchain-ai.github.io/langgraph/reference/func/",
+          "type": "official-docs"
+        }
+      ],
+      "open_questions": [
+        "DESIGN-DOC DRIFT: the design premise 'LangGraph's native cache is index-based' is inaccurate for the RESULT cache — verified-in-source the result cache is content-addressed (default_cache_key pickles inputs; CacheKey ns=function-qualname + key=xxh3 of pickled args). The index/positional keying is in TASK IDENTITY (task_id from step+write_idx), which drives resume/replay, not result caching. Recommend rewording the rationale: the journal is justified by (success-only semantics vs bug #7589, per-node content scoping vs qualname-only namespacing, custom-stream-data loss #6265), not by 'native cache is index-based'.",
+        "Bug #7589 (sync put_writes caches INTERRUPT/ERROR with no guard) is present in installed 1.2.2 source and still OPEN upstream — does the engine run the entrypoint via sync invoke()/stream() or async ainvoke()/astream()? The async loop has the guard; sync does not. If the engine uses CachePolicy on the sync path, error-caching is a live risk until patched.",
+        "Per-leaf identity must not rely on the BackendFactory callable (deprecated 0.5.0, removal 0.7.0). Confirm the engine's intended identity-derivation key (roster name + workflow node id + input content hash?) and whether it passes concrete BackendProtocol instances per leaf — needs a design decision since deepagents no longer supports per-runtime factory backends going forward.",
+        "CompositeBackend route isolation leak (#2884, OPEN) means per-leaf isolation is not guaranteed by the substrate even with routes — the engine's isolation guarantees for parallel leaves need independent verification, not reliance on CompositeBackend routing.",
+        "Determinism guard scope: confirm whether the engine should validate (a) leaf-call ORDER, (b) leaf-call ARGUMENT content, or both, against the journal — the substrate's only signal (bare assert on positional task_id) covers neither robustly and is -O strippable.",
+        "No bounded-queue/backpressure primitive exists upstream; confirm target concurrency-limit and queue-depth semantics for the pipeline() scheduler (asyncio.Semaphore + asyncio.Queue over @task futures is the likely build), and how it interacts with LangGraph checkpoint durability for resume of partially-drained pipelines."
+      ]
+    }
+  ],
+  "verification": {
+    "verified_claims": [
+      {
+        "claim": "(1) LangGraph native @task/node cache keys by CALL INDEX/position, not content hash",
+        "verdict": "partially-confirmed",
+        "evidence": "Two DISTINCT mechanisms, and the claim conflates them. (a) The opt-in CachePolicy RESULT cache is CONTENT-based, NOT positional: _algo.py:858-870 builds CacheKey(ns=(CACHE_NS_WRITES, identifier(call.func)), key=xxh3_128_hexdigest(cache_policy.key_func(*call.input[0], **call.input[1])), ttl); default key_func=default_cache_key pickles recursively-frozen sorted-dict args (_internal/_cache.py:26-31). Lookup matches purely on (ns,key) (_loop.py:1531). It requires an explicit BaseCache wired via entrypoint(cache=...) (func/__init__.py:441,469). So for the RESULT cache the claim is CONTRADICTED. (b) task_id (which drives resume replay-skip WITHOUT any CachePolicy) IS positional: _algo.py:834-842 task_id_func(checkpoint_id_bytes, checkpoint_ns, str(step), name, PUSH, task_path_str(task_path[1]), str(task_path[2])) — step number + node name + write index, no input content. For resume identity the claim is CONFIRMED. Net: partially-confirmed — the design rationale should be reworded; the content-hash journal is justified by success-only semantics + per-node scoping (qualname-only ns) + the positional task_id resume identity, not by 'native cache is index-based'.",
+        "best_source": "/Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/_algo.py:834-842 (positional task_id) and :858-870 (content-based CacheKey); /Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/_internal/_cache.py:26-31"
+      },
+      {
+        "claim": "(2) LangGraph does NOT enforce determinism (no interception of time/random/IO)",
+        "verdict": "confirmed-in-source",
+        "evidence": "The only determinism check is a bare `assert task_id == task_id_checksum, f\"{task_id} != {task_id_checksum}\"` at _algo.py:662 and :855, guarded by `if task_id_checksum is not None` and strippable under python -O/PYTHONOPTIMIZE. No determinism-specific exception class exists (grep of errors.py for determin/nondeterm returned zero). On resume, _reapply_writes_to_succeeded_nodes (_loop.py:724-737) matches saved writes to in-memory tasks purely by task_id (`if task := tasks.get(tid)`), with NO input/output comparison and NO violation detection. No interception/monkeypatching of user time/random/IO: the `import time` in func/__init__.py:321 is inside a docstring example; the sys.modules iteration in pregel/_call.py:66 is for resolving a function's __module__ (identifier), not patching. Determinism is convention only — the fail-loud guard fills a real gap.",
+        "best_source": "/Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/_loop.py:724-737 (_reapply_writes_to_succeeded_nodes — task_id match, no comparison); /Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/_algo.py:662,855 (bare -O-strippable assert)"
+      },
+      {
+        "claim": "(3) max_concurrency has NO CPU-core-derived default in LangGraph",
+        "verdict": "confirmed-in-source",
+        "evidence": "RunnableConfig.max_concurrency is a TypedDict field `int | None` with no default value (langchain_core/runnables/config.py:95). LangGraph's async executor: `if max_concurrency := config.get('max_concurrency'): self.semaphore = asyncio.Semaphore(max_concurrency) else: self.semaphore = None` (pregel/_executor.py:135-140) — None/falsy => UNBOUNDED, no semaphore. The only place CPU cores enter is the langchain-core SYNC path get_executor_for_config: ContextThreadPoolExecutor(max_workers=config.get('max_concurrency')) (config.py:632-634) — when None, stdlib ThreadPoolExecutor default min(32, os.cpu_count()+4) applies. That CPU-core derivation is the stdlib thread-pool fallback, NEVER LangGraph deriving it. The engine must set max_concurrency explicitly to bound fan-out.",
+        "best_source": "/Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/_executor.py:135-140; /Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain_core/runnables/config.py:95,632-634"
+      },
+      {
+        "claim": "(4) @entrypoint resume re-runs the body and skips already-completed @task calls via the checkpointer",
+        "verdict": "confirmed-in-source",
+        "evidence": "On resume, tick() calls _reapply_writes_to_succeeded_nodes (_loop.py:655-656) which restores saved channel writes from checkpoint_pending_writes onto re-issued in-memory tasks, matched by task_id (`if task := tasks.get(tid): task.writes.append((k,v))`, :736-737), skipping ERROR/ERROR_SOURCE_NODE/INTERRUPT/RESUME control signals so failed/interrupted tasks keep empty writes and re-run. The runner skips already-completed leaves: `elif next_task.writes:` returns the cached RETURN via fut.set_result(ret) instead of re-executing (_runner.py:745-756); only tasks where `not t.writes` are scheduled (submit at :758). Tasks with restored writes are emitted with cached=True (_loop.py:670-672). Thus the @entrypoint body re-runs deterministically while completed @task calls are skipped via checkpointer pending writes — exactly as claimed.",
+        "best_source": "/Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/_loop.py:724-737,655-672; /Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/pregel/_runner.py:745-759"
+      },
+      {
+        "claim": "(5) deepagents BackendFactory is invoked per file/exec tool-call with a ToolRuntime that exposes thread_id",
+        "verdict": "partially-confirmed",
+        "evidence": "CONFIRMED that the factory is invoked per file/exec tool call: BackendFactory: TypeAlias = Callable[[ToolRuntime], BackendProtocol] (backends/protocol.py:851); every filesystem and the execute tool closure calls resolved_backend = self._get_backend(runtime) as its first step, and _get_backend does `if callable(self.backend): warn_deprecated(...); return self.backend(runtime)` (middleware/filesystem.py:727-749; same resolve-per-call at :760,799,949,1015,1109,1222 and execute tool sync/async). NUANCE on 'exposes thread_id': ToolRuntime is a dataclass whose fields are [state, context, config, stream_writer, tool_call_id, store, tools, execution_info, server_info] (verified empirically via dataclasses.fields) — there is NO direct thread_id attribute (hasattr==False). thread_id is reachable only via runtime.config['configurable']['thread_id'] (CONFIG_KEY_THREAD_ID = sys.intern('thread_id'), langgraph/_internal/_constants.py:52), and ToolNode populates that config per call. CAVEAT: the callable-factory path is DEPRECATED since 0.5.0, removal 0.7.0, and warns on every tool call.",
+        "best_source": "/Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/middleware/filesystem.py:727-749; /Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/prebuilt/tool_node.py (ToolRuntime dataclass; empirical fields probe shows no thread_id field, config present)"
+      },
+      {
+        "claim": "(6) deepagents backend protocols expose NO lifecycle methods",
+        "verdict": "confirmed-in-source",
+        "evidence": "BackendProtocol (backends/protocol.py:319) exposes only file ops: ls/read/grep/glob/write/edit (+async a* variants) + upload_files/download_files. SandboxBackendProtocol (protocol.py:770) adds only the `id` property (:782) and execute/aexecute (:787,812). A repo-wide regex grep across .venv/.../deepagents/backends/ for def (close|start|stop|astart|astop|create|setup|teardown|shutdown|connect|disconnect|__enter__|__exit__|__aenter__|__aexit__|cleanup|dispose|release) returned ZERO matches (wc -l == 0). Backends are constructed via __init__ only; sandbox lifecycle (e.g. sandbox.stop()) is the caller's responsibility — confirming the design gap the engine must own.",
+        "best_source": "/Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/backends/protocol.py:319-825 (+ zero-match lifecycle grep over deepagents/backends/)"
+      },
+      {
+        "claim": "(7) wrap_tool_call is single-tool-call granularity and cannot fan out N concurrent subagents",
+        "verdict": "confirmed-in-source",
+        "evidence": "ToolCallRequest is a dataclass carrying exactly ONE tool_call: ToolCall (langgraph/prebuilt/tool_node.py:146-147). wrap_tool_call(self, request: ToolCallRequest, handler) -> ToolMessage | Command[Any] returns one ToolMessage/Command (langchain/agents/middleware/types.py:662-666). Fan-out across multiple tool calls is owned by LangGraph ToolNode, NOT the hook: async _afunc iterates `for call, tool_runtime in zip(tool_calls, tool_runtimes): coros.append(self._arun_one(call, ...))` then `outputs = await asyncio.gather(*coros)` (tool_node.py:856-858); the sync path uses `executor.map(self._run_one, tool_calls, input_types, tool_runtimes)` (:823). Each _run_one/_arun_one builds one ToolCallRequest and invokes the wrapper once. Therefore one wrap_tool_call invocation sees exactly one tool call; N-way concurrent subagent fan-out cannot live inside a single hook — it must be at the @task/ToolNode-orchestration layer.",
+        "best_source": "/Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/prebuilt/tool_node.py:146-147 (single tool_call), :823,856-858 (ToolNode owns fan-out); /Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain/agents/middleware/types.py:662-666"
+      },
+      {
+        "claim": "(8) a deepagent ainvoke returns the last AIMessage and/or a structured_response",
+        "verdict": "confirmed-in-source",
+        "evidence": "Output schema _OutputAgentState (langchain/agents/middleware/types.py:367-371): messages: Required[Annotated[list[AnyMessage], add_messages]] (always present, full trajectory) and structured_response: NotRequired[ResponseT] (present only when response_format was set). Verified empirically: create_agent(model=fake, tools=[]).ainvoke({'messages':[HumanMessage('hi')]}) returned OUTPUT KEYS ['messages'] with message types [HumanMessage, AIMessage], last AI content = the final answer, and 'structured_response' absent. Reclamation logic the engine must mirror (deepagents/middleware/subagents.py:494-532, _return_command_with_state_update): if result['structured_response'] is not None -> serialize via model_dump_json() (pydantic) / json.dumps(dataclasses.asdict()) (dataclass) / json.dumps() (else); ELSE walk result['messages'] in REVERSE and take the first AIMessage whose .text.rstrip() is non-empty (defends against Anthropic's trailing empty end_turn AIMessage). Raises ValueError if 'messages' missing.",
+        "best_source": "/Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py:494-532; /Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langchain/agents/middleware/types.py:367-371 (+ empirical ainvoke probe)"
+      },
+      {
+        "claim": "(9) BaseStore is usable as a journal backend",
+        "verdict": "confirmed-in-source",
+        "evidence": "BaseStore (langgraph/store/base/__init__.py:700) exposes get/aget (:748,993), put/aput (:848,1101) with optional TTL + vector index, delete (:929), search (:771), list_namespaces (:938), and batch/abatch (:725,737). namespace=tuple[str,...], key=str, value=dict[str,Any]. @entrypoint(store=...) injects it (langgraph/func/__init__.py:441,469). Verified empirically with InMemoryStore (a BaseStore subclass): a full journal round-trip succeeded — put(('journal','wf1'),'node-hash-abc',{'result':...,'status':'success'}) -> get returned the value -> search(('journal',)) found it -> list_namespaces() returned [('journal','wf1')] -> delete then get returned None. It is directly usable as a content-hashed, namespaced journal substrate.",
+        "best_source": "/Users/panqiwei/Dev/repos/nemori-ai/langchain-dynamic-workflow/.venv/lib/python3.12/site-packages/langgraph/store/base/__init__.py:700-993 (+ empirical InMemoryStore round-trip)"
+      }
+    ],
+    "overall_reliability_note": "Versions confirmed exactly as pinned via importlib.metadata: langgraph 1.2.2, langchain 1.3.2, langchain-core 1.4.0, deepagents 0.6.7, langgraph-checkpoint 4.1.1, langchain-anthropic 1.4.4 (Python 3.12), all under the project .venv. All 9 claims were independently re-verified by reading the installed source directly (not relying on the upstream agents' summaries), plus 3 live empirical probes (ToolRuntime dataclass field introspection, a real create_agent.ainvoke output-shape check, and a full BaseStore/InMemoryStore journal round-trip). Verdicts: 6 confirmed-in-source (claims 2,3,4,6,7,9), 1 confirmed-in-source backed by empirical run (8), and 2 partially-confirmed (1 and 5) where the original phrasing conflated distinct mechanisms. IMPORTANT CORRECTIONS the architecture should absorb: (1) is the highest-stakes nuance — LangGraph's opt-in CachePolicy RESULT cache is CONTENT-addressed (pickled-args xxh3, requires explicit BaseCache via entrypoint(cache=...)), NOT index-based; the POSITIONAL keying lives in task_id which governs resume replay-skip. The content-hash journal patch is still justified, but by success-only semantics (vs the open sync-put_writes interrupt/error-caching bug noted by agents), per-node content scoping (native ns is function-qualname-only), and the positional resume identity — not by 'native cache is index-based'. (5) The BackendFactory IS invoked per file/exec tool call, but ToolRuntime exposes NO direct thread_id attribute (verified empirically) — it is reachable only via runtime.config['configurable']['thread_id'], and the callable-factory path is deprecated (0.5.0, removal 0.7.0) and warns every call. The deepagents reclamation algorithm (subagents.py:494-532) is reproduced verbatim for the engine to mirror. No load-bearing claim was contradicted outright; the two partial verdicts are scoping/phrasing refinements, not architectural failures."
+  }
+}
