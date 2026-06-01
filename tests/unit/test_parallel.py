@@ -8,7 +8,7 @@ from typing import Any
 from langchain_core.runnables import Runnable, RunnableLambda
 
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
-from langchain_dynamic_workflow._context import Ctx
+from langchain_dynamic_workflow._context import Ctx, LeafOutcome
 from langchain_dynamic_workflow._journal import InMemoryJournalStore
 from langchain_dynamic_workflow._roster import Roster
 
@@ -25,8 +25,8 @@ def _noop_runnable() -> Runnable[Any, Any]:
 def _ctx() -> Ctx:
     """Build a Ctx with a no-op leaf runner (parallel tests drive thunks directly)."""
 
-    async def _leaf(agent_type: str, prompt: str) -> dict[str, object]:
-        return {"messages": []}
+    async def _leaf(agent_type: str, prompt: str, model: str | None) -> LeafOutcome:
+        return LeafOutcome(state={"messages": []}, usage=0)
 
     return Ctx(
         roster=Roster(),
@@ -83,13 +83,13 @@ async def test_parallel_respects_concurrency_gate() -> None:
     in_flight = 0
     peak = 0
 
-    async def _leaf(agent_type: str, prompt: str) -> dict[str, object]:
+    async def _leaf(agent_type: str, prompt: str, model: str | None) -> LeafOutcome:
         nonlocal in_flight, peak
         in_flight += 1
         peak = max(peak, in_flight)
         await asyncio.sleep(0.01)
         in_flight -= 1
-        return {"messages": [], "result": prompt}
+        return LeafOutcome(state={"messages": [], "result": prompt}, usage=0)
 
     ctx = Ctx(
         roster=Roster().register("worker", _noop_runnable()),

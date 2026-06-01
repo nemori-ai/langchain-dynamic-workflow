@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
+from ._budget import Budget
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
 from ._determinism import CallSequenceGuard
 from ._journal import JournalRecord, JournalStore, journal_key
@@ -21,8 +23,23 @@ from ._pipeline import Stage, run_pipeline
 from ._result import fold_result
 from ._roster import Roster
 
-LeafRunner = Callable[[str, str], Awaitable[dict[str, Any]]]
-"""Callable that actually invokes a leaf: ``(agent_type, prompt) -> raw state``."""
+
+@dataclass(frozen=True, slots=True)
+class LeafOutcome:
+    """The result of invoking a leaf: its raw output state plus token usage.
+
+    Attributes:
+        state: The leaf runnable's raw output state (contains ``messages``).
+        usage: Total tokens the leaf consumed, metered via the forwarded usage
+            callback; ``0`` when the model reported no usage.
+    """
+
+    state: dict[str, Any]
+    usage: int
+
+
+LeafRunner = Callable[[str, str, "str | None"], Awaitable[LeafOutcome]]
+"""Invokes a leaf: ``(agent_type, prompt, model) -> LeafOutcome`` (state + usage)."""
 
 T = TypeVar("T")
 
@@ -39,6 +56,7 @@ class Ctx:
         sequence_guard: Determinism backstop recording / validating the ordered
             leaf call-key sequence; a fresh recording guard is created when
             omitted.
+        budget: Shared token budget; an unbounded budget is created when omitted.
     """
 
     def __init__(
@@ -49,6 +67,7 @@ class Ctx:
         leaf_runner: LeafRunner,
         gate: ConcurrencyGate | None = None,
         sequence_guard: CallSequenceGuard | None = None,
+        budget: Budget | None = None,
     ) -> None:
         self._roster = roster
         self._journal = journal
@@ -59,11 +78,17 @@ class Ctx:
         self._sequence_guard = (
             sequence_guard if sequence_guard is not None else CallSequenceGuard(recorded=None)
         )
+        self._budget = budget if budget is not None else Budget(total=None)
 
     @property
     def observed_call_sequence(self) -> list[str]:
         """The ordered leaf call-keys observed this run (for journal persistence)."""
         return self._sequence_guard.sequence
+
+    @property
+    def budget(self) -> Budget:
+        """The shared token budget for this run (``.total`` / ``.spent()`` / ``.remaining()``)."""
+        return self._budget
 
     async def agent(
         self,
@@ -81,7 +106,8 @@ class Ctx:
         Args:
             prompt: The prompt for the leaf.
             agent_type: The roster name to resolve.
-            model: Optional model override (part of the journal key).
+            model: Optional model override; folded into the journal key *and*
+                threaded into the leaf invocation so it reaches execution.
             isolation: Isolation mode (part of the journal key).
 
         Returns:
@@ -89,6 +115,7 @@ class Ctx:
 
         Raises:
             KeyError: If ``agent_type`` is not registered.
+            WorkflowBudgetExceededError: If the shared budget is exhausted.
         """
         self._roster.resolve(agent_type)  # fail fast on unknown agent_type
         key = journal_key(
@@ -104,13 +131,22 @@ class Ctx:
         self._sequence_guard.observe(key)
         cached = await self._journal.get(key)
         if cached is not None:
+            # Resume re-counts the cached leaf's usage from the journal record, so
+            # spent() rebuilds to the first run's cumulative total without a model
+            # call. A cache hit never consumes a budget slot beyond its own usage.
+            self._budget.record(key, cached.usage)
             return cached.result
+        # Cap is checked only before dispatching a *new* leaf: an exhausted pool
+        # refuses fresh work while in-flight leaves finish and keep their results.
+        self._budget.ensure_within_cap()
         # The gate bounds the number of leaves actually in flight; a journal hit
         # above never consumes a slot, keeping resume cheap.
-        raw = await self._gate.run(lambda: self._leaf_runner(agent_type, prompt))
-        folded = fold_result(raw)
-        # success-only: unreachable if the leaf raised.
-        await self._journal.put(key, JournalRecord(result=folded, usage=0))
+        outcome = await self._gate.run(lambda: self._leaf_runner(agent_type, prompt, model))
+        folded = fold_result(outcome.state)
+        # success-only: unreachable if the leaf raised. Usage is journaled so the
+        # spend is reconstructable on resume.
+        await self._journal.put(key, JournalRecord(result=folded, usage=outcome.usage))
+        self._budget.record(key, outcome.usage)
         return folded
 
     async def parallel(self, thunks: Sequence[Callable[[], Awaitable[T]]]) -> list[T | None]:

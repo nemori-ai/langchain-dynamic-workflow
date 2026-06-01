@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from langchain_core.messages import AIMessage
 
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
-from langchain_dynamic_workflow._context import Ctx
+from langchain_dynamic_workflow._context import Ctx, LeafOutcome
 from langchain_dynamic_workflow._journal import InMemoryJournalStore
 from langchain_dynamic_workflow._roster import Roster
 
@@ -19,9 +17,11 @@ class _CountingLeaf:
         self.calls = 0
         self.prefix = prefix
 
-    async def __call__(self, agent_type: str, prompt: str) -> dict[str, Any]:
+    async def __call__(self, agent_type: str, prompt: str, model: str | None) -> LeafOutcome:
         self.calls += 1
-        return {"messages": [AIMessage(content=f"{self.prefix}:{prompt}")]}
+        return LeafOutcome(
+            state={"messages": [AIMessage(content=f"{self.prefix}:{prompt}")]}, usage=0
+        )
 
 
 def _ctx(leaf: _CountingLeaf, journal: InMemoryJournalStore) -> Ctx:
