@@ -26,8 +26,12 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from ._background import BgRunManager, BgStatus
-from ._engine import run_workflow
-from ._journal import InMemoryJournalStore, JournalStore
+
+# Journal-store types are imported from the engine's public core entry (not the
+# internal `_journal`) so the host-facing tool depends only on the `run_workflow`
+# surface, preserving the one-directional Layer 2 -> Layer 0/1 boundary that
+# import-linter mechanically guards.
+from ._engine import InMemoryJournalStore, JournalStore, run_workflow
 from ._roster import Roster
 from ._workflows import WorkflowRegistry
 

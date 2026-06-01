@@ -28,6 +28,10 @@ from ._concurrency import (
 )
 from ._context import Ctx, LeafOutcome, WorkflowResolver
 from ._determinism import CallSequenceGuard
+
+# Re-exported on the engine's public core entry so the host-facing surface
+# (tool / middleware) constructs per-run journal stores through `run_workflow`'s
+# module rather than reaching directly into the engine-internal `_journal`.
 from ._journal import InMemoryJournalStore, JournalStore
 from ._progress import ProgressEntry, ProgressLog, ProgressSink
 from ._roster import Roster
