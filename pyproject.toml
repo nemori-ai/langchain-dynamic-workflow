@@ -81,6 +81,9 @@ pythonVersion = "3.12"
 typeCheckingMode = "strict"
 venvPath = "."
 venv = ".venv"
+# langgraph / deepagents ship partial inline types without separate stubs;
+# silence the third-party stub-absence noise while keeping strict on our code.
+reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
