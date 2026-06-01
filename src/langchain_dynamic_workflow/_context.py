@@ -20,6 +20,7 @@ from ._concurrency import ConcurrencyGate, resolve_max_concurrency
 from ._determinism import CallSequenceGuard
 from ._journal import JournalRecord, JournalStore, journal_key
 from ._pipeline import Stage, run_pipeline
+from ._progress import ProgressKind, ProgressLog
 from ._result import fold_result
 from ._roster import Roster
 
@@ -57,6 +58,8 @@ class Ctx:
             leaf call-key sequence; a fresh recording guard is created when
             omitted.
         budget: Shared token budget; an unbounded budget is created when omitted.
+        progress: Replay-idempotent progress log backing ``phase``/``log``; a
+            fresh log delivering to a no-op sink is created when omitted.
     """
 
     def __init__(
@@ -68,6 +71,7 @@ class Ctx:
         gate: ConcurrencyGate | None = None,
         sequence_guard: CallSequenceGuard | None = None,
         budget: Budget | None = None,
+        progress: ProgressLog | None = None,
     ) -> None:
         self._roster = roster
         self._journal = journal
@@ -79,6 +83,11 @@ class Ctx:
             sequence_guard if sequence_guard is not None else CallSequenceGuard(recorded=None)
         )
         self._budget = budget if budget is not None else Budget(total=None)
+        self._progress = (
+            progress
+            if progress is not None
+            else ProgressLog(delivered_count=0, sink=lambda _entry: None)
+        )
 
     @property
     def observed_call_sequence(self) -> list[str]:
@@ -86,9 +95,36 @@ class Ctx:
         return self._sequence_guard.sequence
 
     @property
+    def progress_entry_count(self) -> int:
+        """How many progress entries were recorded this run (for journal persistence)."""
+        return len(self._progress.entries)
+
+    @property
     def budget(self) -> Budget:
         """The shared token budget for this run (``.total`` / ``.spent()`` / ``.remaining()``)."""
         return self._budget
+
+    def phase(self, title: str) -> None:
+        """Open a named progress phase grouping subsequent work.
+
+        Delivery is replay-idempotent: a phase already emitted on a prior run is
+        not re-delivered when the script replays on resume.
+
+        Args:
+            title: The phase title.
+        """
+        self._progress.emit(ProgressKind.PHASE, title)
+
+    def log(self, message: str) -> None:
+        """Emit a free-form progress narration line.
+
+        Delivery is replay-idempotent: a line already emitted on a prior run is
+        not re-delivered when the script replays on resume.
+
+        Args:
+            message: The narration text.
+        """
+        self._progress.emit(ProgressKind.LOG, message)
 
     async def agent(
         self,

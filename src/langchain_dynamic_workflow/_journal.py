@@ -100,6 +100,14 @@ class JournalStore(Protocol):
         """Persist the ordered call-key sequence observed on a completed run."""
         ...
 
+    async def get_progress_count(self) -> int:
+        """Return how many progress entries a prior run already delivered."""
+        ...
+
+    async def put_progress_count(self, count: int) -> None:
+        """Persist the count of progress entries delivered on a completed run."""
+        ...
+
 
 class InMemoryJournalStore:
     """In-process journal store; the v1 default (same-session resume)."""
@@ -107,6 +115,7 @@ class InMemoryJournalStore:
     def __init__(self) -> None:
         self._data: dict[str, JournalRecord] = {}
         self._sequence: list[str] | None = None
+        self._progress_count: int = 0
 
     async def get(self, key: str) -> JournalRecord | None:
         """Return the cached record for ``key``, or ``None`` on miss."""
@@ -123,3 +132,11 @@ class InMemoryJournalStore:
     async def put_sequence(self, sequence: list[str]) -> None:
         """Persist the ordered call-key sequence observed on a completed run."""
         self._sequence = list(sequence)
+
+    async def get_progress_count(self) -> int:
+        """Return how many progress entries a prior run already delivered."""
+        return self._progress_count
+
+    async def put_progress_count(self, count: int) -> None:
+        """Persist the count of progress entries delivered on a completed run."""
+        self._progress_count = count

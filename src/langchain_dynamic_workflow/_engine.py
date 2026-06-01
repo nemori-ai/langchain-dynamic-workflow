@@ -28,7 +28,14 @@ from ._concurrency import (
 from ._context import Ctx, LeafOutcome
 from ._determinism import CallSequenceGuard
 from ._journal import InMemoryJournalStore, JournalStore
+from ._progress import ProgressEntry, ProgressLog, ProgressSink
 from ._roster import Roster
+
+
+def _default_progress_sink(entry: ProgressEntry) -> None:
+    """Print a progress entry to stdout (the default narration sink)."""
+    print(f"[{entry.kind.value}] {entry.message}")
+
 
 Orchestrator = Callable[[Ctx], Awaitable[Any]]
 """A workflow script: ``async def orchestrate(ctx) -> result``."""
@@ -43,6 +50,7 @@ async def run_workflow(
     thread_id: str = "default",
     max_concurrency: int | None = None,
     budget: int | None = None,
+    on_progress: ProgressSink | None = None,
 ) -> Any:
     """Run an orchestration script to completion and return its final result.
 
@@ -59,6 +67,9 @@ async def run_workflow(
             ``None`` (the default) leaves the budget unbounded so the
             loop-until-budget idiom (``while ctx.budget.remaining() > T``) is a
             no-op cap. The spend is rebuilt from journal usage on resume.
+        on_progress: Optional sink receiving each newly-delivered ``phase``/``log``
+            entry; defaults to printing to stdout. Delivery is replay-idempotent —
+            entries already delivered on a prior run are not re-emitted on resume.
         max_concurrency: Optional explicit concurrency cap on in-flight leaves.
             LangGraph has no default (``None`` means unbounded at the substrate),
             so the engine always sets both layers explicitly. The shared
@@ -102,6 +113,8 @@ async def run_workflow(
         return await leaf_task(agent_type, prompt, model)
 
     recorded_sequence = await journal_store.get_sequence()
+    delivered_progress = await journal_store.get_progress_count()
+    progress_sink: ProgressSink = on_progress if on_progress is not None else _default_progress_sink
 
     @entrypoint(checkpointer=saver)
     async def _run(_input: Any) -> Any:
@@ -110,6 +123,9 @@ async def run_workflow(
         # re-count journaled usage, new leaves count their metered usage), so a
         # resumed run reaches the first run's cumulative total.
         run_budget = Budget(total=budget)
+        # On resume, suppress progress entries already delivered on the prior run
+        # so phase/log narration is not repeated; new entries still flow.
+        progress = ProgressLog(delivered_count=delivered_progress, sink=progress_sink)
         ctx = Ctx(
             roster=roster,
             journal=journal_store,
@@ -117,11 +133,14 @@ async def run_workflow(
             gate=gate,
             sequence_guard=sequence_guard,
             budget=run_budget,
+            progress=progress,
         )
         result = await orchestrate(ctx)
-        # Persist the observed call sequence only after the run completes, so the
-        # determinism backstop has a record to replay against on the next resume.
+        # Persist run-level state only after completion, so the determinism
+        # backstop and progress idempotency have a record to replay against on the
+        # next resume.
         await journal_store.put_sequence(ctx.observed_call_sequence)
+        await journal_store.put_progress_count(ctx.progress_entry_count)
         return result
 
     base_config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
