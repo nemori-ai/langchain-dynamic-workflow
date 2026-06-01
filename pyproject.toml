@@ -90,7 +90,29 @@ reportMissingTypeStubs = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-ra"
+# Coverage runs on every `uv run pytest`: the engine measures the source package
+# and the run fails if total line coverage drops below the gate (see
+# [tool.coverage.report] fail_under). The core orchestration paths (agent /
+# parallel / pipeline / journal / resume / background) are integration-tested, so
+# the gate guards against an untested regression sliding in.
+addopts = "-ra --cov=langchain_dynamic_workflow --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = false
+source = ["src/langchain_dynamic_workflow"]
+omit = ["*/__pycache__/*"]
+
+[tool.coverage.report]
+# Core-module line coverage must stay at or above 85%. Total currently sits well
+# above this; the floor catches a regression that strips out tested paths.
+fail_under = 85
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
 
 # import-linter: mechanically guard the locked three-layer architecture so the
 # one-directional dependency (Layer 2 host-facing -> Layer 1 orchestration runtime
