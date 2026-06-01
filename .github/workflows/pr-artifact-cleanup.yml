@@ -1,0 +1,70 @@
+name: PR artifact gist cleanup
+
+# Reads the `<!-- pr-artifact-gist: <id> -->` marker from a closed PR's body
+# and deletes the secret gist that hosted the github-pr Layer A HTML
+# explainer. See .claude/skills/github-pr/SKILL.md for the full workflow.
+#
+# Required repo secret: GIST_DELETE_TOKEN — a fine-grained Personal Access
+# Token with the `gist` scope, owned by an account that has access to the
+# author's PR-artifact gists (typically the same account that created them).
+# If the secret is missing, this workflow no-ops harmlessly and the gist
+# must be cleaned up manually with `gh gist delete <id>`.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  cleanup-gist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract gist ID from PR body
+        id: parse
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          # Match: <!-- pr-artifact-gist: <id> -->
+          # Gist IDs are 20-32 hex characters; allow alphanumerics defensively.
+          gist_id=$(printf '%s' "$PR_BODY" \
+            | grep -oE '<!--[[:space:]]*pr-artifact-gist:[[:space:]]*[A-Za-z0-9]+[[:space:]]*-->' \
+            | head -n1 \
+            | sed -E 's/<!--[[:space:]]*pr-artifact-gist:[[:space:]]*([A-Za-z0-9]+)[[:space:]]*-->/\1/' \
+            || true)
+          if [[ -z "${gist_id}" ]]; then
+            echo "No pr-artifact-gist marker found in PR body — nothing to clean up."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Found gist ID: ${gist_id}"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "gist_id=${gist_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Delete the gist
+        if: steps.parse.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GIST_DELETE_TOKEN }}
+          GIST_ID: ${{ steps.parse.outputs.gist_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::warning::GIST_DELETE_TOKEN secret is not set — skipping deletion."
+            echo "::warning::Manually run: gh gist delete ${GIST_ID}"
+            exit 0
+          fi
+          # Verify token has gist scope before attempting delete.
+          if ! gh api -i user 2>&1 | grep -qi '^x-oauth-scopes:.*gist'; then
+            echo "::warning::GIST_DELETE_TOKEN lacks the 'gist' scope — skipping."
+            echo "::warning::Manually run: gh gist delete ${GIST_ID}"
+            exit 0
+          fi
+          if gh gist view "${GIST_ID}" --files >/dev/null 2>&1; then
+            gh gist delete "${GIST_ID}" --yes
+            echo "Deleted gist ${GIST_ID}."
+          else
+            echo "Gist ${GIST_ID} not found or already deleted — skipping."
+          fi

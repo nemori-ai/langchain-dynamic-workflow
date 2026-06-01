@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PR #__N__ — __TITLE__</title>
+<style>
+  :root {
+    --bg: #fdfdfb;
+    --fg: #1a1a1a;
+    --muted: #5a5a5a;
+    --rule: #d8d4cc;
+    --accent: #b03a2e;       /* hot-path accent */
+    --add: #0a7d34;
+    --del: #b00020;
+    --chip-block: #b00020;
+    --chip-nit: #b88a00;
+    --chip-q: #1d5bbf;
+    --chip-praise: #0a7d34;
+    --risk-red: #f4d4d0;
+    --risk-yellow: #fbecc4;
+    --risk-green: #d6ecd6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14130f;
+      --fg: #ecebe6;
+      --muted: #9a978f;
+      --rule: #2e2c27;
+      --accent: #ff7a6e;
+      --add: #6fdc8c;
+      --del: #ff8696;
+      --risk-red: #4a1d18;
+      --risk-yellow: #4a3a14;
+      --risk-green: #1a3a1f;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--fg); }
+  body {
+    font: 15px/1.55 ui-serif, "Iowan Old Style", "Charter", Georgia, serif;
+    margin: 0;
+    padding: 32px 24px 96px;
+    max-width: 1100px;
+    margin-inline: auto;
+  }
+  code, pre, .mono { font-family: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; font-size: 0.92em; }
+  h1 { font-size: 1.9rem; margin: 0 0 4px; line-height: 1.15; }
+  h2 { font-size: 1.2rem; margin: 32px 0 8px; padding-top: 12px; border-top: 1px solid var(--rule); }
+  h3 { font-size: 1.0rem; margin: 16px 0 6px; }
+  p { margin: 6px 0; }
+  a { color: inherit; text-decoration: underline; text-decoration-color: var(--muted); }
+  .muted { color: var(--muted); }
+  .stats { color: var(--muted); font-family: ui-monospace, monospace; margin-bottom: 8px; }
+  .focus {
+    border-left: 3px solid var(--accent);
+    padding: 8px 12px;
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    margin: 12px 0 8px;
+  }
+  .focus ol { margin: 4px 0 0 18px; padding: 0; }
+  .nav { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 0.9em; margin: 6px 0 16px; }
+  .nav a { white-space: nowrap; }
+
+  /* Risk grid */
+  .risk-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 6px; }
+  .risk { padding: 6px 10px; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .risk.red    { background: var(--risk-red); }
+  .risk.yellow { background: var(--risk-yellow); }
+  .risk.green  { background: var(--risk-green); }
+  .risk .lbl { float: right; font-size: 0.8em; opacity: 0.7; }
+
+  /* Before/after */
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 8px 0; }
+  .compare > div { border: 1px solid var(--rule); padding: 10px 12px; border-radius: 4px; }
+  .compare h4 { margin: 0 0 6px; font-size: 0.9rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  @media (max-width: 720px) { .compare, .file-row { grid-template-columns: 1fr !important; } }
+
+  /* File tour rows */
+  .file-row { display: grid; grid-template-columns: 280px 1fr; gap: 12px; padding: 6px 0; border-bottom: 1px dashed var(--rule); }
+  .file-row code { font-size: 0.85em; }
+
+  /* Annotated diff */
+  .diff { display: grid; grid-template-columns: 1fr 280px; gap: 12px; align-items: start; }
+  .diff pre { margin: 0; padding: 10px; background: color-mix(in srgb, var(--fg) 5%, var(--bg)); border-radius: 4px; overflow-x: auto; font-size: 0.85em; line-height: 1.45; }
+  .diff .add { color: var(--add); }
+  .diff .del { color: var(--del); }
+  .ann { display: flex; flex-direction: column; gap: 8px; }
+  .ann .item { border-left: 3px solid var(--rule); padding: 6px 10px; font-size: 0.88em; }
+  .chip { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 0.75em; font-weight: 600; color: #fff; margin-right: 6px; vertical-align: 1px; }
+  .chip.block   { background: var(--chip-block); }
+  .chip.nit     { background: var(--chip-nit); }
+  .chip.q       { background: var(--chip-q); }
+  .chip.praise  { background: var(--chip-praise); }
+  @media (max-width: 900px) { .diff { grid-template-columns: 1fr; } }
+
+  /* Module map SVG block */
+  .diagram { margin: 8px 0; }
+  .diagram svg { width: 100%; height: auto; max-height: 360px; }
+
+  /* Test plan & open Qs */
+  ul.checks { list-style: none; padding: 0; }
+  ul.checks li::before { content: "☐ "; color: var(--muted); }
+  ul.checks li.done::before { content: "☑ "; color: var(--add); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>__PR_TITLE__</h1>
+  <p class="muted">__ONE_LINE_TLDR__</p>
+  <p class="stats">__N__ files changed · +__ADD__ / −__DEL__ lines · __TEST_STATUS__ · base: <code>__BASE_BRANCH__</code></p>
+  <div class="focus">
+    <strong>Where to focus:</strong>
+    <ol>
+      <li>__FOCUS_1__</li>
+      <li>__FOCUS_2__</li>
+      <li>__FOCUS_3__</li>
+    </ol>
+  </div>
+  <nav class="nav">
+    <a href="#motivation">Motivation</a>
+    <a href="#risk">Risk map</a>
+    <a href="#beforeafter">Before / After</a>
+    <a href="#map">Module map</a>
+    <a href="#tour">File tour</a>
+    <a href="#diff">Annotated diff</a>
+    <a href="#tests">Test plan</a>
+    <a href="#questions">Open questions</a>
+  </nav>
+</header>
+
+<section id="motivation">
+  <h2>1 · Motivation</h2>
+  <p>__WHY_NOW__ — link the trigger (ADR / issue / prior PR / bug report). 2–3 sentences max.</p>
+</section>
+
+<section id="risk">
+  <h2>2 · Risk map</h2>
+  <div class="risk-grid">
+    <div class="risk red">__FILE_PATH__ <span class="lbl">needs careful review</span></div>
+    <div class="risk yellow">__FILE_PATH__ <span class="lbl">worth a look</span></div>
+    <div class="risk green">__FILE_PATH__ <span class="lbl">safe</span></div>
+  </div>
+</section>
+
+<section id="beforeafter">
+  <h2>3 · Before / After</h2>
+  <div class="compare">
+    <div><h4>Before</h4><pre>__BEFORE_CONTENT__</pre></div>
+    <div><h4>After</h4><pre>__AFTER_CONTENT__</pre></div>
+  </div>
+</section>
+
+<section id="map">
+  <h2>4 · Module map</h2>
+  <p class="muted">Hot path in <span style="color:var(--accent)">accent</span>; unchanged edges in gray.</p>
+  <div class="diagram">
+    <svg viewBox="0 0 600 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Module map">
+      <!-- example: replace nodes/edges to match the change -->
+      <g font-family="ui-monospace, monospace" font-size="12">
+        <rect x="20"  y="40"  width="120" height="44" fill="none" stroke="currentColor" rx="4"/>
+        <text x="80"  y="66" text-anchor="middle">entry.py</text>
+        <rect x="240" y="40"  width="120" height="44" fill="none" stroke="currentColor" rx="4"/>
+        <text x="300" y="66" text-anchor="middle">service.py</text>
+        <rect x="460" y="40"  width="120" height="44" fill="none" stroke="currentColor" rx="4"/>
+        <text x="520" y="66" text-anchor="middle">storage.py</text>
+
+        <!-- hot path -->
+        <line x1="140" y1="62" x2="240" y2="62" stroke="var(--accent)" stroke-width="2" marker-end="url(#arr-hot)"/>
+        <line x1="360" y1="62" x2="460" y2="62" stroke="var(--accent)" stroke-width="2" marker-end="url(#arr-hot)"/>
+
+        <defs>
+          <marker id="arr-hot" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+      </g>
+    </svg>
+  </div>
+</section>
+
+<section id="tour">
+  <h2>5 · File tour (grouped by role)</h2>
+
+  <h3>Plumbing</h3>
+  <div class="file-row"><code>__path__</code><div>one-sentence <em>why</em>.</div></div>
+
+  <h3>Core logic</h3>
+  <div class="file-row"><code>__path__</code><div>one-sentence <em>why</em>.</div></div>
+
+  <h3>Tests</h3>
+  <div class="file-row"><code>tests/__path__</code><div>one-sentence <em>why</em>.</div></div>
+</section>
+
+<section id="diff">
+  <h2>6 · Annotated diff — high-risk file</h2>
+  <p class="muted">Showing <code>__path__</code></p>
+  <div class="diff">
+    <pre>
+@@ context @@
+ unchanged
+<span class="del">- old line</span>
+<span class="add">+ new line</span>
+ unchanged
+    </pre>
+    <div class="ann">
+      <div class="item"><span class="chip block">blocking</span>Why this is risky — what reviewer must verify.</div>
+      <div class="item"><span class="chip q">question</span>Author asks: should we …?</div>
+      <div class="item"><span class="chip nit">nit</span>Minor stylistic note.</div>
+    </div>
+  </div>
+</section>
+
+<section id="tests">
+  <h2>7 · Test plan &amp; rollout</h2>
+  <ul class="checks">
+    <li class="done">unit tests — N passed</li>
+    <li class="done"><code>uv run ruff check</code> + <code>uv run pyright</code> — clean</li>
+    <li>manual E2E — describe what to verify</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>8 · Open questions</h2>
+  <ol>
+    <li>__OPEN_Q_1__</li>
+  </ol>
+</section>
+
+</body>
+</html>
