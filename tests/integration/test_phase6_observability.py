@@ -12,9 +12,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+import pytest
 from langchain_core.runnables import Runnable
 
-from langchain_dynamic_workflow import Ctx, InMemoryJournalStore, Roster, run_workflow
+from langchain_dynamic_workflow import (
+    Ctx,
+    InMemoryJournalStore,
+    Roster,
+    WorkflowBudgetExceededError,
+    run_workflow,
+)
 from langchain_dynamic_workflow._observability import Span, SpanKind
 
 UsageLeafFactory = Callable[..., tuple[Runnable[Any, Any], Any]]
@@ -89,3 +96,31 @@ async def test_resume_reports_cached_agent_spans(
     agent_span = next(s for s in second_spans if s.kind == SpanKind.AGENT)
     assert agent_span.attributes["cached"] is True
     assert agent_span.attributes["usage_tokens"] == 5
+
+
+async def test_failing_primitive_emits_error_span_through_run_workflow(
+    make_usage_leaf: UsageLeafFactory,
+) -> None:
+    # Observability-by-default contract: a span whose body raises is still emitted
+    # WITH its error text, not dropped. Drive a real failure (a budget breach inside
+    # agent()) through run_workflow and assert the emitted agent span carries the
+    # error — pinning the claim end-to-end on a real primitive, not just at the
+    # SpanRecorder unit level.
+    leaf, _model = make_usage_leaf("x", tokens_per_call=10)
+    roster = Roster().register("researcher", leaf)
+    spans: list[Span] = []
+
+    async def orchestrate(ctx: Ctx) -> None:
+        await ctx.agent("first", agent_type="researcher")  # spends 10 -> exhausts pool
+        await ctx.agent("second", agent_type="researcher")  # trips the cap -> raises
+
+    with pytest.raises(WorkflowBudgetExceededError):
+        await run_workflow(orchestrate, roster=roster, budget=10, on_span=spans.append)
+
+    agent_spans = [s for s in spans if s.kind == SpanKind.AGENT]
+    # The first leaf succeeded with no error; the budget-tripped second emitted an
+    # error span rather than vanishing from the trace.
+    assert any(
+        s.error is not None and "WorkflowBudgetExceededError" in s.error for s in agent_spans
+    )
+    assert any(s.error is None for s in agent_spans)  # the first leaf's span is clean

@@ -17,9 +17,11 @@ collected so the test asserts the full primitive trace.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
+from contextlib import asynccontextmanager
 from typing import Any
 
+import pytest
 from deepagents import create_deep_agent  # pyright: ignore[reportUnknownVariableType]
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -117,6 +119,26 @@ async def _capstone(ctx: Ctx, args: dict[str, Any]) -> str:
     return f"synthesized {len(survivors)} surviving findings: " + " | ".join(sorted(survivors))
 
 
+class _PeakSandboxManager(SandboxManager):
+    """A ``SandboxManager`` that records the peak number of simultaneously-live leases.
+
+    ``active_count == 0`` after a run proves teardown but cannot distinguish a run
+    that leased a sandbox then cleaned it up from one that never leased at all.
+    Sampling the live count on every lease makes "a sandbox was genuinely leased"
+    observable (``peak >= 1``).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.peak = 0
+
+    @asynccontextmanager
+    async def lease(self, *, leaf_id: str, needs_execution: bool) -> AsyncGenerator[Any]:
+        async with super().lease(leaf_id=leaf_id, needs_execution=needs_execution) as backend:
+            self.peak = max(self.peak, self.active_count)
+            yield backend
+
+
 async def test_capstone_multi_stage_runs_green_with_budget_and_sandbox(
     make_usage_leaf: UsageLeafFactory,
 ) -> None:
@@ -132,9 +154,16 @@ async def test_capstone_multi_stage_runs_green_with_budget_and_sandbox(
     )
 
     spans: list[Span] = []
-    sandbox_manager = SandboxManager()
+    sandbox_manager = _PeakSandboxManager()
+    captured: dict[str, int] = {}
+
+    async def _capturing(ctx: Ctx) -> str:
+        out = await _capstone(ctx, {})
+        captured["spent"] = ctx.budget.spent()
+        return out
+
     result = await run_workflow(
-        _bind({}),
+        _capturing,
         roster=roster,
         budget=10_000,
         sandbox_manager=sandbox_manager,
@@ -158,8 +187,14 @@ async def test_capstone_multi_stage_runs_green_with_budget_and_sandbox(
     # 4 research + 4 refine + 4*3 skeptic = 20 agent leaves.
     assert kinds.count(SpanKind.AGENT) == 4 + 4 + len(TOPICS) * SKEPTICS_PER_FINDING
 
-    # The sandbox-admitted researcher leased and the engine tore everything down:
-    # no live sandbox remains after the run settles.
+    # Budget was genuinely metered through the usage-reporting leaves (a no-op
+    # budget would read 0) and stayed well under the 10_000 cap.
+    assert captured["spent"] > 0
+    assert captured["spent"] < 10_000
+    # The needs_execution researcher was actually leased (peak >= 1) AND the engine
+    # tore every sandbox down — active_count == 0 alone cannot tell "leased then
+    # cleaned up" from "never leased".
+    assert sandbox_manager.peak >= 1
     assert sandbox_manager.active_count == 0
 
 
@@ -296,12 +331,22 @@ async def test_capstone_driven_by_host_agent_in_background(
     assert "synthesized 3 surviving findings" in final_ai[-1].text
 
 
-def test_real_model_variant_is_env_gated() -> None:
-    # The capstone has a real-model variant in examples/06_capstone.py gated behind
-    # LDW_DEMO_REAL_MODEL; the offline tests above never need a key. This asserts the
-    # gating contract is documented in the example so CI never hits a real provider.
+def test_real_model_variant_defaults_to_offline_fake(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The capstone's real-model variant is gated behind LDW_DEMO_REAL_MODEL. With the
+    # var UNSET, _build_leaf must return an OFFLINE fake (RunnableLambda) so CI never
+    # touches a real provider. A grep for the string would still pass if the gating
+    # were inverted; this pins the actual offline-by-default behavior by loading the
+    # example and exercising its leaf factory.
+    import importlib.util
     from pathlib import Path
 
-    example = Path(__file__).resolve().parents[2] / "examples" / "06_capstone.py"
-    source = example.read_text(encoding="utf-8")
-    assert "LDW_DEMO_REAL_MODEL" in source
+    monkeypatch.delenv("LDW_DEMO_REAL_MODEL", raising=False)
+    example_path = Path(__file__).resolve().parents[2] / "examples" / "06_capstone.py"
+    spec = importlib.util.spec_from_file_location("_ldw_capstone_example", example_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    leaf = module._build_leaf("offline-reply")
+    # Offline by default: no real provider is constructed when the env var is unset.
+    assert isinstance(leaf, RunnableLambda)
