@@ -1,0 +1,179 @@
+# 01 · 引擎机制设计（Engine Mechanism Design）
+
+> **范围**：引擎内部（Layer 0 底座 + Layer 1 编排运行时）"怎么算对"的机制设计——控制流反转、七原语、骑 LangGraph 的两块补丁、脚本执行模型、叶子调用契约、sandbox、pipeline、budget、确定性。
+> **对外软件形态**（怎么接入 agent、tool/skills/middleware）见 [02-architecture.md](02-architecture.md)；图见 [uml/](uml/)。
+> **日期**：2026-06-01　**状态**：机制已锁。
+> **勘误**：官方 Claude Code 编排语言是 JS，Anthropic 只文档化行为契约、从未发布原语级 API。本库 Python 原语镜像社区逆向出的 JS 表面，**非**官方 API；本文档才是本端口预期行为的权威。
+
+---
+
+## 1. 核心范式：控制流反转
+
+| | 普通 agent | Dynamic Workflow |
+|---|---|---|
+| 谁决定下一步 | LLM 逐回合 | **确定性脚本（代码）** |
+| 中间结果存哪 | LLM 的 context window | **脚本变量里** |
+| 最终进主 context 的 | 全过程 | **只有结论** |
+
+循环 / 分支 / 扇出写成确定性代码；LLM 只在叶子 `agent()` 出现,每个 subagent 跑在**全新、用完即弃**的 context 里、只吐结果。
+
+## 2. 七个原语
+
+| 原语 | 语义 |
+|---|---|
+| `agent(prompt, *, schema, agent_type, model, label, isolation)` | 起全新 context 的 subagent;带 `schema` 强制结构化输出 + 校验 + 不匹配重试 |
+| `parallel(thunks)` | 并发 + **阻塞 barrier**;thunk 抛错 → 该位 `null`,整体**永不 reject**(用前 `.filter`) |
+| `pipeline(items, *stages)` | 多 stage **无 barrier** 流水线;stage 签名 `(prev_result, original_item, index)`;抛错 → 该 item `null` 跳后续 |
+| `phase(title)` / `log(msg)` | 进度分组 / 叙事日志 |
+| `budget` | `{total, spent(), remaining()}`,**共享池**,到顶 `agent()` 抛 |
+| `workflow(name, args)` | 内联调另一 workflow,**仅一层嵌套**(内层 = `@task`) |
+
+失败语义照搬 Claude Code:`parallel` 永不 reject、`pipeline` 抛错落 `null`。
+
+## 3. 底座同构：LangGraph Functional API + 两偏差（实证）
+
+LangGraph functional API 与 Claude Code Workflow 是同一范式,durable execution 白送大半:
+
+| 维度 | LangGraph 1.2.2（实读源码） |
+|---|---|
+| 控制流归属 | `@entrypoint` 函数体(普通 Python/asyncio) |
+| 工作单元 | `@task`(返回 `SyncAsyncFuture`,可 await 可 `.result()`) |
+| resume | 重放 entrypoint body,已完成 `@task` 凭 `task_id` 取缓存不重跑(`_loop.py:724-737` / `_runner.py:745-759`) |
+| barrier 并行 | 多 future 先发起、await 处隐式 barrier(`asyncio.gather`) |
+| 持久化 | checkpointer + 三档 `durability`(默认 `"async"`,`main.py:2574`) |
+
+**两偏差 → 两补丁(必需,非可选)**。根因:LangGraph 假设 entrypoint body 是**人写可信代码**,本项目脚本是 **LLM 现写的不可信代码**。
+
+### 偏差①(实证改写):缓存键是两套机制,原设计混为一谈
+
+- **结果缓存(CachePolicy)是内容寻址,不是 index-based**:`default_cache_key = pickle.dumps((_freeze(args),_freeze(kwargs)))` 再 xxh3-128(`_internal/_cache.py:26-31`、`_algo.py:858-870`),且 **opt-in**。
+- **真正 positional 的是 `task_id`**:编码 step + 节点名 + write 索引(`_algo.py:834-842`),驱动 resume replay-skip。
+
+### 偏差②(实证):确定性零强制
+
+全底座唯一确定性检查是一句 `assert task_id == task_id_checksum`(`_algo.py:662,855`),被窄守卫包裹且 `python -O` 下**整句剥离**;`errors.py` 无任何确定性异常类;resume 仅按 `task_id` 贴 writes、零比对。
+
+## 4. 补丁① · content-hash journal（success-only）
+
+引擎在 `@task` 之上自建内容哈希 journal:
+
+```
+key = sha256(canonical_json({prompt, agent_type, model,
+        schema: schema.model_json_schema() if schema else None, isolation}))
+命中(且 success) → 反序列化缓存结果(连 @task 都不进,0 模型调用)
+未命中 → 起 @task 跑 deepagent → 校验 → 写 journal(连同 usage)
+```
+
+**正当理由(实证三条,替代原"native 是 index-based"的错误论证)**:
+
+1. **success-only 语义**:bug `#7589`——同步 `SyncPregelLoop.put_writes`(`_loop.py:1586`)缓存结果**无 INTERRUPT/ERROR 守卫**(async 路径有),失败/中断的 task 会被缓存并 replay 成 success。journal 必须显式只写 success。
+2. **per-node content scoping**:原生 ns 仅按函数 qualname 命名,有跨调用点串用风险。
+3. **positional resume identity**:`task_id` 含 step+write_idx,脚本顺序漂移即静默失配。
+
+（附:原生 cache 命中还会丢自定义 stream 数据 `#6265`。）
+
+- `JournalStore` Protocol:v1 = in-memory + LangGraph `BaseStore`(实测往返通过,namespaced KV journal 完美底座)两实现。
+- 命中后若有 `schema`,缓存 JSON 重新校验回 schema 实例。
+
+## 5. 补丁② · 确定性 fail-loud guard（三段式）
+
+确定性**重定义**:不禁绝一切非确定性,只在"非确定性改变了编排的可观测 `agent()` 调用模式"时炸。journal 即确定性 oracle。
+
+| 段 | 机制 | 覆盖 |
+|---|---|---|
+| 预防(便宜) | AST 禁 `import` + 受限 builtins | 仅 L2(不可信源) |
+| 普适 backstop | journal 记调用序列,重放不匹配即 **fail-loud** | 所有源(含手写) |
+| 引擎自持不变量 | `budget.spent()` 重放可重建、`phase`/`log` 幂等 | 引擎自己 |
+
+它顺带把 budget 重放分叉从"静默腐坏"降级成 loud failure。`python -O` 会蒸发底座那句唯一 assert——又一条 guard 必自建的理由。
+
+## 6. 脚本执行模型（接缝① · 方案丙）
+
+执行核统一为"跑一个 async callable",两道前门:
+
+- **手写(可信)**:直接传 `async def orchestrate(ctx)` → 安全维度关、确定性维度仍开。
+- **L2/不可信**:源码字符串 → AST gate → 受限 globals 下 `compile` + **单点** `exec` 成 callable → 完整 guard。
+
+两条路都 checkpoint **源码/注册键**当 entrypoint 输入,resume 时重铸 callable——**callable 临时、源码持久**。callable 是 exec 模型的严格超集,trust 边界显式分级。
+
+**guard 两正交维度**:安全维度(防 exec 逃逸/读文件网络;仅 L2)、确定性维度(防影响编排的非确定性;所有源)。
+
+## 7. 叶子调用契约（接缝②D，verified-in-source）
+
+- **roster 条目** = 公开 `CompiledSubAgent{name, description, runnable}` + 自加 `{needs_execution, default_model?}`;`create_deep_agent(...)` 懒构造一次、持有 `CompiledStateGraph`、作 `@task` 直调,**绕开** deepagents 的 LLM-driven `task` 工具。不碰私有 `_SubagentSpec`。
+- **调用** = `runnable.ainvoke({"messages":[HumanMessage(prompt)]}, config=..., context=...)`。
+- **结果回填**(镜像 `subagents.py:494-532`,即 context-quarantine 边界):有 `structured_response` → 序列化(pydantic `model_dump_json` / dataclass `asdict`+`json.dumps` / 否则 `json.dumps`);否则**逆序**扫 `messages` 取第一条 `.text.rstrip()` 非空的 `AIMessage`(避开 Anthropic 尾部空 `end_turn`);`messages` 缺失抛 `ValueError`。
+- **schema** = `response_format=ToolStrategy(schema, handle_errors=True)`(in-loop 纠错重试);journal 只缓存校验过的最终结果。`ProviderStrategy` 无 in-loop retry,不作默认。
+- **budget 管线**:`UsageMetadataCallbackHandler` 跨嵌套聚合 token;但绕开 task 工具直调时**必须自己复刻 `_build_subagent_config` 的 callbacks 转发**,否则共享 budget 漏算;**每叶子 usage 入 journal** → 保 `spent()` 重放可重建。
+- **state schema**:自定义须继承 `DeepAgentState`(其 `DeltaChannel(snapshot_frequency=50)` 把 checkpoint 增长压到 O(N))。
+
+## 8. sandbox 机制（接缝②E，verified-in-source）
+
+- **默认隔离粒度 = per-leaf**(每个 `agent()` 叶子一个隔离 sandbox);协同工作区(多叶子共享可变工作区)做 opt-in 风险模式。
+- **身份从 journal key 派生**:一举满足 retry 稳定 / resume 稳定 / 唯一性 / 与 journal dedup 自洽。
+- **构造方式**:弃用 `BackendFactory`(deprecated 0.5.0、移除 0.7.0),改 docs 推荐的 **per-leaf backend 实例**——从 `runtime.config["configurable"]["thread_id"]` 读身份、find-or-create 打标 sandbox、包成实例传给 `create_deep_agent`。
+- **SandboxManager 自建**(底座零生命周期方法实证:`BackendProtocol`/`SandboxBackendProtocol` 仅文件操作 + `id`/`execute`,lifecycle grep 零命中):lazy-create / idle+硬 TTL / 池化 / 配额(最大活跃数、per-sandbox 工具调用上限)/ 池耗尽背压 / `sandbox.stop()`。
+- **分层准入**:roster `needs_execution` 元数据;纯推理 agent 走 StateBackend **不分配 sandbox**。
+- **CompositeBackend**:`/shared/` 路由共享产物 store(显式 hand-off、版本化、producer 命名空间、路由前路径规范化防穿越);**但 `#2884`(OPEN)route 隔离会在共享存储后端间泄漏 → 并行叶子隔离不能仅靠 routes,须独立验证**。
+- **并发安全 stance**:默认假设单叶子内 deepagents 可能并发调工具 → per-leaf sandbox 访问默认串行化,实测安全再放开。
+
+## 9. pipeline 调度器（无 barrier，自建——LangGraph 结构盲区）
+
+```
+每 stage 一个 bounded asyncio.Queue(背压,防 item 海啸打爆内存)
+每 stage 一组 worker:pull → 跑 stage fn(内部调 agent())→ push 下级 queue
+全局 semaphore = min(16, cores-2),跨所有 stage 共享
+item 各自独立穿越 → A 在 stage3 时 B 还在 stage1
+stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
+```
+
+底座无任何无-barrier 流式原语(`Send` 是 map-reduce barrier);完全自建。中途异常/预算耗尽须保证队列优雅排空、不死锁。
+
+## 10. budget
+
+共享 token 池 `{total, spent(), remaining()}`,到顶 `agent()` 抛。`spent()` 由 journal 中每叶子 usage 重建 → 重放确定。计量底座:`usage_metadata`(AIMessage)+ `UsageMetadataCallbackHandler`;`ModelCallLimitMiddleware` 可作只计次的粗兜底。
+
+## 11. 并发上限 & 硬上限
+
+- **双层都显式设**:asyncio `Semaphore(min(16, cores-2))` + LangGraph `RunnableConfig.max_concurrency`(底座**默认 None ⇒ 无界**,`_executor.py:135-140`,必须显式设界)。
+- 总量硬顶 `1000`(防失控)。
+
+## 12. Decision Log
+
+| # | 决策 | 选定 |
+|---|---|---|
+| D1 | 项目形态 | 独立开源库,面向 deepagents 社区 |
+| D2 | dynamic 边界 | 含完整 meta 层(LLM 写脚本) |
+| D3 | 脚本语言/执行模型 | Python 原生,骑 LangGraph |
+| D4 | 安全边界 | A1 进程内受限 exec 起步,执行器抽可替换 seam,预留 A2/A3 |
+| D5 | `pipeline()` | 进 v1 |
+| D6 | `workflow()` 嵌套 | `@task`/subgraph 实现 |
+| D7 | `agent()` 解析 | R1 纯命名 roster |
+| D8 | journal 存储 | `JournalStore` Protocol;in-memory + `BaseStore` 两实现 |
+| D9 | 确定性实现 | import-ban + 受限 builtins + 教 LLM `sorted()`/忌迭代 set |
+| D10 | pipeline 背压 | bounded `asyncio.Queue` |
+| D11 | Layer 2 codegen | 一次过:AST 校验通过即执行(违规重试),不做 dry-run |
+| D12 | journal 哈希 | 不纳入 agent 定义/版本哈希 |
+| D13 | sandbox 生命周期 | per-leaf 隔离默认;协同工作区 opt-in |
+| D14 | 接缝① 脚本执行模型 | 方案丙:callable 本体 + 源码前门 + exec 收敛 L2 单点 |
+| D15 | guard 维度切分 | 安全维度(仅 L2)/ 确定性维度(所有源)两正交 |
+| D16 | 确定性强制 | 三段式:AST 预防 + journal-divergence backstop + 引擎自持不变量;不 monkeypatch |
+| D17 | sandbox 身份/构造 | per-leaf 隔离 + journal-key 派生身份 + per-leaf backend **实例**(弃 deprecated factory) + 自建 SandboxManager |
+| D18 | 接缝②D schema 强制 | `ToolStrategy(schema, handle_errors=True)` in-loop 重试 |
+| D19 | 接缝③ L2 交付节奏 | v1 = L0/L1 先行,L2 架构预留紧跟(L2-as-skill,见 02) |
+| D20 | async 后台 tool 执行 | 自建轻量后台机制(无 server / 无重依赖);v1 即含;蓝本 = omne-next 实现 + deepagents async-task API 形态。详见 [02 §3](02-architecture.md) |
+
+## 13. 实现待核实清单（开工前/中逐条钉测试）
+
+1. **journal × 原生 cache 交互**:引擎统一走 async(避 `#7589` sync error-caching);显式决定是否关原生 CachePolicy、让 journal 成唯一记忆化源。
+2. **`task_id` 顺序敏感性**:加"脚本编辑后 resume"集成测试——顺序漂移会静默失配重跑。
+3. **`max_concurrency` 嵌套语义**:确认叶子 fan-out 是共享 entrypoint 层 semaphore,还是 deepagents 子调用另开无界 executor。
+4. **CompositeBackend 隔离泄漏(#2884)**:并行叶子隔离独立验证。
+5. **callback 转发**:`@task` 层直调须复刻 `_build_subagent_config` callbacks 转发,否则共享 budget 漏算。
+6. **`-O` 风险**:生产开 `PYTHONOPTIMIZE` 时底座唯一 determinism assert 蒸发——再证 guard 必自建。
+7. **单叶子内 deepagents 是否并发调工具**:决定 per-leaf sandbox 是否需内部串行化。
+8. **硬契约逐条钉测试**:journal-key 派生身份 / retry 时 thread_id 稳定 / 路径规范化防穿越 / pipeline 异常不死锁。
+
+---
+
+> 信源(版本锚定 langgraph 1.2.2 / langchain 1.3.2 / langchain-core 1.4.0 / deepagents 0.6.7):见 `research/`。
