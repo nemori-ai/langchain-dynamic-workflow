@@ -33,6 +33,7 @@ from ._determinism import CallSequenceGuard
 # (tool / middleware) constructs per-run journal stores through `run_workflow`'s
 # module rather than reaching directly into the engine-internal `_journal`.
 from ._journal import InMemoryJournalStore, JournalStore
+from ._observability import SpanRecorder, SpanSink
 from ._progress import ProgressEntry, ProgressLog, ProgressSink
 from ._roster import Roster
 from ._sandbox import SandboxManager, SharedArtifactStore, build_leaf_backend
@@ -57,6 +58,7 @@ async def run_workflow(
     max_concurrency: int | None = None,
     budget: int | None = None,
     on_progress: ProgressSink | None = None,
+    on_span: SpanSink | None = None,
     sandbox_manager: SandboxManager | None = None,
     workflows: WorkflowResolver | None = None,
 ) -> Any:
@@ -78,6 +80,14 @@ async def run_workflow(
         on_progress: Optional sink receiving each newly-delivered ``phase``/``log``
             entry; defaults to printing to stdout. Delivery is replay-idempotent —
             entries already delivered on a prior run are not re-emitted on resume.
+        on_span: Optional sink receiving a completed observability ``Span`` for
+            every ``agent``/``parallel``/``pipeline`` call (observability-by-default).
+            Each span carries the primitive kind, a name, and attributes (a leaf's
+            ``agent_type`` / ``cached`` / ``usage_tokens``, a fan-out's counts), a
+            wall-clock duration, and an error if the body raised. Unlike progress,
+            spans are *not* replay-suppressed: a resumed run re-emits a span for each
+            replayed leaf, flagged ``cached=True``, so a trace reflects the resume.
+            When omitted, span recording is a silent no-op (zero cost).
         sandbox_manager: Optional per-leaf sandbox lifecycle manager. When
             supplied, a leaf whose roster entry is ``needs_execution`` is leased an
             isolated execution backend (keyed by its derived, resume-stable
@@ -199,6 +209,9 @@ async def run_workflow(
     recorded_sequence = await journal_store.get_sequence()
     delivered_progress = await journal_store.get_progress_count()
     progress_sink: ProgressSink = on_progress if on_progress is not None else _default_progress_sink
+    # One span recorder per run. Spans are emitted live (not replay-suppressed), so
+    # a resumed run re-emits a span for every replayed leaf flagged cached=True.
+    span_recorder = SpanRecorder(sink=on_span)
 
     @entrypoint(checkpointer=saver)
     async def _run(_input: Any) -> Any:
@@ -219,6 +232,7 @@ async def run_workflow(
             budget=run_budget,
             progress=progress,
             workflows=workflows,
+            spans=span_recorder,
         )
         try:
             result = await orchestrate(ctx)

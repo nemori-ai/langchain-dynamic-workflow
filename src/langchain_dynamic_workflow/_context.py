@@ -25,6 +25,7 @@ from ._errors import (
     WorkflowNestingError,
 )
 from ._journal import JournalRecord, JournalStore, journal_key
+from ._observability import SpanKind, SpanRecorder
 from ._pipeline import Stage, run_pipeline
 from ._progress import ProgressKind, ProgressLog
 from ._result import fold_result
@@ -137,6 +138,10 @@ class Ctx:
             fresh log delivering to a no-op sink is created when omitted.
         workflows: Optional resolver for ``ctx.workflow(name, args)`` inline
             nesting; when omitted, any ``workflow()`` call raises ``LookupError``.
+        spans: Span recorder backing observability-by-default; every
+            ``agent``/``parallel``/``pipeline`` call emits a completed span. A
+            silent no-op recorder is created when omitted, so observability costs
+            nothing until a sink is wired.
     """
 
     def __init__(
@@ -150,6 +155,7 @@ class Ctx:
         budget: Budget | None = None,
         progress: ProgressLog | None = None,
         workflows: WorkflowResolver | None = None,
+        spans: SpanRecorder | None = None,
     ) -> None:
         self._roster = roster
         self._journal = journal
@@ -167,6 +173,7 @@ class Ctx:
             else ProgressLog(delivered_count=0, sink=lambda _entry: None)
         )
         self._workflows = workflows
+        self._spans = spans if spans is not None else SpanRecorder()
 
     @property
     def observed_call_sequence(self) -> list[str]:
@@ -301,51 +308,64 @@ class Ctx:
             schema=None,
             isolation=isolation,
         )
-        # Determinism backstop: record this call-key (fresh run) or validate it
-        # against the recorded sequence (replay). A divergence fails loud here,
-        # before any cache entry is served. Only the *sequential* agent() path
-        # (fan-out depth 0) is recorded: calls dispatched inside parallel() /
-        # pipeline() observe in wall-clock completion order, which varies run to
-        # run under real (variable-latency) leaves, so recording them would trip
-        # the backstop spuriously on a deterministic resume. The journal still
-        # guards fan-out leaves by content hash; only their *ordering* is excluded.
-        if _FANOUT_DEPTH.get() == 0:
-            self._sequence_guard.observe(key)
-        cached = await self._journal.get(key)
-        if cached is not None:
-            # Resume re-counts the cached leaf's usage from the journal record, so
-            # spent() rebuilds to the first run's cumulative total without a model
-            # call. A cache hit never consumes a budget slot beyond its own usage.
-            self._budget.record(key, cached.usage)
-            return cached.result
-        # Cap is checked only before dispatching a *new* leaf: an exhausted pool
-        # refuses fresh work while in-flight leaves finish and keep their results.
-        self._budget.ensure_within_cap()
-        # Sandbox admission: derive the leaf's stable identity from its content-hash
-        # key and tell the runner whether this leaf needs an isolated execution
-        # sandbox. The runner (engine side) leases the right backend per leaf_id and
-        # threads it into the leaf config; reasoning leaves allocate nothing. The
-        # identity is the same key that dedups the journal, so it is stable across
-        # retry/resume by construction.
-        leaf_id = leaf_id_from_key(key)
-        # The gate bounds the number of leaves actually in flight; a journal hit
-        # above never consumes a slot, keeping resume cheap. The leaf runner
-        # receives the *effective* model so the config it threads matches the key.
-        outcome = await self._gate.run(
-            lambda: self._leaf_runner(
-                agent_type,
-                prompt,
-                effective_model,
-                leaf_id=leaf_id,
-                needs_execution=entry.needs_execution,
+        # Observability-by-default: the whole leaf lifecycle (determinism check,
+        # journal lookup, dispatch) runs inside a span so a trace shows the agent
+        # type, the cache outcome, the token usage, and any failure — with no
+        # instrumentation in the orchestration script. The span is emitted on exit
+        # whether this returns cleanly or raises (e.g. a budget breach).
+        with self._spans.span(SpanKind.AGENT, agent_type) as span:
+            span.set("agent_type", agent_type)
+            # Determinism backstop: record this call-key (fresh run) or validate it
+            # against the recorded sequence (replay). A divergence fails loud here,
+            # before any cache entry is served. Only the *sequential* agent() path
+            # (fan-out depth 0) is recorded: calls dispatched inside parallel() /
+            # pipeline() observe in wall-clock completion order, which varies run to
+            # run under real (variable-latency) leaves, so recording them would trip
+            # the backstop spuriously on a deterministic resume. The journal still
+            # guards fan-out leaves by content hash; only their *ordering* is excluded.
+            if _FANOUT_DEPTH.get() == 0:
+                self._sequence_guard.observe(key)
+            cached = await self._journal.get(key)
+            if cached is not None:
+                # Resume re-counts the cached leaf's usage from the journal record,
+                # so spent() rebuilds to the first run's cumulative total without a
+                # model call. A cache hit never consumes a budget slot beyond its
+                # own usage. The span reports the hit so a trace distinguishes a
+                # replayed leaf from a fresh one.
+                self._budget.record(key, cached.usage)
+                span.set("cached", True)
+                span.set("usage_tokens", cached.usage)
+                return cached.result
+            # Cap is checked only before dispatching a *new* leaf: an exhausted pool
+            # refuses fresh work while in-flight leaves finish and keep their results.
+            self._budget.ensure_within_cap()
+            # Sandbox admission: derive the leaf's stable identity from its
+            # content-hash key and tell the runner whether this leaf needs an
+            # isolated execution sandbox. The runner (engine side) leases the right
+            # backend per leaf_id and threads it into the leaf config; reasoning
+            # leaves allocate nothing. The identity is the same key that dedups the
+            # journal, so it is stable across retry/resume by construction.
+            leaf_id = leaf_id_from_key(key)
+            # The gate bounds the number of leaves actually in flight; a journal hit
+            # above never consumes a slot, keeping resume cheap. The leaf runner
+            # receives the *effective* model so the config it threads matches the key.
+            outcome = await self._gate.run(
+                lambda: self._leaf_runner(
+                    agent_type,
+                    prompt,
+                    effective_model,
+                    leaf_id=leaf_id,
+                    needs_execution=entry.needs_execution,
+                )
             )
-        )
-        folded = fold_result(outcome.state)
-        # success-only: unreachable if the leaf raised. Usage is journaled so the
-        # spend is reconstructable on resume.
-        await self._journal.put(key, JournalRecord(result=folded, usage=outcome.usage))
-        self._budget.record(key, outcome.usage)
-        return folded
+            folded = fold_result(outcome.state)
+            # success-only: unreachable if the leaf raised. Usage is journaled so
+            # the spend is reconstructable on resume.
+            await self._journal.put(key, JournalRecord(result=folded, usage=outcome.usage))
+            self._budget.record(key, outcome.usage)
+            span.set("cached", False)
+            span.set("usage_tokens", outcome.usage)
+            return folded
 
     async def parallel(self, thunks: Sequence[Callable[[], Awaitable[T]]]) -> list[T | None]:
         """Fan out a list of thunks concurrently with a blocking barrier.
@@ -393,34 +413,42 @@ class Ctx:
                 # Failure isolation: one bad leaf must not abort the barrier.
                 return None
 
-        if not thunks:
-            return []
-        # Mark the fan-out frame: agent() calls inside the thunks must not record
-        # into the determinism backstop (their observe order is non-deterministic).
-        # The depth is set before the tasks are spawned so each child copies it.
-        token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
-        try:
-            # return_exceptions keeps the barrier intact (every thunk settles) even
-            # when one raises a control-flow signal, so in-flight leaves finish and
-            # journal before we fail loud.
-            settled = await asyncio.gather(
-                *[_guarded(thunk) for thunk in thunks], return_exceptions=True
-            )
-        finally:
-            _FANOUT_DEPTH.reset(token)
-        results: list[T | None] = []
-        control_flow_error: BaseException | None = None
-        for outcome in settled:
-            if isinstance(outcome, BaseException):
-                # Only re-raised control-flow signals reach here (leaf failures are
-                # already None via _guarded). Remember the first; fail loud below.
-                control_flow_error = control_flow_error or outcome
-                results.append(None)
-            else:
-                results.append(outcome)
-        if control_flow_error is not None:
-            raise control_flow_error
-        return results
+        # The barrier runs inside a PARALLEL span so a trace shows the fan-out width
+        # and how many thunks survived, plus a loud control-flow failure if one
+        # escapes the barrier.
+        with self._spans.span(SpanKind.PARALLEL, "parallel") as span:
+            span.set("thunk_count", len(thunks))
+            if not thunks:
+                span.set("surviving_count", 0)
+                return []
+            # Mark the fan-out frame: agent() calls inside the thunks must not
+            # record into the determinism backstop (their observe order is
+            # non-deterministic). The depth is set before the tasks are spawned so
+            # each child copies it.
+            token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
+            try:
+                # return_exceptions keeps the barrier intact (every thunk settles)
+                # even when one raises a control-flow signal, so in-flight leaves
+                # finish and journal before we fail loud.
+                settled = await asyncio.gather(
+                    *[_guarded(thunk) for thunk in thunks], return_exceptions=True
+                )
+            finally:
+                _FANOUT_DEPTH.reset(token)
+            results: list[T | None] = []
+            control_flow_error: BaseException | None = None
+            for outcome in settled:
+                if isinstance(outcome, BaseException):
+                    # Only re-raised control-flow signals reach here (leaf failures
+                    # are already None via _guarded). Remember the first; fail loud.
+                    control_flow_error = control_flow_error or outcome
+                    results.append(None)
+                else:
+                    results.append(outcome)
+            if control_flow_error is not None:
+                raise control_flow_error
+            span.set("surviving_count", sum(1 for r in results if r is not None))
+            return results
 
     async def pipeline(self, items: Sequence[Any], *stages: Stage) -> list[Any | None]:
         """Stream ``items`` through ``stages`` without a barrier between stages.
@@ -446,13 +474,20 @@ class Ctx:
         Raises:
             ValueError: If no stages are supplied.
         """
-        # Mark the fan-out frame so agent() calls inside the stages skip the
-        # determinism backstop: items interleave stages by per-leaf completion
-        # timing, so the observe order is wall-clock-dependent and would diverge
-        # run to run under real leaves. The depth is set before the stage workers
-        # are spawned (inside run_pipeline) so each worker task inherits it.
-        token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
-        try:
-            return await run_pipeline(items, stages, gate=self._gate)
-        finally:
-            _FANOUT_DEPTH.reset(token)
+        # The streaming run is wrapped in a PIPELINE span recording the input width
+        # and surviving count (a stage that raises drops its item to None), so a
+        # trace shows the pipeline shape without the script instrumenting it.
+        with self._spans.span(SpanKind.PIPELINE, "pipeline") as span:
+            span.set("item_count", len(items))
+            # Mark the fan-out frame so agent() calls inside the stages skip the
+            # determinism backstop: items interleave stages by per-leaf completion
+            # timing, so the observe order is wall-clock-dependent and would diverge
+            # run to run under real leaves. The depth is set before the stage workers
+            # are spawned (inside run_pipeline) so each worker task inherits it.
+            token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
+            try:
+                results = await run_pipeline(items, stages, gate=self._gate)
+            finally:
+                _FANOUT_DEPTH.reset(token)
+            span.set("surviving_count", sum(1 for r in results if r is not None))
+            return results

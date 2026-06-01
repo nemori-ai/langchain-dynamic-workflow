@@ -18,6 +18,7 @@ from ._errors import (
     WorkflowNestingError,
 )
 from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal_key
+from ._observability import Span, SpanKind, SpanSink
 from ._progress import ProgressEntry, ProgressKind, ProgressSink
 from ._result import fold_result
 from ._roster import Roster, RosterEntry
@@ -45,6 +46,9 @@ __all__ = [
     "Roster",
     "RosterEntry",
     "SandboxManager",
+    "Span",
+    "SpanKind",
+    "SpanSink",
     "WorkflowBudgetExceededError",
     "WorkflowDeterminismError",
     "WorkflowNestingError",
