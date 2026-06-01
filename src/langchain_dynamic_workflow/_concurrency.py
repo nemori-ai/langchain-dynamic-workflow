@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from typing import TypeVar
 
 from langchain_core.runnables import RunnableConfig
@@ -68,19 +69,29 @@ def with_max_concurrency(config: RunnableConfig, limit: int) -> RunnableConfig:
 
 
 class ConcurrencyGate:
-    """An asyncio semaphore wrapper bounding concurrent leaf invocations.
+    """A reentrant asyncio semaphore bounding concurrent leaf invocations.
 
     The gate is shared across every fan-out path in a single workflow run so
     that ``agent`` / ``parallel`` / ``pipeline`` draw from one global pool rather
     than each opening an unbounded set of tasks.
 
+    It is **reentrant per logical unit**: a coroutine that already holds the gate
+    may re-acquire it without consuming a second slot. This is essential because
+    fan-out layers (``parallel`` / ``pipeline``) acquire the gate around a unit
+    of work that itself calls ``agent()``, which also gates — without reentrancy
+    a non-reentrant semaphore would deadlock once every slot is held by an outer
+    acquisition waiting on an inner one. Reentrancy is tracked with a
+    :class:`~contextvars.ContextVar`, so each :class:`asyncio.Task` (e.g. each
+    ``gather`` branch) carries its own depth counter.
+
     Args:
-        limit: The maximum number of in-flight operations permitted.
+        limit: The maximum number of distinct in-flight units permitted.
     """
 
     def __init__(self, *, limit: int) -> None:
         self._limit = limit
         self._semaphore = asyncio.Semaphore(limit)
+        self._depth: ContextVar[int] = ContextVar("concurrency_gate_depth", default=0)
 
     @property
     def limit(self) -> int:
@@ -88,11 +99,19 @@ class ConcurrencyGate:
         return self._limit
 
     async def __aenter__(self) -> ConcurrencyGate:
-        await self._semaphore.acquire()
+        depth = self._depth.get()
+        if depth == 0:
+            # Outermost acquisition for this unit: take a real slot.
+            await self._semaphore.acquire()
+        self._depth.set(depth + 1)
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
-        self._semaphore.release()
+        depth = self._depth.get()
+        self._depth.set(depth - 1)
+        if depth == 1:
+            # Releasing the outermost acquisition: return the slot.
+            self._semaphore.release()
 
     async def run(self, factory: Callable[[], Awaitable[T]]) -> T:
         """Run a coroutine produced by ``factory`` while holding the gate.

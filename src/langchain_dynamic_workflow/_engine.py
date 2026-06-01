@@ -17,6 +17,12 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.func import entrypoint, task
 
+from ._concurrency import (
+    HARD_CEILING,
+    ConcurrencyGate,
+    resolve_max_concurrency,
+    with_max_concurrency,
+)
 from ._context import Ctx
 from ._journal import InMemoryJournalStore, JournalStore
 from ._roster import Roster
@@ -43,14 +49,22 @@ async def run_workflow(
             Pass the *same* instance across calls to get cached-result resume.
         checkpointer: LangGraph checkpointer; defaults to an in-memory saver.
         thread_id: Durable-execution thread id.
-        max_concurrency: Optional explicit concurrency cap (LangGraph has no
-            default — leaving this ``None`` means unbounded at the substrate).
+        max_concurrency: Optional explicit concurrency cap on in-flight leaves.
+            LangGraph has no default (``None`` means unbounded at the substrate),
+            so the engine always sets both layers explicitly. The shared
+            :class:`ConcurrencyGate` is the *authoritative* bound (resolved to
+            ``min(16, cores - 2)`` when omitted). The substrate ``max_concurrency``
+            is pinned to the hard ceiling so it is never unbounded yet never
+            throttles below the gate — setting both to the same value makes the two
+            semaphores interleave and the effective cap fall one below the target.
 
     Returns:
         Whatever the orchestration callable returns.
     """
     journal_store: JournalStore = journal if journal is not None else InMemoryJournalStore()
     saver: BaseCheckpointSaver[Any] = checkpointer if checkpointer is not None else InMemorySaver()
+    limit = resolve_max_concurrency(max_concurrency)
+    gate = ConcurrencyGate(limit=limit)
 
     @task
     async def leaf_task(agent_type: str, prompt: str) -> dict[str, Any]:
@@ -61,15 +75,19 @@ async def run_workflow(
         return result
 
     async def leaf_runner(agent_type: str, prompt: str) -> dict[str, Any]:
+        # The single durable leaf path, shared by agent / parallel / pipeline.
+        # The shared gate (applied inside Ctx) bounds how many of these run at
+        # once across every fan-out path in this run.
         return await leaf_task(agent_type, prompt)
 
     @entrypoint(checkpointer=saver)
     async def _run(_input: Any) -> Any:
-        ctx = Ctx(roster=roster, journal=journal_store, leaf_runner=leaf_runner)
+        ctx = Ctx(roster=roster, journal=journal_store, leaf_runner=leaf_runner, gate=gate)
         return await orchestrate(ctx)
 
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
-    if max_concurrency is not None:
-        config["max_concurrency"] = max_concurrency
+    base_config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    # The gate is the precise cap; the substrate semaphore is pinned high (never
+    # None/unbounded) so it stays explicit without fighting the gate.
+    config = with_max_concurrency(base_config, HARD_CEILING)
     result: Any = await _run.ainvoke({}, config=config)  # pyright: ignore[reportUnknownMemberType]
     return result
