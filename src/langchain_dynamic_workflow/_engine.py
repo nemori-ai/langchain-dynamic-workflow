@@ -77,8 +77,11 @@ async def run_workflow(
             supplied, a leaf whose roster entry is ``needs_execution`` is leased an
             isolated execution backend (keyed by its derived, resume-stable
             identity) that is threaded into the leaf config; a pure-reasoning leaf
-            allocates no sandbox. When omitted, leaves run without sandbox
-            admission, preserving Phase 1-3 behaviour exactly.
+            allocates no sandbox. After the script settles (clean return or raise)
+            the engine stops every execution sandbox it leased this run, so the
+            manager holds no live sandboxes once the run completes. When omitted,
+            leaves run without sandbox admission, preserving Phase 1-3 behaviour
+            exactly.
         max_concurrency: Optional explicit concurrency cap on in-flight leaves.
             LangGraph has no default (``None`` means unbounded at the substrate),
             so the engine always sets both layers explicitly. The shared
@@ -100,6 +103,11 @@ async def run_workflow(
     # artifact off to a consumer leaf while each leaf's non-shared files stay
     # private to its own isolated sandbox.
     shared_store = SharedArtifactStore()
+    # Identities of every execution sandbox actually leased this run. A lease keeps
+    # its sandbox live for find-or-create reuse across retries, so nothing reclaims
+    # it on its own; the engine owns the lifecycle finale and stops each one after
+    # the script settles. Reasoning leaves never lease, so they never land here.
+    leased_execution_leaf_ids: set[str] = set()
 
     @task
     async def leaf_task(
@@ -146,6 +154,10 @@ async def run_workflow(
         async with sandbox_manager.lease(
             leaf_id=leaf_id, needs_execution=needs_execution
         ) as backend:
+            if needs_execution:
+                # Record the leased execution identity so the engine can stop its
+                # sandbox after the run; the lease itself keeps it live for reuse.
+                leased_execution_leaf_ids.add(leaf_id)
             if needs_execution and isinstance(backend, SandboxBackendProtocol):
                 # Give the execution leaf the /shared/ hand-off route on top of its
                 # isolated sandbox: non-shared paths stay private, /shared/ paths go
@@ -197,7 +209,20 @@ async def run_workflow(
             budget=run_budget,
             progress=progress,
         )
-        result = await orchestrate(ctx)
+        try:
+            result = await orchestrate(ctx)
+        finally:
+            # Lifecycle finale: stop every execution sandbox leased this run,
+            # whether the script returned cleanly or raised. A lease deliberately
+            # keeps its sandbox live for find-or-create reuse across retries, so
+            # nothing reclaims it on its own — the engine owns teardown. stop() is
+            # idempotent, so stopping an already-reclaimed (TTL) sandbox is a no-op.
+            # Reasoning leaves never lease, so this leaves the active count at zero
+            # after a run, satisfying the "stop() 被调用清理" lifecycle contract.
+            if sandbox_manager is not None:
+                for leaf_id in leased_execution_leaf_ids:
+                    await sandbox_manager.stop(leaf_id)
+                leased_execution_leaf_ids.clear()
         # Reconcile call count on a clean return: observe() catches forward
         # divergence (mismatched / extra calls) as it happens, but an
         # early-terminating replay (fewer calls than recorded) is only detectable

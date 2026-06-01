@@ -18,6 +18,7 @@ agents — a workflow with many reasoning leaves allocates zero of them.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
@@ -288,16 +289,25 @@ class SandboxManager:
     leaves rather than logical agents.
 
     Acquisition is find-or-create per ``leaf_id``: a leaf that retries within a
-    run resolves the same backend instance, which keeps a leaf's workspace stable
-    across retries. The manager self-manages the rest of the lifecycle:
+    run resolves the same backend instance, so an *un-reclaimed* sandbox keeps its
+    workspace stable across retries. Identity is unconditionally stable (same
+    ``leaf_id`` always maps to the same identity string); workspace persistence is
+    the weaker guarantee — it holds until the sandbox is reclaimed by TTL or
+    evicted under quota pressure, after which a re-running leaf find-or-creates a
+    fresh, empty backend under that same identity. The manager self-manages the
+    rest of the lifecycle:
 
     - **Idle / hard TTL**: a sandbox idle past ``idle_ttl`` (or alive past
       ``hard_ttl`` regardless of recent use) is reclaimed on the next
       acquisition, releasing its slot. The hard TTL caps total lifetime so a
       long-lived-but-busy sandbox cannot live forever.
     - **Max-active quota**: at most ``max_active`` sandboxes are live at once.
-    - **Backpressure**: when the pool is at the quota and every slot is in use,
-      a new :meth:`lease` blocks until a slot frees rather than over-allocating.
+    - **Backpressure**: when the pool is at the quota a new :meth:`lease` first
+      reclaims TTL-expired idle sandboxes, then evicts the least-recently-used
+      *idle* sandbox to admit the new leaf, and only blocks when every slot is
+      genuinely in use — never over-allocating past the quota. Eviction is what
+      keeps a bounded pool from deadlocking when idle-but-alive sandboxes (kept
+      for find-or-create reuse) occupy every slot and no TTL reclaims them.
 
     Args:
         max_active: Maximum number of simultaneously live sandboxes, or ``None``
@@ -417,10 +427,16 @@ class SandboxManager:
             yield StateBackend()
             return
         async with self._slot_freed:
-            # Wait for room: at quota, first reclaim TTL-expired idle sandboxes,
-            # then evict the least-recently-used *idle* sandbox to admit new work,
-            # and only block when every slot is still in use. A leaf reusing an
-            # already-live sandbox (same leaf_id) never waits — it is not new work.
+            # Wait for room at quota, in three escalating steps:
+            #   1. reclaim TTL-expired idle sandboxes (frees slots cleanly);
+            #   2. if still full, evict the least-recently-used *idle* sandbox to
+            #      admit this new leaf (a slot held only for find-or-create reuse
+            #      is yielded so distinct new work is not starved under a bounded
+            #      pool with no TTL — without this the pool deadlocks once every
+            #      slot holds an idle-but-alive sandbox);
+            #   3. only when every slot is genuinely in use, park until a release.
+            # A leaf reusing an already-live sandbox (same leaf_id) never waits and
+            # is never evicted — it is not new work, so its workspace stays intact.
             while self._would_exceed_quota(leaf_id):
                 self.reclaim_idle()
                 if not self._would_exceed_quota(leaf_id):
@@ -460,8 +476,19 @@ class SandboxManager:
 
         Only idle sandboxes (no in-flight lease) are eligible; an in-use sandbox
         is never torn down mid-leaf. This is what turns the max-active cap into a
-        bounded pool: when full but some sandboxes are merely idle, a new leaf
-        evicts the stalest one rather than waiting forever.
+        bounded pool that does not deadlock: a lease keeps its sandbox live for
+        find-or-create reuse even after release, so without eviction a pool of
+        idle-but-alive sandboxes would block every distinct new leaf forever when
+        no TTL reclaims them. Eviction reclaims the stalest idle workspace to admit
+        new work, never the caller's own (a same-``leaf_id`` reuse never reaches
+        here because it does not exceed the quota).
+
+        Eviction is the one place a leaf's workspace can be discarded while the run
+        is still live: an evicted ``leaf_id`` that later re-runs derives the *same*
+        identity (so it still maps to one logical sandbox) but find-or-creates a
+        fresh, empty backend. Identity stability (same key -> same id) holds
+        unconditionally; *workspace* persistence across a reuse holds only while
+        the sandbox has not been evicted under quota pressure.
 
         Returns:
             ``True`` if an idle sandbox was evicted, ``False`` when every live
@@ -505,6 +532,17 @@ class SharedArtifactStore:
     The store is the single shared object handed to every per-leaf composite
     backend; the per-leaf isolation lives in each leaf's *own* backend, never
     here — so a leaf's non-shared files can never reach this store.
+
+    Every store operation runs under a :class:`threading.Lock`. The hand-off path
+    is the one place a single in-memory object is touched concurrently from
+    multiple OS threads: each leaf's file op reaches the store through the backend
+    protocol's async defaults (``awrite``/``aread`` -> ``asyncio.to_thread``), so
+    under ``ctx.parallel`` a producer's ``write_namespaced`` can run on one thread
+    while a consumer's ``read_merged`` iterates the same dict on another. The lock
+    makes the read snapshot atomic with respect to writes, closing the
+    ``dictionary changed size during iteration`` race — the same cross-thread
+    safety the :class:`JournalStore` protocol mandates for fan-out, here made
+    explicit rather than implicit.
     """
 
     def __init__(self) -> None:
@@ -512,14 +550,21 @@ class SharedArtifactStore:
         # on write; reads scan namespaces in sorted order for a deterministic
         # resolution when two producers wrote the same path.
         self._artifacts: dict[tuple[str, str], str] = {}
+        # Guards every access to _artifacts: the dict is mutated and iterated from
+        # different to_thread worker threads concurrently under parallel fan-out.
+        self._lock = threading.Lock()
 
     def write_namespaced(self, producer: str, path: str, content: str) -> None:
         """Store ``content`` under ``producer``'s namespace at ``path``."""
-        self._artifacts[(producer, normalize_path(path))] = content
+        canonical = normalize_path(path)
+        with self._lock:
+            self._artifacts[(producer, canonical)] = content
 
     def read_namespaced(self, producer: str, path: str) -> str | None:
         """Read ``producer``'s artifact at ``path``, or ``None`` on miss."""
-        return self._artifacts.get((producer, normalize_path(path)))
+        canonical = normalize_path(path)
+        with self._lock:
+            return self._artifacts.get((producer, canonical))
 
     def read_merged(self, path: str) -> str | None:
         """Read ``path`` across all producer namespaces (deterministic order).
@@ -532,7 +577,11 @@ class SharedArtifactStore:
             producer order, or ``None`` if no producer wrote that path.
         """
         canonical = normalize_path(path)
-        for (_producer, stored_path), content in sorted(self._artifacts.items()):
+        with self._lock:
+            # Snapshot under the lock so a concurrent write_namespaced on another
+            # to_thread worker can never mutate the dict mid-iteration.
+            items = sorted(self._artifacts.items())
+        for (_producer, stored_path), content in items:
             if stored_path == canonical:
                 return content
         return None
@@ -548,9 +597,12 @@ class SharedArtifactStore:
         """
         canonical = normalize_path(prefix_path)
         prefix = canonical if canonical.endswith("/") else f"{canonical}/"
+        with self._lock:
+            # Snapshot the keys under the lock for the same reason as read_merged.
+            stored_paths = [stored_path for (_producer, stored_path) in self._artifacts]
         seen = {
             stored_path
-            for (_producer, stored_path) in self._artifacts
+            for stored_path in stored_paths
             if stored_path == canonical or stored_path.startswith(prefix)
         }
         return sorted(seen)

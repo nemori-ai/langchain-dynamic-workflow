@@ -9,6 +9,8 @@ that tries to escape the shared route is normalized and blocked before routing.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from langchain_dynamic_workflow._sandbox import (
@@ -77,6 +79,73 @@ async def test_shared_writes_are_producer_namespaced() -> None:
     # Distinct namespaces => both artifacts coexist in the shared store.
     assert store.read_namespaced("a", "/out.txt") == "from-a"
     assert store.read_namespaced("b", "/out.txt") == "from-b"
+
+
+def test_shared_store_is_concurrency_safe_under_threaded_fanout() -> None:
+    # The hand-off path touches one in-memory store from multiple OS threads: under
+    # ctx.parallel a producer's write_namespaced runs on one to_thread worker while
+    # a consumer's read_merged / stored_paths_under reads the same dict on another.
+    # This exercises that exact contention — writer threads grow the dict while
+    # reader threads concurrently read/iterate it, all joined (bounded, no
+    # busy-spin) — and pins two invariants: (1) no thread raises (the dict-mutation
+    # race in particular), and (2) the final state reflects EVERY write with no
+    # dropped or torn entry. The lock is what makes each read snapshot atomic with
+    # respect to writes, the cross-thread safety the JournalStore protocol mandates
+    # for fan-out, here made explicit rather than relying on the GIL.
+    #
+    # Note: under standard CPython the store's `sorted(dict.items())` / dict
+    # comprehension snapshots are GIL-atomic, so this is a correctness + contention
+    # guard rather than a deterministic reproducer of the bare-iteration race; the
+    # lock additionally protects the contract on free-threaded (no-GIL) builds.
+    store = SharedArtifactStore()
+    writes_per_writer = 500
+    num_writers = 4
+    reader_iterations = 4_000
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+    num_readers = 2
+    # Parties: every writer + every reader + the main thread that releases them.
+    start = threading.Barrier(num_writers + num_readers + 1)
+
+    def writer(writer_index: int) -> None:
+        try:
+            start.wait()
+            for i in range(writes_per_writer):
+                # Each write adds a distinct key, so the dict grows under any reader
+                # iterating it concurrently on the unlocked path.
+                store.write_namespaced(
+                    f"p{writer_index}", f"/w{writer_index}-{i}.txt", f"{writer_index}:{i}"
+                )
+        except BaseException as exc:  # catch the dict-mutation race (and anything)
+            with errors_lock:
+                errors.append(exc)
+
+    def reader() -> None:
+        try:
+            start.wait()
+            for i in range(reader_iterations):
+                # read_merged sorts+iterates the whole dict; stored_paths_under
+                # comprehends it — both iterate while writers mutate.
+                store.read_merged(f"/w0-{i % writes_per_writer}.txt")
+                if i % 50 == 0:
+                    store.stored_paths_under("/")
+        except BaseException as exc:  # catch the dict-mutation race (and anything)
+            with errors_lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(w,)) for w in range(num_writers)]
+    threads += [threading.Thread(target=reader) for _ in range(num_readers)]
+    for thread in threads:
+        thread.start()
+    start.wait()  # release all threads at once for maximal overlap
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []  # no thread tripped the dict-mutation race (or anything else)
+    # Every write landed and is readable: the lock dropped no mutation.
+    assert len(store.stored_paths_under("/")) == num_writers * writes_per_writer
+    assert store.read_merged("/w0-0.txt") == "0:0"
 
 
 async def test_traversal_through_shared_route_is_blocked() -> None:

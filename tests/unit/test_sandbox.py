@@ -31,6 +31,16 @@ class _FakeClock:
         self._now += seconds
 
 
+def _is_live(manager: SandboxManager, leaf_id: str) -> bool:
+    """Whether ``leaf_id`` currently holds a live slot in ``manager``.
+
+    Inspects the manager's slot map directly: there is no public per-leaf liveness
+    query, and these tests need to assert *which* sandbox eviction reclaimed (not
+    merely the count), to anti-corrupt the LRU-eviction policy.
+    """
+    return leaf_id in manager._slots  # pyright: ignore[reportPrivateUsage]
+
+
 def test_leaf_id_is_derived_from_journal_key_and_is_stable() -> None:
     # The same leaf call (same content-hash key) must yield the same leaf_id on
     # every derivation, so retry/resume route to the same sandbox identity.
@@ -158,6 +168,59 @@ async def test_hard_ttl_reclaims_even_recently_used_sandboxes() -> None:
     reclaimed = manager.reclaim_idle()
     assert reclaimed == 1
     assert manager.active_count == 0
+
+
+async def test_lease_evicts_lru_idle_sandbox_to_admit_new_work_at_quota() -> None:
+    # At quota with NO in-flight lease (every slot held only for find-or-create
+    # reuse), a distinct new leaf must be admitted by evicting the stalest idle
+    # sandbox — not block forever. Without eviction the pool deadlocks once every
+    # slot holds an idle-but-alive sandbox and no TTL reclaims it. The fake clock
+    # makes "least-recently-used" deterministic: leaf-a is released first, so it is
+    # the eviction target when leaf-c needs a slot.
+    clock = _FakeClock()
+    manager = SandboxManager(max_active=2, clock=clock)
+    async with manager.lease(leaf_id="leaf-a", needs_execution=True):
+        pass
+    clock.advance(1.0)  # leaf-a now strictly less-recently-used than leaf-b
+    async with manager.lease(leaf_id="leaf-b", needs_execution=True):
+        pass
+    assert manager.active_count == 2  # both idle but kept alive for reuse
+    # leaf-c is new work; the pool is full of idle sandboxes. It must evict the
+    # LRU idle one (leaf-a) and be admitted without blocking — never exceeding the
+    # quota.
+    async with manager.lease(leaf_id="leaf-c", needs_execution=True):
+        assert manager.active_count == 2  # quota never breached
+    # leaf-a was the eviction target (released earliest); leaf-b and leaf-c remain.
+    live = {leaf_id for leaf_id in ("leaf-a", "leaf-b", "leaf-c") if _is_live(manager, leaf_id)}
+    assert live == {"leaf-b", "leaf-c"}
+    await manager.stop("leaf-b")
+    await manager.stop("leaf-c")
+
+
+async def test_evicted_then_reacquired_leaf_gets_a_fresh_workspace() -> None:
+    # Eviction's contract limit: identity is stable across an evict+reacquire (same
+    # leaf_id -> same id), but the *workspace* is not — a re-running evicted leaf
+    # find-or-creates a brand-new, empty backend. This pins the qualified guarantee
+    # so the identity-stability docs are not mistaken for workspace persistence.
+    clock = _FakeClock()
+    manager = SandboxManager(max_active=1, clock=clock)
+    async with manager.lease(leaf_id="leaf-a", needs_execution=True) as first:
+        assert isinstance(first, SandboxBackendProtocol)
+        first.write("/state.txt", "v1")
+    clock.advance(1.0)
+    # leaf-b is new work at quota=1: it evicts the only idle sandbox (leaf-a).
+    async with manager.lease(leaf_id="leaf-b", needs_execution=True):
+        pass
+    assert not _is_live(manager, "leaf-a")  # leaf-a was evicted
+    await manager.stop("leaf-b")
+    # leaf-a re-runs: SAME derived identity, but a FRESH instance with no prior
+    # file state (the evicted workspace is gone).
+    async with manager.lease(leaf_id="leaf-a", needs_execution=True) as reacquired:
+        assert isinstance(reacquired, SandboxBackendProtocol)
+        assert reacquired.id == "leaf-a"  # identity stable
+        read = reacquired.read("/state.txt")
+        assert read.file_data is None  # workspace did NOT survive eviction
+    await manager.stop("leaf-a")
 
 
 async def test_max_active_quota_applies_backpressure_until_a_slot_frees() -> None:

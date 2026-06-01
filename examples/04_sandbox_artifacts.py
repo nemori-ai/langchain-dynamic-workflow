@@ -107,6 +107,8 @@ async def main() -> None:
     for line in result["produced"]:
         print(f"  - {line}")
     print(f"shared hand-off (consumer picked up both artifacts): {result['collected']!r}")
+    # The engine's lifecycle finale stops every execution sandbox it leased once
+    # the script settles, so the manager holds zero live sandboxes after the run.
     print(f"active sandboxes still live after the run: {manager.active_count}")
 
 
