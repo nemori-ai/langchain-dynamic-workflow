@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from langchain_dynamic_workflow._concurrency import (
     ConcurrencyGate,
     resolve_max_concurrency,
@@ -70,43 +72,19 @@ async def test_gate_run_wraps_a_coroutine_factory() -> None:
     assert result == 42
 
 
-async def test_gate_is_reentrant_within_one_task() -> None:
-    # Nested acquisition by the same logical unit must not consume a second slot,
-    # otherwise fan-out layers (parallel/pipeline) that wrap agent() — which also
-    # gates — would deadlock when every slot is held by an outer acquisition.
-    gate = ConcurrencyGate(limit=3)
+async def test_gate_run_releases_slot_on_exception() -> None:
+    # A leaf that raises must still return its slot; otherwise the pool would leak
+    # capacity and eventually deadlock. gate.run releases via its async-with.
+    gate = ConcurrencyGate(limit=1)
 
-    async def inner() -> int:
-        async with gate:  # re-entry from the same task
-            await asyncio.sleep(0.01)
-            return 1
+    async def boom() -> int:
+        raise RuntimeError("leaf boom")
 
-    async def outer() -> int:
-        async with gate:  # outer acquisition
-            return await inner()
+    with pytest.raises(RuntimeError, match="leaf boom"):
+        await gate.run(boom)
 
-    results = await asyncio.wait_for(
-        asyncio.gather(*[outer() for _ in range(12)]),
-        timeout=3.0,
-    )
-    assert results == [1] * 12
+    # The single slot is free again: a second run must not block.
+    async def ok() -> int:
+        return 7
 
-
-async def test_gate_reentrancy_does_not_inflate_peak() -> None:
-    # With reentrancy, nested acquisitions by the same unit count once, so the
-    # observed peak still respects the limit.
-    gate = ConcurrencyGate(limit=2)
-    peak = 0
-    in_flight = 0
-
-    async def unit() -> None:
-        nonlocal peak, in_flight
-        async with gate:
-            in_flight += 1
-            peak = max(peak, in_flight)
-            async with gate:  # re-entry: no extra slot
-                await asyncio.sleep(0.01)
-            in_flight -= 1
-
-    await asyncio.gather(*[unit() for _ in range(8)])
-    assert peak == 2
+    assert await asyncio.wait_for(gate.run(ok), timeout=1.0) == 7

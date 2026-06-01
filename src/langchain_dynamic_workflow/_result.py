@@ -1,9 +1,9 @@
 """Leaf result folding — the context-quarantine boundary.
 
 Mirrors deepagents' own subagent result extraction: the only thing that crosses
-back into the orchestration script is a single string (or, in later phases, a
-validated structured object). The leaf's intermediate tool calls and messages
-never enter the caller's context.
+back into the orchestration script is the leaf's folded final text — a single
+string. The leaf's intermediate tool calls and messages never enter the caller's
+context.
 """
 
 from __future__ import annotations

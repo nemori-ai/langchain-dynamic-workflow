@@ -4,8 +4,18 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
 from langchain_dynamic_workflow._pipeline import run_pipeline
+
+
+async def test_pipeline_empty_stages_raises() -> None:
+    # A pipeline with no stages is a programming error; the documented guard must
+    # fail loudly rather than silently return the items unprocessed.
+    gate = ConcurrencyGate(limit=2)
+    with pytest.raises(ValueError, match="at least one stage"):
+        await run_pipeline([1, 2], (), gate=gate)
 
 
 async def test_pipeline_preserves_input_order() -> None:

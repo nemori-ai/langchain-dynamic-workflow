@@ -13,8 +13,9 @@ import contextlib
 from collections.abc import Callable
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage
-from langchain_core.runnables import Runnable, RunnableLambda
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 
 from langchain_dynamic_workflow import (
     Ctx,
@@ -23,6 +24,7 @@ from langchain_dynamic_workflow import (
     journal_key,
     run_workflow,
 )
+from langchain_dynamic_workflow._concurrency import HARD_CEILING, with_max_concurrency
 
 FakeLeafFactory = Callable[..., tuple[Runnable[Any, Any], Any]]
 
@@ -257,3 +259,31 @@ async def test_halfway_resume_hits_journal_zero_calls(make_fake_leaf: FakeLeafFa
     assert second == ["good", "recovered"]
     assert ok_state.calls == 1  # zero additional calls: served from journal
     assert flaky_state.calls == 2  # ran live to recover
+
+
+async def test_run_workflow_injects_substrate_max_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The substrate (LangGraph) cap must always be set explicitly — never left at
+    # None/unbounded. The gate is the authoritative cap, but the substrate value
+    # is the second explicit layer; pin that run_workflow actually injects it, so a
+    # regression that dropped the injection (reverting to unbounded) is caught
+    # rather than silently passing.
+    captured: dict[str, int] = {}
+
+    def spy(config: RunnableConfig, limit: int) -> RunnableConfig:
+        captured["limit"] = limit
+        return with_max_concurrency(config, limit)
+
+    monkeypatch.setattr("langchain_dynamic_workflow._engine.with_max_concurrency", spy)
+
+    tracker = {"in_flight": 0, "peak": 0}
+    roster = Roster().register("worker", _instrumented_leaf(tracker, delay=0.0))
+
+    async def orchestrate(ctx: Ctx) -> str | None:
+        return await ctx.agent("q", agent_type="worker")
+
+    result = await run_workflow(orchestrate, roster=roster, thread_id="t1")
+    assert result == "done:q"
+    # The injected substrate cap is pinned to the hard ceiling (explicit, never None).
+    assert captured["limit"] == HARD_CEILING

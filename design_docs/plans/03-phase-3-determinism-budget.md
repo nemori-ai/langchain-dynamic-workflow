@@ -79,6 +79,7 @@ examples/03_loop_until_budget.py
 ## 对 Phase 1–2 的 refactor
 
 - journal value schema 由 result → `{result, usage}`；更新 Phase 1/2 journal 相关断言。Phase 1/2 全部测试须保持绿。
+- **承接 Phase 2 review（minor #5）**：`agent()` 把 `model`/`isolation` 折进 journal key，但 `LeafRunner` 签名只有 `(agent_type, prompt)`，override 从不到达叶子（model= 被静默忽略）。Phase 3 本就要为 usage/budget refactor 叶子路径，顺带把 `LeafRunner`/`leaf_task` 扩成接收并尊重 `model`（把 model override 落到叶子调用上）；`isolation` 的贯通留给 Phase 4（sandbox）。补一条测试：`model=` 不同 → 实际驱动的模型不同（用可区分的 fake leaf 断言），关闭 key-vs-execution 的口子。
 
 ## 交给 Phase 4+ 的点
 

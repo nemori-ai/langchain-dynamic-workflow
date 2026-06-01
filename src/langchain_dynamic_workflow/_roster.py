@@ -22,8 +22,8 @@ class RosterEntry:
         name: The roster key used by ``agent(agent_type=...)``.
         runnable: The leaf runnable; its state must include ``messages``.
         description: Human-readable description.
-        needs_execution: Whether this agent type needs a sandbox (tiered
-            admission; consumed by the sandbox subsystem in a later phase).
+        needs_execution: Whether this agent type requires an isolated execution
+            sandbox (tiered admission) rather than pure in-context reasoning.
         default_model: Optional default model identifier.
     """
 

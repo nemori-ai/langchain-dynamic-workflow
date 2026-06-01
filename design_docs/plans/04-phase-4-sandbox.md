@@ -72,6 +72,7 @@ examples/04_sandbox_artifacts.py
 ## 对 Phase 1–3 的 refactor
 
 - `_leaf` 调用路径接入 SandboxManager（按 leaf_id acquire/传 backend）。Phase 1–3 全部测试须保持绿（纯推理叶子路径不变）。
+- **承接 Phase 2 review（minor #5）**：把 `agent(isolation=...)` 贯通到叶子运行器，让 isolation 模式真正参与 backend 选择（当前它只影响 journal key）。这与本阶段的 per-leaf 隔离/身份派生天然同源，一并闭合 isolation 的 key-vs-execution 口子。
 
 ## 交给 Phase 5+ 的点
 
