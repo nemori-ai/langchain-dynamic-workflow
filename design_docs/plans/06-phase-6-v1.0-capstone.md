@@ -21,6 +21,7 @@
 - **capstone demo**：多阶段——`parallel` 扇出研究 → `pipeline` 提炼 → 对抗式验证（N skeptic 叶子，多数存活）→ 综述；由 host deepagent 经 workflow tool 后台驱动。
 - **覆盖率门**：核心模块 line ≥85%；`agent/parallel/pipeline/journal/resume/background` 必须有集成测试覆盖。
 - **文档**：README quickstart（照着能跑通）、公共 API 稳定性说明、CHANGELOG、`version="0.1.0"`。
+- **承接 Phase 5 review（nit）资源耗尽硬化**：`BgRunManager` 当前对 host 发起的后台 run 数无上限——给它加一个 `max_concurrent_runs` 配额（满则 `run` 命令拒绝并回明确提示，而非无界 `asyncio.create_task` 扇出），契合 AGENTS.md「bounded queues / 资源耗尽防护」铁律；补一条满额拒绝测试。
 
 ## 验收标准
 

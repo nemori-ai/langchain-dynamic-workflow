@@ -19,7 +19,7 @@ from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.types import Command
 
 from langchain_dynamic_workflow import Ctx, Roster
-from langchain_dynamic_workflow._background import BgRunManager, BgStatus
+from langchain_dynamic_workflow._background import BgRunManager, BgStatus, ResultStore
 from langchain_dynamic_workflow._workflows import WorkflowRegistry
 from langchain_dynamic_workflow.tool import create_workflow_tool
 
@@ -173,6 +173,76 @@ async def test_resume_replays_journal_zero_model_calls(
     status = await _ainvoke_command(tool, {"command": "status", "run_id": resumed_run_id}, runtime)
     assert "Paris" in status
     assert model.calls == calls_after_first  # zero additional model calls on resume
+
+
+async def test_status_offloads_large_result_with_summary_and_handle(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Acceptance: a large result is offloaded behind a handle, and the HOST-FACING
+    # status reply carries a summary + handle rather than inlining the full payload.
+    # inline_max_chars=8 forces the offload branch deterministically.
+    leaf, _state = make_fake_leaf("a-long-research-conclusion-well-over-the-inline-limit")
+    roster = Roster().register("researcher", leaf)
+
+    async def orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        return await ctx.agent("Q", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("wf", orchestrate)
+    manager = BgRunManager(result_store=ResultStore(inline_max_chars=8))
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+    runtime = _runtime(thread_id="host-1")
+
+    run_out = await _ainvoke_command(tool, {"command": "run", "workflow": "wf"}, runtime)
+    run_id = _launched_run_id(run_out)
+    await manager.wait(run_id, thread_id="host-1")
+
+    status = await _ainvoke_command(tool, {"command": "status", "run_id": run_id}, runtime)
+    # The host sees the offload surface: an "offloaded" notice + a fetchable handle,
+    # not the full inlined value.
+    assert "offload" in status.lower()
+    assert "handle:" in status
+    assert "result://" in status
+
+
+async def test_resume_after_partial_run_replays_completed_leaf_and_runs_rest_live(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Mid-run/partial resume through the tool surface: a parallel run where one leaf
+    # journals and the other fails the first pass (lands None, success-only so it is
+    # NOT journaled). Resuming the same run_id reuses the journal: the completed leaf
+    # replays at zero cost while only the previously-failed leaf runs live.
+    ok_leaf, ok_state = make_fake_leaf("good")
+    flaky_leaf, flaky_state = make_fake_leaf("recovered", fail_times=1)
+    roster = Roster().register("ok", ok_leaf).register("flaky", flaky_leaf)
+
+    async def orchestrate(ctx: Ctx, args: dict[str, Any]) -> list[str | None]:
+        return await ctx.parallel(
+            [
+                lambda: ctx.agent("stable", agent_type="ok"),
+                lambda: ctx.agent("unstable", agent_type="flaky"),
+            ]
+        )
+
+    workflows = WorkflowRegistry().register("wf", orchestrate)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+    runtime = _runtime(thread_id="host-1")
+
+    run_out = await _ainvoke_command(tool, {"command": "run", "workflow": "wf"}, runtime)
+    run_id = _launched_run_id(run_out)
+    await manager.wait(run_id, thread_id="host-1")
+    # First pass: ok leaf ran and journaled; flaky leaf failed once (not journaled).
+    assert ok_state.calls == 1
+    assert flaky_state.calls == 1
+
+    resume_out = await _ainvoke_command(tool, {"command": "resume", "run_id": run_id}, runtime)
+    resumed_id = _launched_run_id(resume_out)
+    await manager.wait(resumed_id, thread_id="host-1")
+    # Completed leaf served from the journal (zero new calls); the failed one ran live.
+    assert ok_state.calls == 1
+    assert flaky_state.calls == 2
+    status = await _ainvoke_command(tool, {"command": "status", "run_id": resumed_id}, runtime)
+    assert "good" in status and "recovered" in status
 
 
 async def test_unknown_workflow_name_is_a_loud_tool_error(

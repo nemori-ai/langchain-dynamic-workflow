@@ -92,19 +92,6 @@ T = TypeVar("T")
 _FANOUT_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
     "langchain_dynamic_workflow_fanout_depth", default=0
 )
-
-_WORKFLOW_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
-    "langchain_dynamic_workflow_workflow_depth", default=0
-)
-"""How many ``ctx.workflow()`` frames are currently on the stack.
-
-The top-level orchestration script runs at depth ``0``. A ``ctx.workflow(name)``
-call enters depth ``1`` (one level of nesting); attempting another
-``ctx.workflow()`` from inside that frame would push depth ``2``, which the engine
-refuses — only one level of inlining is allowed (decision D6: inner = ``@task`` /
-subgraph). The variable is a :class:`~contextvars.ContextVar` so the depth is
-isolated per asyncio task and restored on frame exit.
-"""
 """Per-task fan-out nesting depth.
 
 ``parallel`` / ``pipeline`` increment this for the duration of their body; an
@@ -115,6 +102,21 @@ thunks / stage workers (each copies the current context at creation), without an
 of those tasks observing a sibling's mutation. The determinism backstop records a
 call-key only at depth ``0`` — the sequential path, where positional cache
 misalignment is the genuine risk.
+"""
+
+_WORKFLOW_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "langchain_dynamic_workflow_workflow_depth", default=0
+)
+"""How many ``ctx.workflow()`` frames are currently on the stack.
+
+The top-level orchestration script runs at depth ``0``. A ``ctx.workflow(name)``
+call enters depth ``1`` (one level of nesting); attempting another
+``ctx.workflow()`` from inside that frame would push depth ``2``, which the engine
+refuses. The inner workflow runs inline within the parent's entrypoint body and
+shares the parent context; its leaf ``agent()`` calls still execute as durable
+``@task`` invocations and journal normally, so resumability is unaffected. The
+variable is a :class:`~contextvars.ContextVar` so the depth is isolated per
+asyncio task and restored on frame exit.
 """
 
 
@@ -207,12 +209,12 @@ class Ctx:
         """Inline another workflow by name, exactly one level deep.
 
         Resolves ``name`` against the workflow registry and runs its orchestration
-        callable against *this* context, so the inner workflow shares the parent's
-        journal, budget, concurrency gate, and progress log — its leaves are
-        deduped and budgeted as if written inline. Nesting is allowed exactly one
-        level (decision D6: the inner workflow is a ``@task`` / subgraph in the
-        same durable-execution scope); a ``workflow()`` call from inside an
-        already-nested workflow fails loud rather than recursing without bound.
+        callable inline against *this* context, so the inner workflow shares the
+        parent's journal, budget, concurrency gate, and progress log — its leaves
+        are deduped and budgeted as if written inline, and each still executes as a
+        durable ``@task`` leaf so resumability is unaffected. Nesting is allowed
+        exactly one level; a ``workflow()`` call from inside an already-nested
+        workflow fails loud rather than recursing without bound.
 
         Args:
             name: The workflow name to resolve in the registry.

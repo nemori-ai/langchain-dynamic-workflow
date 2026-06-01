@@ -38,7 +38,7 @@ class Ctx:
 - bg run 状态存**专用 state channel**（仿 deepagents `async_tasks`，扛 context 压缩）。
 - **scope 边界**：middleware 横切作用于 **host 回合**；workflow run 内部 leaf 的 budget/journal 在引擎内部 scope（别混）。
 - **skills = L2-as-skill**：一套 SKILL.md（教写脚本 + DSL + 确定性铁律 + 范式），`create_deep_agent(skills=[...])` 原生加载；`skills_metadata` 不传子 agent。
-- `workflow()` 一级嵌套（内层 = `@task`/subgraph）；二级嵌套抛错。
+- `workflow()` 一级嵌套：内层 workflow **inline 跑在父 entrypoint body 内、共享父 `Ctx`**（journal/budget/gate/progress 一并共享），其叶子 `agent()` 仍各自走 durable `@task`、journal 正常，故可 resume；二级嵌套抛 `WorkflowNestingError`。（实现取 inline 共享而非为内层单建 subgraph——一级嵌套下二者等效，inline 更简洁。）
 
 ## 验收标准
 
