@@ -97,8 +97,11 @@ async def run_workflow(
         usage_handler = UsageMetadataCallbackHandler()
         configurable: dict[str, Any] = {}
         if model is not None:
-            # Thread the model override into the leaf config so it reaches
-            # execution, not just the journal key (closes the key-vs-execution gap).
+            # Propagate the effective model into the leaf config so a config-aware
+            # leaf (one that reads configurable['model'] to pick a provider) runs
+            # with it. A leaf whose model is bound at construction ignores this and
+            # runs its built-in model; the value still partitions the journal key,
+            # so the override is a consistent cache-partitioning knob in either case.
             configurable["model"] = model
         leaf_config: RunnableConfig = {"callbacks": [usage_handler], "configurable": configurable}
         state: dict[str, Any] = await entry.runnable.ainvoke(
@@ -136,9 +139,20 @@ async def run_workflow(
             progress=progress,
         )
         result = await orchestrate(ctx)
-        # Persist run-level state only after completion, so the determinism
-        # backstop and progress idempotency have a record to replay against on the
-        # next resume.
+        # Persist run-level state only after the script completes successfully. This
+        # is deliberately asymmetric with the per-leaf journal: each completed leaf
+        # is journaled the moment it finishes (inside agent()), but the call-key
+        # sequence and the progress-delivered count are persisted only here, on a
+        # clean return. A run that raises mid-flight (e.g.
+        # WorkflowBudgetExceededError) therefore leaves completed leaves cached but
+        # the progress count at its prior value (0 on a first run). A subsequent
+        # re-run replays leaves from the journal at zero model cost, but because the
+        # progress count was never advanced it re-delivers the phase/log narration
+        # emitted before the failure. This is intended: a failed run is logically
+        # incomplete, and re-narrating the work that is about to be retried is
+        # preferable to silently skipping it. Callers that must suppress duplicate
+        # narration across a failed-then-retried run should make their progress sink
+        # idempotent (e.g. de-dupe on entry identity).
         await journal_store.put_sequence(ctx.observed_call_sequence)
         await journal_store.put_progress_count(ctx.progress_entry_count)
         return result

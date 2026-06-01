@@ -139,11 +139,25 @@ class Ctx:
         Resolves ``agent_type`` against the roster, consults the journal, and on
         a miss invokes the leaf and persists the result (success-only).
 
+        The effective model is the ``model`` override when supplied, otherwise the
+        roster entry's ``default_model``. That effective value is what is folded
+        into the journal key and threaded into the leaf config — so two calls that
+        resolve to the same effective model share one cache entry, and the leaf
+        sees a single, consistent ``configurable['model']``.
+
+        Model handling is best described as *config propagation*, not a runtime
+        model swap: the effective model reaches ``config['configurable']['model']``
+        and is honored by config-aware leaves (those that read that key to pick a
+        provider). A leaf whose model is bound at construction (e.g. a plain
+        ``create_deep_agent``) ignores the config value and runs its built-in
+        model; the override still keys the journal distinctly, so it remains a
+        deliberate cache-partitioning knob even where it does not swap the model.
+
         Args:
             prompt: The prompt for the leaf.
             agent_type: The roster name to resolve.
-            model: Optional model override; folded into the journal key *and*
-                threaded into the leaf invocation so it reaches execution.
+            model: Optional per-call model override. When ``None`` the roster
+                entry's ``default_model`` is used as the effective model.
             isolation: Isolation mode (part of the journal key).
 
         Returns:
@@ -153,11 +167,15 @@ class Ctx:
             KeyError: If ``agent_type`` is not registered.
             WorkflowBudgetExceededError: If the shared budget is exhausted.
         """
-        self._roster.resolve(agent_type)  # fail fast on unknown agent_type
+        entry = self._roster.resolve(agent_type)  # fail fast on unknown agent_type
+        # Resolve the effective model once: an explicit override wins, otherwise
+        # the roster entry's registered default. Both the journal key and the leaf
+        # config are derived from this single value so they can never disagree.
+        effective_model = model if model is not None else entry.default_model
         key = journal_key(
             prompt=prompt,
             agent_type=agent_type,
-            model=model,
+            model=effective_model,
             schema=None,
             isolation=isolation,
         )
@@ -176,8 +194,11 @@ class Ctx:
         # refuses fresh work while in-flight leaves finish and keep their results.
         self._budget.ensure_within_cap()
         # The gate bounds the number of leaves actually in flight; a journal hit
-        # above never consumes a slot, keeping resume cheap.
-        outcome = await self._gate.run(lambda: self._leaf_runner(agent_type, prompt, model))
+        # above never consumes a slot, keeping resume cheap. The leaf runner
+        # receives the *effective* model so the config it threads matches the key.
+        outcome = await self._gate.run(
+            lambda: self._leaf_runner(agent_type, prompt, effective_model)
+        )
         folded = fold_result(outcome.state)
         # success-only: unreachable if the leaf raised. Usage is journaled so the
         # spend is reconstructable on resume.

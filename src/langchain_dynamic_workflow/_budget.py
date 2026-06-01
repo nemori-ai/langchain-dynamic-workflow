@@ -12,6 +12,19 @@ call across a workflow run. Two invariants make it correct under resume:
   ``total``, the next ``agent()`` raises :class:`WorkflowBudgetExceededError`,
   while leaves already in flight finish and keep their results.
 
+This is a *soft cap*, not a hard ceiling, and the distinction matters under
+concurrent fan-out. ``ensure_within_cap()`` runs synchronously before a leaf is
+dispatched, but ``record()`` runs only after the leaf completes. So in a
+``parallel()`` barrier of ``N`` leaves dispatched while the pool still has
+headroom, all ``N`` can pass the pre-dispatch check before any has recorded its
+usage. The barrier can therefore overshoot ``total`` by up to the combined usage
+of the leaves admitted in that window — bounded by the concurrency gate's limit
+(at most ``gate.limit`` leaves run at once) and never beyond a single barrier's
+worth of work. The next ``agent()`` after the barrier settles sees the overshot
+``spent()`` and refuses. This is the intended trade: in-flight leaves keep their
+results rather than being cancelled to claw back tokens, and ``remaining()``
+floors at zero so the overshoot never surfaces as a negative figure.
+
 A budget with no ``total`` never trips the cap and reports an unbounded
 ``remaining()`` (the ``while budget.remaining() > THRESHOLD`` loop idiom).
 

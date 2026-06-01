@@ -9,11 +9,18 @@ leaf execution.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import pytest
-from langchain_core.runnables import Runnable
+from deepagents import create_deep_agent  # pyright: ignore[reportUnknownVariableType]
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages.ai import UsageMetadata
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
+from pydantic import PrivateAttr
 
 from langchain_dynamic_workflow import (
     Ctx,
@@ -127,3 +134,191 @@ async def test_model_override_reaches_leaf_execution(
 
     results = await run_workflow(orchestrate, roster=roster, thread_id="t1")
     assert results == ["ran-with:opus", "ran-with:haiku", "ran-with:default"]
+
+
+async def test_default_model_is_used_when_no_override(
+    make_model_echo_leaf: ModelEchoLeafFactory,
+) -> None:
+    # A leaf registered with default_model and called with no model= override must
+    # run with the default (config-aware leaf honors it). Pins that default_model
+    # is live configuration, not dead — the effective model resolves to the
+    # registered default and reaches leaf execution.
+    roster = Roster().register("worker", make_model_echo_leaf(), default_model="sonnet")
+
+    async def orchestrate(ctx: Ctx) -> str:
+        return await ctx.agent("q", agent_type="worker")
+
+    result = await run_workflow(orchestrate, roster=roster, thread_id="t1")
+    assert result == "ran-with:sonnet"
+
+
+async def test_override_beats_default_model_and_shares_key_with_explicit_call() -> None:
+    # The effective model is "override else default_model", and it is what feeds
+    # BOTH the journal key and the leaf config. So an explicit model="sonnet" call
+    # and a no-override call against a default_model="sonnet" leaf resolve to the
+    # same effective model: one journal entry, one model run, the second served
+    # from cache. This pins that key and execution are derived from one value and
+    # cannot disagree. The leaf counts its runs and echoes the model it received.
+    runs: dict[str, int] = {"n": 0}
+
+    async def _counting(
+        inp: dict[str, Any], config: RunnableConfig | None = None
+    ) -> dict[str, Any]:
+        runs["n"] += 1
+        configurable = (config or {}).get("configurable", {})
+        model = configurable.get("model", "default")
+        return {"messages": [*inp["messages"], AIMessage(content=f"ran-with:{model}")]}
+
+    roster = Roster().register("worker", RunnableLambda(_counting), default_model="sonnet")
+
+    async def orchestrate(ctx: Ctx) -> list[str]:
+        return [
+            await ctx.agent("q", agent_type="worker", model="sonnet"),  # explicit
+            await ctx.agent("q", agent_type="worker"),  # falls back to default_model
+        ]
+
+    results = await run_workflow(orchestrate, roster=roster, thread_id="t1")
+    assert results == ["ran-with:sonnet", "ran-with:sonnet"]
+    assert runs["n"] == 1  # the second call was a journal cache hit (same effective model)
+
+
+class _BarrierUsageModel(BaseChatModel):
+    """A usage-metering chat model that parks every call at a barrier first.
+
+    Awaiting a shared :class:`asyncio.Barrier` in ``_agenerate`` forces all
+    concurrently-dispatched leaves to be in flight *simultaneously* before any of
+    them returns and records usage. That makes the budget pre-dispatch check
+    (``ensure_within_cap``) run for every leaf in the barrier before a single
+    ``record`` lands — deterministically exercising the soft-cap concurrent
+    overshoot path rather than relying on a scheduling race.
+
+    Attributes:
+        parties: The number of concurrent calls the barrier waits for.
+        tokens_per_call: Total tokens reported per generation.
+        model_name: The model name emitted so the usage callback aggregates it.
+    """
+
+    parties: int
+    tokens_per_call: int = 10
+    model_name: str = "barrier-usage-model"
+    _barrier: asyncio.Barrier | None = PrivateAttr(default=None)
+    _calls: int = PrivateAttr(default=0)
+
+    @property
+    def calls(self) -> int:
+        """Number of generations performed."""
+        return self._calls
+
+    @property
+    def _llm_type(self) -> str:
+        return "barrier-usage-fake"
+
+    def _get_barrier(self) -> asyncio.Barrier:
+        # Lazily create the barrier on the running loop the first call lands on, so
+        # construction does not depend on an event loop already being active.
+        if self._barrier is None:
+            self._barrier = asyncio.Barrier(self.parties)
+        return self._barrier
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        raise NotImplementedError("barrier model is async-only")
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        # Block until every party in the barrier has arrived: this guarantees all
+        # concurrent leaves are in flight before any returns and records usage.
+        await self._get_barrier().wait()
+        self._calls += 1
+        usage = UsageMetadata(
+            input_tokens=self.tokens_per_call,
+            output_tokens=0,
+            total_tokens=self.tokens_per_call,
+        )
+        message = AIMessage(
+            content="note",
+            usage_metadata=usage,
+            response_metadata={"model_name": self.model_name},
+        )
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> BaseChatModel:
+        """Ignore tools and return self (the fake never emits tool calls)."""
+        return self
+
+
+async def test_parallel_barrier_overshoots_soft_cap_keeping_inflight_results() -> None:
+    # The budget is a SOFT cap, not a hard ceiling: under parallel() all N thunks
+    # pass the pre-dispatch ensure_within_cap() before any has recorded usage, so a
+    # single barrier can overshoot total by up to the combined usage of the leaves
+    # admitted in that window. With total=10 (one leaf's worth) but a barrier of 4
+    # leaves dispatched while the pool still reads as having headroom, all 4 are
+    # admitted and complete, spending 40 — a 4x overshoot. The acceptance criterion
+    # "in-flight leaves keep their results" must hold concurrently, not just for the
+    # trivial sequential one-extra-call case. The next agent() after the barrier
+    # settles is what finally refuses.
+    parties = 4
+    model = _BarrierUsageModel(parties=parties, tokens_per_call=10)
+    leaf = cast(Runnable[Any, Any], create_deep_agent(model=model))
+    roster = Roster().register("worker", leaf)
+    captured: dict[str, Any] = {}
+
+    async def orchestrate(ctx: Ctx) -> None:
+        # total=10 means the pool has room for exactly one leaf, yet the barrier of
+        # 4 all pass ensure_within_cap() before any records and overshoot to 40.
+        results = await ctx.parallel(
+            [lambda i=i: ctx.agent(f"q{i}", agent_type="worker") for i in range(parties)]
+        )
+        captured["results"] = results
+        captured["spent"] = ctx.budget.spent()
+        # After the barrier settles the pool is over budget; remaining floors at 0.
+        captured["remaining"] = ctx.budget.remaining()
+
+    await run_workflow(
+        orchestrate,
+        roster=roster,
+        thread_id="t1",
+        budget=10,
+        max_concurrency=parties,  # let all four be in flight at once
+        on_progress=lambda _e: None,
+    )
+    # All four leaves were admitted and kept their results (none cancelled to claw
+    # back tokens): the soft cap overshot to 4x its total.
+    assert captured["results"] == ["note", "note", "note", "note"]
+    assert captured["spent"] == parties * 10  # 40: a four-leaf overshoot of a one-leaf cap
+    assert captured["remaining"] == 0  # floored, never negative
+    assert model.calls == parties
+
+
+async def test_post_overshoot_dispatch_is_refused(make_usage_leaf: UsageLeafFactory) -> None:
+    # The other half of the soft-cap contract: once a barrier has overshot the cap,
+    # the NEXT sequential agent() sees the overshot spent() and refuses loud. This
+    # pins that the overshoot is bounded to a single barrier — the cap is not
+    # disabled, it is enforced again the moment a new dispatch is attempted.
+    leaf, _model = make_usage_leaf("note", tokens_per_call=10)
+    roster = Roster().register("worker", leaf)
+
+    async def orchestrate(ctx: Ctx) -> None:
+        # A small sequential barrier overshoots total=10 to 20...
+        await ctx.parallel([lambda i=i: ctx.agent(f"q{i}", agent_type="worker") for i in range(2)])
+        # ...and the next dispatch is refused now that spent() >= total.
+        await ctx.agent("after", agent_type="worker")
+
+    with pytest.raises(WorkflowBudgetExceededError, match="exhausted"):
+        await run_workflow(
+            orchestrate,
+            roster=roster,
+            thread_id="t1",
+            budget=10,
+            on_progress=lambda _e: None,
+        )

@@ -24,7 +24,11 @@ class RosterEntry:
         description: Human-readable description.
         needs_execution: Whether this agent type requires an isolated execution
             sandbox (tiered admission) rather than pure in-context reasoning.
-        default_model: Optional default model identifier.
+        default_model: Default model identifier used as the effective model when an
+            ``agent()`` call supplies no ``model`` override. The effective model is
+            folded into the journal key and propagated into the leaf config; it is
+            honored by config-aware leaves and ignored by leaves whose model is
+            bound at construction (in which case it still partitions the cache key).
     """
 
     name: str

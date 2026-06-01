@@ -58,7 +58,7 @@ class WorkflowBudgetExceededError(RuntimeError): ...
 ```
 src/langchain_dynamic_workflow/_determinism.py   # 调用序列记录 + 重放校验（backstop）
 src/langchain_dynamic_workflow/_budget.py         # Budget + usage 重建 + callback 转发
-修改 _journal.py（value 增加 usage 字段）、_context.py（phase/log/budget + 序列记录）、_leaf.py（usage 采集 + callback 转发）
+修改 _journal.py（value 增加 usage 字段）、_context.py（phase/log/budget + 序列记录）、_engine.py 的 leaf_task（usage 采集 + callback 转发；本仓库无独立 _leaf.py，叶子路径在 _engine.py，LeafRunner/LeafOutcome 在 _context.py）
 tests/unit/test_determinism.py、test_budget.py
 tests/integration/test_phase3_loop_until_budget.py
 examples/03_loop_until_budget.py
@@ -68,7 +68,7 @@ examples/03_loop_until_budget.py
 
 1. **journal value 扩展**：Red（put/get 带 usage 往返）→ journal value 从纯 result 改为 `{result, usage}` → 迁移 Phase 1/2 测试 → Green → commit。
 2. **`_determinism.py` 序列记录**：Red（重放同序列通过、改序列抛 `WorkflowDeterminismError`）→ 实现（journal 记 ordered call-keys；重放比对）→ Green → commit。
-3. **`_budget.py`**：Red（`spent()` 由 usage 累计；resume 重建相等；cap 抛 `WorkflowBudgetExceededError`；无 total → inf）→ 实现 + `UsageMetadataCallbackHandler` 转发（**`@task` 直调须复刻 `_build_subagent_config` callbacks 转发**）→ Green → commit。
+3. **`_budget.py`**：Red（`spent()` 由 usage 累计；resume 重建相等；cap 抛 `WorkflowBudgetExceededError`；无 total → inf）→ 实现 + `UsageMetadataCallbackHandler` 转发（**`@task` 直调须复刻 `_build_subagent_config` callbacks 转发**，落在 `_engine.py` 的 `leaf_task` 内，非独立 `_leaf.py`）→ Green → commit。
 4. **`phase`/`log`**：Red（输出捕获 + 重放幂等）→ 在 `Ctx` 实现 → Green → commit。
 5. **集成 + 示例 + 质量门**：`examples/03_loop_until_budget.py`；ruff+pyright 清零；里程碑 commit。
 
