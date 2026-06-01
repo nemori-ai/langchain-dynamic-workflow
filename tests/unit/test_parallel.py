@@ -1,0 +1,93 @@
+"""Unit tests for ``Ctx.parallel`` fan-out semantics (barrier + None-on-error)."""
+
+from __future__ import annotations
+
+import asyncio
+
+from langchain_dynamic_workflow._concurrency import ConcurrencyGate
+from langchain_dynamic_workflow._context import Ctx
+from langchain_dynamic_workflow._journal import InMemoryJournalStore
+from langchain_dynamic_workflow._roster import Roster
+
+
+def _ctx() -> Ctx:
+    """Build a Ctx with a no-op leaf runner (parallel tests drive thunks directly)."""
+
+    async def _leaf(agent_type: str, prompt: str) -> dict[str, object]:
+        return {"messages": []}
+
+    return Ctx(
+        roster=Roster(),
+        journal=InMemoryJournalStore(),
+        leaf_runner=_leaf,
+        gate=ConcurrencyGate(limit=8),
+    )
+
+
+async def test_parallel_returns_results_in_input_order() -> None:
+    ctx = _ctx()
+
+    async def make(value: int, delay: float) -> int:
+        await asyncio.sleep(delay)
+        return value
+
+    # Reverse the completion order via delays; result order must still follow input order.
+    results = await ctx.parallel(
+        [
+            lambda: make(0, 0.03),
+            lambda: make(1, 0.0),
+            lambda: make(2, 0.02),
+        ]
+    )
+    assert results == [0, 1, 2]
+
+
+async def test_parallel_failed_thunk_becomes_none_and_does_not_raise() -> None:
+    ctx = _ctx()
+
+    async def ok(value: int) -> int:
+        return value
+
+    async def boom() -> int:
+        raise RuntimeError("thunk exploded")
+
+    results = await ctx.parallel([lambda: ok(10), boom, lambda: ok(30)])
+    # Failure lands as None in-place; the call as a whole never raises.
+    assert results == [10, None, 30]
+    # Idiomatic downstream filtering works.
+    assert [r for r in results if r is not None] == [10, 30]
+
+
+async def test_parallel_empty_returns_empty_list() -> None:
+    ctx = _ctx()
+    assert await ctx.parallel([]) == []
+
+
+async def test_parallel_respects_concurrency_gate() -> None:
+    # The gate passed to parallel must cap in-flight thunks.
+    gate = ConcurrencyGate(limit=2)
+
+    async def _leaf(agent_type: str, prompt: str) -> dict[str, object]:
+        return {"messages": []}
+
+    ctx = Ctx(
+        roster=Roster(),
+        journal=InMemoryJournalStore(),
+        leaf_runner=_leaf,
+        gate=gate,
+    )
+
+    in_flight = 0
+    peak = 0
+
+    async def work(value: int) -> int:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return value
+
+    results = await ctx.parallel([lambda i=i: work(i) for i in range(10)])
+    assert results == list(range(10))
+    assert peak <= 2
