@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
+from langchain_dynamic_workflow._errors import WorkflowBudgetExceededError
 from langchain_dynamic_workflow._pipeline import run_pipeline
 
 
@@ -158,6 +159,37 @@ async def test_pipeline_tiny_queue_backpressure_does_not_deadlock() -> None:
         timeout=3.0,
     )
     assert results == [(i + 1) * 2 for i in range(20)]
+
+
+async def test_pipeline_control_flow_error_fails_loud_across_workers_and_drains() -> None:
+    # An engine control-flow signal (budget/determinism) raised by a stage must NOT
+    # be masked as a dropped None like an ordinary leaf failure: it propagates out
+    # of run_pipeline. This stresses the abort path under multiple workers (gate
+    # limit 4), two stages, and backpressure (queue_maxsize 2 << 8 items): the
+    # pipeline must drain queued items without deadlocking and re-raise the signal.
+    gate = ConcurrencyGate(limit=4)
+    stage_two_seen: list[int] = []
+
+    async def stage_one(prev: int, item: int, index: int) -> int:
+        await asyncio.sleep(0.005)
+        if item == 3:
+            raise WorkflowBudgetExceededError("budget exhausted mid-pipeline")
+        return item
+
+    async def stage_two(prev: int, item: int, index: int) -> int:
+        stage_two_seen.append(item)
+        return prev * 10
+
+    with pytest.raises(WorkflowBudgetExceededError, match="exhausted"):
+        await asyncio.wait_for(
+            run_pipeline(
+                list(range(8)),
+                [stage_one, stage_two],
+                gate=gate,
+                queue_maxsize=2,
+            ),
+            timeout=3.0,
+        )
 
 
 async def test_pipeline_empty_items_returns_empty() -> None:
