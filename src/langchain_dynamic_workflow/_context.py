@@ -16,6 +16,7 @@ from typing import Any, TypeVar
 
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
 from ._journal import JournalStore, journal_key
+from ._pipeline import Stage, run_pipeline
 from ._result import fold_result
 from ._roster import Roster
 
@@ -125,3 +126,29 @@ class Ctx:
         if not thunks:
             return []
         return await asyncio.gather(*[_guarded(thunk) for thunk in thunks])
+
+    async def pipeline(self, items: Sequence[Any], *stages: Stage) -> list[Any | None]:
+        """Stream ``items`` through ``stages`` without a barrier between stages.
+
+        Each item travels through every stage independently — item A can reach the
+        last stage while item B is still in the first. Each stage is
+        ``(prev_result, original_item, index) -> next_result`` and typically calls
+        ``agent()`` internally, so per-leaf journal caching applies: a resumed run
+        replays completed leaves from the journal (zero model calls) and only the
+        unfinished ones run live. A stage that raises drops that item to ``None``,
+        which then skips the remaining stages. Results are returned in input order.
+
+        Concurrency across all stages is bounded by the shared gate.
+
+        Args:
+            items: The input items.
+            *stages: One or more stage functions applied in order.
+
+        Returns:
+            A list aligned to ``items`` input order; each entry is the item's
+            final result, or ``None`` if any stage raised for it.
+
+        Raises:
+            ValueError: If no stages are supplied.
+        """
+        return await run_pipeline(items, stages, gate=self._gate)
