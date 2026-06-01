@@ -17,6 +17,12 @@ agents — a workflow with many reasoning leaves allocates zero of them.
 
 from __future__ import annotations
 
+import asyncio
+import time
+from collections.abc import AsyncGenerator, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+
 from deepagents.backends.protocol import (
     BackendProtocol,
     EditResult,
@@ -182,6 +188,26 @@ class InMemorySandbox(SandboxBackendProtocol):
         return LsResult(entries=entries)
 
 
+@dataclass(slots=True)
+class _SandboxSlot:
+    """Bookkeeping for one live sandbox: the backend plus its lifecycle clocks.
+
+    Attributes:
+        sandbox: The isolated execution backend instance.
+        created_at: Monotonic timestamp when the sandbox was first created;
+            drives the hard TTL (total-lifetime cap).
+        last_used_at: Monotonic timestamp of the most recent lease release;
+            drives the idle TTL (reclaim-after-inactivity).
+        in_use: How many concurrent leases currently hold this sandbox; a slot is
+            reclaimable only when idle (``in_use == 0``).
+    """
+
+    sandbox: InMemorySandbox
+    created_at: float
+    last_used_at: float
+    in_use: int = field(default=0)
+
+
 class SandboxManager:
     """Owns the lifecycle of per-leaf isolated sandboxes.
 
@@ -194,21 +220,84 @@ class SandboxManager:
 
     Acquisition is find-or-create per ``leaf_id``: a leaf that retries within a
     run resolves the same backend instance, which keeps a leaf's workspace stable
-    across retries.
+    across retries. The manager self-manages the rest of the lifecycle:
+
+    - **Idle / hard TTL**: a sandbox idle past ``idle_ttl`` (or alive past
+      ``hard_ttl`` regardless of recent use) is reclaimed on the next
+      acquisition, releasing its slot. The hard TTL caps total lifetime so a
+      long-lived-but-busy sandbox cannot live forever.
+    - **Max-active quota**: at most ``max_active`` sandboxes are live at once.
+    - **Backpressure**: when the pool is at the quota and every slot is in use,
+      a new :meth:`lease` blocks until a slot frees rather than over-allocating.
+
+    Args:
+        max_active: Maximum number of simultaneously live sandboxes, or ``None``
+            for an unbounded pool (no backpressure).
+        idle_ttl: Seconds a sandbox may sit idle before it is reclaimed, or
+            ``None`` to disable idle reclamation.
+        hard_ttl: Maximum total seconds a sandbox may live regardless of recent
+            use, or ``None`` to disable the hard cap.
+        clock: Monotonic time source (seconds); injectable for deterministic
+            TTL testing. Defaults to :func:`time.monotonic`.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_active: int | None = None,
+        idle_ttl: float | None = None,
+        hard_ttl: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         # Live execution sandboxes keyed by leaf identity. Reasoning leaves never
         # enter this map — that is what keeps active_count tied to execution work.
-        self._sandboxes: dict[str, InMemorySandbox] = {}
+        self._slots: dict[str, _SandboxSlot] = {}
+        self._max_active = max_active
+        self._idle_ttl = idle_ttl
+        self._hard_ttl = hard_ttl
+        self._clock = clock
+        # Signalled whenever a slot frees, so a lease parked under backpressure
+        # can wake and re-check for room rather than busy-spinning.
+        self._slot_freed = asyncio.Condition()
 
     @property
     def active_count(self) -> int:
         """How many isolated execution sandboxes are currently live."""
-        return len(self._sandboxes)
+        return len(self._slots)
+
+    def reclaim_idle(self) -> int:
+        """Reclaim every idle sandbox whose idle or hard TTL has elapsed.
+
+        Only idle sandboxes (no in-flight lease) are eligible: a sandbox in use
+        is never torn down mid-leaf. A sandbox is reclaimed when it has sat idle
+        longer than ``idle_ttl`` or has been alive longer than ``hard_ttl``.
+
+        Returns:
+            The number of sandboxes reclaimed.
+        """
+        now = self._clock()
+        expired = [
+            leaf_id
+            for leaf_id, slot in self._slots.items()
+            if slot.in_use == 0 and self._is_expired(slot, now)
+        ]
+        for leaf_id in expired:
+            del self._slots[leaf_id]
+        return len(expired)
+
+    def _is_expired(self, slot: _SandboxSlot, now: float) -> bool:
+        """Whether ``slot`` has exceeded either its idle or hard TTL."""
+        if self._idle_ttl is not None and now - slot.last_used_at >= self._idle_ttl:
+            return True
+        return self._hard_ttl is not None and now - slot.created_at >= self._hard_ttl
 
     def acquire(self, *, leaf_id: str, needs_execution: bool) -> BackendProtocol:
         """Return the backend a leaf should run against (tiered admission).
+
+        This is the synchronous find-or-create primitive. It neither waits for a
+        slot nor reclaims TTL-expired sandboxes — :meth:`lease` wraps it with the
+        full lifecycle (reclamation + backpressure). Use :meth:`lease` from the
+        engine; ``acquire`` is exposed for direct, single-leaf use.
 
         Args:
             leaf_id: The leaf's derived identity (see :func:`leaf_id_from_key`).
@@ -224,19 +313,113 @@ class SandboxManager:
         if not needs_execution:
             # Tiered admission: reasoning leaves are never allocated a sandbox.
             return StateBackend()
-        existing = self._sandboxes.get(leaf_id)
+        existing = self._slots.get(leaf_id)
         if existing is not None:
-            return existing
+            return existing.sandbox
+        now = self._clock()
         sandbox = InMemorySandbox(identity=leaf_id)
-        self._sandboxes[leaf_id] = sandbox
+        self._slots[leaf_id] = _SandboxSlot(sandbox=sandbox, created_at=now, last_used_at=now)
         return sandbox
+
+    @asynccontextmanager
+    async def lease(
+        self, *, leaf_id: str, needs_execution: bool
+    ) -> AsyncGenerator[BackendProtocol]:
+        """Lease a backend for the duration of a leaf invocation.
+
+        For execution leaves this is the full lifecycle path: it reclaims
+        TTL-expired idle sandboxes, blocks under backpressure when the pool is at
+        its max-active quota with every slot in use, then find-or-creates the
+        leaf's sandbox and marks it busy for the body. On exit the sandbox is
+        marked idle (its idle clock reset) and kept for find-or-create reuse, and
+        a waiter parked under backpressure is woken.
+
+        Reasoning leaves bypass the pool entirely: they yield a fresh
+        :class:`StateBackend` without consuming a slot or applying backpressure.
+
+        Args:
+            leaf_id: The leaf's derived identity.
+            needs_execution: Whether the leaf requires an isolated sandbox.
+
+        Yields:
+            The backend the leaf should run against.
+        """
+        if not needs_execution:
+            yield StateBackend()
+            return
+        async with self._slot_freed:
+            # Wait for room: at quota, first reclaim TTL-expired idle sandboxes,
+            # then evict the least-recently-used *idle* sandbox to admit new work,
+            # and only block when every slot is still in use. A leaf reusing an
+            # already-live sandbox (same leaf_id) never waits — it is not new work.
+            while self._would_exceed_quota(leaf_id):
+                self.reclaim_idle()
+                if not self._would_exceed_quota(leaf_id):
+                    break
+                if self._evict_one_idle():
+                    break
+                # Every slot is in use: park until a lease releases one.
+                await self._slot_freed.wait()
+            slot = self._slots.get(leaf_id)
+            if slot is None:
+                now = self._clock()
+                sandbox = InMemorySandbox(identity=leaf_id)
+                slot = _SandboxSlot(sandbox=sandbox, created_at=now, last_used_at=now)
+                self._slots[leaf_id] = slot
+            slot.in_use += 1
+        try:
+            yield slot.sandbox
+        finally:
+            async with self._slot_freed:
+                slot.in_use -= 1
+                slot.last_used_at = self._clock()
+                # Wake one parked lease so it can re-check for room.
+                self._slot_freed.notify()
+
+    def _would_exceed_quota(self, leaf_id: str) -> bool:
+        """Whether admitting a *new* sandbox for ``leaf_id`` would breach the cap.
+
+        Reusing an existing sandbox (``leaf_id`` already live) is always allowed —
+        it adds no new sandbox to the pool.
+        """
+        if self._max_active is None or leaf_id in self._slots:
+            return False
+        return self.active_count >= self._max_active
+
+    def _evict_one_idle(self) -> bool:
+        """Evict the least-recently-used idle sandbox to make room at quota.
+
+        Only idle sandboxes (no in-flight lease) are eligible; an in-use sandbox
+        is never torn down mid-leaf. This is what turns the max-active cap into a
+        bounded pool: when full but some sandboxes are merely idle, a new leaf
+        evicts the stalest one rather than waiting forever.
+
+        Returns:
+            ``True`` if an idle sandbox was evicted, ``False`` when every live
+            sandbox is currently in use (the caller must then block).
+        """
+        idle = [
+            (slot.last_used_at, leaf_id)
+            for leaf_id, slot in self._slots.items()
+            if slot.in_use == 0
+        ]
+        if not idle:
+            return False
+        idle.sort()
+        _, lru_leaf_id = idle[0]
+        del self._slots[lru_leaf_id]
+        return True
 
     async def stop(self, leaf_id: str) -> None:
         """Tear down and release the sandbox held by ``leaf_id`` (idempotent).
+
+        Releasing a slot wakes one lease parked under backpressure.
 
         Args:
             leaf_id: The leaf identity whose sandbox should be released. Stopping
                 an unknown or already-released identity is a no-op so cleanup can
                 run unconditionally.
         """
-        self._sandboxes.pop(leaf_id, None)
+        async with self._slot_freed:
+            if self._slots.pop(leaf_id, None) is not None:
+                self._slot_freed.notify()

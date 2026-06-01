@@ -9,11 +9,26 @@ TTL/quota/backpressure lifecycle, and the ``/shared/`` hand-off backend with
 
 from __future__ import annotations
 
+import asyncio
+
 from deepagents.backends.protocol import SandboxBackendProtocol
 from deepagents.backends.state import StateBackend
 
 from langchain_dynamic_workflow._journal import journal_key
 from langchain_dynamic_workflow._sandbox import SandboxManager, leaf_id_from_key
+
+
+class _FakeClock:
+    """A manually-advanced monotonic clock for deterministic TTL tests."""
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
 
 
 def test_leaf_id_is_derived_from_journal_key_and_is_stable() -> None:
@@ -104,3 +119,82 @@ async def test_stop_unknown_leaf_id_is_a_noop() -> None:
     manager = SandboxManager()
     await manager.stop("never-allocated")
     assert manager.active_count == 0
+
+
+async def test_lease_acquires_and_releases_a_slot() -> None:
+    # The async lease is the engine-facing path: it acquires a backend for the
+    # leaf and, once it exits, the sandbox remains live but idle (reusable).
+    manager = SandboxManager(max_active=2)
+    async with manager.lease(leaf_id="leaf-a", needs_execution=True) as backend:
+        assert isinstance(backend, SandboxBackendProtocol)
+        assert manager.active_count == 1
+    # The slot is released for reuse but the sandbox persists for find-or-create.
+    assert manager.active_count == 1
+    await manager.stop("leaf-a")
+
+
+async def test_idle_ttl_reclaims_expired_sandboxes() -> None:
+    # A sandbox idle past its idle TTL is reclaimed on the next acquisition,
+    # freeing its slot. The fake clock makes expiry deterministic.
+    clock = _FakeClock()
+    manager = SandboxManager(idle_ttl=10.0, clock=clock)
+    async with manager.lease(leaf_id="leaf-a", needs_execution=True):
+        pass
+    assert manager.active_count == 1
+    clock.advance(11.0)  # leaf-a is now idle past its TTL
+    reclaimed = manager.reclaim_idle()
+    assert reclaimed == 1
+    assert manager.active_count == 0
+
+
+async def test_hard_ttl_reclaims_even_recently_used_sandboxes() -> None:
+    # The hard TTL caps a sandbox's total lifetime regardless of recent use, so a
+    # long-lived-but-busy sandbox cannot live forever.
+    clock = _FakeClock()
+    manager = SandboxManager(idle_ttl=100.0, hard_ttl=10.0, clock=clock)
+    async with manager.lease(leaf_id="leaf-a", needs_execution=True):
+        pass
+    clock.advance(11.0)  # past the hard TTL even though idle TTL has not elapsed
+    reclaimed = manager.reclaim_idle()
+    assert reclaimed == 1
+    assert manager.active_count == 0
+
+
+async def test_max_active_quota_applies_backpressure_until_a_slot_frees() -> None:
+    # With the pool at its max-active quota and both slots held by in-flight
+    # leases, a third lease must block (backpressure) until one of them exits —
+    # never over-allocate past the cap.
+    manager = SandboxManager(max_active=2)
+    started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def hold(leaf: str, *, gate: asyncio.Event | None = None) -> None:
+        async with manager.lease(leaf_id=leaf, needs_execution=True):
+            if gate is not None:
+                await gate.wait()
+
+    holder_a = asyncio.create_task(hold("leaf-a", gate=release_first))
+    holder_b = asyncio.create_task(hold("leaf-b", gate=release_first))
+    # Let both holders take their slots.
+    while manager.active_count < 2:
+        await asyncio.sleep(0)
+
+    third_entered = asyncio.Event()
+
+    async def third() -> None:
+        async with manager.lease(leaf_id="leaf-c", needs_execution=True):
+            third_entered.set()
+
+    third_task = asyncio.create_task(third())
+    # Give the third lease a chance to run; it must be parked on the full pool.
+    await asyncio.sleep(0.02)
+    assert not third_entered.is_set()
+    assert manager.active_count == 2  # never exceeded the quota
+
+    # Free the two holders; the third now gets a slot.
+    release_first.set()
+    await asyncio.wait_for(asyncio.gather(holder_a, holder_b), timeout=2.0)
+    started.set()
+    await asyncio.wait_for(third_task, timeout=2.0)
+    assert third_entered.is_set()
+    await manager.stop("leaf-c")
