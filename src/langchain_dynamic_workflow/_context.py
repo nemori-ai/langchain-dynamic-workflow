@@ -65,6 +65,7 @@ class LeafRunner(Protocol):
         *,
         leaf_id: str = "",
         needs_execution: bool = False,
+        response_format: Any = None,
     ) -> Awaitable[LeafOutcome]:
         """Run the leaf and return its ``LeafOutcome`` (raw state + token usage)."""
         ...
