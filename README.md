@@ -73,7 +73,9 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Pass the **same** `journal=` across calls to get cached-result resume (completed leaves replay at zero model cost), `budget=` for a shared token ceiling, and `on_span=` for an observability trace. To let a **host agent** drive workflows in the background, attach `create_workflow_middleware(roster, workflows=...)` to a host `create_deep_agent` — the agent calls a single `workflow` tool (`run` / `status` / `resume` / `cancel`) and is notified when a run finishes.
+Pass the **same** `journal=` across calls to get cached-result resume (completed leaves replay at zero model cost), `budget=` for a shared token ceiling, and `on_span=` for an observability trace. To let a **host agent** drive workflows in the background, attach `create_workflow_middleware(roster, workflows=...)` to a host `create_deep_agent` — the agent calls a single `workflow` tool to launch a registered workflow by name (`run`) or **author and submit an ad-hoc script on the spot** (`run_script` — the meta layer), poll it (`status`), `resume`, or `cancel`, and is notified when a run finishes.
+
+`run_script` is the meta layer: the agent writes an `async def orchestrate(ctx, args)` and submits the source, which passes an **AST security gate** and runs under a restricted-builtins namespace. The gate stops an accidental slip — it is **not a security sandbox**; a determined adversarial script can still escape, so submit only scripts the agent authors itself (for adversarial input, run the engine behind an out-of-process isolation backend). Build-time code can do the same programmatically with `run_workflow_from_source(source, roster=...)`.
 
 Every example under [`examples/`](examples/) runs **offline with no API key** (fake models). To drive real leaves through OpenRouter and capture LangSmith traces, install the demo extras with `uv sync --group example`, put `OPENROUTER_API_KEY` and the `LANGSMITH_*` settings in a local `.env`, then set `LDW_DEMO_REAL_MODEL` (model defaults to `anthropic/claude-opus-4.8`; set it to any OpenRouter slug to override). The flagship is [`examples/06_capstone.py`](examples/06_capstone.py): a host agent driving a background `parallel`-research → `pipeline`-refine → adversarial-verify → synthesize workflow. For a fully real run, [`examples/07_deep_research_real_e2e.py`](examples/07_deep_research_real_e2e.py) has a **live OpenRouter host agent** decide to launch a registered `deep_research` workflow (search → extract → adversarial-verify → synthesize) end to end.
 
@@ -89,10 +91,11 @@ LDW_DEMO_REAL_MODEL=anthropic/claude-opus-4.8 uv run python examples/07_deep_res
 The stable, public surface is exported from the package root and follows semantic versioning from `0.1.0`:
 
 - **Library core**: `run_workflow` — the developer / build-time entry.
+- **Meta layer**: `compile_workflow_source` / `run_workflow_from_source` / `extract_meta` — compile and run an LLM-authored source string through the AST gate.
 - **Registries**: `Roster` / `RosterEntry`, `WorkflowRegistry`.
-- **Host-facing**: `create_workflow_tool`, `create_workflow_middleware`, `skills_path`.
+- **Host-facing**: `create_workflow_tool`, `create_workflow_middleware`, `skills_path` / `skill_files`.
 - **Primitives**: exposed on the `Ctx` handed to your script — `agent` / `parallel` / `pipeline` / `phase` / `log` / `budget` / `workflow`.
-- **Types & errors**: `Budget`, `JournalStore` / `InMemoryJournalStore` / `JournalRecord`, `SandboxManager`, `Span` / `SpanKind` / `SpanSink`, the `BgRunManager` family, and the `Workflow*Error` exceptions.
+- **Types & errors**: `Budget`, `JournalStore` / `InMemoryJournalStore` / `JournalRecord`, `SandboxManager`, `Span` / `SpanKind` / `SpanSink`, the `BgRunManager` family, and the `Workflow*Error` exceptions (including `WorkflowScriptError`).
 
 Public signatures are stable; new parameters are added keyword-only with defaults. Names prefixed with `_` (modules and members) are internal and may change without notice.
 

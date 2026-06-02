@@ -82,10 +82,13 @@ def _render_notification(notices: list[Notice]) -> str:
 class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
     """Contributes the workflow tool and injects background-run completion notices.
 
-    The package's built-in orchestration skill (which teaches a host to author
-    workflow scripts) is loaded separately onto ``create_deep_agent`` via
-    ``skills_path()`` / ``skill_files()``; this middleware only contributes the
-    workflow tool and the completion-notice injection.
+    The contributed tool exposes both meta-layer paths: launching a registered
+    workflow by name (``run``) and launching an ad-hoc script the host authors on
+    the spot (``run_script``, gated and compiled before it runs). The package's
+    built-in orchestration skill (which teaches a host to author such scripts) is
+    loaded separately onto ``create_deep_agent`` via ``skills_path()`` /
+    ``skill_files()``; this middleware only contributes the workflow tool and the
+    completion-notice injection.
 
     Args:
         roster: The leaf registry forwarded to launched runs.

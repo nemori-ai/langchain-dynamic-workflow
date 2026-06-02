@@ -82,6 +82,14 @@ def test_skill_md_has_valid_frontmatter() -> None:
         assert token in text
 
 
+def test_skill_documents_run_script_and_its_security_caveat() -> None:
+    # The meta layer lets a host author an ad-hoc script, so the skill must teach the
+    # run_script surface and carry the loud A1 caveat that the gate is not a sandbox.
+    text = (skills_path() / SKILL_NAME / "SKILL.md").read_text(encoding="utf-8")
+    assert "run_script" in text
+    assert "not a security sandbox" in text.lower()
+
+
 async def test_skill_metadata_reaches_host_prompt() -> None:
     # Eager load with a FilesystemBackend so skills are read from disk into the
     # system prompt the host model sees.
