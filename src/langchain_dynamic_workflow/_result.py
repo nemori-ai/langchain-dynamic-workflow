@@ -57,7 +57,8 @@ def fold_structured(result: dict[str, Any], schema: type[BaseModel]) -> BaseMode
 
     Raises:
         ValueError: If ``result`` has no ``structured_response`` (the leaf was not
-            built with the expected ``response_format``).
+            built with the expected ``response_format``), or the response is not an
+            instance of ``schema`` (the builder bound a mismatched ``response_format``).
     """
     response = result.get("structured_response")
     if response is None:
@@ -65,5 +66,11 @@ def fold_structured(result: dict[str, Any], schema: type[BaseModel]) -> BaseMode
             f"leaf result has no 'structured_response' for schema {schema.__name__!r}; "
             "the leaf was not built with a matching response_format "
             "(register the agent_type with a builder that forwards response_format)"
+        )
+    if not isinstance(response, schema):
+        raise ValueError(
+            f"leaf structured_response is a {type(response).__name__!r}, expected "
+            f"{schema.__name__!r}; the agent_type's builder bound a response_format that does "
+            "not match the requested schema"
         )
     return response

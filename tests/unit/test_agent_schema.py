@@ -35,7 +35,13 @@ def _ctx_with_structured(structured: Claim, counter: list[int]) -> Ctx:
         response_format: Any = None,
     ) -> LeafOutcome:
         counter[0] += 1
-        return LeafOutcome(state={"messages": [], "structured_response": structured}, usage=7)
+        # Honor the bound schema like a real create_deep_agent(response_format=...):
+        # the structured_response is an instance of response_format.schema (the
+        # dict path converts to a DynamicSchema), reusing the source object's data.
+        obj: BaseModel = structured
+        if response_format is not None:
+            obj = response_format.schema.model_validate(structured.model_dump())
+        return LeafOutcome(state={"messages": [], "structured_response": obj}, usage=7)
 
     return Ctx(
         roster=Roster().register("x", builder=_unused_builder),  # unused: leaf_runner faked

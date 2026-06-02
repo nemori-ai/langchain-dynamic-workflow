@@ -431,7 +431,11 @@ class Ctx:
             folded_obj: str | BaseModel
             if structured_model is not None:
                 folded_obj = fold_structured(outcome.state, structured_model)
-                result_str = folded_obj.model_dump_json()
+                # Dump by alias with round-trip semantics so a schema with field
+                # aliases survives resume: model_validate_json (the replay path)
+                # validates by alias by default, so the stored JSON must use aliases
+                # too. For alias-free models this is identical to a plain dump.
+                result_str = folded_obj.model_dump_json(by_alias=True, round_trip=True)
             else:
                 folded_obj = fold_result(outcome.state)
                 result_str = folded_obj

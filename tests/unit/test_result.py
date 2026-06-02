@@ -16,6 +16,10 @@ class _V(BaseModel):
     refuted: bool
 
 
+class _OtherV(BaseModel):
+    approved: bool
+
+
 def test_fold_returns_last_nonempty_ai_text() -> None:
     result = {"messages": [HumanMessage(content="q"), AIMessage(content="the answer")]}
     assert fold_result(result) == "the answer"
@@ -51,3 +55,12 @@ def test_fold_structured_returns_structured_response() -> None:
 def test_fold_structured_missing_response_fails_loud() -> None:
     with pytest.raises(ValueError, match="structured_response"):
         fold_structured({"messages": []}, _V)
+
+
+def test_fold_structured_wrong_type_fails_loud() -> None:
+    # A mis-wired builder binds a response_format that does not match the requested
+    # schema, so the leaf hands back a different model. Run 1 would silently accept
+    # it; fold must reject the type mismatch loudly instead.
+    state: dict[str, Any] = {"messages": [], "structured_response": _OtherV(approved=True)}
+    with pytest.raises(ValueError, match=r"_OtherV|_V|expected|schema"):
+        fold_structured(state, _V)

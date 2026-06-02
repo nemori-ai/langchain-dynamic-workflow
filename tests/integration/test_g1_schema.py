@@ -6,7 +6,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable, RunnableLambda
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from langchain_dynamic_workflow import Roster, run_workflow, run_workflow_from_source
 from langchain_dynamic_workflow._journal import InMemoryJournalStore
@@ -17,14 +17,33 @@ class Verdict(BaseModel):
     reason: str
 
 
-def _structured_builder(*, response_format: Any = None) -> Runnable[Any, Any]:
-    # A fake leaf whose output state carries a structured_response matching the
-    # bound response_format's schema — stands in for a create_deep_agent built
-    # with response_format=ToolStrategy(Verdict).
+class Aliased(BaseModel):
+    """A schema whose field carries a serialization alias distinct from its name."""
+
+    text: str = Field(alias="claimText")
+
+
+def _aliased_builder(*, response_format: Any = None) -> Runnable[Any, Any]:
     async def _call(inp: dict[str, Any], config: Any = None) -> dict[str, Any]:
         return {
             "messages": [*inp["messages"], AIMessage(content="done")],
-            "structured_response": Verdict(refuted=False, reason="solid"),
+            "structured_response": Aliased(claimText="hello"),
+        }
+
+    return RunnableLambda(_call)
+
+
+def _structured_builder(*, response_format: Any = None) -> Runnable[Any, Any]:
+    # A fake leaf standing in for a create_deep_agent built with
+    # response_format=ToolStrategy(M): it returns a structured_response that is an
+    # instance of the *bound* schema (Verdict for the class path, the converted
+    # DynamicSchema for the dict path), faithfully mirroring the real contract.
+    async def _call(inp: dict[str, Any], config: Any = None) -> dict[str, Any]:
+        model = response_format.schema if response_format is not None else Verdict
+        structured = model.model_validate({"refuted": False, "reason": "solid"})
+        return {
+            "messages": [*inp["messages"], AIMessage(content="done")],
+            "structured_response": structured,
         }
 
     return RunnableLambda(_call)
@@ -70,6 +89,23 @@ async def test_schema_resume_restores_object_from_journal() -> None:
     first = await run_workflow(orchestrate, roster=roster, journal=journal)
     second = await run_workflow(orchestrate, roster=roster, journal=journal)
     assert first == second == "solid"
+
+
+async def test_aliased_schema_survives_resume() -> None:
+    # The structured result is dumped to JSON for the journal and re-validated on
+    # resume. A schema with a field alias only round-trips if the dump emits the
+    # alias (model_validate_json validates by alias by default) — otherwise the
+    # second run's cache hit fails to revalidate.
+    roster = Roster().register("namer", builder=_aliased_builder)
+    journal = InMemoryJournalStore()
+
+    async def orchestrate(ctx: Any) -> Any:
+        obj = await ctx.agent("name it", agent_type="namer", schema=Aliased)
+        return obj.text
+
+    first = await run_workflow(orchestrate, roster=roster, journal=journal)
+    second = await run_workflow(orchestrate, roster=roster, journal=journal)
+    assert first == second == "hello"
 
 
 async def test_l2_script_inline_dict_schema_runs_through_gate() -> None:
