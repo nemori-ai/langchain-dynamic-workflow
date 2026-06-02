@@ -49,6 +49,18 @@ dev = [
     "import-linter>=2.11",
     "pytest-cov>=7.1.0",
 ]
+# Optional extras for driving the runnable examples against a real model with
+# tracing. The examples run fully offline with fake models on the base install;
+# install this group (`uv sync --group example`) to exercise the live path.
+# python-dotenv loads credentials from a local .env; langchain-openrouter routes
+# real deepagent leaves through OpenRouter; langsmith captures the run traces
+# (auto-enabled from LANGSMITH_* env vars — already a transitive dep, pinned here
+# to make the tracing dependency explicit).
+example = [
+    "python-dotenv>=1.0",
+    "langchain-openrouter>=0.2",
+    "langsmith>=0.1",
+]
 
 [build-system]
 requires = ["hatchling"]

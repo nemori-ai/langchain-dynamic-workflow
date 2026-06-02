@@ -8,8 +8,9 @@ Two fan-out shapes in one script:
    pipeline (research -> summarize); each item travels independently.
 
 Both share one bounded concurrency gate. Runs offline with a built-in fake model
-(no API key needed). Set ``LDW_DEMO_REAL_MODEL=anthropic:claude-haiku-4-5`` (and
-an API key) to drive real deepagents instead.
+(no API key needed). Set ``LDW_DEMO_REAL_MODEL`` to drive real deepagents through
+OpenRouter instead (model ``anthropic/claude-opus-4.8``; credentials from a local
+``.env``). The live path needs ``uv sync --group example``.
 
     uv run python examples/02_fanout.py
 """
@@ -17,10 +18,10 @@ an API key) to drive real deepagents instead.
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Sequence
 from typing import Any
 
+from _demo_models import load_demo_env, real_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -57,15 +58,11 @@ class _ScriptedModel(BaseChatModel):
 
 
 def _build_model(prefix: str) -> Any:
-    spec = os.environ.get("LDW_DEMO_REAL_MODEL")
-    if spec:
-        from langchain.chat_models import init_chat_model
-
-        return init_chat_model(spec)
-    return _ScriptedModel(prefix=prefix)
+    return real_model() or _ScriptedModel(prefix=prefix)
 
 
 async def main() -> None:
+    load_demo_env()
     roster = Roster()
     roster.register(
         "researcher",

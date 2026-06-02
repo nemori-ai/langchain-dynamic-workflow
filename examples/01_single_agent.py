@@ -1,8 +1,9 @@
 """Phase 1 demo: a single deepagent leaf orchestrated by ``run_workflow``.
 
 Runs offline with a built-in fake model (no API key needed). Set
-``LDW_DEMO_REAL_MODEL=anthropic:claude-haiku-4-5`` (and an API key) to drive a
-real deepagent instead.
+``LDW_DEMO_REAL_MODEL`` to drive a real deepagent through OpenRouter instead
+(model ``anthropic/claude-opus-4.8``; credentials from a local ``.env``). The
+live path needs ``uv sync --group example``.
 
     uv run python examples/01_single_agent.py
 """
@@ -10,10 +11,10 @@ real deepagent instead.
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Sequence
 from typing import Any
 
+from _demo_models import load_demo_env, real_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -46,15 +47,11 @@ class _ScriptedModel(BaseChatModel):
 
 
 def _build_model() -> Any:
-    spec = os.environ.get("LDW_DEMO_REAL_MODEL")
-    if spec:
-        from langchain.chat_models import init_chat_model
-
-        return init_chat_model(spec)
-    return _ScriptedModel(reply="Paris")
+    return real_model() or _ScriptedModel(reply="Paris")
 
 
 async def main() -> None:
+    load_demo_env()
     leaf = create_deep_agent(model=_build_model())
     roster = Roster().register("geographer", leaf, description="Answers geography questions")
 

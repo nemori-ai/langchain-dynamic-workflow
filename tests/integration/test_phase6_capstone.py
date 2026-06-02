@@ -338,10 +338,15 @@ def test_real_model_variant_defaults_to_offline_fake(monkeypatch: pytest.MonkeyP
     # were inverted; this pins the actual offline-by-default behavior by loading the
     # example and exercising its leaf factory.
     import importlib.util
+    import sys
     from pathlib import Path
 
     monkeypatch.delenv("LDW_DEMO_REAL_MODEL", raising=False)
-    example_path = Path(__file__).resolve().parents[2] / "examples" / "06_capstone.py"
+    examples_dir = Path(__file__).resolve().parents[2] / "examples"
+    # The example imports its sibling ``_demo_models`` helper, which resolves via
+    # sys.path[0] when run as a script; mirror that here so exec_module can load it.
+    monkeypatch.setattr(sys, "path", [str(examples_dir), *sys.path])
+    example_path = examples_dir / "06_capstone.py"
     spec = importlib.util.spec_from_file_location("_ldw_capstone_example", example_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

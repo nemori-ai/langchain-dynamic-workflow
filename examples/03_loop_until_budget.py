@@ -10,8 +10,9 @@ Run it twice against the same journal to see resume in action: the second run
 serves every leaf from the journal (zero model calls) yet rebuilds the same
 ``spent()`` total, and the already-delivered progress narration is suppressed.
 
-Set ``LDW_DEMO_REAL_MODEL=anthropic:claude-haiku-4-5`` (and an API key) to drive
-a real deepagent instead.
+Set ``LDW_DEMO_REAL_MODEL`` to drive a real deepagent through OpenRouter instead
+(model ``anthropic/claude-opus-4.8``; credentials from a local ``.env``). The
+live path needs ``uv sync --group example``.
 
     uv run python examples/03_loop_until_budget.py
 """
@@ -19,10 +20,10 @@ a real deepagent instead.
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Sequence
 from typing import Any
 
+from _demo_models import load_demo_env, real_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -79,12 +80,7 @@ class _UsageModel(BaseChatModel):
 
 
 def _build_model() -> Any:
-    spec = os.environ.get("LDW_DEMO_REAL_MODEL")
-    if spec:
-        from langchain.chat_models import init_chat_model
-
-        return init_chat_model(spec)
-    return _UsageModel()
+    return real_model() or _UsageModel()
 
 
 async def orchestrate(ctx: Ctx) -> dict[str, Any]:
@@ -104,6 +100,7 @@ async def orchestrate(ctx: Ctx) -> dict[str, Any]:
 
 
 async def main() -> None:
+    load_demo_env()
     roster = Roster()
     roster.register(
         "researcher",

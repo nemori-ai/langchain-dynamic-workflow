@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from _demo_models import load_demo_env
 from deepagents.backends.protocol import BackendProtocol
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
@@ -64,6 +65,7 @@ def _consumer_leaf(shared_paths: list[str]) -> Runnable[Any, Any]:
 
 
 async def main() -> None:
+    load_demo_env()
     roster = (
         Roster()
         .register(

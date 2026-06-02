@@ -21,9 +21,10 @@ This is the full 0.1.0 loop with every major feature stacked, fully offline:
    result and folds the conclusion into its final answer.
 
 By default every leaf is a deterministic fake (no API key). Set
-``LDW_DEMO_REAL_MODEL=anthropic:claude-haiku-4-5`` (and a key) to drive real
-deepagent leaves inside the workflow; the host model stays scripted so the demo
-is deterministic and the leaf split stays reproducible.
+``LDW_DEMO_REAL_MODEL`` to drive real deepagent leaves through OpenRouter (model
+``anthropic/claude-opus-4.8``; credentials from a local ``.env``); the host model
+stays scripted so the demo is deterministic and the leaf split stays
+reproducible. The live path needs ``uv sync --group example``.
 
     uv run python examples/06_capstone.py
 """
@@ -31,10 +32,10 @@ is deterministic and the leaf split stays reproducible.
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Sequence
 from typing import Any
 
+from _demo_models import load_demo_env, real_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -64,11 +65,9 @@ _RUN_ID_BOX: dict[str, str] = {}
 
 def _build_leaf(reply: str) -> Any:
     """Build a research/refine leaf: a real deepagent if env-gated, else a fake."""
-    spec = os.environ.get("LDW_DEMO_REAL_MODEL")
-    if spec:
-        from langchain.chat_models import init_chat_model
-
-        return create_deep_agent(model=init_chat_model(spec))
+    model = real_model()
+    if model is not None:
+        return create_deep_agent(model=model)
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
         return {"messages": [*inp["messages"], AIMessage(content=reply)]}
@@ -175,6 +174,7 @@ def _call(command: str, **args: str) -> ChatResult:
 
 
 async def main() -> None:
+    load_demo_env()
     roster = (
         Roster()
         .register(

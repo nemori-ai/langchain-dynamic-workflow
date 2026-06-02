@@ -74,7 +74,7 @@ asyncio.run(main())
 
 跨多次调用传入**同一个** `journal=` 即可获得命中缓存的断点续跑（已完成的叶子以零模型成本重放）；`budget=` 设共享 token 上限；`on_span=` 接一个可观测性 trace。想让 **host agent** 在后台驱动 workflow，就把 `create_workflow_middleware(roster, workflows=...)` 挂到一个 host `create_deep_agent` 上 —— agent 通过单个 `workflow` 工具（`run` / `status` / `resume` / `cancel`）调度，并在 run 完成时收到通知。
 
-[`examples/`](examples/) 下的每个示例都**离线、无需 API key**（用 fake model）即可运行；设 `LDW_DEMO_REAL_MODEL=anthropic:claude-haiku-4-5`（并配好 key）即可驱动真实叶子。旗舰示例是 [`examples/06_capstone.py`](examples/06_capstone.py)：host agent 在后台驱动一条 `parallel` 研究 → `pipeline` 提炼 → 对抗式验证 → 综述的 workflow。
+[`examples/`](examples/) 下的每个示例都**离线、无需 API key**（用 fake model）即可运行；若要通过 OpenRouter 驱动真实叶子并用 LangSmith 看 trace，先用 `uv sync --group example` 装上示例附加依赖，在本地 `.env` 里配好 `OPENROUTER_API_KEY` 与 `LANGSMITH_*`，再设 `LDW_DEMO_REAL_MODEL`（模型默认 `anthropic/claude-opus-4.8`，设成任意 OpenRouter slug 即可覆盖）。旗舰示例是 [`examples/06_capstone.py`](examples/06_capstone.py)：host agent 在后台驱动一条 `parallel` 研究 → `pipeline` 提炼 → 对抗式验证 → 综述的 workflow。
 
 ```bash
 uv run python examples/06_capstone.py
