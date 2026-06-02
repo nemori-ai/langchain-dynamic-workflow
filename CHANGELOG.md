@@ -6,7 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.1.0] - 2026-06-02
 
-First tagged release: the engine is feature-complete for v1.0 and the public API
+First tagged release: the engine is feature-complete for 0.1.0 and the public API
 is stable.
 
 ### Added

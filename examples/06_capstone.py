@@ -1,7 +1,7 @@
-"""Phase 6 capstone demo (flagship v1.0): a host deepagent drives a multi-stage
+"""Phase 6 capstone demo (flagship 0.1.0): a host deepagent drives a multi-stage
 adversarial research workflow in the background.
 
-This is the full v1.0 loop with every major feature stacked, fully offline:
+This is the full 0.1.0 loop with every major feature stacked, fully offline:
 
 1. A host ``create_deep_agent`` (scripted fake model) calls the ``workflow`` tool
    with ``command="run"`` to launch the capstone **in the background**. The tool

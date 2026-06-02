@@ -1,4 +1,4 @@
-# Phase 6 · v1.0 收口（集成 / 硬化 / 可观测 / 文档）实现计划
+# Phase 6 · 0.1.0 收口（集成 / 硬化 / 可观测 / 文档）实现计划
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development 或 superpowers:executing-plans。步骤用 `- [ ]` 跟踪。
 
@@ -10,7 +10,7 @@
 
 ---
 
-## 里程碑 M6（= v1.0）
+## 里程碑 M6（= 0.1.0）
 
 多特性 capstone 端到端全绿；import-linter 绿；覆盖率达标；公共 API + README 文档化；version 0.1.0。
 
@@ -54,7 +54,7 @@ README.md / README_zh.md（quickstart 更新）、CHANGELOG.md
 3. **覆盖率门**：加 `pytest-cov` + 阈值；补齐核心路径集成测试到 ≥85% → commit。
 4. **capstone demo**：Red（多阶段 e2e：parallel+pipeline+budget+sandbox+对抗验证，host 后台驱动）→ 实现 `examples/06_capstone.py` + 集成测试（fake model）→ Green → commit。
 5. **文档 + 版本**：README/README_zh quickstart、CHANGELOG、`version="0.1.0"`、classifier 升级 → commit。
-6. **v1.0 收口 commit/tag**：全门绿（ruff/pyright/pytest/cov/import-linter）→ 里程碑 commit（tag 由 `github-tag-release`/仓库约定处理，不在本 plan 自动打）。
+6. **0.1.0 收口 commit/tag**：全门绿（ruff/pyright/pytest/cov/import-linter）→ 里程碑 commit（tag 由 `github-tag-release`/仓库约定处理，不在本 plan 自动打）。
 
 ## demo 规格（M6，capstone）
 
@@ -64,6 +64,6 @@ README.md / README_zh.md（quickstart 更新）、CHANGELOG.md
 
 - 为满足 import-linter 边界可能小重构模块归属；为覆盖率补测试。Phase 1–5 全部测试须保持绿。
 
-## v1.0 之后（v2 backlog，见 roadmap）
+## 0.1.0 之后（v2 backlog，见 roadmap）
 
 A2/A3 安全硬化、codegen prompt 工程深化、独立 `*-tracing` 子包、跨进程持久化（sqlite/postgres checkpointer）、skill 语义检索、`agent(isolation="worktree")`。
