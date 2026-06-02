@@ -30,13 +30,21 @@ is stable.
   with traversal guarding, TTL reclamation, and an engine-owned teardown finale.
 - **Leaf roster** — `Roster` / `RosterEntry` resolving named deepagent leaves.
 - **Host-facing surface (Layer 2)** — `create_workflow_tool` (the agent's single
-  multi-command runtime surface: `run` / `status` / `resume` / `cancel`) and
-  `create_workflow_middleware` (packages the tool + injects in-band completion
-  notifications), backed by a self-built async background run mechanism
+  multi-command runtime surface: `run` / `run_script` / `status` / `resume` /
+  `cancel`) and `create_workflow_middleware` (packages the tool + injects in-band
+  completion notifications), backed by a self-built async background run mechanism
   (`BgRunManager`, `ResultStore`) with composite `(thread_id, run_id)` keying,
   large-result offload, and idle/hard TTL sweep.
+- **Meta layer (Layer 2)** — an AST security gate + a single, confined restricted
+  `exec` that compiles a host-authored source string into an orchestration
+  callable: `compile_workflow_source`, `run_workflow_from_source`, `extract_meta`,
+  and a `WorkflowScriptError` carrying the enumerated gate violations. The
+  `run_script` tool command lets a host author an `async def orchestrate(ctx, args)`
+  on the spot; a rejection returns the violations so the host can fix and resubmit.
+  The engine stays source-unaware (it only runs callables); `exec` is confined to
+  this one auditable seam. The gate is not a security sandbox (A1 boundary).
 - **L2-as-skill teaching pack** — bundled orchestration `SKILL.md`, located via
-  `skills_path()`.
+  `skills_path()` or loaded disk-free via `skill_files()`.
 - **Observability-by-default** — every `agent` / `parallel` / `pipeline` call
   emits a structured `Span` (kind, name, attributes, duration, error) to an
   opt-in `run_workflow(on_span=...)` sink; the default recorder is a silent no-op.
@@ -45,9 +53,12 @@ is stable.
   as a clear message) once the quota is full, rather than launching unbounded.
 - **Architecture guards** — import-linter contracts enforcing the one-directional
   Layer 2 -> Layer 1 -> Layer 0 dependency, plus a coverage gate (line >= 85%).
-- **Examples** — `examples/01`..`06`, ending in `06_capstone.py`: a multi-stage
-  parallel-research -> pipeline-refine -> adversarial-verify -> synthesize
-  workflow driven by a host agent in the background. All examples run offline on
-  fake models; a real-leaf variant is env-gated behind `LDW_DEMO_REAL_MODEL`.
+- **Examples** — `examples/01`..`08`. `06_capstone.py` is the flagship: a
+  multi-stage parallel-research -> pipeline-refine -> adversarial-verify ->
+  synthesize workflow driven by a host agent in the background.
+  `07_deep_research_real_e2e.py` has a live OpenRouter host launch a registered
+  `deep_research` workflow; `08_meta_layer_run_script.py` has the host author an
+  ad-hoc script and submit it via `run_script`. All examples run offline on fake
+  models; a real-leaf variant is env-gated behind `LDW_DEMO_REAL_MODEL`.
 
-[0.1.0]: https://github.com/OWNER/langchain-dynamic-workflow/releases/tag/v0.1.0
+[0.1.0]: https://github.com/nemori-ai/langchain-dynamic-workflow/releases/tag/v0.1.0
