@@ -1,26 +1,30 @@
 ---
 name: dynamic-workflow
 description: >-
-  Author a deterministic orchestration script for the dynamic-workflow engine,
-  then launch it with the workflow tool. Use when a task needs control-flow
-  inversion — loops, branching, or fan-out owned by deterministic code rather
-  than by turn-by-turn model decisions — so that intermediate results live in
-  script variables and only the final conclusion reaches your context. Keywords:
-  orchestrate, fan-out, parallel, pipeline, multi-agent, deterministic workflow,
-  background run, run/status/resume/cancel.
+  Launch and manage a registered dynamic-workflow orchestration through the
+  workflow tool, and understand how these deterministic scripts invert control
+  flow. Use when a task needs control-flow inversion — loops, branching, or
+  fan-out owned by deterministic code rather than by turn-by-turn model decisions
+  — so that intermediate results live in script variables and only the final
+  conclusion reaches your context. Keywords: orchestrate, fan-out, parallel,
+  pipeline, multi-agent, deterministic workflow, background run,
+  run/status/resume/cancel.
 ---
 
 # Dynamic Workflow orchestration
 
-This skill teaches you to write a **deterministic orchestration script** and run
-it through the `workflow` tool. The control flow lives in code you author, not in
+This skill explains how **deterministic orchestration scripts** work and how to
+launch one through the `workflow` tool. The control flow lives in code, not in
 your turn-by-turn decisions: loops, branching, and fan-out are deterministic, the
 intermediate results stay in script variables, and only the final result is
 returned to you.
 
-A script is an `async def orchestrate(ctx, args)` coroutine. It receives a `ctx`
-object exposing the orchestration primitives and an `args` mapping of inputs. It
-returns the final result.
+A script is an `async def orchestrate(ctx, args)` coroutine — authored ahead of
+time and **registered under a name**. At runtime you do not write or submit a
+script; you recognize when a task fits a registered workflow, launch it **by
+name** with the `workflow` tool, and manage its lifecycle. The DSL, determinism
+rules, and patterns below describe how these scripts are built, so you can pick
+the right registered workflow and reason about what it does.
 
 ## The DSL (`ctx` primitives)
 
@@ -104,8 +108,9 @@ async def orchestrate(ctx, args):
 
 The script is launched **in the background**, so your turn is not blocked:
 
-1. `workflow(command="run", workflow="<name>", args={...})` — returns a `run_id`
-   placeholder immediately. The run executes in the background.
+1. `workflow(command="run", workflow="<registered-name>", args={...})` — launch a
+   registered workflow by name; returns a `run_id` placeholder immediately. The
+   run executes in the background.
 2. Continue working. When the run finishes, a `<workflow_notification>` is
    injected before your next reply listing the finished `run_id`(s).
 3. `workflow(command="status", run_id="<id>")` — fetch the result. A large result

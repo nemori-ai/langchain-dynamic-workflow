@@ -75,10 +75,13 @@ asyncio.run(main())
 
 Pass the **same** `journal=` across calls to get cached-result resume (completed leaves replay at zero model cost), `budget=` for a shared token ceiling, and `on_span=` for an observability trace. To let a **host agent** drive workflows in the background, attach `create_workflow_middleware(roster, workflows=...)` to a host `create_deep_agent` — the agent calls a single `workflow` tool (`run` / `status` / `resume` / `cancel`) and is notified when a run finishes.
 
-Every example under [`examples/`](examples/) runs **offline with no API key** (fake models). To drive real leaves through OpenRouter and capture LangSmith traces, install the demo extras with `uv sync --group example`, put `OPENROUTER_API_KEY` and the `LANGSMITH_*` settings in a local `.env`, then set `LDW_DEMO_REAL_MODEL` (model defaults to `anthropic/claude-opus-4.8`; set it to any OpenRouter slug to override). The flagship is [`examples/06_capstone.py`](examples/06_capstone.py): a host agent driving a background `parallel`-research → `pipeline`-refine → adversarial-verify → synthesize workflow.
+Every example under [`examples/`](examples/) runs **offline with no API key** (fake models). To drive real leaves through OpenRouter and capture LangSmith traces, install the demo extras with `uv sync --group example`, put `OPENROUTER_API_KEY` and the `LANGSMITH_*` settings in a local `.env`, then set `LDW_DEMO_REAL_MODEL` (model defaults to `anthropic/claude-opus-4.8`; set it to any OpenRouter slug to override). The flagship is [`examples/06_capstone.py`](examples/06_capstone.py): a host agent driving a background `parallel`-research → `pipeline`-refine → adversarial-verify → synthesize workflow. For a fully real run, [`examples/07_deep_research_real_e2e.py`](examples/07_deep_research_real_e2e.py) has a **live OpenRouter host agent** decide to launch a registered `deep_research` workflow (search → extract → adversarial-verify → synthesize) end to end.
 
 ```bash
 uv run python examples/06_capstone.py
+
+# fully real end-to-end (live OpenRouter host + leaves):
+LDW_DEMO_REAL_MODEL=anthropic/claude-opus-4.8 uv run python examples/07_deep_research_real_e2e.py
 ```
 
 ## Public API
