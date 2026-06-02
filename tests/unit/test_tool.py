@@ -287,6 +287,96 @@ async def test_status_unknown_run_id_reports_unknown(
     assert "ghost" in out
 
 
+_AUTHORED_SCRIPT = """\
+async def orchestrate(ctx, args):
+    return await ctx.agent(f"Summarize {args['topic']}", agent_type="writer")
+"""
+
+
+async def test_run_script_launches_an_authored_script(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # The meta-layer surface: a host authors an ad-hoc script and submits it via
+    # run_script — no registered workflow name needed. It launches in the
+    # background like a named run and status fetches its result.
+    leaf, _state = make_fake_leaf("the-summary")
+    roster = Roster().register("writer", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(
+        tool,
+        {"command": "run_script", "script": _AUTHORED_SCRIPT, "args": {"topic": "batteries"}},
+        runtime,
+    )
+    assert isinstance(out, Command)
+    run_id = _launched_run_id(out)
+    await manager.wait(run_id, thread_id="host-1")
+
+    status = await _ainvoke_command(tool, {"command": "status", "run_id": run_id}, runtime)
+    assert "the-summary" in status
+
+
+async def test_run_script_rejects_gate_violation_as_plain_string(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # A script that fails the AST gate must come back as a plain error string
+    # enumerating the violation (the feed-back-and-retry channel) — never a
+    # Command, and nothing is launched.
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("writer", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    bad_script = "import os\nasync def orchestrate(ctx, args):\n    return 1\n"
+    out = await _ainvoke_command(tool, {"command": "run_script", "script": bad_script}, runtime)
+    assert isinstance(out, str)
+    assert "import" in out.lower()
+
+
+async def test_run_script_requires_a_script(make_fake_leaf: FakeLeafFactory) -> None:
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("writer", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(tool, {"command": "run_script"}, runtime)
+    assert isinstance(out, str)
+    assert "script" in out.lower()
+
+
+async def test_run_script_resume_recompiles_and_replays_journal(
+    make_deep_leaf: Callable[[str], tuple[Runnable[Any, Any], Any]],
+) -> None:
+    # Resume of an ad-hoc run re-forges the callable from the persisted source and
+    # re-runs against the same journal, so the completed leaf replays at zero cost.
+    leaf, model = make_deep_leaf("Paris")
+    roster = Roster().register("geographer", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    script = (
+        "async def orchestrate(ctx, args):\n"
+        '    return await ctx.agent("Capital of France?", agent_type="geographer")\n'
+    )
+    run_out = await _ainvoke_command(tool, {"command": "run_script", "script": script}, runtime)
+    run_id = _launched_run_id(run_out)
+    await manager.wait(run_id, thread_id="host-1")
+    calls_after_first = model.calls
+
+    resume_out = await _ainvoke_command(tool, {"command": "resume", "run_id": run_id}, runtime)
+    resumed_id = _launched_run_id(resume_out)
+    await manager.wait(resumed_id, thread_id="host-1")
+
+    status = await _ainvoke_command(tool, {"command": "status", "run_id": resumed_id}, runtime)
+    assert "Paris" in status
+    assert model.calls == calls_after_first  # zero additional model calls on resume
+
+
 async def test_run_refused_when_concurrent_run_quota_full(
     make_fake_leaf: FakeLeafFactory,
 ) -> None:

@@ -27,13 +27,19 @@ from pydantic import BaseModel, Field
 
 from ._background import BgRunManager, BgRunQuotaExceededError, BgStatus
 
+# The meta-layer codegen (AST gate + restricted exec) and its error type sit in
+# Layer 2 alongside this tool; the `run_script` command compiles an untrusted
+# source string through them. They never reach the engine internals directly.
+from ._codegen import compile_workflow_source, extract_meta
+
 # Journal-store types are imported from the engine's public core entry (not the
 # internal `_journal`) so the host-facing tool depends only on the `run_workflow`
 # surface, preserving the one-directional Layer 2 -> Layer 0/1 boundary that
 # import-linter mechanically guards.
 from ._engine import InMemoryJournalStore, JournalStore, run_workflow
+from ._errors import WorkflowScriptError
 from ._roster import Roster
-from ._workflows import WorkflowRegistry
+from ._workflows import WorkflowFn, WorkflowRegistry
 
 # The tool is agnostic to the host's concrete context/state types, so the runtime
 # and Command updates are parameterized with Any (the host state schema, not the
@@ -52,12 +58,19 @@ class WorkflowToolSchema(BaseModel):
     is never advertised to the model; the model supplies only these fields.
     """
 
-    command: Literal["run", "status", "resume", "cancel"] = Field(
+    command: Literal["run", "run_script", "status", "resume", "cancel"] = Field(
         description="Which workflow operation to perform."
     )
     workflow: str | None = Field(
         default=None,
         description="The registered workflow name to launch (required for 'run').",
+    )
+    script: str | None = Field(
+        default=None,
+        description=(
+            "Orchestration script source to launch (required for 'run_script'): a "
+            "self-contained 'async def orchestrate(ctx, args)' coroutine you author."
+        ),
     )
     run_id: str | None = Field(
         default=None,
@@ -65,7 +78,7 @@ class WorkflowToolSchema(BaseModel):
     )
     args: dict[str, Any] | None = Field(
         default=None,
-        description="Optional arguments passed to the launched workflow (for 'run').",
+        description="Optional arguments for the launched workflow (for 'run' / 'run_script').",
     )
 
 
@@ -77,6 +90,12 @@ Commands (pass `command`):
     Returns immediately with a `run_id` placeholder; the workflow keeps running in
     the background and you may continue your turn. A completion notification is
     delivered before your next reply.
+- `run_script`: launch an orchestration `script` you author on the spot — a
+    self-contained `async def orchestrate(ctx, args)` coroutine — when no registered
+    workflow fits. The script is checked by a security gate before it runs; if it is
+    rejected, the specific violations come back so you can fix them and resubmit.
+    Use only scripts you author yourself: the gate stops an accidental slip, not a
+    determined adversary (it is not a security sandbox).
 - `status`: given a `run_id`, return the run's current status and — once done —
     its result. A large result is summarized and offloaded behind a handle.
 - `resume`: given a finished or interrupted `run_id`, re-run the same workflow
@@ -122,19 +141,45 @@ def create_workflow_tool(
     # Per-run journals so `resume` can re-run a workflow against the journal its
     # first run populated — completed leaves replay from cache at zero model cost.
     journals: dict[str, JournalStore] = {}
-    # The orchestration arguments each run was launched with, so `resume` can
-    # re-launch the same workflow with the same args.
-    run_specs: dict[str, tuple[str, dict[str, Any]]] = {}
+    # How each run can be re-launched on `resume`, as a tagged spec
+    # ``(kind, name_or_source, args)`` where ``kind`` is "name" (a registered
+    # workflow re-resolved by name) or "script" (an ad-hoc source recompiled).
+    run_specs: dict[str, tuple[str, str, dict[str, Any]]] = {}
+
+    def _label_for_script(source: str) -> str:
+        """Best-effort run label from a script's optional top-level ``meta['name']``."""
+        try:
+            meta = extract_meta(source)
+        except WorkflowScriptError:
+            return "ad-hoc-script"
+        if isinstance(meta, dict):
+            name = meta.get("name")
+            if isinstance(name, str) and name:
+                return name
+        return "ad-hoc-script"
+
+    def _resolve_spec(spec: tuple[str, str, dict[str, Any]]) -> tuple[WorkflowFn, dict[str, Any]]:
+        """Rebuild a run's orchestration callable + args from its resume spec.
+
+        A "name" spec re-resolves the registered workflow; a "script" spec
+        recompiles the persisted source (it passed the gate on first launch, so the
+        recompile succeeds), realizing "the callable is transient, the source is
+        durable".
+        """
+        kind, name_or_source, args = spec
+        if kind == "script":
+            return compile_workflow_source(name_or_source), args
+        return workflows.resolve(name_or_source), args
 
     def _launch(
         *,
-        workflow_name: str,
+        workflow_fn: WorkflowFn,
         args: dict[str, Any],
+        spec: tuple[str, str, dict[str, Any]],
         thread_id: str,
         journal: JournalStore,
     ) -> str:
         """Detach a workflow run onto the background manager; return its run_id."""
-        workflow_fn = workflows.resolve(workflow_name)  # KeyError on unknown name
 
         async def _orchestrate(ctx: Any) -> Any:
             return await workflow_fn(ctx, args)
@@ -156,8 +201,12 @@ def create_workflow_tool(
 
         slot = manager.start(_coro(), thread_id=thread_id)
         journals[slot.run_id] = journal
-        run_specs[slot.run_id] = (workflow_name, args)
+        run_specs[slot.run_id] = spec
         return slot.run_id
+
+    def _launch_record(run_id: str, *, label: str) -> dict[str, str]:
+        """The ``workflow_runs`` state record for a freshly launched run."""
+        return {"run_id": run_id, "workflow": label, "status": BgStatus.RUNNING.value}
 
     def _run_command(
         runtime: _ToolRuntime, *, workflow: str | None, args: dict[str, Any] | None
@@ -169,8 +218,9 @@ def create_workflow_tool(
         thread_id = _host_thread_id(runtime)
         try:
             run_id = _launch(
-                workflow_name=workflow,
+                workflow_fn=workflows.resolve(workflow),
                 args=args or {},
+                spec=("name", workflow, args or {}),
                 thread_id=thread_id,
                 journal=InMemoryJournalStore(),
             )
@@ -188,9 +238,44 @@ def create_workflow_tool(
         return Command(
             update={
                 "messages": [ToolMessage(message, tool_call_id=runtime.tool_call_id)],
-                WORKFLOW_RUNS_STATE_KEY: [
-                    {"run_id": run_id, "workflow": workflow, "status": BgStatus.RUNNING.value}
-                ],
+                WORKFLOW_RUNS_STATE_KEY: [_launch_record(run_id, label=workflow)],
+            }
+        )
+
+    def _run_script_command(
+        runtime: _ToolRuntime, *, script: str | None, args: dict[str, Any] | None
+    ) -> str | _Command:
+        if not script:
+            return "run_script: the 'script' source is required."
+        try:
+            # The single security checkpoint for an ad-hoc script: gate + compile.
+            # On rejection the violations are returned verbatim (a plain string, not
+            # a Command) so the host can fix them and resubmit — nothing is launched.
+            workflow_fn = compile_workflow_source(script)
+        except WorkflowScriptError as exc:
+            return f"run_script: the script was rejected and nothing was launched.\n{exc}"
+        label = _label_for_script(script)
+        thread_id = _host_thread_id(runtime)
+        try:
+            run_id = _launch(
+                workflow_fn=workflow_fn,
+                args=args or {},
+                spec=("script", script, args or {}),
+                thread_id=thread_id,
+                journal=InMemoryJournalStore(),
+            )
+        except BgRunQuotaExceededError as exc:
+            return f"run_script: {exc}"
+        message = (
+            f"Launched your authored script (labeled {label!r}) in the background. "
+            f"run_id: {run_id}. It is running now; you can continue, and a completion "
+            "notification will arrive before your next reply. Use command='status' with "
+            "this run_id to fetch the result."
+        )
+        return Command(
+            update={
+                "messages": [ToolMessage(message, tool_call_id=runtime.tool_call_id)],
+                WORKFLOW_RUNS_STATE_KEY: [_launch_record(run_id, label=label)],
             }
         )
 
@@ -222,28 +307,25 @@ def create_workflow_tool(
         if run_id not in run_specs:
             return f"resume: unknown run_id {run_id!r}; nothing to resume."
         thread_id = _host_thread_id(runtime)
-        workflow_name, args = run_specs[run_id]
+        spec = run_specs[run_id]
+        workflow_fn, args = _resolve_spec(spec)
+        label = _label_for_script(spec[1]) if spec[0] == "script" else spec[1]
         # Re-run against the same journal so completed leaves replay from cache.
         new_run_id = _launch(
-            workflow_name=workflow_name,
+            workflow_fn=workflow_fn,
             args=args,
+            spec=spec,
             thread_id=thread_id,
             journal=journals[run_id],
         )
         message = (
-            f"Resumed workflow {workflow_name!r} from run {run_id!r} against its journal. "
+            f"Resumed {label!r} from run {run_id!r} against its journal. "
             f"New run_id: {new_run_id}. Completed steps replay at zero model cost."
         )
         return Command(
             update={
                 "messages": [ToolMessage(message, tool_call_id=runtime.tool_call_id)],
-                WORKFLOW_RUNS_STATE_KEY: [
-                    {
-                        "run_id": new_run_id,
-                        "workflow": workflow_name,
-                        "status": BgStatus.RUNNING.value,
-                    }
-                ],
+                WORKFLOW_RUNS_STATE_KEY: [_launch_record(new_run_id, label=label)],
             }
         )
 
@@ -259,25 +341,31 @@ def create_workflow_tool(
     async def workflow_tool(
         command: str,
         workflow: str | None = None,
+        script: str | None = None,
         run_id: str | None = None,
         args: dict[str, Any] | None = None,
         *,
         runtime: _ToolRuntime,
     ) -> str | _Command:
-        """Dispatch a workflow command (``run`` / ``status`` / ``resume`` / ``cancel``).
+        """Dispatch one workflow command (run / run_script / status / resume / cancel).
 
         ``runtime`` is keyword-only and injected by the tool node; it is never
         part of the model-facing schema.
         """
         if command == "run":
             return _run_command(runtime, workflow=workflow, args=args)
+        if command == "run_script":
+            return _run_script_command(runtime, script=script, args=args)
         if command == "status":
             return _status_command(runtime, run_id=run_id)
         if command == "resume":
             return _resume_command(runtime, run_id=run_id)
         if command == "cancel":
             return await _cancel_command(runtime, run_id=run_id)
-        return f"unknown command {command!r}; expected one of: run, status, resume, cancel."
+        return (
+            f"unknown command {command!r}; expected one of: "
+            "run, run_script, status, resume, cancel."
+        )
 
     # Under ``from __future__ import annotations`` the ``runtime`` annotation is a
     # string at runtime, so the tool's injected-arg detection (which reads the raw
