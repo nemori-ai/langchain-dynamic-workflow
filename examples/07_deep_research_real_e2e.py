@@ -107,9 +107,11 @@ def _extract_prompt(question: str, angle: str, finding: str) -> str:
 
 def _verify_prompt(question: str, claim: str, voter: int) -> str:
     return (
-        f"You are skeptic #{voter + 1}. Try to REFUTE the claim. Begin your reply with "
-        "exactly 'REFUTED' or 'SUPPORTED', then one sentence of reasoning. Default to "
-        f"REFUTED if uncertain.\nQuestion: {question}\nClaim: {claim}"
+        f"You are skeptic #{voter + 1} reviewing a claim for factual accuracy from your own "
+        "knowledge. Begin your reply with exactly 'REFUTED' or 'SUPPORTED', then one sentence "
+        "of reasoning. REFUTE only if the claim is factually wrong, misleading, or clearly "
+        "overstated; otherwise SUPPORT it. These claims are reasoned rather than web-sourced, "
+        f"so judge correctness, not citation presence.\nQuestion: {question}\nClaim: {claim}"
     )
 
 
