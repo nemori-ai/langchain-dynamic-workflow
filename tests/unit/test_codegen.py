@@ -1,0 +1,112 @@
+"""Unit tests for the Layer 2 codegen — the single ``exec`` point of the meta layer.
+
+``compile_workflow_source`` is where an untrusted source string crosses into a
+runnable orchestration callable: AST gate, then ``compile`` + a single ``exec``
+into a namespace whose ``__builtins__`` is a curated safe whitelist (never the
+real builtins), then the ``orchestrate`` coroutine is extracted. These tests pin
+that the namespace is genuinely restricted, that structural defects (no
+``orchestrate``, not a coroutine, wrong arity) and gate violations are rejected,
+that ``extract_meta`` reads only a pure literal, and that
+``run_workflow_from_source`` carries a compiled script end to end through the
+engine with fake leaves.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any, cast
+
+import pytest
+from langchain_core.runnables import Runnable
+
+from langchain_dynamic_workflow import Roster
+from langchain_dynamic_workflow._codegen import (
+    compile_workflow_source,
+    extract_meta,
+    run_workflow_from_source,
+)
+from langchain_dynamic_workflow._errors import WorkflowScriptError
+
+FakeLeafFactory = Callable[..., tuple[Runnable[Any, Any], Any]]
+
+_ARGS_ONLY_SCRIPT = """\
+async def orchestrate(ctx, args):
+    doubled = [n * 2 for n in sorted(args["nums"])]
+    return sum(doubled)
+"""
+
+_AGENT_SCRIPT = """\
+async def orchestrate(ctx, args):
+    return await ctx.agent(f"Summarize {args['topic']}", agent_type="writer")
+"""
+
+
+async def test_compiles_and_runs_a_valid_script() -> None:
+    fn = compile_workflow_source(_ARGS_ONLY_SCRIPT)
+    unused_ctx: Any = object()  # this script ignores ctx
+    result = await fn(unused_ctx, {"nums": [3, 1, 2]})
+    assert result == 12  # (1 + 2 + 3) * 2
+
+
+def test_restricted_namespace_excludes_real_builtins() -> None:
+    # The compiled function's globals must expose only the safe whitelist as
+    # __builtins__ — the real, escape-capable builtins must be absent.
+    fn = compile_workflow_source(_ARGS_ONLY_SCRIPT)
+    builtins_table = cast(Any, fn).__globals__["__builtins__"]
+    for safe in ("len", "sorted", "sum", "range"):
+        assert safe in builtins_table
+    for dangerous in ("open", "__import__", "eval", "exec", "getattr", "globals"):
+        assert dangerous not in builtins_table
+
+
+def test_missing_orchestrate_is_rejected() -> None:
+    with pytest.raises(WorkflowScriptError) as exc:
+        compile_workflow_source("x = 1\n")
+    assert "orchestrate" in str(exc.value)
+
+
+def test_non_coroutine_orchestrate_is_rejected() -> None:
+    with pytest.raises(WorkflowScriptError) as exc:
+        compile_workflow_source("def orchestrate(ctx, args):\n    return 1\n")
+    assert "orchestrate" in str(exc.value).lower()
+
+
+def test_wrong_arity_orchestrate_is_rejected() -> None:
+    with pytest.raises(WorkflowScriptError):
+        compile_workflow_source("async def orchestrate(ctx):\n    return 1\n")
+
+
+def test_gate_violation_propagates_through_compile() -> None:
+    source = "import os\nasync def orchestrate(ctx, args):\n    return 1\n"
+    with pytest.raises(WorkflowScriptError) as exc:
+        compile_workflow_source(source)
+    assert "import" in str(exc.value).lower()
+
+
+def test_extract_meta_reads_a_pure_literal() -> None:
+    source = 'meta = {"name": "deep_research", "phases": ["scope", "synth"]}\n' + _AGENT_SCRIPT
+    meta = extract_meta(source)
+    assert meta == {"name": "deep_research", "phases": ["scope", "synth"]}
+
+
+def test_extract_meta_returns_none_when_absent() -> None:
+    assert extract_meta(_AGENT_SCRIPT) is None
+
+
+def test_extract_meta_rejects_a_non_literal() -> None:
+    # A computed meta value cannot be statically extracted; it must be rejected
+    # rather than silently executed.
+    source = "meta = {'name': undefined_symbol}\n" + _AGENT_SCRIPT
+    with pytest.raises(WorkflowScriptError):
+        extract_meta(source)
+
+
+async def test_run_workflow_from_source_runs_end_to_end(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    leaf, _state = make_fake_leaf("a summary")
+    roster = Roster().register("writer", leaf)
+    result = await run_workflow_from_source(
+        _AGENT_SCRIPT, roster=roster, args={"topic": "batteries"}
+    )
+    assert result == "a summary"

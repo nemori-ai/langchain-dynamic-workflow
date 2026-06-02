@@ -10,6 +10,7 @@ from importlib.metadata import version
 
 from ._background import BgRunManager, BgRunQuotaExceededError, BgStatus, ResultStore
 from ._budget import Budget
+from ._codegen import compile_workflow_source, extract_meta, run_workflow_from_source
 from ._context import Ctx
 from ._engine import Orchestrator, run_workflow
 from ._errors import (
@@ -57,11 +58,14 @@ __all__ = [
     "WorkflowRegistry",
     "WorkflowScriptError",
     "__version__",
+    "compile_workflow_source",
     "create_workflow_middleware",
     "create_workflow_tool",
+    "extract_meta",
     "fold_result",
     "journal_key",
     "run_workflow",
+    "run_workflow_from_source",
     "skill_files",
     "skills_path",
 ]
