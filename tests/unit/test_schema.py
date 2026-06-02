@@ -30,9 +30,11 @@ def test_dict_object_scalars_and_required() -> None:
     }
     model = to_pydantic_model(schema)
     inst = model.model_validate({"refuted": True, "reason": "x"})
-    assert inst.refuted is True
-    assert inst.reason == "x"
-    assert inst.score is None  # optional -> defaulted None
+    # The dict converter returns a ``BaseModel`` subtype with dynamically-built
+    # fields, so they are read via ``getattr`` rather than static attributes.
+    assert getattr(inst, "refuted") is True  # noqa: B009
+    assert getattr(inst, "reason") == "x"  # noqa: B009
+    assert getattr(inst, "score") is None  # noqa: B009  # optional -> defaulted None
 
 
 def test_dict_array_and_nested_object_and_enum() -> None:
@@ -55,8 +57,10 @@ def test_dict_array_and_nested_object_and_enum() -> None:
     }
     model = to_pydantic_model(schema)
     inst = model.model_validate({"items": [{"title": "t", "impact": "high"}]})
-    assert inst.items[0].title == "t"
-    assert inst.items[0].impact.value == "high"
+    # Dynamically-built nested fields are read via ``getattr`` (see note above).
+    items = getattr(inst, "items")  # noqa: B009
+    assert getattr(items[0], "title") == "t"  # noqa: B009
+    assert getattr(items[0], "impact").value == "high"  # noqa: B009
 
 
 def test_unsupported_construct_fails_loud() -> None:

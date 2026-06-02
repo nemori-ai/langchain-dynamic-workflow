@@ -14,7 +14,10 @@ import asyncio
 import contextvars
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar, overload
+
+from langchain.agents.structured_output import ToolStrategy
+from pydantic import BaseModel
 
 from ._budget import Budget
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
@@ -28,9 +31,10 @@ from ._journal import JournalRecord, JournalStore, journal_key
 from ._observability import SpanKind, SpanRecorder
 from ._pipeline import Stage, run_pipeline
 from ._progress import ProgressKind, ProgressLog
-from ._result import fold_result
+from ._result import fold_result, fold_structured
 from ._roster import Roster
 from ._sandbox import leaf_id_from_key
+from ._schema import to_pydantic_model
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +94,7 @@ class WorkflowResolver(Protocol):
 
 
 T = TypeVar("T")
+M = TypeVar("M", bound=BaseModel)
 
 _FANOUT_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
     "langchain_dynamic_workflow_fanout_depth", default=0
@@ -256,15 +261,54 @@ class Ctx:
         finally:
             _WORKFLOW_DEPTH.reset(token)
 
+    @overload
     async def agent(
         self,
         prompt: str,
         *,
         agent_type: str,
+        schema: type[M],
+        model: str | None = ...,
+        isolation: str = ...,
+    ) -> M: ...
+
+    @overload
+    async def agent(
+        self,
+        prompt: str,
+        *,
+        agent_type: str,
+        schema: dict[str, Any],
+        model: str | None = ...,
+        isolation: str = ...,
+    ) -> BaseModel: ...
+
+    @overload
+    async def agent(
+        self,
+        prompt: str,
+        *,
+        agent_type: str,
+        schema: None = ...,
+        model: str | None = ...,
+        isolation: str = ...,
+    ) -> str: ...
+
+    async def agent(
+        self,
+        prompt: str,
+        *,
+        agent_type: str,
+        schema: type[BaseModel] | dict[str, Any] | None = None,
         model: str | None = None,
         isolation: str = "shared",
-    ) -> str:
-        """Run a leaf subagent and return its folded final text.
+    ) -> str | BaseModel:
+        """Run a leaf subagent and return its folded result.
+
+        Without ``schema`` the folded final text is returned. With ``schema`` (a
+        pydantic ``BaseModel`` subclass or an inline JSON-schema ``dict``) the leaf
+        is built with a matching ``response_format`` and the validated structured
+        object is returned — the script reads it by attribute.
 
         Resolves ``agent_type`` against the roster, consults the journal, and on
         a miss invokes the leaf and persists the result (success-only).
@@ -286,27 +330,38 @@ class Ctx:
         Args:
             prompt: The prompt for the leaf.
             agent_type: The roster name to resolve.
+            schema: Optional structured-output schema (pydantic class or JSON-schema
+                dict). Requires the roster entry to be registered with a builder.
             model: Optional per-call model override. When ``None`` the roster
                 entry's ``default_model`` is used as the effective model.
             isolation: Isolation mode (part of the journal key).
 
         Returns:
-            The leaf's folded final text.
+            The folded final text, or the validated structured object when
+            ``schema`` is given.
 
         Raises:
             KeyError: If ``agent_type`` is not registered.
+            ValueError: If ``schema`` is given for a runnable-only roster entry, or
+                a dict schema uses an unsupported construct.
             WorkflowBudgetExceededError: If the shared budget is exhausted.
         """
         entry = self._roster.resolve(agent_type)  # fail fast on unknown agent_type
+        # Normalize a supplied schema (pydantic class or JSON-schema dict) to a
+        # concrete pydantic model. ``None`` keeps the schema-less text path.
+        structured_model = to_pydantic_model(schema) if schema is not None else None
         # Resolve the effective model once: an explicit override wins, otherwise
         # the roster entry's registered default. Both the journal key and the leaf
         # config are derived from this single value so they can never disagree.
         effective_model = model if model is not None else entry.default_model
+        # The schema is part of the journal key (via its JSON schema), so a
+        # schema-bound call partitions distinctly from a schema-less one and from
+        # a call bound to a different schema — resume restores the exact variant.
         key = journal_key(
             prompt=prompt,
             agent_type=agent_type,
             model=effective_model,
-            schema=None,
+            schema=structured_model,
             isolation=isolation,
         )
         # Observability-by-default: the whole leaf lifecycle (determinism check,
@@ -332,10 +387,13 @@ class Ctx:
                 # so spent() rebuilds to the first run's cumulative total without a
                 # model call. A cache hit never consumes a budget slot beyond its
                 # own usage. The span reports the hit so a trace distinguishes a
-                # replayed leaf from a fresh one.
+                # replayed leaf from a fresh one. A schema-bound result was stored
+                # as model_dump_json, so it is restored via model_validate_json.
                 self._budget.record(key, cached.usage)
                 span.set("cached", True)
                 span.set("usage_tokens", cached.usage)
+                if structured_model is not None:
+                    return structured_model.model_validate_json(cached.result)
                 return cached.result
             # Cap is checked only before dispatching a *new* leaf: an exhausted pool
             # refuses fresh work while in-flight leaves finish and keep their results.
@@ -347,6 +405,14 @@ class Ctx:
             # leaves allocate nothing. The identity is the same key that dedups the
             # journal, so it is stable across retry/resume by construction.
             leaf_id = leaf_id_from_key(key)
+            # A schema binds the leaf to a ToolStrategy(model) so it emits a
+            # validated structured_response; schema-less calls pass None. The same
+            # response_format is threaded through to the roster's builder.
+            response_format = (
+                ToolStrategy(structured_model, handle_errors=True)
+                if structured_model is not None
+                else None
+            )
             # The gate bounds the number of leaves actually in flight; a journal hit
             # above never consumes a slot, keeping resume cheap. The leaf runner
             # receives the *effective* model so the config it threads matches the key.
@@ -357,16 +423,25 @@ class Ctx:
                     effective_model,
                     leaf_id=leaf_id,
                     needs_execution=entry.needs_execution,
+                    response_format=response_format,
                 )
             )
-            folded = fold_result(outcome.state)
+            # With a schema, fold the validated structured object and journal its
+            # canonical JSON; without one, fold the final text directly.
+            folded_obj: str | BaseModel
+            if structured_model is not None:
+                folded_obj = fold_structured(outcome.state, structured_model)
+                result_str = folded_obj.model_dump_json()
+            else:
+                folded_obj = fold_result(outcome.state)
+                result_str = folded_obj
             # success-only: unreachable if the leaf raised. Usage is journaled so
             # the spend is reconstructable on resume.
-            await self._journal.put(key, JournalRecord(result=folded, usage=outcome.usage))
+            await self._journal.put(key, JournalRecord(result=result_str, usage=outcome.usage))
             self._budget.record(key, outcome.usage)
             span.set("cached", False)
             span.set("usage_tokens", outcome.usage)
-            return folded
+            return folded_obj
 
     async def parallel(self, thunks: Sequence[Callable[[], Awaitable[T]]]) -> list[T | None]:
         """Fan out a list of thunks concurrently with a blocking barrier.

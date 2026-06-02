@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel
@@ -42,7 +44,7 @@ def test_fold_raises_without_messages_key() -> None:
 
 def test_fold_structured_returns_structured_response() -> None:
     inst = _V(refuted=True)
-    state = {"messages": [], "structured_response": inst}
+    state: dict[str, Any] = {"messages": [], "structured_response": inst}
     assert fold_structured(state, _V) is inst
 
 
