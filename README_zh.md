@@ -76,7 +76,7 @@ asyncio.run(main())
 
 `run_script` 即 meta 层：agent 写一段 `async def orchestrate(ctx, args)` 并提交源码，源码先过一道 **AST 安全 gate**、在受限 builtins 命名空间下执行。这道 gate 只挡"好心手滑"，**不是安全沙箱**——对抗性脚本仍可能逃逸，所以**只提交 agent 自己写的脚本**（对抗输入请把引擎跑在进程外隔离 backend 后面）。build-time 代码可用 `run_workflow_from_source(source, roster=...)` 编程式做同一件事。
 
-[`examples/`](examples/) 下的每个示例都**离线、无需 API key**（用 fake model）即可运行；若要通过 OpenRouter 驱动真实叶子并用 LangSmith 看 trace，先用 `uv sync --group example` 装上示例附加依赖，在本地 `.env` 里配好 `OPENROUTER_API_KEY` 与 `LANGSMITH_*`，再设 `LDW_DEMO_REAL_MODEL`（模型默认 `anthropic/claude-opus-4.8`，设成任意 OpenRouter slug 即可覆盖）。旗舰示例是 [`examples/06_capstone.py`](examples/06_capstone.py)：host agent 在后台驱动一条 `parallel` 研究 → `pipeline` 提炼 → 对抗式验证 → 综述的 workflow。若要全真运行，[`examples/07_deep_research_real_e2e.py`](examples/07_deep_research_real_e2e.py) 让一个**真实的 OpenRouter host agent**自行决定启动已注册的 `deep_research` workflow（search → extract → 对抗式验证 → 综述），端到端跑通。
+[`examples/`](examples/) 下的每个示例都**离线、无需 API key**（用 fake model）即可运行；若要通过 OpenRouter 驱动真实叶子并用 LangSmith 看 trace，先用 `uv sync --group example` 装上示例附加依赖，在本地 `.env` 里配好 `OPENROUTER_API_KEY` 与 `LANGSMITH_*`，再设 `LDW_DEMO_REAL_MODEL`（模型默认 `anthropic/claude-opus-4.8`，设成任意 OpenRouter slug 即可覆盖）。旗舰示例是 [`examples/06_capstone.py`](examples/06_capstone.py)：host agent 在后台驱动一条 `parallel` 研究 → `pipeline` 提炼 → 对抗式验证 → 综述的 workflow。若要全真运行，[`examples/07_deep_research_real_e2e.py`](examples/07_deep_research_real_e2e.py) 让一个**真实的 OpenRouter host agent**自行决定启动已注册的 `deep_research` workflow（search → extract → 对抗式验证 → 综述），端到端跑通。[`examples/08_meta_layer_run_script.py`](examples/08_meta_layer_run_script.py) 展示 **meta 层**：host **当场手写**一段临时脚本并经 `run_script` 提交（离线模式还会演示 gate 拦下不安全的首版、host 看到违规后改对重提）。
 
 ```bash
 uv run python examples/06_capstone.py

@@ -10,7 +10,11 @@ covers the compiled path just as it covers a hand-written one.
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from collections.abc import Callable
+from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -20,11 +24,27 @@ from langchain_dynamic_workflow import (
     InMemoryJournalStore,
     Roster,
     WorkflowDeterminismError,
+    WorkflowScriptError,
+    compile_workflow_source,
     run_workflow_from_source,
 )
 
 FakeLeafFactory = Callable[..., tuple[Runnable[Any, Any], Any]]
 DeepLeafFactory = Callable[[str], tuple[Runnable[Any, Any], Any]]
+
+
+def _load_example() -> ModuleType:
+    """Import ``examples/08_meta_layer_run_script.py`` as a module (sibling import safe)."""
+    examples_dir = Path(__file__).resolve().parents[2] / "examples"
+    if str(examples_dir) not in sys.path:
+        sys.path.insert(0, str(examples_dir))
+    path = examples_dir / "08_meta_layer_run_script.py"
+    spec = importlib.util.spec_from_file_location("_ldw_meta_layer_example", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 _PARALLEL_SCRIPT = """\
 async def orchestrate(ctx, args):
@@ -100,3 +120,30 @@ async def test_determinism_backstop_covers_compiled_scripts(
     await run_workflow_from_source(script_a, roster=roster, journal=journal)
     with pytest.raises(WorkflowDeterminismError):
         await run_workflow_from_source(script_b, roster=roster, journal=journal)
+
+
+async def test_example_authored_script_is_gate_valid_and_runs(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Guard the shipped demo: the script the example host eventually submits must
+    # stay gate-valid and actually fan out + synthesize through the real engine.
+    module = _load_example()
+    researcher, researcher_state = make_fake_leaf("a finding")
+    writer, _writer_state = make_fake_leaf("the recommendation")
+    roster = Roster().register("researcher", researcher).register("writer", writer)
+
+    result = await run_workflow_from_source(
+        module.AUTHORED_SCRIPT, roster=roster, args={"topics": module.TOPICS}
+    )
+
+    assert researcher_state.calls == len(module.TOPICS)  # one researcher per topic
+    assert result == "the recommendation"
+
+
+def test_example_rejected_script_actually_trips_the_gate() -> None:
+    # The example's "teachable" first script must really be rejected (for its
+    # import), so the demo's feed-back-and-retry loop is not fiction.
+    module = _load_example()
+    with pytest.raises(WorkflowScriptError) as exc:
+        compile_workflow_source(module.REJECTED_SCRIPT)
+    assert "import" in str(exc.value).lower()
