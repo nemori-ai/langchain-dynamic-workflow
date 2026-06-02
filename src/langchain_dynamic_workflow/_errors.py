@@ -41,3 +41,22 @@ class WorkflowNestingError(RuntimeError):
     a second nesting level, which the engine refuses by raising this instead of
     silently allowing unbounded recursion.
     """
+
+
+class WorkflowScriptError(RuntimeError):
+    """Raised when an LLM-authored orchestration script is rejected before execution.
+
+    The meta layer compiles an untrusted source string into an orchestration
+    callable behind a static AST gate. This is raised when the source cannot be
+    turned into a safe, runnable script: a syntax error, an AST-gate security
+    violation (an import, dunder attribute traversal, a banned builtin, or a
+    ``str.format`` attribute-injection vector), or a structural problem (the
+    script does not define an ``async def orchestrate(ctx, args)`` coroutine). The
+    message enumerates every violation found in one pass so the author can fix them
+    all at once and resubmit.
+
+    The AST gate guards against an honest model's slip, not an adversary: an
+    in-process restricted ``exec`` is not a security sandbox. Only compile source
+    you authored yourself; for adversarial input use an out-of-process isolation
+    backend.
+    """

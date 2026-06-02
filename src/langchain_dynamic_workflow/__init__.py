@@ -16,6 +16,7 @@ from ._errors import (
     WorkflowBudgetExceededError,
     WorkflowDeterminismError,
     WorkflowNestingError,
+    WorkflowScriptError,
 )
 from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal_key
 from ._observability import Span, SpanKind, SpanSink
@@ -54,6 +55,7 @@ __all__ = [
     "WorkflowDeterminismError",
     "WorkflowNestingError",
     "WorkflowRegistry",
+    "WorkflowScriptError",
     "__version__",
     "create_workflow_middleware",
     "create_workflow_tool",
