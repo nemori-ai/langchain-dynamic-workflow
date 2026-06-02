@@ -134,12 +134,13 @@ root_packages = ["langchain_dynamic_workflow"]
 # Required because a contract forbids an external package (langgraph).
 include_external_packages = true
 
-# Layer 2 (host-facing surface) reaches the engine only through the public core
-# entry (`run_workflow` in _engine) plus the public registries. It must never
-# reach into the deep orchestration internals — journal, budget, determinism,
-# pipeline, concurrency, sandbox, progress, context. Those are Layer 0/1 mechanics
-# behind the `run_workflow` wall; a tool/middleware import of them would couple the
-# agent-facing surface to engine internals and break the one-directional boundary.
+# Layer 2 (host-facing surface + meta-layer codegen) reaches the engine only
+# through the public core entry (`run_workflow` in _engine) plus the public
+# registries. It must never reach into the deep orchestration internals — journal,
+# budget, determinism, pipeline, concurrency, sandbox, progress, context. Those are
+# Layer 0/1 mechanics behind the `run_workflow` wall; a tool/middleware/codegen
+# import of them would couple the agent-facing surface to engine internals and
+# break the one-directional boundary.
 [[tool.importlinter.contracts]]
 name = "Layer 2 host-facing must not reach Layer 0/1 engine internals"
 type = "forbidden"
@@ -151,6 +152,7 @@ source_modules = [
     "langchain_dynamic_workflow.tool",
     "langchain_dynamic_workflow.middleware",
     "langchain_dynamic_workflow._background",
+    "langchain_dynamic_workflow._codegen",
 ]
 forbidden_modules = [
     "langchain_dynamic_workflow._journal",
@@ -163,16 +165,18 @@ forbidden_modules = [
     "langchain_dynamic_workflow._context",
 ]
 
-# The roster (leaf resolution) and the determinism guard are deliberately
-# substrate-agnostic: they must never import LangGraph internals. Coupling leaf
-# resolution or the determinism oracle to LangGraph would leak the substrate up
-# into layers that are meant to stay portable across it.
+# The roster (leaf resolution), the determinism guard, and the AST security gate
+# are deliberately substrate-agnostic: they must never import LangGraph internals.
+# Coupling leaf resolution, the determinism oracle, or the meta-layer security
+# wall to LangGraph would leak the substrate up into layers that are meant to stay
+# portable across it.
 [[tool.importlinter.contracts]]
-name = "Roster and determinism guard stay free of LangGraph internals"
+name = "Roster, determinism guard, and AST gate stay free of LangGraph internals"
 type = "forbidden"
 source_modules = [
     "langchain_dynamic_workflow._roster",
     "langchain_dynamic_workflow._determinism",
+    "langchain_dynamic_workflow._ast_gate",
 ]
 forbidden_modules = ["langgraph"]
 
