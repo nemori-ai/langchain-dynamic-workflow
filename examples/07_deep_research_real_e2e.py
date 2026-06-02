@@ -44,6 +44,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableConfig, RunnableLambda
+from pydantic import BaseModel
 
 from langchain_dynamic_workflow import (
     BgRunManager,
@@ -85,6 +86,23 @@ HOST_SYSTEM_PROMPT = (
 )
 
 
+# ── structured leaf contracts (schema-as-handoff) ─────────────────────────────
+
+
+class Claim(BaseModel):
+    """A single falsifiable claim extracted from one angle's research notes."""
+
+    text: str
+    checkable: bool
+
+
+class Verdict(BaseModel):
+    """One skeptic's adversarial ruling on a claim."""
+
+    refuted: bool
+    reason: str
+
+
 # ── the registered workflow ──────────────────────────────────────────────────
 
 
@@ -100,18 +118,19 @@ def _search_prompt(question: str, angle: str) -> str:
 def _extract_prompt(question: str, angle: str, finding: str) -> str:
     return (
         "From the research notes below, extract the single most important, falsifiable "
-        "claim bearing on the question. State it as ONE concrete, checkable sentence — no "
-        f"preamble.\nQuestion: {question}\nAngle: {angle}\nNotes: {finding}"
+        "claim bearing on the question. Put the claim as ONE concrete sentence in `text`, "
+        "and set `checkable` to true only if it is a factual statement that could in "
+        f"principle be verified.\nQuestion: {question}\nAngle: {angle}\nNotes: {finding}"
     )
 
 
 def _verify_prompt(question: str, claim: str, voter: int) -> str:
     return (
         f"You are skeptic #{voter + 1} reviewing a claim for factual accuracy from your own "
-        "knowledge. Begin your reply with exactly 'REFUTED' or 'SUPPORTED', then one sentence "
-        "of reasoning. REFUTE only if the claim is factually wrong, misleading, or clearly "
-        "overstated; otherwise SUPPORT it. These claims are reasoned rather than web-sourced, "
-        f"so judge correctness, not citation presence.\nQuestion: {question}\nClaim: {claim}"
+        "knowledge. Set `refuted` to true only if the claim is factually wrong, misleading, "
+        "or clearly overstated; otherwise set it to false. Give one sentence of `reason`. "
+        "These claims are reasoned rather than web-sourced, so judge correctness, not "
+        f"citation presence.\nQuestion: {question}\nClaim: {claim}"
     )
 
 
@@ -129,13 +148,13 @@ def _synthesize_prompt(question: str, confirmed: list[str]) -> str:
     )
 
 
-def _is_refuted(verdict: str) -> bool:
-    """A skeptic vote counts as a refutation when its reply starts with ``REFUTED``."""
-    return verdict.strip().upper().startswith("REFUTED")
-
-
 async def deep_research(ctx: Ctx, args: dict[str, Any]) -> str:
-    """search -> extract -> adversarial verify -> synthesize, deep-research style."""
+    """search -> extract -> adversarial verify -> synthesize, deep-research style.
+
+    The extract and verify leaves hand back **schema-validated objects** (``Claim``
+    / ``Verdict``), so the reduce between phases is plain Python over typed data —
+    no brittle string parsing of the leaves' prose.
+    """
     question: str = args["question"]
 
     ctx.phase("search")
@@ -150,28 +169,32 @@ async def deep_research(ctx: Ctx, args: dict[str, Any]) -> str:
 
     ctx.phase("extract")
 
-    async def _extract(_prev: Any, item: tuple[str, str], _index: int) -> str:
+    async def _extract(_prev: Any, item: tuple[str, str], _index: int) -> Claim:
         angle, finding = item
-        return await ctx.agent(_extract_prompt(question, angle, finding), agent_type="extractor")
+        return await ctx.agent(
+            _extract_prompt(question, angle, finding), agent_type="extractor", schema=Claim
+        )
 
-    claims = [claim for claim in await ctx.pipeline(paired, _extract) if claim]
-    ctx.log(f"extracted {len(claims)} candidate claims")
+    claims = [c for c in await ctx.pipeline(paired, _extract) if c is not None and c.checkable]
+    ctx.log(f"extracted {len(claims)} checkable claims")
 
     ctx.phase("verify")
     confirmed: list[str] = []
     for claim in claims:
         verdicts = await ctx.parallel(
             [
-                lambda c=claim, v=v: ctx.agent(_verify_prompt(question, c, v), agent_type="skeptic")
+                lambda c=claim.text, v=v: ctx.agent(
+                    _verify_prompt(question, c, v), agent_type="skeptic", schema=Verdict
+                )
                 for v in range(SKEPTICS_PER_CLAIM)
             ]
         )
-        refutes = sum(1 for verdict in verdicts if verdict and _is_refuted(verdict))
+        refutes = sum(1 for verdict in verdicts if verdict is not None and verdict.refuted)
         survived = refutes < REFUTATIONS_TO_KILL
         mark = "kept" if survived else "killed"
-        ctx.log(f"claim {mark} ({refutes}/{SKEPTICS_PER_CLAIM} refute): {claim.strip()[:50]}")
+        ctx.log(f"claim {mark} ({refutes}/{SKEPTICS_PER_CLAIM} refute): {claim.text.strip()[:50]}")
         if survived:
-            confirmed.append(claim)
+            confirmed.append(claim.text)
 
     ctx.phase("synthesize")
     return await ctx.agent(_synthesize_prompt(question, confirmed), agent_type="writer")
@@ -190,24 +213,57 @@ def _fake_echo_leaf(prefix: str) -> Any:
     return RunnableLambda(_leaf)
 
 
-def _fake_const_leaf(reply: str) -> Any:
-    """An offline fake leaf that always returns a fixed reply (used for the skeptic)."""
+def _fake_structured_leaf(structured: BaseModel, *, reply: str) -> Any:
+    """An offline fake leaf that attaches a fixed ``structured_response``.
+
+    Stands in for a ``create_deep_agent`` built with ``response_format=ToolStrategy(...)``:
+    the leaf appends an ``AIMessage`` and hands back the given validated model
+    instance under ``structured_response`` so ``agent(schema=...)`` can fold it out.
+    """
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
-        return {"messages": [*inp["messages"], AIMessage(content=reply)]}
+        return {
+            "messages": [*inp["messages"], AIMessage(content=reply)],
+            "structured_response": structured,
+        }
 
     return RunnableLambda(_leaf)
 
 
 def _build_leaf(role: str) -> Any:
+    """Build a schema-less text leaf (researcher / writer)."""
     model = real_model()
     if model is not None:
         return create_deep_agent(model=model)
-    if role == "skeptic":
-        # Offline skeptics always SUPPORT, so every claim survives — a deterministic,
-        # readable demo. The real path exercises genuine adversarial refutation.
-        return _fake_const_leaf("SUPPORTED: consistent with the cited evidence")
     return _fake_echo_leaf(role)
+
+
+def _build_extractor(*, response_format: Any = None) -> Any:
+    """Builder for the ``extractor`` leaf, forwarding ``response_format`` (Claim)."""
+    model = real_model()
+    if model is not None:
+        return create_deep_agent(model=model, response_format=response_format)
+    # Offline: emit a deterministic checkable Claim so every angle survives extraction.
+    return _fake_structured_leaf(
+        Claim(
+            text="RAG and long-context LLMs trade recall breadth for context cost",
+            checkable=True,
+        ),
+        reply="extracted a checkable claim",
+    )
+
+
+def _build_skeptic(*, response_format: Any = None) -> Any:
+    """Builder for the ``skeptic`` leaf, forwarding ``response_format`` (Verdict)."""
+    model = real_model()
+    if model is not None:
+        return create_deep_agent(model=model, response_format=response_format)
+    # Offline skeptics never refute, so every claim survives — a deterministic,
+    # readable demo. The real path exercises genuine adversarial refutation.
+    return _fake_structured_leaf(
+        Verdict(refuted=False, reason="consistent with the cited evidence"),
+        reply="reviewed the claim",
+    )
 
 
 # ── offline scripted host (deterministic; real host replaces it when env-gated) ──
@@ -286,8 +342,8 @@ async def main() -> None:
     roster = (
         Roster()
         .register("researcher", _build_leaf("researcher"), description="Researches one angle")
-        .register("extractor", _build_leaf("extractor"), description="Extracts a falsifiable claim")
-        .register("skeptic", _build_leaf("skeptic"), description="Adversarially verifies a claim")
+        .register("extractor", builder=_build_extractor, description="Extracts a falsifiable claim")
+        .register("skeptic", builder=_build_skeptic, description="Adversarially verifies a claim")
         .register("writer", _build_leaf("writer"), description="Synthesizes the final report")
     )
     workflows = WorkflowRegistry().register("deep_research", deep_research)
