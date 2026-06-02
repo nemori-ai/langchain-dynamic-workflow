@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from deepagents import create_deep_agent  # pyright: ignore[reportUnknownVariableType]
+from deepagents.backends import StateBackend
 from deepagents.backends.filesystem import FilesystemBackend
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -22,7 +23,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import PrivateAttr
 
-from langchain_dynamic_workflow.skills import skills_path
+from langchain_dynamic_workflow.skills import DEFAULT_SKILL_MOUNT, skill_files, skills_path
 
 SKILL_NAME = "dynamic-workflow"
 
@@ -107,3 +108,49 @@ def _candidate_paths() -> list[Path]:
 def test_skills_path_is_stable() -> None:
     first, second = _candidate_paths()
     assert first == second
+
+
+def test_skill_files_returns_bundled_skill_in_memory() -> None:
+    # The disk-free loader reads each bundled SKILL.md via importlib.resources and
+    # returns a {virtual_path: text} mapping, so a consumer can seed a virtual
+    # backend without the skill ever existing as a physical file on their disk.
+    files = skill_files()
+    key = f"{DEFAULT_SKILL_MOUNT}/{SKILL_NAME}/SKILL.md"
+    assert key in files
+    # The in-memory content is the packaged SKILL.md verbatim (cross-checked against
+    # the on-disk read) and carries the real frontmatter + DSL surface.
+    on_disk = (skills_path() / SKILL_NAME / "SKILL.md").read_text(encoding="utf-8")
+    assert files[key] == on_disk
+    assert files[key].startswith("---")
+    for token in ("ctx.agent", "ctx.parallel", "ctx.pipeline"):
+        assert token in files[key]
+
+
+def test_skill_files_honors_custom_mount() -> None:
+    # The mount prefix roots every key so it can match the source passed to
+    # create_deep_agent(skills=[mount]).
+    files = skill_files(mount="/custom/skills")
+    assert files  # non-empty
+    assert all(path.startswith("/custom/skills/") for path in files)
+    assert f"/custom/skills/{SKILL_NAME}/SKILL.md" in files
+
+
+async def test_skill_files_seed_a_virtual_backend_into_the_prompt() -> None:
+    # The whole point of skill_files(): the disk-free route must reach the host
+    # prompt too. Seed a virtual (state) backend via invoke ``files=...`` — no
+    # FilesystemBackend, no real directory — and assert the skill metadata still
+    # surfaces, exactly as the on-disk route does in
+    # test_skill_metadata_reaches_host_prompt.
+    model = PromptCapturingModel()
+    host = create_deep_agent(  # pyright: ignore[reportUnknownVariableType]
+        model=model,
+        skills=[DEFAULT_SKILL_MOUNT],
+        backend=StateBackend(),
+    )
+    # State backends store files as FileData dicts; wrap the raw skill text.
+    files = {path: {"content": text, "encoding": "utf-8"} for path, text in skill_files().items()}
+    payload: dict[str, Any] = {"messages": [HumanMessage(content="hi")], "files": files}
+    await host.ainvoke(payload)  # pyright: ignore[reportUnknownMemberType, reportArgumentType]
+    prompt = "\n".join(model.captured)
+    assert SKILL_NAME in prompt
+    assert "control-flow inversion" in prompt

@@ -82,14 +82,16 @@ def _render_notification(notices: list[Notice]) -> str:
 class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
     """Contributes the workflow tool and injects background-run completion notices.
 
+    The package's built-in orchestration skill (which teaches a host to author
+    workflow scripts) is loaded separately onto ``create_deep_agent`` via
+    ``skills_path()`` / ``skill_files()``; this middleware only contributes the
+    workflow tool and the completion-notice injection.
+
     Args:
         roster: The leaf registry forwarded to launched runs.
         workflows: The named-workflow registry the tool resolves.
         manager: The shared background run manager owning run lifecycle and the
             completion-notice queue.
-        skills_dir: Optional path to the orchestration skills directory; exposed
-            for the host to pass to ``create_deep_agent(skills=[...])`` (the
-            skills are loaded natively by deepagents, not by this middleware).
         checkpointer: Optional checkpointer forwarded to launched runs.
         max_concurrency: Optional concurrency cap forwarded to launched runs.
         budget: Optional shared token ceiling forwarded to launched runs.
@@ -103,14 +105,12 @@ class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
         roster: Roster,
         workflows: WorkflowRegistry,
         manager: BgRunManager,
-        skills_dir: str | None = None,
         checkpointer: BaseCheckpointSaver[Any] | None = None,
         max_concurrency: int | None = None,
         budget: int | None = None,
     ) -> None:
         super().__init__()
         self._manager = manager
-        self.skills_dir = skills_dir
         self.tools = [
             create_workflow_tool(
                 roster,
@@ -160,7 +160,6 @@ def create_workflow_middleware(
     *,
     workflows: WorkflowRegistry,
     manager: BgRunManager | None = None,
-    skills_dir: str | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     max_concurrency: int | None = None,
     max_concurrent_runs: int | None = None,
@@ -174,8 +173,6 @@ def create_workflow_middleware(
         manager: Optional shared background run manager; a fresh one is created
             when omitted. Pass the *same* instance to the tool factory if you
             build the tool separately, so completion notices reach the host.
-        skills_dir: Optional orchestration skills directory exposed on the
-            middleware for the host to pass to ``create_deep_agent(skills=[...])``.
         checkpointer: Optional checkpointer forwarded to launched runs.
         max_concurrency: Optional concurrency cap forwarded to launched runs.
         max_concurrent_runs: Optional cap on concurrent host-initiated background
@@ -197,7 +194,6 @@ def create_workflow_middleware(
             if manager is not None
             else BgRunManager(max_concurrent_runs=max_concurrent_runs)
         ),
-        skills_dir=skills_dir,
         checkpointer=checkpointer,
         max_concurrency=max_concurrency,
         budget=budget,

@@ -25,7 +25,7 @@ from ._roster import Roster, RosterEntry
 from ._sandbox import SandboxManager
 from ._workflows import WorkflowRegistry
 from .middleware import create_workflow_middleware
-from .skills import skills_path
+from .skills import skill_files, skills_path
 from .tool import create_workflow_tool
 
 __version__ = version("langchain-dynamic-workflow")
@@ -60,5 +60,6 @@ __all__ = [
     "fold_result",
     "journal_key",
     "run_workflow",
+    "skill_files",
     "skills_path",
 ]

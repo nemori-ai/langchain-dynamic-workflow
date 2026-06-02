@@ -18,7 +18,7 @@ host deepagent 后台驱动 workflow、poll/notify 取回结论；skills 教 hos
 
 ```python
 def create_workflow_tool(roster: Roster, *, ...) -> BaseTool       # 多命令 run/status/resume/cancel
-def create_workflow_middleware(roster: Roster, *, skills_dir=None, ...) -> AgentMiddleware
+def create_workflow_middleware(roster: Roster, *, ...) -> AgentMiddleware
     # .tools = [workflow_tool]；abefore_model 注入 <workflow_notification>；持 BgRunManager
 
 class BgRunManager:
