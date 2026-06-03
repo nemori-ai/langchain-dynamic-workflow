@@ -149,6 +149,13 @@
 
 ---
 
+## M1 实测发现（新候选 backlog，非 M1 范围）
+
+M1 的真模型 E2E 过程中浮现两条值得后续处理的信号：
+
+- **K · host 无法按名发现已注册工作流。** 一个有能力的 host（opus）在道层 prompt + skill + tool description 下会**自驱**工具，但因 tool description 不枚举"可用的已注册工作流名"，它选择 `run_script` **自拟**一个等效工作流，而非跑注册的 `deep_research`。改进点：tool description / `help` 暴露已注册工作流清单（让 host 能 `run` 现成的，而非总是重新 author）。归类近 M7（人体工学）或独立小项。
+- **host 模型能力门槛。** 道层 prompt（无机制 coaching）下，弱模型（haiku）驱动不动多步工具流；需够强的 host（opus 可）。这是模型能力问题、非 skill/tool 缺口（opus 证明接缝自足），记作 demo 运行约定：真 host demo 用够强的模型。
+
 ## 状态
 
 - **对比阶段**：✅ 完成。10 主题逐一带 `file:line` 证据 + 置信度（证据稿 `docs/plans/2026-06-03-v0.3.0-cc-vs-port-comparison.md`）。战略定调=允许超集。
