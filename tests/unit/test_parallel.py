@@ -33,6 +33,7 @@ def _ctx() -> Ctx:
         leaf_id: str = "",
         needs_execution: bool = False,
         response_format: Any = None,
+        isolation: str = "shared",
     ) -> LeafOutcome:
         return LeafOutcome(state={"messages": []}, usage=0)
 
@@ -99,6 +100,7 @@ async def test_parallel_respects_concurrency_gate() -> None:
         leaf_id: str = "",
         needs_execution: bool = False,
         response_format: Any = None,
+        isolation: str = "shared",
     ) -> LeafOutcome:
         nonlocal in_flight, peak
         in_flight += 1

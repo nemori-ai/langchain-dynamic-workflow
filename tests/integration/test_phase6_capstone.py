@@ -133,8 +133,12 @@ class _PeakSandboxManager(SandboxManager):
         self.peak = 0
 
     @asynccontextmanager
-    async def lease(self, *, leaf_id: str, needs_execution: bool) -> AsyncGenerator[Any]:
-        async with super().lease(leaf_id=leaf_id, needs_execution=needs_execution) as backend:
+    async def lease(
+        self, *, leaf_id: str, needs_execution: bool, isolation: str = "shared"
+    ) -> AsyncGenerator[Any]:
+        async with super().lease(
+            leaf_id=leaf_id, needs_execution=needs_execution, isolation=isolation
+        ) as backend:
             self.peak = max(self.peak, self.active_count)
             yield backend
 

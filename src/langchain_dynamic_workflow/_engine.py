@@ -137,6 +137,7 @@ async def run_workflow(
         leaf_id: str,
         needs_execution: bool,
         response_format: Any = None,
+        isolation: str = "shared",
     ) -> LeafOutcome:
         roster.resolve(agent_type)  # fail fast on unknown agent_type
         # Resolve the runnable bound to the requested response_format: a schema-less
@@ -179,7 +180,7 @@ async def run_workflow(
         # StateBackend with no allocation. The backend is threaded into the leaf
         # config under a dedicated key so a backend-aware leaf can run against it.
         async with sandbox_manager.lease(
-            leaf_id=leaf_id, needs_execution=needs_execution
+            leaf_id=leaf_id, needs_execution=needs_execution, isolation=isolation
         ) as backend:
             if needs_execution:
                 # Record the leased execution identity so the engine can stop its
@@ -206,6 +207,7 @@ async def run_workflow(
         leaf_id: str = "",
         needs_execution: bool = False,
         response_format: Any = None,
+        isolation: str = "shared",
     ) -> LeafOutcome:
         # The single durable leaf path, shared by agent / parallel / pipeline.
         # The shared gate (applied inside Ctx) bounds how many of these run at
@@ -217,6 +219,7 @@ async def run_workflow(
             leaf_id=leaf_id,
             needs_execution=needs_execution,
             response_format=response_format,
+            isolation=isolation,
         )
 
     recorded_sequence = await journal_store.get_sequence()
