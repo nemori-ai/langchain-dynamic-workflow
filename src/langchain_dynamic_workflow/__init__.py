@@ -19,10 +19,11 @@ from ._errors import (
     WorkflowNestingError,
     WorkflowScriptError,
 )
-from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal_key
+from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal_key, race_key
 from ._leaves import read_only_builder, read_only_leaf
 from ._observability import Span, SpanKind, SpanSink
 from ._progress import ProgressEntry, ProgressKind, ProgressSink
+from ._race_types import RaceCandidate, RaceResult
 from ._reduce import (
     Consensus,
     Reconciled,
@@ -58,6 +59,8 @@ __all__ = [
     "ProgressEntry",
     "ProgressKind",
     "ProgressSink",
+    "RaceCandidate",
+    "RaceResult",
     "Reconciled",
     "ResultStore",
     "ReviewItem",
@@ -82,6 +85,7 @@ __all__ = [
     "extract_meta",
     "fold_result",
     "journal_key",
+    "race_key",
     "read_only_builder",
     "read_only_leaf",
     "reconcile",
