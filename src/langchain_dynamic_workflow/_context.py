@@ -720,10 +720,17 @@ class Ctx:
             # envelope is self-contained so replay needs no candidate leaf entry.
             cached = await self._journal.get(rkey)
             if cached is not None:
-                self._budget.record(rkey, cached.usage)
                 decision = json.loads(cached.result)
                 cached_index = int(decision["winner_index"])
                 cached_result_str = decision["result"]
+                # Reconstruct the winner's spend under its OWN leaf key — the key the
+                # fresh run counted it under — NOT the race-key. The journal hit on
+                # rkey guarantees identical candidates (rkey is derived from their leaf
+                # keys), so leaf_keys[cached_index] is the winner's key. Recording per
+                # leaf key keeps spend reconstructable AND idempotent: a later agent()
+                # with the winner's exact params hits the same key and is not
+                # double-counted (recording under rkey would, since rkey != leaf_key).
+                self._budget.record(leaf_keys[cached_index], cached.usage)
                 decoded: Any = (
                     schema_model.model_validate_json(cached_result_str)
                     if schema_model is not None
@@ -736,16 +743,20 @@ class Ctx:
             span.set("replayed", False)
 
             # Fresh run: dispatch all candidates concurrently; first to satisfy wins.
-            token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
-            tasks = [
-                asyncio.ensure_future(self._run_race_candidate(candidate))
-                for candidate in candidates
-            ]
-            index_of = {task: index for index, task in enumerate(tasks)}
+            # The depth is incremented just before the try and the tasks are created
+            # INSIDE it, so the finally always tears the tasks down and resets the
+            # depth even if task creation raises — mirroring parallel()/pipeline().
             winner_index: int | None = None
             winner_result: Any = None
             to_raise: BaseException | None = None
+            tasks: list[asyncio.Task[Any]] = []
+            token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
             try:
+                tasks = [
+                    asyncio.ensure_future(self._run_race_candidate(candidate))
+                    for candidate in candidates
+                ]
+                index_of = {task: index for index, task in enumerate(tasks)}
                 remaining = set(tasks)
                 while remaining and winner_index is None and to_raise is None:
                     done, remaining = await asyncio.wait(

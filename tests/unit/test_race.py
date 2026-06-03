@@ -56,14 +56,18 @@ def _text_runner(
 
 
 def _ctx(
-    leaf_runner: Any, *, budget: Budget | None = None, gate: ConcurrencyGate | None = None
+    leaf_runner: Any,
+    *,
+    budget: Budget | None = None,
+    gate: ConcurrencyGate | None = None,
+    journal: InMemoryJournalStore | None = None,
 ) -> Ctx:
     return Ctx(
         roster=Roster()
         .register("inv", _noop_runnable())
         .register("winner", _noop_runnable())
         .register("loser", _noop_runnable()),
-        journal=InMemoryJournalStore(),
+        journal=journal if journal is not None else InMemoryJournalStore(),
         leaf_runner=leaf_runner,
         gate=gate if gate is not None else ConcurrencyGate(limit=8),
         budget=budget,
@@ -171,6 +175,37 @@ async def test_race_budget_signal_fails_loud() -> None:
             win=lambda text: text == "WIN",
             win_tag="t",
         )
+
+
+async def test_race_replay_records_winner_under_leaf_key_not_race_key() -> None:
+    # Replay must reconstruct the winner's spend under the winner's LEAF key (the key
+    # the fresh run counted it under), never the race-key. A single winning candidate
+    # is journaled on the fresh run; on replay the race dispatches nothing but rebuilds
+    # spend. If it recorded under the race-key, a later agent() with the winner's exact
+    # params would record the same usage AGAIN under the leaf key (rkey != leaf_key),
+    # double-counting one leaf's tokens and breaking fresh-vs-replay spend agreement.
+    journal = InMemoryJournalStore()
+    runner = _text_runner({"h0": "WIN"}, usage=7)
+    cands = [RaceCandidate(prompt="h0", agent_type="inv")]
+
+    # Fresh run: the winner's agent() records 7 under its leaf key; rkey is not a budget
+    # key. A repeated identical agent() is a journal hit, idempotent -> spent stays 7.
+    fresh_budget = Budget(total=None)
+    fresh = _ctx(runner, budget=fresh_budget, journal=journal)
+    r1: RaceResult[str] = await fresh.race(cands, win=lambda text: text == "WIN", win_tag="t")
+    await fresh.agent("h0", agent_type="inv")  # winner's exact params -> same leaf key
+    assert r1.winner == "WIN"
+    assert fresh_budget.spent() == 7
+
+    # Replay run (shares the journal -> rkey hit, zero dispatch). Spend is rebuilt under
+    # the winner's leaf key, so the later identical agent() stays idempotent and the
+    # winner's 7 tokens are counted ONCE — not 7 (rkey) + 7 (leaf key) = 14.
+    replay_budget = Budget(total=None)
+    replay = _ctx(runner, budget=replay_budget, journal=journal)
+    r2: RaceResult[str] = await replay.race(cands, win=lambda text: text == "WIN", win_tag="t")
+    await replay.agent("h0", agent_type="inv")
+    assert r2.winner == "WIN"
+    assert replay_budget.spent() == 7
 
 
 async def test_race_cancels_losers_and_releases_gate_slots() -> None:
