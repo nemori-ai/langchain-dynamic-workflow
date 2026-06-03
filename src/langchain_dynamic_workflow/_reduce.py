@@ -12,6 +12,7 @@ so they are inherently replay-safe and never touch the journal or determinism gu
 from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Iterable, Sequence
+from dataclasses import dataclass
 from typing import Any, overload
 
 
@@ -69,3 +70,55 @@ def dedup(items: Iterable[Any], *, key: Callable[[Any], Hashable] | None = None)
         seen.add(identity)
         kept.append(item)
     return kept
+
+
+@dataclass(frozen=True)
+class ReviewItem[T, V]:
+    """One item plus every reviewer's verdict on it (``None`` = that reviewer failed)."""
+
+    item: T
+    verdicts: Sequence[V | None]
+
+
+@dataclass(frozen=True)
+class Reconciled[T]:
+    """The outcome of reconciling N independent reviewers over a set of items."""
+
+    included: list[T]
+    excluded: list[T]
+    conflicts: list[T]
+
+
+def reconcile[T, V](
+    review_items: Sequence[ReviewItem[T, V]], *, include: Callable[[V], bool]
+) -> Reconciled[T]:
+    """Bucket items by independent-reviewer agreement (dual-blind screening, PRISMA-style).
+
+    Per item: if any verdict is ``None`` or there are no verdicts, the item is a
+    conflict (fail-safe: never auto-decide on missing review). Otherwise, if every
+    reviewer would ``include`` it, it is included; if none would, it is excluded; a
+    mix is a conflict to escalate.
+
+    Args:
+        review_items: Each item paired with its reviewers' verdicts.
+        include: Predicate returning ``True`` when a verdict says 'include'.
+
+    Returns:
+        A :class:`Reconciled` partition into included / excluded / conflicts.
+    """
+    included: list[T] = []
+    excluded: list[T] = []
+    conflicts: list[T] = []
+    for review in review_items:
+        verdicts = review.verdicts
+        if not verdicts or any(verdict is None for verdict in verdicts):
+            conflicts.append(review.item)
+            continue
+        decisions = [include(verdict) for verdict in verdicts if verdict is not None]
+        if all(decisions):
+            included.append(review.item)
+        elif not any(decisions):
+            excluded.append(review.item)
+        else:
+            conflicts.append(review.item)
+    return Reconciled(included=included, excluded=excluded, conflicts=conflicts)

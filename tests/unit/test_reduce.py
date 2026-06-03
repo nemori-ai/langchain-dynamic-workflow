@@ -6,7 +6,13 @@ from dataclasses import dataclass
 
 import pytest
 
-from langchain_dynamic_workflow._reduce import dedup, survives
+from langchain_dynamic_workflow._reduce import (
+    Reconciled,
+    ReviewItem,
+    dedup,
+    reconcile,
+    survives,
+)
 
 
 @dataclass
@@ -66,3 +72,40 @@ def test_dedup_merges_by_key() -> None:
 def test_dedup_empty_and_all_none() -> None:
     assert dedup([]) == []
     assert dedup([None, None]) == []
+
+
+@dataclass
+class _Screen:
+    keep: bool
+
+
+def _items(*rows: tuple[str, list[_Screen | None]]) -> list[ReviewItem[str, _Screen]]:
+    return [ReviewItem(item=name, verdicts=verdicts) for name, verdicts in rows]
+
+
+def test_reconcile_three_buckets() -> None:
+    review = _items(
+        ("all-include", [_Screen(keep=True), _Screen(keep=True)]),
+        ("all-exclude", [_Screen(keep=False), _Screen(keep=False)]),
+        ("mixed", [_Screen(keep=True), _Screen(keep=False)]),
+    )
+    result = reconcile(review, include=lambda s: s.keep)
+    assert result == Reconciled(
+        included=["all-include"], excluded=["all-exclude"], conflicts=["mixed"]
+    )
+
+
+def test_reconcile_none_verdict_is_conflict_failsafe() -> None:
+    review = _items(("had-a-failed-reviewer", [_Screen(keep=True), None]))
+    result = reconcile(review, include=lambda s: s.keep)
+    assert result.conflicts == ["had-a-failed-reviewer"]
+    assert result.included == [] and result.excluded == []
+
+
+def test_reconcile_empty_verdicts_is_conflict() -> None:
+    review = _items(("no-reviews", []))
+    assert reconcile(review, include=lambda s: s.keep).conflicts == ["no-reviews"]
+
+
+def test_reconcile_empty_input() -> None:
+    assert reconcile([], include=lambda s: s.keep) == Reconciled([], [], [])
