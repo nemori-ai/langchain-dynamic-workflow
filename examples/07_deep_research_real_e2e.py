@@ -11,7 +11,8 @@ deep-research dynamic workflow onto this engine's primitives:
 
     search (parallel fan-out, one researcher per angle)
       -> extract (no-barrier pipeline: one falsifiable claim per finding)
-      -> verify (3-vote adversarial skeptics per claim; >=2 refutes kills it)
+      -> verify (3-vote adversarial skeptics per claim; >=2 refutes kills it; each
+                 skeptic is a read-only judge — it can only verify, never edit)
       -> synthesize (one writer folds the surviving claims into a report)
 
 The leaves reason from the model's own knowledge (no live WebSearch/WebFetch tools
@@ -53,6 +54,7 @@ from langchain_dynamic_workflow import (
     Roster,
     WorkflowRegistry,
     create_workflow_middleware,
+    read_only_leaf,
     skills_path,
 )
 from langchain_dynamic_workflow.middleware import WORKFLOW_NOTIFICATION_TAG
@@ -254,10 +256,19 @@ def _build_extractor(*, response_format: Any = None) -> Any:
 
 
 def _build_skeptic(*, response_format: Any = None) -> Any:
-    """Builder for the ``skeptic`` leaf, forwarding ``response_format`` (Verdict)."""
+    """Builder for the ``skeptic`` leaf (a read-only judge), forwarding ``response_format``.
+
+    The skeptic adversarially verifies a claim — it should only *judge*, never mutate
+    state. Building it with ``read_only_leaf`` (a deny-write FilesystemPermission)
+    makes that physical: even though it is a full deepagent with file tools, a write
+    is refused at the tool boundary, so a hallucinated "fix" can never escape the
+    verifier. This is the canonical way a host wires a read-only judge into a
+    workflow: register the builder, and ``ctx.agent(agent_type="skeptic", schema=...)``
+    yields a structured, read-only verdict.
+    """
     model = real_model()
     if model is not None:
-        return create_deep_agent(model=model, response_format=response_format)
+        return read_only_leaf(model, response_format=response_format)
     # Offline skeptics never refute, so every claim survives — a deterministic,
     # readable demo. The real path exercises genuine adversarial refutation.
     return _fake_structured_leaf(

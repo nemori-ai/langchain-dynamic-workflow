@@ -112,6 +112,7 @@ key = sha256(canonical_json({prompt, agent_type, model,
 - **schema** = 脚本传 pydantic 类或内联 JSON-schema `dict`,后者经 `to_pydantic_model` 归一为 pydantic 模型(进程级缓存,等值 dict → 同一类 → 同一 `model_json_schema()`;对 `$ref`/`allOf`/`anyOf`/`oneOf`/`patternProperties`/`not`、非 bool 的 `additionalProperties`、不在 `properties` 中的 `required`、未支持的约束关键字(`pattern`/`minimum`/`format`/`const`…)、值相等坍缩的枚举(`True==1`/`1==1.0`)一律 **fail-loud,不静默降级**,并设递归深度/字段数/枚举规模/缓存条目数护栏防资源耗尽);引擎以 `response_format=ToolStrategy(model, handle_errors=True)`(in-loop 纠错重试)构造叶子,journal 只缓存校验过的 `model_dump_json`、命中以 `model_validate_json` 还原。`ProviderStrategy` 无 in-loop retry,不作默认。
 - **budget 管线**:`UsageMetadataCallbackHandler` 跨嵌套聚合 token;但绕开 task 工具直调时**必须自己复刻 `_build_subagent_config` 的 callbacks 转发**,否则共享 budget 漏算;**每叶子 usage 入 journal** → 保 `spent()` 重放可重建。
 - **state schema**:自定义须继承 `DeepAgentState`(其 `DeltaChannel(snapshot_frequency=50)` 把 checkpoint 增长压到 O(N))。
+- **只读裁判叶(D-G4)**:库级 `read_only_leaf` / `read_only_builder` 以 `create_deep_agent(permissions=[FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")])` 构造**工具面只读**的叶——可 read/grep/glob/ls,写/编辑在工具边界被拒(实测:fake 模型调 `write_file` → 无文件落地)。deepagents 无 execute 权限维度,故只读裁判同时 `needs_execution=False`(走 `StateBackend`、无 execute 工具,该默认后端遵守 deny-write)。adversarial-verify / judge-panel 的裁判注册为只读叶 → 幻觉修复落不了地("生成"与"判定"分离);builder 形态支持 `schema=`(裁判返 `Verdict`)。只读是工具面属性、归宿主侧装配,引擎不参与。
 
 ## 8. sandbox 机制（接缝②E，verified-in-source）
 
@@ -170,6 +171,7 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | D-G1a | roster 注册形态(schema 落地) | **callable builder**(`(*, response_format) -> Runnable`),否决"roster 持 deep-agent kwargs 自建":依赖倒置(引擎不耦合 deepagents 构造签名)+ roster 通用性(任意 `Runnable` 工厂皆可)+ 宿主稳定性(`response_format` 是构造期参数、预构造 runnable 无法事后改)。`runnable` / `builder` 互斥,前者仅 schema-less |
 | D-G1b | 构建缓存归属 | **缓存归 Roster**(`(agent_type, schema) -> Runnable` 进程级、并发安全):内聚(紧邻持有 builder 的 roster)+ 生命周期匹配(编译图跨 run 无状态,进程级正合)+ 构建期无外求 + resume 不重建。二者在"预构造 runnable 无法事后绑 `response_format`"约束下,落实了 D18 的逐次 schema 绑定 |
 | D-G2 | `isolation="worktree"` 保真度 | **v1 默认 = 内存播种副本**(`InMemoryWorktreeProvider`:`seed` 给隔离 base 快照拷贝、`collect` 算相对 seed 变更集)+ **真 git-worktree 后端作同 `WorktreeProvider` 协议后的可插拔生产实现**(未在 v1 交付)。否决"仅文档化 seam"(不兑现卖点)与"v1 直接上真 git worktree"(与 offline-first 跨度大)。`SandboxManager._new_sandbox` 仅 slot 新建时播种;`isolation` 经 `agent → leaf_task → lease` 透传;fix 叶复用 G1 `schema=Patch` 自报变更(生成/应用分离) |
+| D-G4 | read-only judge 形态 | **库级辅助**(`read_only_leaf` / `read_only_builder`)+ deny-write `FilesystemPermission` + `needs_execution=False`,否决"引擎内建只读 agentType":引擎不构造叶(宿主构造),只读是工具面属性归宿主侧;deepagents 无 execute 权限维度,靠不分配 sandbox 禁执行 + deny-write 禁写,叠加才是真只读;builder 形态复用 G1,只读 + 结构化裁决一行可得 |
 | D19 | 接缝③ L2 交付节奏 | v1 = L0/L1 先行,L2 架构预留紧跟(L2-as-skill,见 02) |
 | D20 | async 后台 tool 执行 | 自建轻量后台机制(无 server / 无重依赖);v1 即含;蓝本 = omne-next 实现 + deepagents async-task API 形态。详见 [02 §3](02-architecture.md) |
 

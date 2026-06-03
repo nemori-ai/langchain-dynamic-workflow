@@ -20,6 +20,7 @@ from ._errors import (
     WorkflowScriptError,
 )
 from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal_key
+from ._leaves import read_only_builder, read_only_leaf
 from ._observability import Span, SpanKind, SpanSink
 from ._progress import ProgressEntry, ProgressKind, ProgressSink
 from ._result import fold_result
@@ -67,6 +68,8 @@ __all__ = [
     "extract_meta",
     "fold_result",
     "journal_key",
+    "read_only_builder",
+    "read_only_leaf",
     "run_workflow",
     "run_workflow_from_source",
     "skill_files",
