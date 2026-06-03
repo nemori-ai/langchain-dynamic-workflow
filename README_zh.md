@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 ![Types: pyright strict](https://img.shields.io/badge/types-pyright%20strict-blue.svg)
-![Status: alpha 0.1.0](https://img.shields.io/badge/status-alpha%200.1.0-orange.svg)
+![Status: alpha 0.2.0](https://img.shields.io/badge/status-alpha%200.2.0-orange.svg)
 
 [English](README.md) | **中文**
 
