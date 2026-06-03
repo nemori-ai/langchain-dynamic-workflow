@@ -139,3 +139,25 @@ async def test_run_script_can_call_injected_reduce_helpers() -> None:
     unused_ctx: Any = object()  # this script ignores ctx
     result = await orchestrate(unused_ctx, {})
     assert result == (True, 1, ["x"], ["a", "b"])
+
+
+async def test_run_script_can_construct_injected_race_types() -> None:
+    # A host-authored script reaches the race value types by name (no import — the
+    # AST gate forbids imports). Proves the meta-layer namespace injection delivers
+    # the race primitive's surface to on-the-fly scripts, not only to imported
+    # developer workflows.
+    from langchain_dynamic_workflow._codegen import compile_workflow_source
+
+    source = (
+        "async def orchestrate(ctx, args):\n"
+        "    candidates = [RaceCandidate(prompt=h, agent_type='inv') for h in args['hyps']]\n"
+        "    probe = RaceResult(winner='x', winner_index=0)\n"
+        "    return (len(candidates), candidates[0].agent_type, probe.won)\n"
+    )
+    orchestrate = compile_workflow_source(source)
+    # Run the compiled body (it touches only the injected race types + literals,
+    # never ctx) and assert the computed result — proving the injected names resolve
+    # AND execute, not merely that they are present.
+    unused_ctx: Any = object()
+    result = await orchestrate(unused_ctx, {"hyps": ["a", "b", "c"]})
+    assert result == (3, "inv", True)
