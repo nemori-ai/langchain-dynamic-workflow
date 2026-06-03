@@ -57,9 +57,11 @@ class _SlotCreationSpyManager(SandboxManager):
 
     @asynccontextmanager
     async def lease(
-        self, *, leaf_id: str, needs_execution: bool
+        self, *, leaf_id: str, needs_execution: bool, isolation: str = "shared"
     ) -> AsyncGenerator[BackendProtocol]:
-        async with super().lease(leaf_id=leaf_id, needs_execution=needs_execution) as backend:
+        async with super().lease(
+            leaf_id=leaf_id, needs_execution=needs_execution, isolation=isolation
+        ) as backend:
             # Sample inside the body, where this leaf's slot (if any) is live and
             # counted, so the peak reflects genuine simultaneous occupancy.
             self._sample()

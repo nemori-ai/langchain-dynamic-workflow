@@ -70,6 +70,7 @@ class LeafRunner(Protocol):
         leaf_id: str = "",
         needs_execution: bool = False,
         response_format: Any = None,
+        isolation: str = "shared",
     ) -> Awaitable[LeafOutcome]:
         """Run the leaf and return its ``LeafOutcome`` (raw state + token usage)."""
         ...
@@ -347,6 +348,15 @@ class Ctx:
             WorkflowBudgetExceededError: If the shared budget is exhausted.
         """
         entry = self._roster.resolve(agent_type)  # fail fast on unknown agent_type
+        # isolation="worktree" needs an execution sandbox to seed into; a reasoning
+        # leaf has none, so requesting a worktree on it is a contradiction — fail
+        # loud rather than silently hand back an unseeded StateBackend.
+        if isolation == "worktree" and not entry.needs_execution:
+            raise ValueError(
+                f"isolation='worktree' requires agent_type {agent_type!r} to be registered "
+                "with needs_execution=True (a worktree is seeded into an execution sandbox; "
+                "a reasoning leaf has none)"
+            )
         # Normalize a supplied schema (pydantic class or JSON-schema dict) to a
         # concrete pydantic model. ``None`` keeps the schema-less text path.
         structured_model = to_pydantic_model(schema) if schema is not None else None
@@ -424,6 +434,7 @@ class Ctx:
                     leaf_id=leaf_id,
                     needs_execution=entry.needs_execution,
                     response_format=response_format,
+                    isolation=isolation,
                 )
             )
             # With a schema, fold the validated structured object and journal its

@@ -41,7 +41,11 @@ correct one yourself.
   imports needed) — it returns a **validated structured object** you read by
   attribute, so the next line is plain Python over typed data. `agent_type` names a
   registered leaf; a schema requires that leaf to be registered with a builder.
-  This is the only place a model runs.
+  This is the only place a model runs. Pass `isolation="worktree"` only for a leaf
+  that **mutates files in parallel** with its siblings (e.g. one fixer per file in a
+  fix swarm): it runs in its own copy of a seeded base workspace, isolated from the
+  others, and should hand back its change as a structured patch. Read-only and
+  synthesis leaves stay on the default `"shared"`.
 - `await ctx.parallel(thunks)` — fan out a list of zero-argument thunks
   concurrently with a blocking barrier. Returns results in input order; a thunk
   whose leaf fails lands as `None` (it never aborts the barrier). Filter the

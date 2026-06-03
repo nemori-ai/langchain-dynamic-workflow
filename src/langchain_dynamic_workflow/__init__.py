@@ -26,6 +26,7 @@ from ._result import fold_result
 from ._roster import Roster, RosterEntry
 from ._sandbox import SandboxManager
 from ._workflows import WorkflowRegistry
+from ._worktree import InMemoryWorktreeProvider, WorktreeProvider
 from .middleware import create_workflow_middleware
 from .skills import skill_files, skills_path
 from .tool import create_workflow_tool
@@ -39,6 +40,7 @@ __all__ = [
     "Budget",
     "Ctx",
     "InMemoryJournalStore",
+    "InMemoryWorktreeProvider",
     "JournalRecord",
     "JournalStore",
     "Orchestrator",
@@ -57,6 +59,7 @@ __all__ = [
     "WorkflowNestingError",
     "WorkflowRegistry",
     "WorkflowScriptError",
+    "WorktreeProvider",
     "__version__",
     "compile_workflow_source",
     "create_workflow_middleware",

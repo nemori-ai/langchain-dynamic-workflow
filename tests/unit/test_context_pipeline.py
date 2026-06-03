@@ -28,6 +28,7 @@ class _CountingLeaf:
         leaf_id: str = "",
         needs_execution: bool = False,
         response_format: Any = None,
+        isolation: str = "shared",
     ) -> LeafOutcome:
         self.calls += 1
         return LeafOutcome(

@@ -46,8 +46,19 @@ classDiagram
   class DeterminismGuard { +check_replay(seq) }
   class PipelineScheduler { +run(items, stages) list }
   class SandboxManager {
-    +acquire(leaf_id) Backend
+    +acquire(leaf_id, isolation) Backend
+    +lease(leaf_id, needs_execution, isolation) Backend
     +stop(id)
+    -worktree_provider: WorktreeProvider?
+  }
+  class WorktreeProvider {
+    <<protocol>>
+    +seed(leaf_id) Mapping
+    +collect(leaf_id, files) dict
+  }
+  class InMemoryWorktreeProvider {
+    +seed(leaf_id) Mapping
+    +collect(leaf_id, files) dict
   }
   class WorkflowTool {
     <<BaseTool, multi-command>>
@@ -83,6 +94,8 @@ classDiagram
   Journal ..> JournalStore
   Roster *-- RosterEntry
   SandboxManager ..> Backend : deepagents backend 实例
+  SandboxManager ..> WorktreeProvider : isolation=worktree 播种
+  WorktreeProvider <|.. InMemoryWorktreeProvider
   WorkflowMiddleware *-- WorkflowTool
   WorkflowMiddleware *-- BgRunManager
   WorkflowTool --> BgRunManager
