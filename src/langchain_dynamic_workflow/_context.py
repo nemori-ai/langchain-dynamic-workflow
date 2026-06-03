@@ -713,6 +713,26 @@ class Ctx:
             # varies run to run), mirroring leaves inside parallel() / pipeline().
             if _FANOUT_DEPTH.get() == 0:
                 self._sequence_guard.observe(rkey)
+
+            # Replay: a journaled race decision reproduces the winner deterministically
+            # and dispatches NOTHING — the losers never re-run, so a resumed race is
+            # cheaper than the first (correct: the decision is already made). The
+            # envelope is self-contained so replay needs no candidate leaf entry.
+            cached = await self._journal.get(rkey)
+            if cached is not None:
+                self._budget.record(rkey, cached.usage)
+                decision = json.loads(cached.result)
+                cached_index = int(decision["winner_index"])
+                cached_result_str = decision["result"]
+                decoded: Any = (
+                    schema_model.model_validate_json(cached_result_str)
+                    if schema_model is not None
+                    else cached_result_str
+                )
+                span.set("replayed", True)
+                span.set("won", True)
+                span.set("winner_index", cached_index)
+                return RaceResult[T](winner=cast(T, decoded), winner_index=cached_index)
             span.set("replayed", False)
 
             # Fresh run: dispatch all candidates concurrently; first to satisfy wins.

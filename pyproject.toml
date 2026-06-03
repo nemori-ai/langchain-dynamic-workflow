@@ -107,7 +107,11 @@ testpaths = ["tests"]
 # [tool.coverage.report] fail_under). The core orchestration paths (agent /
 # parallel / pipeline / journal / resume / background) are integration-tested, so
 # the gate guards against an untested regression sliding in.
-addopts = "-ra --cov=langchain_dynamic_workflow --cov-report=term-missing"
+# --import-mode=importlib lets same-basename test modules coexist across the unit
+# and integration trees (e.g. tests/unit/test_race.py and
+# tests/integration/test_race.py) without sys.path-prepend collisions and without
+# sprinkling __init__.py files through the test trees.
+addopts = "-ra --import-mode=importlib --cov=langchain_dynamic_workflow --cov-report=term-missing"
 
 [tool.coverage.run]
 branch = false
