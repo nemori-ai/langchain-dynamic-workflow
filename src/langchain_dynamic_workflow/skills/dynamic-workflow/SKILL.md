@@ -176,13 +176,14 @@ async def orchestrate(ctx, args):
                 for v in range(3)  # a voter index keeps the 3 skeptics distinct (resume-safe)
             ]
         )
-        # Fail-safe: a skeptic that failed (None) counts as a refutation, so a claim
-        # is never confirmed on absent verification.
-        refutes = sum(1 for v in votes if v is None or v.refuted)
-        if refutes < 2:  # survives a 3-skeptic majority
+        if survives(votes, against=lambda v: v.refuted, kill_at=2):
             confirmed.append(claim)
     return confirmed
 ```
+
+`survives` bakes in the fail-safe — a `None` (failed skeptic) counts as a
+refutation, so a claim is never confirmed on absent verification. It is available
+by name in a `run_script` script (no import needed).
 
 **Pipeline review → verify (pipeline by default; `parallel` only for a real
 barrier).** Stream each dimension through review-then-verify with no barrier, so a
@@ -226,7 +227,7 @@ async def orchestrate(ctx, args):
     findings = await ctx.parallel(
         [lambda t=t: ctx.agent(f"Research {t}", agent_type="researcher") for t in topics]
     )
-    kept = sorted({f.strip() for f in findings if f})  # reduce in plain Python
+    kept = sorted(dedup(f.strip() for f in findings if f))  # dedup() drops None + de-dupes
     return await ctx.agent("Synthesize these findings:\n" + "\n".join(kept), agent_type="writer")
 ```
 
@@ -291,8 +292,7 @@ async def orchestrate(ctx, args):
             for lens in lenses
         ]
     )
-    passes = sum(1 for r in rulings if r is not None and r.sound)
-    return "accepted" if passes >= 2 else "rejected"
+    return "accepted" if survives(rulings, against=lambda r: not r.sound, kill_at=2) else "rejected"
 ```
 
 **Per-stage model routing (cost discipline).** Spend a cheap model on bulk triage
@@ -330,9 +330,63 @@ async def orchestrate(ctx, args):
     return [r for r in results if r is not None]
 ```
 
+**Cross-leaf corroboration (`corroborate`).** When several leaves research the same
+space, keep only what *more than one* of them independently produced. `corroborate`
+groups equivalent items by a key and keeps groups with enough support — a far
+stronger signal than any single leaf. Available by name in `run_script`.
+
+```python
+async def orchestrate(ctx, args):
+    topics = sorted(args["topics"])
+    findings = await ctx.parallel(
+        [lambda t=t: ctx.agent(f"State one fact about {t}", agent_type="researcher", schema={
+            "type": "object",
+            "properties": {"fact": {"type": "string"}},
+            "required": ["fact"],
+            "additionalProperties": False,
+        }) for t in topics]
+    )
+    groups = corroborate(findings, key=lambda f: f.fact.strip().lower(), min_support=2)
+    return [g.members[0].fact for g in groups]  # one representative per corroborated group
+```
+
+**Dual-blind reconciliation (`reconcile`).** Two (or more) independent reviewers
+screen each item; the script keeps only what they unanimously include, drops what
+they unanimously exclude, and escalates disagreements (or a failed reviewer) as
+conflicts. The fan-out stays explicit; `reconcile` just buckets the verdicts.
+
+```python
+async def orchestrate(ctx, args):
+    records = sorted(args["records"])
+    review = []
+    for record in records:
+        verdicts = await ctx.parallel(
+            [lambda r=record, n=n: ctx.agent(
+                f"Reviewer #{n + 1}: should this record be INCLUDED in the review? {r}",
+                agent_type="screener",
+                schema={
+                    "type": "object",
+                    "properties": {"keep": {"type": "boolean"}},
+                    "required": ["keep"],
+                    "additionalProperties": False,
+                },
+            ) for n in range(2)]
+        )
+        review.append(ReviewItem(item=record, verdicts=verdicts))
+    result = reconcile(review, include=lambda v: v.keep)
+    ctx.log(f"included {len(result.included)}, conflicts {len(result.conflicts)} to escalate")
+    return result.included
+```
+
 A judge in any of these patterns ideally cannot edit — separate the agent that
 *generates* from the one that *judges* so a hallucinated fix can't land. Register
 the judge as a read-only leaf when your roster supports it.
+
+The reduce helpers — `survives`, `dedup`, `reconcile`, `corroborate` (and the
+`ReviewItem` / `Reconciled` / `Consensus` types) — are available by name inside a
+`run_script` script (injected into the namespace); you do not import them. They are
+pure functions over the result list `ctx.parallel` / `ctx.pipeline` hands back, so
+the fan-out stays explicit and the reduce stays correct.
 
 ## Authoring a script for `run_script`
 
