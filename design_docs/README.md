@@ -22,4 +22,4 @@
 
 ## 状态
 
-架构已锁（5 面承重墙 + 3 条接缝 + 对外形态全部收口）。v0.1.0 已实现；v0.2.0 用例驱动 gap-closing 进行中（批次见 [`v0_2_0_plans/00-roadmap.md`](v0_2_0_plans/00-roadmap.md)：**G1 `agent(schema=)` 已落地**，G3/G2/G4 plan 已定稿待执行）。历史批次归档在 `v0_1_0_plans/`。
+架构已锁（5 面承重墙 + 3 条接缝 + 对外形态全部收口）。v0.1.0、v0.2.0 均已实现并打 tag。v0.2.0 用例驱动 gap-closing 四个 gap 全部收口（批次见 [`v0_2_0_plans/00-roadmap.md`](v0_2_0_plans/00-roadmap.md)：**G1 `agent(schema=)`、G3 质量范式库、G2 `isolation="worktree"` 真隔离、G4 只读裁判 leaf 均已落地**）。历史批次归档在 `v0_1_0_plans/`。v0.3.0 用例收集进行中。

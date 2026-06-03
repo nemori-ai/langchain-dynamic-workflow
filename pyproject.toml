@@ -1,6 +1,6 @@
 [project]
 name = "langchain-dynamic-workflow"
-version = "0.1.0"
+version = "0.2.0"
 description = "Deterministic, scripted, resumable multi-agent orchestration for LangChain deepagents — a community port of Claude Code's Dynamic Workflows."
 readme = "README.md"
 requires-python = ">=3.12"
