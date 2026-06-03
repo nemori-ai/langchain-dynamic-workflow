@@ -54,8 +54,10 @@ from langchain_dynamic_workflow import (
     Roster,
     WorkflowRegistry,
     create_workflow_middleware,
+    dedup,
     read_only_leaf,
     skills_path,
+    survives,
 )
 from langchain_dynamic_workflow.middleware import WORKFLOW_NOTIFICATION_TAG
 
@@ -177,8 +179,11 @@ async def deep_research(ctx: Ctx, args: dict[str, Any]) -> str:
             _extract_prompt(question, angle, finding), agent_type="extractor", schema=Claim
         )
 
-    claims = [c for c in await ctx.pipeline(paired, _extract) if c is not None and c.checkable]
-    ctx.log(f"extracted {len(claims)} checkable claims")
+    extracted = [c for c in await ctx.pipeline(paired, _extract) if c is not None and c.checkable]
+    claims = dedup(extracted, key=lambda c: c.text.strip().lower())
+    ctx.log(
+        f"extracted {len(claims)} checkable claims ({len(extracted) - len(claims)} dups merged)"
+    )
 
     ctx.phase("verify")
     confirmed: list[str] = []
@@ -191,10 +196,9 @@ async def deep_research(ctx: Ctx, args: dict[str, Any]) -> str:
                 for v in range(SKEPTICS_PER_CLAIM)
             ]
         )
-        refutes = sum(1 for verdict in verdicts if verdict is not None and verdict.refuted)
-        survived = refutes < REFUTATIONS_TO_KILL
+        survived = survives(verdicts, against=lambda v: v.refuted, kill_at=REFUTATIONS_TO_KILL)
         mark = "kept" if survived else "killed"
-        ctx.log(f"claim {mark} ({refutes}/{SKEPTICS_PER_CLAIM} refute): {claim.text.strip()[:50]}")
+        ctx.log(f"claim {mark}: {claim.text.strip()[:50]}")
         if survived:
             confirmed.append(claim.text)
 
