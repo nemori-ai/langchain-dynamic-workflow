@@ -30,6 +30,15 @@ from typing import Any, cast
 from ._ast_gate import validate_workflow_source
 from ._engine import run_workflow
 from ._errors import WorkflowScriptError
+from ._reduce import (
+    Consensus,
+    Reconciled,
+    ReviewItem,
+    corroborate,
+    dedup,
+    reconcile,
+    survives,
+)
 from ._roster import Roster
 from ._workflows import WorkflowFn
 
@@ -75,6 +84,18 @@ Deliberately excludes ``print`` (use ``ctx.log`` / ``ctx.phase``), ``type`` /
 _SAFE_BUILTINS: dict[str, Any] = {name: getattr(builtins, name) for name in _SAFE_BUILTIN_NAMES}
 """The exact ``__builtins__`` mapping bound into a compiled script's namespace."""
 
+_SCRIPT_REDUCE_API: dict[str, Any] = {
+    "survives": survives,
+    "dedup": dedup,
+    "reconcile": reconcile,
+    "corroborate": corroborate,
+    "ReviewItem": ReviewItem,
+    "Reconciled": Reconciled,
+    "Consensus": Consensus,
+}
+"""Cross-leaf reduce helpers injected as script globals so a host-authored script
+calls them by name without an import (the AST gate forbids imports)."""
+
 
 def compile_workflow_source(source: str) -> WorkflowFn:
     """Validate, compile, and execute an untrusted script into an orchestration callable.
@@ -104,7 +125,7 @@ def compile_workflow_source(source: str) -> WorkflowFn:
     # __builtins__ untouched), so the executed module — and the orchestrate closure
     # it defines, whose __globals__ is this namespace — can never reach the real
     # builtins.
-    namespace: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
+    namespace: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS, **_SCRIPT_REDUCE_API}
     exec(code, namespace)
 
     orchestrate = namespace.get("orchestrate")
