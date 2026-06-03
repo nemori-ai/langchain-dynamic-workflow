@@ -46,6 +46,8 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.state import StateBackend
 
+from ._worktree import WorktreeProvider
+
 SANDBOX_ID_PREFIX = "leaf"
 """Prefix applied to every derived sandbox identity for readability in logs."""
 
@@ -434,6 +436,7 @@ class SandboxManager:
         idle_ttl: float | None = None,
         hard_ttl: float | None = None,
         clock: Callable[[], float] = time.monotonic,
+        worktree_provider: WorktreeProvider | None = None,
     ) -> None:
         # Live execution sandboxes keyed by leaf identity. Reasoning leaves never
         # enter this map — that is what keeps active_count tied to execution work.
@@ -442,9 +445,35 @@ class SandboxManager:
         self._idle_ttl = idle_ttl
         self._hard_ttl = hard_ttl
         self._clock = clock
+        # Seeds + collects changesets for isolation="worktree" leaves; None keeps
+        # worktree leaves as plain empty sandboxes (no seeding source).
+        self._worktree_provider = worktree_provider
         # Signalled whenever a slot frees, so a lease parked under backpressure
         # can wake and re-check for room rather than busy-spinning.
         self._slot_freed = asyncio.Condition()
+
+    def _new_sandbox(self, leaf_id: str, isolation: str) -> InMemorySandbox:
+        """Create a leaf's sandbox, seeding it from the worktree base when asked.
+
+        For ``isolation="worktree"`` with a configured provider the sandbox is
+        populated with an isolated copy of the base snapshot before the leaf runs;
+        otherwise it starts empty (the prior per-leaf behavior).
+
+        Args:
+            leaf_id: The leaf's derived identity.
+            isolation: ``"worktree"`` to seed from the base snapshot, else ``"shared"``.
+
+        Returns:
+            The new, possibly-seeded :class:`InMemorySandbox`.
+        """
+        sandbox = InMemorySandbox(identity=leaf_id)
+        if isolation == "worktree" and self._worktree_provider is not None:
+            seed = self._worktree_provider.seed(leaf_id)
+            if seed:
+                sandbox.upload_files(
+                    [(path, content.encode("utf-8")) for path, content in seed.items()]
+                )
+        return sandbox
 
     @property
     def active_count(self) -> int:
@@ -477,7 +506,9 @@ class SandboxManager:
             return True
         return self._hard_ttl is not None and now - slot.created_at >= self._hard_ttl
 
-    def acquire(self, *, leaf_id: str, needs_execution: bool) -> BackendProtocol:
+    def acquire(
+        self, *, leaf_id: str, needs_execution: bool, isolation: str = "shared"
+    ) -> BackendProtocol:
         """Return the backend a leaf should run against (tiered admission).
 
         This is the synchronous find-or-create primitive that honors the same
@@ -496,6 +527,9 @@ class SandboxManager:
             needs_execution: Whether the leaf requires an isolated execution
                 sandbox. When ``False`` the leaf is pure reasoning and is handed
                 a fresh :class:`StateBackend` without being allocated a sandbox.
+            isolation: ``"worktree"`` seeds the new sandbox from the worktree base
+                snapshot (when a provider is configured); ``"shared"`` (the default)
+                leaves it empty, preserving the prior per-leaf behavior.
 
         Returns:
             An isolated :class:`InMemorySandbox` for execution leaves (the same
@@ -527,13 +561,13 @@ class SandboxManager:
                     "use lease() to wait for a slot to free"
                 )
         now = self._clock()
-        sandbox = InMemorySandbox(identity=leaf_id)
+        sandbox = self._new_sandbox(leaf_id, isolation)
         self._slots[leaf_id] = _SandboxSlot(sandbox=sandbox, created_at=now, last_used_at=now)
         return sandbox
 
     @asynccontextmanager
     async def lease(
-        self, *, leaf_id: str, needs_execution: bool
+        self, *, leaf_id: str, needs_execution: bool, isolation: str = "shared"
     ) -> AsyncGenerator[BackendProtocol]:
         """Lease a backend for the duration of a leaf invocation.
 
@@ -550,6 +584,9 @@ class SandboxManager:
         Args:
             leaf_id: The leaf's derived identity.
             needs_execution: Whether the leaf requires an isolated sandbox.
+            isolation: ``"worktree"`` seeds the leased sandbox from the worktree
+                base snapshot (when a provider is configured); ``"shared"`` (the
+                default) leaves it empty.
 
         Yields:
             The backend the leaf should run against.
@@ -579,7 +616,7 @@ class SandboxManager:
             slot = self._slots.get(leaf_id)
             if slot is None:
                 now = self._clock()
-                sandbox = InMemorySandbox(identity=leaf_id)
+                sandbox = self._new_sandbox(leaf_id, isolation)
                 slot = _SandboxSlot(sandbox=sandbox, created_at=now, last_used_at=now)
                 self._slots[leaf_id] = slot
             slot.in_use += 1
