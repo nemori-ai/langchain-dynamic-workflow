@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -52,6 +53,20 @@ async def test_read_only_leaf_cannot_write() -> None:
     assert any(
         isinstance(m, AIMessage) and "could not write" in m.text.lower() for m in out["messages"]
     )
+
+
+def test_read_only_leaf_rejects_backend_kwarg() -> None:
+    # A `backend` override (esp. a callable factory) could expose an execute tool
+    # that has no write-permission check, defeating read-only. Reject it loud.
+    with pytest.raises(ValueError, match=r"backend"):
+        read_only_leaf(_WriteAttemptModel(), backend=object())
+
+
+def test_read_only_leaf_rejects_permissions_kwarg() -> None:
+    # A caller-supplied permissions would collide with the deny-write rule; reject
+    # it loud rather than surface a duplicate-keyword TypeError.
+    with pytest.raises(ValueError, match=r"permissions"):
+        read_only_leaf(_WriteAttemptModel(), permissions=[])
 
 
 async def test_read_only_builder_forwards_response_format() -> None:

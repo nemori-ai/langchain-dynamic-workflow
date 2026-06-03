@@ -48,6 +48,17 @@ def read_only_leaf(
     Returns:
         A compiled deepagent whose filesystem writes are denied.
     """
+    # Reject overrides that would defeat the read-only guarantee: a caller-supplied
+    # `permissions` collides with the deny-write rule, and a `backend` (especially a
+    # callable factory) can resolve to an execution-capable backend whose execute
+    # tool has no write-permission check. Use create_deep_agent directly for those.
+    for forbidden in ("backend", "permissions"):
+        if forbidden in kwargs:
+            raise ValueError(
+                f"read_only_leaf does not accept {forbidden!r}: it forces a deny-write "
+                "permission and the default (non-execution) state backend to guarantee "
+                "read-only. Use create_deep_agent directly if you need to override them."
+            )
     extra: dict[str, Any] = dict(kwargs)
     if system_prompt is not None:
         extra["system_prompt"] = system_prompt

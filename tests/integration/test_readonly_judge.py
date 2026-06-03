@@ -28,9 +28,18 @@ class _WriteThenJudgeModel(BaseChatModel):
     def _generate(
         self, messages: list[BaseMessage], stop: Any = None, run_manager: Any = None, **kw: Any
     ) -> ChatResult:
-        if any(getattr(m, "type", "") == "tool" for m in messages):
-            verdict = AIMessage(content="verdict: the code is unsound; I could not edit it")
-            return ChatResult(generations=[ChatGeneration(message=verdict)])
+        tool_msgs = [m for m in messages if getattr(m, "type", "") == "tool"]
+        if tool_msgs:
+            # Discriminate denied-vs-succeeded so the test proves the write was
+            # ATTEMPTED and DENIED (not merely never tried): if the write had
+            # succeeded, the verdict would say "edited" and the assertion below fails.
+            denied = any("permission denied" in m.text.lower() for m in tool_msgs)
+            text = (
+                "verdict: the code is unsound; my edit was refused (write denied)"
+                if denied
+                else "verdict: I edited the file"
+            )
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
         call = AIMessage(
             content="",
             tool_calls=[
@@ -51,7 +60,8 @@ async def test_read_only_judge_runs_through_the_engine() -> None:
 
     result = await run_workflow(orchestrate, roster=roster)
 
-    # The judge ran end to end through the engine and returned its verdict; its
-    # attempt to edit was blocked by the read-only permission (it "could not edit").
+    # The judge ran end to end through the engine and returned its verdict; the
+    # "write denied" path proves its edit was ATTEMPTED and refused by the read-only
+    # permission (a successful write would have made the fake say "I edited the file").
     assert "verdict" in result.lower()
-    assert "could not edit" in result.lower()
+    assert "write denied" in result.lower()
