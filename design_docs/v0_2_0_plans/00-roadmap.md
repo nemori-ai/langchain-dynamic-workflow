@@ -12,25 +12,27 @@
 
 | # | Gap | 社区频率 | 现状 | 杠杆 | 依赖 | Plan |
 |---|---|---|---|---|---|---|
-| **G1** | `agent()` 无 `schema`、返回纯文本 | ubiquitous | 签名无 schema、`journal_key(schema=None)` 写死、`fold` 不取 `structured_response` | 最高 | 无 | [`01-g1-agent-schema-structured-output.md`](01-g1-agent-schema-structured-output.md) |
-| **G3** | SKILL.md 只教机械用法，缺质量模式库 | 质量分水岭 | 仅 3 个基础 pattern + 确定性规则 | 高 | G1 | 待写 |
-| **G2** | `isolation='worktree'` 无真实语义 | occasional（CC 旗舰 Bun 迁移用例） | isolation 仅入 journal key，无行为差异 | 中 | 无 | 待写 |
-| **G4** | 无开箱 read-only judge agentType | occasional | `agent_type` 仅解析用户 roster | 低 | 无 | 待写 |
+| **G1** | `agent()` 无 `schema`、返回纯文本 | ubiquitous | ✅ **已落地**（`feat/g1-agent-schema`）：`schema=` + builder-roster + journal 往返 + 跨模型评审 7 缺陷已修 + 真 E2E ×2 | 最高 | 无 | [`01-g1-agent-schema-structured-output.md`](01-g1-agent-schema-structured-output.md) |
+| **G3** | SKILL.md 只教机械用法，缺质量模式库 | 质量分水岭 | 仅 3 个基础 pattern + 确定性规则 | 高 | G1 | [`02-g3-skill-pattern-library.md`](02-g3-skill-pattern-library.md) |
+| **G2** | `isolation='worktree'` 无真实语义 | occasional（CC 旗舰 Bun 迁移用例） | isolation 仅入 journal key，无行为差异 | 中 | 无 | [`03-g2-worktree-isolation.md`](03-g2-worktree-isolation.md) |
+| **G4** | 无开箱 read-only judge agentType | occasional | `agent_type` 仅解析用户 roster | 低 | 无（与 G3 协同） | [`04-g4-readonly-judge.md`](04-g4-readonly-judge.md) |
 
 **退役的伪 gap（经社区数据核实，不投入）：** 一层嵌套（CC 也是 one-level）、跨会话 resume（CC same-session，我们更强）、pipeline 签名 / budget.total / parallel 语义（均已对齐）、`args` 字符串化（CC 怪癖，我们原生 dict 更干净）。
 
 ## 推进顺序
 
 ```
-G1  agent(schema=...)         ← 总开关、ubiquitous          【plan 已就绪】
- └─ G3  SKILL.md 质量模式库     ← 依赖 G1；CC 质量真正所在
-      └─ G2  isolation=worktree ← 旗舰迁移用例
-           └─ G4  read-only judge type ← 人体工学
+G1  agent(schema=...)         ← 总开关、ubiquitous          【✅ 已落地】
+ └─ G3  SKILL.md 质量模式库     ← 依赖 G1；CC 质量真正所在    【plan 就绪】
+      └─ G2  isolation=worktree ← 旗舰迁移用例                【plan 就绪】
+           └─ G4  read-only judge type ← 人体工学            【plan 就绪】
 ```
 
-每条 gap 落地必须：① 走完整 TDD（Red→Green→Refactor）；② 用一个社区真实用例当验收门；③ **同步更新 evergreen 设计文档**（`design_docs/{01,02}.md` + `uml/`）。
+每条 gap 落地必须：① 走完整 TDD（Red→Green→Refactor）；② 用一个社区真实用例当**真模型 E2E 验收门**（offline fake 证机制、`LDW_DEMO_REAL_MODEL` 真跑证逼近度）；③ **同步更新 evergreen 设计文档**（`design_docs/{01,02}.md` + `uml/`）。
 
 ## 状态
 
-- **G1**：plan 就绪（`01-...md`，9 个 task），待执行。
-- **G3 / G2 / G4**：待 G1 落地后逐条写 plan。
+- **G1**：✅ **已落地**于 `feat/g1-agent-schema`（10 提交：规划 + 9-task 实现 + 1 跨模型评审修复）。独立全量闸门绿（276 passed）、Codex 跨模型评审 7 缺陷全修、真模型 E2E ×2 通过、evergreen 文档已同步。
+- **G3 / G2 / G4**：plan 已定稿（`02`/`03`/`04`），按序待执行。G4 的 deepagents 只读 API、G2 的 sandbox 播种表面均已在各自 plan 开工前核实。
+
+> **执行序列：** G3 → G2 → G4（G3 是 CC 质量真正所在、紧承 G1；G2/G4 在其后；G4 与 G3 的 judge 模式协同——09 示例的裁判改用 G4 `read_only_builder`）。
