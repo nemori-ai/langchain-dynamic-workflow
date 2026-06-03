@@ -30,6 +30,8 @@
 
 失败语义照搬 Claude Code:`parallel` 永不 reject、`pipeline` 抛错落 `null`。
 
+这些是"能写什么"；用好它们的**作者模式库**（adversarial-verify、pipeline-by-default、loop-until-dry + 硬 MAX_ROUNDS、judge-panel、model-routing…）及其确定性适配见 [03-authoring-patterns.md](03-authoring-patterns.md)，可运行投影在 `skills/dynamic-workflow/SKILL.md`。
+
 ## 3. 底座同构：LangGraph Functional API + 两偏差（实证）
 
 LangGraph functional API 与 Claude Code Workflow 是同一范式,durable execution 白送大半:
