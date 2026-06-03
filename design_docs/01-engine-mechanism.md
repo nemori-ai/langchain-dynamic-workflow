@@ -122,6 +122,7 @@ key = sha256(canonical_json({prompt, agent_type, model,
 - **分层准入**:roster `needs_execution` 元数据;纯推理 agent 走 StateBackend **不分配 sandbox**。
 - **CompositeBackend**:`/shared/` 路由共享产物 store(显式 hand-off、版本化、producer 命名空间、路由前路径规范化防穿越);**但 `#2884`(OPEN)route 隔离会在共享存储后端间泄漏 → 并行叶子隔离不能仅靠 routes,须独立验证**。
 - **并发安全 stance**:默认假设单叶子内 deepagents 可能并发调工具 → per-leaf sandbox 访问默认串行化,实测安全再放开。
+- **`isolation="worktree"`(D-G2)**:并行改文件的 fix 叶各跑在**从 base 快照播种的隔离可变副本**里——`WorktreeProvider.seed(leaf_id)` 给一份隔离拷贝,`SandboxManager._new_sandbox` 在 slot **新建时**用 `upload_files` 播种(retry 复用不重播),`isolation` 经 `agent → leaf_task → lease` 透传。叶子改完**返回 `Patch`**(G1 `schema=`,落实"生成"与"应用"分离)。v1 默认语义 = 内存播种副本(`InMemoryWorktreeProvider`);真 git-worktree 后端(`git worktree add` per 叶 + `git diff` 作 `collect`)是同 `WorktreeProvider` 协议后的可插拔生产实现,未在 v1 交付。`"shared"`(默认)维持空 sandbox 的既有 per-leaf 隔离。
 
 ## 9. pipeline 调度器（无 barrier，自建——LangGraph 结构盲区）
 
@@ -168,6 +169,7 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | D18 | 接缝②D schema 强制 | `ToolStrategy(schema, handle_errors=True)` in-loop 重试 |
 | D-G1a | roster 注册形态(schema 落地) | **callable builder**(`(*, response_format) -> Runnable`),否决"roster 持 deep-agent kwargs 自建":依赖倒置(引擎不耦合 deepagents 构造签名)+ roster 通用性(任意 `Runnable` 工厂皆可)+ 宿主稳定性(`response_format` 是构造期参数、预构造 runnable 无法事后改)。`runnable` / `builder` 互斥,前者仅 schema-less |
 | D-G1b | 构建缓存归属 | **缓存归 Roster**(`(agent_type, schema) -> Runnable` 进程级、并发安全):内聚(紧邻持有 builder 的 roster)+ 生命周期匹配(编译图跨 run 无状态,进程级正合)+ 构建期无外求 + resume 不重建。二者在"预构造 runnable 无法事后绑 `response_format`"约束下,落实了 D18 的逐次 schema 绑定 |
+| D-G2 | `isolation="worktree"` 保真度 | **v1 默认 = 内存播种副本**(`InMemoryWorktreeProvider`:`seed` 给隔离 base 快照拷贝、`collect` 算相对 seed 变更集)+ **真 git-worktree 后端作同 `WorktreeProvider` 协议后的可插拔生产实现**(未在 v1 交付)。否决"仅文档化 seam"(不兑现卖点)与"v1 直接上真 git worktree"(与 offline-first 跨度大)。`SandboxManager._new_sandbox` 仅 slot 新建时播种;`isolation` 经 `agent → leaf_task → lease` 透传;fix 叶复用 G1 `schema=Patch` 自报变更(生成/应用分离) |
 | D19 | 接缝③ L2 交付节奏 | v1 = L0/L1 先行,L2 架构预留紧跟(L2-as-skill,见 02) |
 | D20 | async 后台 tool 执行 | 自建轻量后台机制(无 server / 无重依赖);v1 即含;蓝本 = omne-next 实现 + deepagents async-task API 形态。详见 [02 §3](02-architecture.md) |
 

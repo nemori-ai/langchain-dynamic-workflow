@@ -3,9 +3,14 @@
 ``isolation="worktree"`` gives each file-mutating leaf its own copy of a base
 snapshot to edit; the changeset (relative to the seed) is collected afterward so the
 orchestration layer can review and merge patches — separating *generating* a change
-from *applying* it. The in-memory provider is the offline default; a real
-git-worktree filesystem backend is a pluggable implementation behind the same seam
-(see the module docstring note at the bottom of this file).
+from *applying* it.
+
+:class:`InMemoryWorktreeProvider` is the offline default. The :class:`WorktreeProvider`
+protocol is the seam for a production backend: a real git-worktree provider would
+``git worktree add`` a fresh tree per leaf (rooted on a deepagents filesystem
+backend so the leaf can run real ``git`` / build / test), then ``git diff`` that
+tree for :meth:`WorktreeProvider.collect`. It implements the same two methods and
+plugs in wherever the in-memory provider does.
 """
 
 from __future__ import annotations
