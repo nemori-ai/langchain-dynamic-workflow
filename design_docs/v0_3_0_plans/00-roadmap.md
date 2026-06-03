@@ -14,7 +14,7 @@
 
 | 里程碑 | 主题 | 对比判定 | 现状一句话 | 杠杆 | 工作量 | 依赖 | Plan |
 |---|---|---|---|---|---|---|---|
-| **M1** | **F 跨叶归约** | CONFIRMED-GAP | 只有单叶 fold，无 vote/dedup/judge-panel 原语；跨叶归约全靠脚本手写 | 最高（6 用例） | 低–中 | G1 + G4 | **首刀** · plan 待写 |
+| **M1** | **F 跨叶归约** | CONFIRMED-GAP | 只有单叶 fold，无 vote/dedup/judge-panel 原语；跨叶归约全靠脚本手写 | 最高（6 用例） | 低–中 | G1 + G4 | ✅ 已落地 · [`01-f-cross-leaf-reduce.md`](01-f-cross-leaf-reduce.md) |
 | **M2** | **B 早退/取消/流式（+E 批处理人体工学）** | CONFIRMED + PARTIAL | parallel 严格 barrier、无 first-wins/在飞取消；缺 batch-map + count/ETA | 高 | 中 | 核心调度器 | 待写 |
 | **M3** | **D 跨会话持久** | CONFIRMED-GAP（与 CC 持平，未超越） | 接缝在但只有内存 store/saver、host 用进程内 dict | 高（超集赢面） | 中 | journal/checkpointer 接缝 | 待写 |
 | **M4** | **C 运行中 HITL 签核** | CONFIRMED-GAP（底座现成） | 全无 interrupt/pause；LangGraph `interrupt` 未 import 暴露 | 中–高（超集赢面） | 中 | M3（持久化）+ LangGraph interrupt | 待写 |
@@ -152,7 +152,7 @@
 ## 状态
 
 - **对比阶段**：✅ 完成。10 主题逐一带 `file:line` 证据 + 置信度（证据稿 `docs/plans/2026-06-03-v0.3.0-cc-vs-port-comparison.md`）。战略定调=允许超集。
-- **M1（F 跨叶归约）**：首刀，plan 待写（下一步进 superpowers:brainstorming → writing-plans 出 bite-sized TDD plan）。
+- **M1（F 跨叶归约）**：✅ 已落地。`_reduce` 四个纯函数 `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`)经包根导出 + `run_script` 命名空间注入;SKILL.md 增补 corroborate/reconcile 范式;`examples/07` 换用 `survives`/`dedup`、`examples/12` 新增双盲复核 demo。Plan = [`01-f-cross-leaf-reduce.md`](01-f-cross-leaf-reduce.md)。
 - **M2–M7**：roadmap 已排定，impl plan 逐里程碑增补。
 
 > **执行序列：** M1 F → M2 B(+E) → M3 D → M4 C → M5 A → M6 I → M7 H。F 首刀（接 G1+G4，纯编排层最干净）；B 紧随修核心原语；D/C 走超集；A/I 配对成重基建 epic；H 收尾引擎机制增强。

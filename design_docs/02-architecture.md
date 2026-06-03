@@ -45,6 +45,8 @@ Layer 0/1 = 引擎本体（见 01）。Layer 2 在 v1 以 **skill** 形态落地
 
 > "tool + skills"是两种不同性质:**tool 是唯一可调用面;skills 是 prompt 行为塑形**。闭环 = skills 教 → agent 写出 script → `workflow_tool(run, script)` 执行 → 只回结论。
 
+> **跨叶归约 helper(F)随 primitives 同属开发者面**:`survives` / `dedup` / `reconcile` / `corroborate`(+ `ReviewItem` / `Reconciled` / `Consensus`)是折叠 `parallel` / `pipeline` 结果列表的纯函数,从包根导出供开发者 `import`,并由引擎注入 `run_script` 命名空间(L2 脚本禁 import,按名直调)——详见 [01 §2](01-engine-mechanism.md)。
+
 ### 2.3 build-time 接线（开发者干,agent 不参与）
 
 ```python

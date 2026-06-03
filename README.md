@@ -170,6 +170,7 @@ The stable, public surface is exported from the package root and follows semanti
 - **Registries** — `Roster` / `RosterEntry`, `WorkflowRegistry`.
 - **Host-facing** — `create_workflow_tool`, `create_workflow_middleware`, `skills_path` / `skill_files`.
 - **Primitives** — exposed on the `Ctx` handed to your script: `agent` / `parallel` / `pipeline` / `phase` / `log` / `budget` / `workflow`.
+- **Cross-leaf reduce** — pure helpers that fold the result lists `parallel` / `pipeline` hand back: `survives` (refute-by-default vote), `dedup`, `reconcile` (dual-blind reviewer reconciliation), `corroborate` (cross-leaf corroboration), plus the `ReviewItem` / `Reconciled` / `Consensus` result types. Also injected into the `run_script` namespace, so a host-authored script calls them by name without an import.
 - **Types and errors** — `Budget`, `JournalStore` / `InMemoryJournalStore` / `JournalRecord`, `SandboxManager`, `Span` / `SpanKind` / `SpanSink`, the `BgRunManager` family, and the `Workflow*Error` exceptions (including `WorkflowScriptError`).
 
 Public signatures are stable; new parameters are added keyword-only with defaults. Names prefixed with `_` (modules and members) are internal and may change without notice.
