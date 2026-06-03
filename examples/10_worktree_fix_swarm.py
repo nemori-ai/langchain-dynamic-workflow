@@ -88,11 +88,14 @@ def _fix_prompt(target: str) -> str:
 
 
 def _review_prompt(voter: int, patch: Patch) -> str:
-    files = ", ".join(f.path for f in patch.files)
+    changes = "\n".join(
+        f"--- {f.path} ---\nBEFORE:\n{BASE_REPO.get(f.path, '(new file)')}\nAFTER:\n{f.new_content}"
+        for f in patch.files
+    )
     return (
-        f"Reviewer #{voter + 1}: does this patch correctly fix a real bug and touch "
-        f"only the intended file? Approve only if so.\nSummary: {patch.summary}\n"
-        f"Files: {files}"
+        f"Reviewer #{voter + 1}: comparing BEFORE and AFTER, does this patch correctly "
+        f"fix a real bug and touch only the intended file? Approve only if so.\n"
+        f"Summary: {patch.summary}\n{changes}"
     )
 
 
