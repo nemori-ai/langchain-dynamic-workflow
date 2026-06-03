@@ -7,8 +7,10 @@ from dataclasses import dataclass
 import pytest
 
 from langchain_dynamic_workflow._reduce import (
+    Consensus,
     Reconciled,
     ReviewItem,
+    corroborate,
     dedup,
     reconcile,
     survives,
@@ -109,3 +111,27 @@ def test_reconcile_empty_verdicts_is_conflict() -> None:
 
 def test_reconcile_empty_input() -> None:
     assert reconcile([], include=lambda s: s.keep) == Reconciled([], [], [])
+
+
+def test_corroborate_keeps_groups_meeting_min_support() -> None:
+    items = ["RAG", "rag", "long-ctx", "RAG"]  # key=str.lower: rag x3, long-ctx x1
+    groups = corroborate(items, key=str.lower, min_support=2)
+    assert groups == [Consensus(key="rag", members=["RAG", "rag", "RAG"])]
+
+
+def test_corroborate_drops_none_then_groups() -> None:
+    items = ["a", None, "A", None]
+    assert corroborate(items, key=str.lower, min_support=2) == [
+        Consensus(key="a", members=["a", "A"])
+    ]
+
+
+def test_corroborate_first_seen_key_order() -> None:
+    items = ["b", "B", "a", "A"]
+    keys = [g.key for g in corroborate(items, key=str.lower, min_support=2)]
+    assert keys == ["b", "a"]
+
+
+def test_corroborate_min_support_below_one_raises() -> None:
+    with pytest.raises(ValueError, match="min_support must be >= 1"):
+        corroborate(["a"], key=str.lower, min_support=0)

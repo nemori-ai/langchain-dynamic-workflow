@@ -122,3 +122,45 @@ def reconcile[T, V](
         else:
             conflicts.append(review.item)
     return Reconciled(included=included, excluded=excluded, conflicts=conflicts)
+
+
+@dataclass(frozen=True)
+class Consensus[K: Hashable, T]:
+    """A group of equivalent items that cleared the cross-leaf corroboration threshold."""
+
+    key: K
+    members: list[T]
+
+
+def corroborate[T, K: Hashable](
+    items: Iterable[T | None], *, key: Callable[[T], K], min_support: int = 2
+) -> list[Consensus[K, T]]:
+    """Group equivalent items by ``key``; keep groups with >= ``min_support`` members.
+
+    Cross-leaf corroboration: an item is kept only if at least ``min_support``
+    leaves independently produced an equivalent item (same key). ``None`` (failed
+    leaves) are dropped before grouping. Groups are returned in first-seen key order.
+
+    Args:
+        items: The leaves' outputs; ``None`` is dropped.
+        key: Maps an item to its equivalence key.
+        min_support: Minimum corroborating members for a group to survive (>= 1).
+
+    Returns:
+        The surviving groups, in first-seen key order.
+
+    Raises:
+        ValueError: If ``min_support < 1``.
+    """
+    if min_support < 1:
+        raise ValueError(f"min_support must be >= 1, got {min_support}")
+    groups: dict[K, list[T]] = {}
+    for item in items:
+        if item is None:
+            continue
+        groups.setdefault(key(item), []).append(item)
+    return [
+        Consensus(key=group_key, members=members)
+        for group_key, members in groups.items()
+        if len(members) >= min_support
+    ]
