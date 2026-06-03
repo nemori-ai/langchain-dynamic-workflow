@@ -54,7 +54,9 @@ async def test_screening_includes_a_corroborated_unanimous_claim() -> None:
         .register(
             "source",
             builder=_structured_builder(
-                lambda: module.Candidate(claim="Shared claim across sources")
+                lambda: module.Candidate(
+                    claim="Shared claim across sources", aspect=module.ASPECTS[0]
+                )
             ),
         )
         .register(
@@ -90,7 +92,9 @@ async def test_failed_screener_routes_corroborated_claim_to_conflicts() -> None:
         Roster()
         .register(
             "source",
-            builder=_structured_builder(lambda: module.Candidate(claim="Shared claim")),
+            builder=_structured_builder(
+                lambda: module.Candidate(claim="Shared claim", aspect=module.ASPECTS[0])
+            ),
         )
         .register("screener", builder=_failing_screener_builder)
     )
