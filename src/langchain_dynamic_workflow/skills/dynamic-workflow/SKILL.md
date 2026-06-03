@@ -81,8 +81,12 @@ Sequential refine-until-budget:
 
 ```python
 async def orchestrate(ctx, args):
+    MAX_REVISIONS = 5  # a hard cap, so a stubborn model can't loop forever
     draft = await ctx.agent(args["task"], agent_type="writer")
-    while ctx.budget.remaining() > 500:
+    for _ in range(MAX_REVISIONS):
+        # Guard the budget check with .total: with no budget, remaining() is inf.
+        if ctx.budget.total and ctx.budget.remaining() < 500:
+            break
         critique = await ctx.agent(f"Critique: {draft}", agent_type="critic")
         if "looks good" in critique.lower():
             break
@@ -168,7 +172,9 @@ async def orchestrate(ctx, args):
                 for v in range(3)  # a voter index keeps the 3 skeptics distinct (resume-safe)
             ]
         )
-        refutes = sum(1 for v in votes if v is not None and v.refuted)
+        # Fail-safe: a skeptic that failed (None) counts as a refutation, so a claim
+        # is never confirmed on absent verification.
+        refutes = sum(1 for v in votes if v is None or v.refuted)
         if refutes < 2:  # survives a 3-skeptic majority
             confirmed.append(claim)
     return confirmed
@@ -287,7 +293,10 @@ async def orchestrate(ctx, args):
 
 **Per-stage model routing (cost discipline).** Spend a cheap model on bulk triage
 and a strong one only on the survivors. `model` is part of the cache key (so it
-partitions resume correctly); `label` / `phase` are not.
+partitions resume correctly); `label` / `phase` are not. Note: `model=` swaps the
+model only for **config-aware** leaves — a leaf with its model bound at
+construction ignores it (the override still partitions the cache key, but won't
+change which model runs).
 
 ```python
 async def orchestrate(ctx, args):

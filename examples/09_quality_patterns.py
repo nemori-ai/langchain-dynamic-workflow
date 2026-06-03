@@ -141,7 +141,9 @@ async def code_review(ctx: Any, args: dict[str, Any]) -> list[str]:
                     for v in range(SKEPTICS_PER_FINDING)
                 ]
             )
-            refutes = sum(1 for vote in votes if vote is not None and vote.refuted)
+            # Fail-safe: a skeptic that failed (None) counts as a refutation, so a
+            # finding is never confirmed on absent verification.
+            refutes = sum(1 for vote in votes if vote is None or vote.refuted)
             survived = refutes < REFUTES_TO_KILL
             mark = "kept" if survived else "killed"
             ctx.log(f"finding {mark} ({refutes}/{SKEPTICS_PER_FINDING}): {finding.title[:60]}")

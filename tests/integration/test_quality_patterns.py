@@ -102,6 +102,39 @@ def _skeptic_builder(counter: dict[str, int]) -> Any:
     return builder
 
 
+def _failing_skeptic_builder() -> Any:
+    """Fake skeptic that always raises, so ctx.parallel lands a ``None`` vote."""
+
+    def builder(*, response_format: Any = None) -> Any:
+        async def _leaf(
+            inp: dict[str, Any], config: RunnableConfig | None = None
+        ) -> dict[str, Any]:
+            raise RuntimeError("skeptic crashed")
+
+        return RunnableLambda(_leaf)
+
+    return builder
+
+
+async def test_failed_skeptics_refuse_rather_than_confirm() -> None:
+    # Fail-safe: when verification fails (None votes), a finding must NOT be silently
+    # confirmed — absent scrutiny counts as refutation, not as a pass.
+    module = _load_example()
+    counter: dict[str, int] = {}
+    roster = (
+        Roster()
+        .register("reviewer", builder=_reviewer_builder(module, counter))
+        .register("skeptic", builder=_failing_skeptic_builder())
+    )
+
+    async def orchestrate(ctx: Any) -> Any:
+        return await module.code_review(ctx, {"target": "login.py"})
+
+    confirmed = await run_workflow(orchestrate, roster=roster)
+
+    assert confirmed == []  # every finding's skeptics failed -> nothing confirmed
+
+
 async def test_quality_workflow_drops_refuted_finding_and_keeps_the_real_bug() -> None:
     module = _load_example()
     counter: dict[str, int] = {}
@@ -120,8 +153,9 @@ async def test_quality_workflow_drops_refuted_finding_and_keeps_the_real_bug() -
     # survives (0 refutes).
     assert _REAL_BUG in confirmed
     assert _BAIT not in confirmed
-    # loop-until-dry converged within the hard cap rather than spinning forever.
-    assert 1 <= counter["reviewer"] <= module.MAX_ROUNDS
+    # loop-until-dry converged via two dry rounds (reviewer ran fewer times than the
+    # hard cap), proving the dry-streak exit fired rather than the MAX_ROUNDS backstop.
+    assert 1 <= counter["reviewer"] < module.MAX_ROUNDS
 
 
 async def test_quality_workflow_runs_three_skeptics_per_finding() -> None:

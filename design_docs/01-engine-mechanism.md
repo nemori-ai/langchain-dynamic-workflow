@@ -77,7 +77,7 @@ key = sha256(canonical_json({prompt, agent_type, model,
 
 （附:原生 cache 命中还会丢自定义 stream 数据 `#6265`。）
 
-- `JournalStore` Protocol:v1 = in-memory + LangGraph `BaseStore`(实测往返通过,namespaced KV journal 完美底座)两实现。
+- `JournalStore` Protocol:v1 交付 **in-memory 实现（默认，进程内）**;LangGraph `BaseStore`-backed 持久化(跨会话 resume 的底座,namespaced KV)是 Protocol 之后的**文档化扩展点,未交付**。故默认 resume 是同进程语义,跨会话需接一个持久 `JournalStore`。
 - 命中后若有 `schema`,以 `model_validate_json` 把缓存 JSON 重新校验回归一后的 pydantic 模型实例(`to_pydantic_model` 的等值-dict 同类缓存保证 `model_json_schema()` 逐字节稳定 → resume 不静默重跑)。
 
 ## 5. 补丁② · 确定性 fail-loud guard（三段式）
@@ -155,7 +155,7 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | D5 | `pipeline()` | 进 v1 |
 | D6 | `workflow()` 嵌套 | `@task`/subgraph 实现 |
 | D7 | `agent()` 解析 | R1 纯命名 roster |
-| D8 | journal 存储 | `JournalStore` Protocol;in-memory + `BaseStore` 两实现 |
+| D8 | journal 存储 | `JournalStore` Protocol;v1 交付 in-memory 实现(默认、进程内);`BaseStore` 持久化(跨会话)是文档化扩展点,未交付 |
 | D9 | 确定性实现 | import-ban + 受限 builtins + 教 LLM `sorted()`/忌迭代 set |
 | D10 | pipeline 背压 | bounded `asyncio.Queue` |
 | D11 | Layer 2 codegen | 一次过:AST 校验通过即执行(违规重试),不做 dry-run |

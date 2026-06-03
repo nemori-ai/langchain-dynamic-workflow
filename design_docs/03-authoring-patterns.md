@@ -38,7 +38,7 @@
 | 维度 | Claude Code | 本引擎 | 说明 |
 |---|---|---|---|
 | `args` 传递 | 字符串化怪癖（须自己 parse） | **原生 dict** | 我们更干净，作者直接拿结构化 args |
-| resume 范围 | same-session | **可跨会话** | 我们更强；journal 持久化，换进程/会话仍能 replay |
+| resume 范围 | same-session | **架构上可跨会话（需持久 journal）** | `JournalStore` 可插拔；接一个持久实现即跨会话 replay，CC 仅 same-session。但**默认 ships in-memory（同进程）**——跨会话非开箱，须自备持久 store（见 [01](01-engine-mechanism.md) D8） |
 | 嵌套层数 | 一层（`workflow()` 内不能再 `workflow()`） | 一层（一致） | 与 CC 对齐，二层 fail-loud |
 
 退役的伪 gap（经社区数据核实，非 CC-parity 差距、不投入）：一层嵌套、跨会话 resume、pipeline 签名 / `budget.total` / `parallel` 语义、`args` 字符串化——详见 [v0_2_0_plans/00-roadmap.md](v0_2_0_plans/00-roadmap.md)。
