@@ -155,8 +155,8 @@ async def orchestrate(ctx, args):
     for claim in claims:
         votes = await ctx.parallel(
             [
-                lambda c=claim: ctx.agent(
-                    f"Try to refute this claim. Default to refuted=true unless you can ground it: {c}",
+                lambda c=claim, v=v: ctx.agent(
+                    f"Skeptic #{v + 1}: try to refute this claim, defaulting to refuted unless you can ground it: {c}",
                     agent_type="skeptic",
                     schema={
                         "type": "object",
@@ -165,7 +165,7 @@ async def orchestrate(ctx, args):
                         "additionalProperties": False,
                     },
                 )
-                for _ in range(3)
+                for v in range(3)  # a voter index keeps the 3 skeptics distinct (resume-safe)
             ]
         )
         refutes = sum(1 for v in votes if v is not None and v.refuted)
