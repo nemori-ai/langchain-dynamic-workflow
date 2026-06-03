@@ -75,6 +75,32 @@ Follow the conventions under `.claude/rules/`:
 - `docstring.md` — docstring conventions (English, Google style).
 - `testing.md` — testing conventions (pytest + pytest-asyncio).
 
+## Examples & Demos
+
+The `examples/` demos must read like a real user driving the product, not a tutorial that
+hand-holds the agent on tool mechanics. Draw the line at **道 vs 术** (mental model vs
+technique):
+
+- **Mental model (道) — allowed in the `system_prompt`.** A host prompt may carry
+  workflow-related mental models and philosophy: the *why* and *when* — control-flow
+  inversion, decomposing a hard task into parallel sub-work and synthesizing, cross-checking
+  before committing, delegating heavy multi-step work to run in the background, composing a
+  procedure when no ready-made one exists. This is the conceptual persona a real deployment
+  would give its assistant.
+- **Technique (术) — never in a prompt.** The same prompt must NOT teach *how* to drive the
+  `workflow` tool: no command names (`run` / `run_script` / `status` / `resume` / `cancel`),
+  no registered-workflow names, no `args` shapes, no script-authoring steps or AST-gate
+  rules. That is the job of the tool's `description`, its `help` command, and the bundled
+  `SKILL.md` (loaded via `skills=[...]`). A demo that coaches the mechanics hides whether
+  those are self-sufficient — exactly what the demo should prove.
+- **User messages are a real user's words** — a natural request, never tool instructions.
+- **Offline scripted hosts** (deterministic `BaseChatModel` fakes) encode the turn logic in
+  code, not in a prompt, so they are exempt from the persona rule — but their user messages
+  should still read naturally.
+- When a real-model demo (`LDW_DEMO_REAL_MODEL`) cannot complete from a 道-level prompt + the
+  skill + the tool description alone, that is a signal to improve the skill or the tool
+  description — never to drop down to 术 in the prompt.
+
 ## Design & Plan File Management
 
 - **Temporary design/plan docs** go in `docs/plans/` — gitignored, not version-controlled.

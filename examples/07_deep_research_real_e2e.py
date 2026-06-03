@@ -54,8 +54,10 @@ from langchain_dynamic_workflow import (
     Roster,
     WorkflowRegistry,
     create_workflow_middleware,
+    dedup,
     read_only_leaf,
     skills_path,
+    survives,
 )
 from langchain_dynamic_workflow.middleware import WORKFLOW_NOTIFICATION_TAG
 
@@ -78,13 +80,11 @@ REFUTATIONS_TO_KILL = 2
 _RUN_ID_BOX: dict[str, str] = {}
 
 HOST_SYSTEM_PROMPT = (
-    "You are a research assistant with a `workflow` tool that runs a deterministic, "
-    "multi-agent `deep_research` pipeline in the background. When the user asks you to "
-    "research a topic, call the tool with command='run', workflow='deep_research', and "
-    "args={'question': <the user's question>}. It returns a run_id immediately and runs "
-    "in the background, so end your turn right after launching. When you are later "
-    "notified that the run finished, call the tool with command='status' and that run_id "
-    "to retrieve the report, then present it clearly."
+    "You are a thorough research assistant. You tackle a hard question by breaking it into "
+    "independent angles, investigating them in parallel, cross-checking the findings and "
+    "dropping claims that do not hold up, and only then synthesizing a clear, well-sourced "
+    "answer — and you prefer to run that heavier, multi-step work in the background rather "
+    "than cram it into a single pass. Make full use of the tools and skills available to you."
 )
 
 
@@ -177,8 +177,11 @@ async def deep_research(ctx: Ctx, args: dict[str, Any]) -> str:
             _extract_prompt(question, angle, finding), agent_type="extractor", schema=Claim
         )
 
-    claims = [c for c in await ctx.pipeline(paired, _extract) if c is not None and c.checkable]
-    ctx.log(f"extracted {len(claims)} checkable claims")
+    extracted = [c for c in await ctx.pipeline(paired, _extract) if c is not None and c.checkable]
+    claims = dedup(extracted, key=lambda c: c.text.strip().lower())
+    ctx.log(
+        f"extracted {len(claims)} checkable claims ({len(extracted) - len(claims)} dups merged)"
+    )
 
     ctx.phase("verify")
     confirmed: list[str] = []
@@ -191,10 +194,9 @@ async def deep_research(ctx: Ctx, args: dict[str, Any]) -> str:
                 for v in range(SKEPTICS_PER_CLAIM)
             ]
         )
-        refutes = sum(1 for verdict in verdicts if verdict is not None and verdict.refuted)
-        survived = refutes < REFUTATIONS_TO_KILL
+        survived = survives(verdicts, against=lambda v: v.refuted, kill_at=REFUTATIONS_TO_KILL)
         mark = "kept" if survived else "killed"
-        ctx.log(f"claim {mark} ({refutes}/{SKEPTICS_PER_CLAIM} refute): {claim.text.strip()[:50]}")
+        ctx.log(f"claim {mark}: {claim.text.strip()[:50]}")
         if survived:
             confirmed.append(claim.text)
 
@@ -245,14 +247,20 @@ def _build_extractor(*, response_format: Any = None) -> Any:
     model = real_model()
     if model is not None:
         return create_deep_agent(model=model, response_format=response_format)
-    # Offline: emit a deterministic checkable Claim so every angle survives extraction.
-    return _fake_structured_leaf(
-        Claim(
-            text="RAG and long-context LLMs trade recall breadth for context cost",
-            checkable=True,
-        ),
-        reply="extracted a checkable claim",
-    )
+
+    # Offline: emit an ANGLE-DISTINCT checkable claim (the prompt names the angle). Each
+    # angle yields its own claim, so dedup() is honestly a no-op here — it merges only
+    # true duplicates, never distinct claims — and every angle survives to the verify
+    # fan-out, mirroring the real per-angle shape instead of collapsing to one claim.
+    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        prompt = inp["messages"][-1].text if inp["messages"] else ""
+        angle = next((a for a in ANGLES if a in prompt), "general")
+        return {
+            "messages": [*inp["messages"], AIMessage(content="extracted a checkable claim")],
+            "structured_response": Claim(text=f"a checkable claim about {angle}", checkable=True),
+        }
+
+    return RunnableLambda(_leaf)
 
 
 def _build_skeptic(*, response_format: Any = None) -> Any:

@@ -169,6 +169,7 @@ LDW_DEMO_REAL_MODEL=anthropic/claude-opus-4.8 uv run python examples/07_deep_res
 - **注册表** —— `Roster` / `RosterEntry`、`WorkflowRegistry`。
 - **host 面** —— `create_workflow_tool`、`create_workflow_middleware`、`skills_path` / `skill_files`。
 - **原语** —— 挂在传给脚本的 `Ctx` 上：`agent` / `parallel` / `pipeline` / `phase` / `log` / `budget` / `workflow`。
+- **跨叶归约** —— 折叠 `parallel` / `pipeline` 返回的结果列表的纯函数：`survives`（refute-by-default 投票）、`dedup`、`reconcile`（双盲复核调解）、`corroborate`（跨叶相互印证），外加 `ReviewItem` / `Reconciled` / `Consensus` 结果类型。同时注入 `run_script` 命名空间——host 当场写的脚本无需 import 即可按名调用。
 - **类型与异常** —— `Budget`、`JournalStore` / `InMemoryJournalStore` / `JournalRecord`、`SandboxManager`、`Span` / `SpanKind` / `SpanSink`、`BgRunManager` 家族，以及 `Workflow*Error` 系列异常（含 `WorkflowScriptError`）。
 
 公开签名稳定；新增参数一律 keyword-only 带默认值。以 `_` 开头的模块和成员属于内部实现，可能随时变动。

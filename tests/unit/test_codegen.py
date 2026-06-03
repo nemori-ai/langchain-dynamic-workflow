@@ -110,3 +110,32 @@ async def test_run_workflow_from_source_runs_end_to_end(
         _AGENT_SCRIPT, roster=roster, args={"topic": "batteries"}
     )
     assert result == "a summary"
+
+
+async def test_run_script_can_call_injected_reduce_helpers() -> None:
+    # A host-authored script reaches the reduce helpers by name (no import — the AST
+    # gate forbids imports). Proves the meta-layer namespace injection delivers F to
+    # the host's on-the-fly scripts, not only to imported developer workflows.
+    from langchain_dynamic_workflow._codegen import compile_workflow_source
+
+    source = (
+        "async def orchestrate(ctx, args):\n"
+        "    votes = [{'refuted': False}, {'refuted': True}, {'refuted': False}]\n"
+        "    kept = survives(votes, against=lambda v: v['refuted'], kill_at=2)\n"
+        "    groups = corroborate(['a', 'A', 'b'], key=lambda s: s.lower(), min_support=2)\n"
+        "    review = [ReviewItem(item='x', verdicts=[{'k': True}, {'k': True}])]\n"
+        "    bucket = reconcile(review, include=lambda v: v['k'])\n"
+        "    uniq = dedup(['a', 'a', 'b'])\n"
+        "    return (kept, len(groups), bucket.included, uniq)\n"
+    )
+    orchestrate = compile_workflow_source(source)
+    # Actually RUN the compiled body (it touches only the injected reduce helpers +
+    # literals, never ctx), and assert the computed result — proving the injected
+    # names resolve AND execute correctly end to end, not merely that they exist:
+    #   survives([F, T, F], kill_at=2)        -> True  (1 against < 2)
+    #   corroborate(['a','A','b'], min=2)     -> 1 group ('a','A' share key 'a')
+    #   reconcile([both-include 'x'])         -> included == ['x']
+    #   dedup(['a','a','b'])                  -> ['a','b']
+    unused_ctx: Any = object()  # this script ignores ctx
+    result = await orchestrate(unused_ctx, {})
+    assert result == (True, 1, ["x"], ["a", "b"])

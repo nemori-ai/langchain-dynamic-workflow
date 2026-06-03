@@ -23,6 +23,15 @@ from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal
 from ._leaves import read_only_builder, read_only_leaf
 from ._observability import Span, SpanKind, SpanSink
 from ._progress import ProgressEntry, ProgressKind, ProgressSink
+from ._reduce import (
+    Consensus,
+    Reconciled,
+    ReviewItem,
+    corroborate,
+    dedup,
+    reconcile,
+    survives,
+)
 from ._result import fold_result
 from ._roster import Roster, RosterEntry
 from ._sandbox import SandboxManager
@@ -39,6 +48,7 @@ __all__ = [
     "BgRunQuotaExceededError",
     "BgStatus",
     "Budget",
+    "Consensus",
     "Ctx",
     "InMemoryJournalStore",
     "InMemoryWorktreeProvider",
@@ -48,7 +58,9 @@ __all__ = [
     "ProgressEntry",
     "ProgressKind",
     "ProgressSink",
+    "Reconciled",
     "ResultStore",
+    "ReviewItem",
     "Roster",
     "RosterEntry",
     "SandboxManager",
@@ -63,15 +75,19 @@ __all__ = [
     "WorktreeProvider",
     "__version__",
     "compile_workflow_source",
+    "corroborate",
     "create_workflow_middleware",
     "create_workflow_tool",
+    "dedup",
     "extract_meta",
     "fold_result",
     "journal_key",
     "read_only_builder",
     "read_only_leaf",
+    "reconcile",
     "run_workflow",
     "run_workflow_from_source",
     "skill_files",
     "skills_path",
+    "survives",
 ]
