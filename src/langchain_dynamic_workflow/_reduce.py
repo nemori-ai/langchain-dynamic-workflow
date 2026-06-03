@@ -33,12 +33,21 @@ def survives[T](votes: Sequence[T | None], *, against: Callable[[T], bool], kill
         ``True`` if the 'against' tally is below ``kill_at``.
 
     Raises:
-        ValueError: If ``votes`` is empty (no verification ran) or ``kill_at < 1``.
+        ValueError: If ``votes`` is empty (no verification ran), ``kill_at < 1``, or
+            ``kill_at`` exceeds the vote count (an unreachable threshold that would
+            confirm unconditionally — even an all-failed panel — defeating the
+            fail-safe).
     """
     if not votes:
         raise ValueError("survives() requires at least one vote; got an empty sequence")
     if kill_at < 1:
         raise ValueError(f"kill_at must be >= 1, got {kill_at}")
+    if kill_at > len(votes):
+        raise ValueError(
+            f"kill_at ({kill_at}) exceeds the vote count ({len(votes)}); the kill "
+            "threshold is unreachable, so the thing would survive unconditionally "
+            "(including an all-failed panel) — defeating the None fail-safe"
+        )
     against_count = sum(1 for vote in votes if vote is None or against(vote))
     return against_count < kill_at
 

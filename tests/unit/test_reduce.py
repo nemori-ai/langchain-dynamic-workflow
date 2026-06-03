@@ -59,6 +59,18 @@ def test_kill_at_below_one_raises() -> None:
         survives([_Vote(refuted=False)], against=lambda v: v.refuted, kill_at=0)
 
 
+def test_unreachable_kill_at_raises() -> None:
+    # kill_at greater than the vote count is structurally unsatisfiable: the against
+    # tally can never reach it, so the thing would survive unconditionally — including
+    # an all-None panel where every verification leaf failed. That silently re-arms the
+    # exact fail-safe hole M1 exists to close, so it must fail loud instead.
+    all_failed: list[_Vote | None] = [None, None]
+    with pytest.raises(ValueError, match="unreachable"):
+        survives(all_failed, against=lambda v: v.refuted, kill_at=3)
+    with pytest.raises(ValueError, match="unreachable"):
+        survives([_Vote(refuted=False)], against=lambda v: v.refuted, kill_at=2)
+
+
 def test_dedup_preserves_first_seen_order() -> None:
     assert dedup(["b", "a", "b", "c", "a"]) == ["b", "a", "c"]
 
