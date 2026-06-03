@@ -7,8 +7,10 @@ plain ``"shared"`` lease must stay empty (no seed) — the existing behavior.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 
@@ -53,6 +55,33 @@ async def test_shared_lease_is_not_seeded() -> None:
         assert backend.read("/a.py").error  # not seeded
 
 
+class _CountingWorktreeProvider:
+    """A worktree provider that tallies seed() calls (to prove no re-seeding)."""
+
+    def __init__(self, base: dict[str, str]) -> None:
+        self._base = dict(base)
+        self.seed_calls = 0
+
+    def seed(self, leaf_id: str) -> Mapping[str, str]:
+        self.seed_calls += 1
+        return dict(self._base)
+
+    def collect(self, leaf_id: str, files: Mapping[str, str]) -> dict[str, str]:
+        return {}
+
+
+async def test_worktree_seeds_once_across_find_or_create_reuse() -> None:
+    # Leasing the same un-evicted leaf_id twice (a retry) reuses the live sandbox and
+    # must NOT re-seed — re-seeding would clobber a leaf's in-progress edits.
+    provider = _CountingWorktreeProvider(_BASE)
+    manager = SandboxManager(worktree_provider=provider)
+    async with manager.lease(leaf_id="L1", needs_execution=True, isolation="worktree") as b1:
+        b1.write("/scratch.py", "in progress")
+    async with manager.lease(leaf_id="L1", needs_execution=True, isolation="worktree") as b2:
+        assert not b2.read("/scratch.py").error  # the reused workspace is preserved
+    assert provider.seed_calls == 1  # seeded once on create, never again on reuse
+
+
 async def test_worktree_without_provider_is_not_seeded() -> None:
     # isolation="worktree" with no provider configured falls back to an empty
     # sandbox (no seeding source), never raising.
@@ -86,6 +115,20 @@ async def test_engine_threads_isolation_so_worktree_leaf_is_seeded() -> None:
     await run_workflow(orchestrate, roster=roster, sandbox_manager=manager)
 
     assert seen["a"] == "print(1)\n"  # the leaf ran against the seeded base
+
+
+async def test_worktree_on_reasoning_leaf_fails_loud() -> None:
+    # isolation="worktree" needs a sandbox to seed into; a reasoning leaf
+    # (needs_execution=False) has none, so requesting a worktree must fail loud
+    # rather than silently hand back an empty StateBackend keyed as "worktree".
+    manager = SandboxManager(worktree_provider=InMemoryWorktreeProvider(_BASE))
+    roster = Roster().register("thinker", RunnableLambda(lambda inp: inp))  # needs_execution=False
+
+    async def orchestrate(ctx: Any) -> Any:
+        return await ctx.agent("think", agent_type="thinker", isolation="worktree")
+
+    with pytest.raises(ValueError, match=r"worktree|needs_execution"):
+        await run_workflow(orchestrate, roster=roster, sandbox_manager=manager)
 
 
 async def test_worktree_leaf_resume_hits_cache() -> None:

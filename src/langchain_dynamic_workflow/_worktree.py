@@ -21,7 +21,17 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class WorktreeProvider(Protocol):
-    """Seeds a worktree leaf's sandbox and collects its changeset versus the seed."""
+    """Seeds a worktree leaf's sandbox and collects its changeset versus the seed.
+
+    Division of labor in v1: ``seed`` is the engine-facing hook — the SandboxManager
+    calls it when it creates a worktree leaf's sandbox. ``collect`` is the
+    changeset primitive a provider exposes for an integration that *holds* the
+    sandbox (notably a real git-worktree provider, whose ``collect`` is ``git diff``);
+    the default in-memory engine path does not auto-call it, because a fix leaf hands
+    its change back as a returned ``Patch`` (D-G2: generation and application stay
+    separate). Both methods are part of the seam so a production backend implements
+    one contract.
+    """
 
     def seed(self, leaf_id: str) -> Mapping[str, str]:
         """Return the files to populate a worktree leaf's sandbox with before it runs.

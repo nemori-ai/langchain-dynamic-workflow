@@ -135,7 +135,12 @@ async def fix_swarm(ctx: Any, args: dict[str, Any]) -> list[dict[str, Any]]:
         mark = "kept" if kept else "dropped"
         ctx.log(f"patch {mark} ({approvals}/{REVIEWERS_PER_PATCH}): {patch.summary}")
         if kept:
-            approved.append({"summary": patch.summary, "files": [f.path for f in patch.files]})
+            approved.append(
+                {
+                    "summary": patch.summary,
+                    "files": [{"path": f.path, "new_content": f.new_content} for f in patch.files],
+                }
+            )
     return approved
 
 
@@ -155,7 +160,12 @@ def _fixer_builder(*, response_format: Any = None) -> Any:
         target = next(path for path in BASE_REPO if path in prompt)
         original = backend.read(target).file_data  # proves the worktree was seeded
         base = original["content"] if original is not None else ""
-        fixed = base.split("  # bug")[0].rstrip() + "\n"  # drop the buggy line's comment
+        # Apply the actual fix (and drop the now-resolved bug comment), line by line.
+        fixed_lines = []
+        for line in base.splitlines():
+            line = line.replace("a - b", "a + b").replace("s.lower()", "s.upper()")
+            fixed_lines.append(line.split("  # bug")[0].rstrip())
+        fixed = "\n".join(fixed_lines) + "\n"
         patch = schema.model_validate(
             {"summary": f"fixed {target}", "files": [{"path": target, "new_content": fixed}]}
         )
@@ -209,7 +219,8 @@ async def main() -> None:
     approved = await run_workflow(orchestrate, roster=roster, sandbox_manager=manager)
     print(f"approved patches ({len(approved)}):")
     for patch in approved:
-        print(f"  - {patch['summary']} -> {patch['files']}")
+        paths = [f["path"] for f in patch["files"]]
+        print(f"  - {patch['summary']} -> {paths}")
 
 
 if __name__ == "__main__":
