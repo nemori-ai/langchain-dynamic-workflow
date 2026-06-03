@@ -224,7 +224,17 @@ async def main() -> None:
     config: RunnableConfig = {"configurable": {"thread_id": "demo-6-host"}}
 
     state1 = await host.ainvoke(
-        {"messages": [{"role": "user", "content": "Run the verified research capstone"}]},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Research alpha, beta, gamma, and delta, fact-check the findings, "
+                        "and give me a synthesized brief."
+                    ),
+                }
+            ]
+        },
         config=config,
     )
     run_id = state1["workflow_runs"][-1]["run_id"]

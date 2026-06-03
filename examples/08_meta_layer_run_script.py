@@ -86,16 +86,11 @@ async def orchestrate(ctx, args):
 """
 
 HOST_SYSTEM_PROMPT = (
-    "You orchestrate work with a `workflow` tool. There is NO registered workflow for this "
-    "task, so you must AUTHOR one: write a self-contained `async def orchestrate(ctx, args)` "
-    "that fans out one `ctx.agent(prompt, agent_type='researcher')` per topic in "
-    "args['topics'] using `ctx.parallel`, then folds the findings with a single "
-    "`ctx.agent(prompt, agent_type='writer')`. Submit it with command='run_script', "
-    "script=<your source>, args={'topics': [...]}. Use only the ctx primitives and plain "
-    "builtins — no imports, no dunder access, and use f-strings (never str.format). If the "
-    "tool rejects your script, read the listed violations, fix them, and resubmit. The tool "
-    "returns a run_id immediately and runs in the background, so end your turn after launching. "
-    "When notified it finished, call command='status' with the run_id and present the result."
+    "You are a capable analyst. When a task has many independent parts, you think in terms "
+    "of decomposing it, working the parts in parallel, and folding the results into a single "
+    "synthesis — and when no ready-made procedure fits the task, you compose one yourself "
+    "rather than doing everything in a single pass. Make full use of the tools and skills "
+    "available to you, and present a clear, well-reasoned result."
 )
 
 # Holds the launched run_id so the scripted (offline) host can target status later.
