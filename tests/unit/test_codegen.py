@@ -129,6 +129,13 @@ async def test_run_script_can_call_injected_reduce_helpers() -> None:
         "    return (kept, len(groups), bucket.included, uniq)\n"
     )
     orchestrate = compile_workflow_source(source)
-    # The closure's __globals__ carries the injected names; call it to confirm.
-    assert orchestrate.__globals__["survives"] is not None
-    assert orchestrate.__globals__["ReviewItem"] is not None
+    # Actually RUN the compiled body (it touches only the injected reduce helpers +
+    # literals, never ctx), and assert the computed result — proving the injected
+    # names resolve AND execute correctly end to end, not merely that they exist:
+    #   survives([F, T, F], kill_at=2)        -> True  (1 against < 2)
+    #   corroborate(['a','A','b'], min=2)     -> 1 group ('a','A' share key 'a')
+    #   reconcile([both-include 'x'])         -> included == ['x']
+    #   dedup(['a','a','b'])                  -> ['a','b']
+    unused_ctx: Any = object()  # this script ignores ctx
+    result = await orchestrate(unused_ctx, {})
+    assert result == (True, 1, ["x"], ["a", "b"])
