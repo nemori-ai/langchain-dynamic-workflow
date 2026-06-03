@@ -35,9 +35,13 @@ correct one yourself.
 
 ## The DSL (`ctx` primitives)
 
-- `await ctx.agent(prompt, *, agent_type, model=None, isolation="shared")` — run
-  one leaf subagent in a fresh, discarded context and get back its final text.
-  `agent_type` names a registered leaf. This is the only place a model runs.
+- `await ctx.agent(prompt, *, agent_type, schema=None, model=None, isolation="shared")` — run
+  one leaf subagent in a fresh, discarded context. Without `schema` it returns the
+  leaf's final **text**. With `schema` — a JSON-schema `dict` written inline (no
+  imports needed) — it returns a **validated structured object** you read by
+  attribute, so the next line is plain Python over typed data. `agent_type` names a
+  registered leaf; a schema requires that leaf to be registered with a builder.
+  This is the only place a model runs.
 - `await ctx.parallel(thunks)` — fan out a list of zero-argument thunks
   concurrently with a blocking barrier. Returns results in input order; a thunk
   whose leaf fails lands as `None` (it never aborts the barrier). Filter the
@@ -109,6 +113,26 @@ async def orchestrate(ctx, args):
         return await ctx.agent(f"Summarize: {prev}", agent_type="summarizer")
 
     return await ctx.pipeline(sorted(args["items"]), research, summarize)
+```
+
+Structured output as the JS-handoff (schema):
+
+```python
+async def orchestrate(ctx, args):
+    verdict = await ctx.agent(
+        f"Refute this claim if you can: {args['claim']}",
+        agent_type="skeptic",
+        schema={
+            "type": "object",
+            "properties": {
+                "refuted": {"type": "boolean"},
+                "reason": {"type": "string"},
+            },
+            "required": ["refuted", "reason"],
+            "additionalProperties": False,
+        },
+    )
+    return "rejected" if verdict.refuted else "stands"
 ```
 
 ## Authoring a script for `run_script`

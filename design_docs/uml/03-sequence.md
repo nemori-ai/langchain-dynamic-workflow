@@ -18,9 +18,16 @@ sequenceDiagram
   par 后台脱离运行
     M->>E: 执行
     E->>E: compile/exec script → Ctx
-    E->>L: agent()/parallel()/pipeline() = @task 扇出
-    L-->>E: 仅最终结果 (context quarantine)
-    E->>E: journal(success-only) + usage; 中间不出引擎
+    alt agent(schema=) 结构化分支
+      E->>E: to_pydantic_model(schema) 归一 → ToolStrategy(model, handle_errors=True)
+      E->>L: roster.runnable_for(response_format) 取 @task 叶 → 扇出
+      L-->>E: structured_response (context quarantine)
+      E->>E: fold_structured → journal 存 model_dump_json + usage
+    else schema-less 文本分支
+      E->>L: agent()/parallel()/pipeline() = @task 扇出
+      L-->>E: 仅最终文本 (context quarantine)
+      E->>E: fold_result → journal(success-only) + usage; 中间不出引擎
+    end
     E-->>M: 最终结论
     M->>M: done callback → 入队通知 + offload 大结果
   end
@@ -43,11 +50,12 @@ sequenceDiagram
 
   A->>T: resume(run_id)
   T->>E: 重放 entrypoint (同 thread_id)
-  E->>J: 每个 agent() 查 content-hash
+  E->>J: 每个 agent() 查 content-hash (schema dict 先 to_pydantic_model 归一再入 key)
   J-->>E: 命中(success) → 返缓存 (0 模型调用)
-  E->>E: 未命中 → live 重跑; 序列不匹配 → fail-loud
+  E->>E: 有 schema → model_validate_json 还原结构化对象; 无 schema → 返缓存文本
+  E->>E: 未命中 → live 重跑(runnable_for 取缓存绑定变体); 序列不匹配 → fail-loud
   E-->>T: 续跑至最终结论
   T-->>A: 结果
 ```
 
-**要点**:resume 靠 `@entrypoint` 重放 + content-hash journal(success-only)命中返缓存;只有未完成/失败的叶子 live 重跑;调用序列漂移 → 确定性 backstop fail-loud。
+**要点**:resume 靠 `@entrypoint` 重放 + content-hash journal(success-only)命中返缓存;带 `schema` 的叶子命中以 `model_validate_json` 还原结构化对象(归一缓存保 `model_json_schema()` 逐字节稳定 → 不静默重跑);只有未完成/失败的叶子 live 重跑(`runnable_for` 取已缓存的 schema 绑定变体);调用序列漂移 → 确定性 backstop fail-loud。

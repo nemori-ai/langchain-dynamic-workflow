@@ -21,7 +21,7 @@
 
 | 原语 | 语义 |
 |---|---|
-| `agent(prompt, *, schema, agent_type, model, label, isolation)` | 起全新 context 的 subagent;带 `schema` 强制结构化输出 + 校验 + 不匹配重试 |
+| `agent(prompt, *, schema, agent_type, model, label, isolation)` | 起全新 context 的 subagent;带 `schema` 强制结构化输出 + 校验 + 不匹配重试。`schema` 可为 pydantic 类或 **JSON-schema dict(L2 脚本禁 import 时的内联形态,引擎经 `to_pydantic_model` 归一为 pydantic)**;脚本下一行直接属性访问 |
 | `parallel(thunks)` | 并发 + **阻塞 barrier**;thunk 抛错 → 该位 `null`,整体**永不 reject**(用前 `.filter`) |
 | `pipeline(items, *stages)` | 多 stage **无 barrier** 流水线;stage 签名 `(prev_result, original_item, index)`;抛错 → 该 item `null` 跳后续 |
 | `phase(title)` / `log(msg)` | 进度分组 / 叙事日志 |
@@ -58,10 +58,13 @@ LangGraph functional API 与 Claude Code Workflow 是同一范式,durable execut
 引擎在 `@task` 之上自建内容哈希 journal:
 
 ```
+schema(dict 来源)先经 to_pydantic_model 归一为 pydantic 模型,再取其 model_json_schema() 入 key:
 key = sha256(canonical_json({prompt, agent_type, model,
-        schema: schema.model_json_schema() if schema else None, isolation}))
+        schema: model.model_json_schema() if schema else None, isolation}))
 命中(且 success) → 反序列化缓存结果(连 @task 都不进,0 模型调用)
-未命中 → 起 @task 跑 deepagent → 校验 → 写 journal(连同 usage)
+        ├─ 有 schema → model_validate_json(缓存 JSON) 还原结构化对象
+        └─ 无 schema → 直接返缓存文本
+未命中 → 起 @task 跑 deepagent → 校验 → 写 journal(有 schema 存 model_dump_json,连同 usage)
 ```
 
 **正当理由(实证三条,替代原"native 是 index-based"的错误论证)**:
@@ -73,7 +76,7 @@ key = sha256(canonical_json({prompt, agent_type, model,
 （附:原生 cache 命中还会丢自定义 stream 数据 `#6265`。）
 
 - `JournalStore` Protocol:v1 = in-memory + LangGraph `BaseStore`(实测往返通过,namespaced KV journal 完美底座)两实现。
-- 命中后若有 `schema`,缓存 JSON 重新校验回 schema 实例。
+- 命中后若有 `schema`,以 `model_validate_json` 把缓存 JSON 重新校验回归一后的 pydantic 模型实例(`to_pydantic_model` 的等值-dict 同类缓存保证 `model_json_schema()` 逐字节稳定 → resume 不静默重跑)。
 
 ## 5. 补丁② · 确定性 fail-loud guard（三段式）
 
@@ -100,10 +103,11 @@ key = sha256(canonical_json({prompt, agent_type, model,
 
 ## 7. 叶子调用契约（接缝②D，verified-in-source）
 
-- **roster 条目** = 公开 `CompiledSubAgent{name, description, runnable}` + 自加 `{needs_execution, default_model?}`;`create_deep_agent(...)` 懒构造一次、持有 `CompiledStateGraph`、作 `@task` 直调,**绕开** deepagents 的 LLM-driven `task` 工具。不碰私有 `_SubagentSpec`。
+- **roster 条目**(Builder-roster,D-G1a) = `RosterEntry{name, description, needs_execution, default_model?}` + **`runnable` / `builder` 二选一**:`runnable` 是预构造的 `CompiledStateGraph`(`create_deep_agent(...)` 懒构造一次、作 `@task` 直调,**绕开** deepagents 的 LLM-driven `task` 工具),**仅服务 schema-less**;`builder = (*, response_format) -> Runnable` 是工厂,按需以 `response_format=ToolStrategy(...)` 构造结构化变体,使 `agent(schema=)` 可用。`register(...)` 互斥校验:不给或都给即 fail-loud。不碰私有 `_SubagentSpec`。
+- **`runnable_for(name, *, response_format)` 解析 + 构建缓存**(D-G1b):`response_format=None` 取 schema-less 变体(builder 条目调一次 builder、`runnable` 条目直接返预构造体);带 `response_format` 则要求 builder 条目(预构造 `runnable` 条目 fail-loud),按 `(agent_type, response_format identity)` 缓存绑定变体——`identity` 取被绑 pydantic 模型 `model_json_schema()` 的 sha256(与 journal key 同源)。缓存归 Roster(进程级、并发安全),因编译图跨 run 无状态,resume 不重建。
 - **调用** = `runnable.ainvoke({"messages":[HumanMessage(prompt)]}, config=..., context=...)`。
-- **结果回填**(镜像 `subagents.py:494-532`,即 context-quarantine 边界):有 `structured_response` → 序列化(pydantic `model_dump_json` / dataclass `asdict`+`json.dumps` / 否则 `json.dumps`);否则**逆序**扫 `messages` 取第一条 `.text.rstrip()` 非空的 `AIMessage`(避开 Anthropic 尾部空 `end_turn`);`messages` 缺失抛 `ValueError`。
-- **schema** = `response_format=ToolStrategy(schema, handle_errors=True)`(in-loop 纠错重试);journal 只缓存校验过的最终结果。`ProviderStrategy` 无 in-loop retry,不作默认。
+- **结果回填**(镜像 `subagents.py:494-532`,即 context-quarantine 边界):有 `structured_response` → 序列化(pydantic `model_dump_json` / dataclass `asdict`+`json.dumps` / 否则 `json.dumps`);否则**逆序**扫 `messages` 取第一条 `.text.rstrip()` 非空的 `AIMessage`(避开 Anthropic 尾部空 `end_turn`);`messages` 缺失抛 `ValueError`。`agent(schema=)` 路径走 `fold_structured(state, model)`——取 `structured_response`,缺失**或类型不匹配**(`isinstance` 校验,防 builder 绑错 `response_format`)均 fail-loud;回填序列化用 `model_dump_json(by_alias=True, round_trip=True)`,保带 field alias 的 schema 经 resume 往返不裂(`model_validate_json` 默认按 alias 校验)。
+- **schema** = 脚本传 pydantic 类或内联 JSON-schema `dict`,后者经 `to_pydantic_model` 归一为 pydantic 模型(进程级缓存,等值 dict → 同一类 → 同一 `model_json_schema()`;对 `$ref`/`allOf`/`anyOf`/`oneOf`/`patternProperties`/`not`、非 bool 的 `additionalProperties`、不在 `properties` 中的 `required`、未支持的约束关键字(`pattern`/`minimum`/`format`/`const`…)、值相等坍缩的枚举(`True==1`/`1==1.0`)一律 **fail-loud,不静默降级**,并设递归深度/字段数/枚举规模/缓存条目数护栏防资源耗尽);引擎以 `response_format=ToolStrategy(model, handle_errors=True)`(in-loop 纠错重试)构造叶子,journal 只缓存校验过的 `model_dump_json`、命中以 `model_validate_json` 还原。`ProviderStrategy` 无 in-loop retry,不作默认。
 - **budget 管线**:`UsageMetadataCallbackHandler` 跨嵌套聚合 token;但绕开 task 工具直调时**必须自己复刻 `_build_subagent_config` 的 callbacks 转发**,否则共享 budget 漏算;**每叶子 usage 入 journal** → 保 `spent()` 重放可重建。
 - **state schema**:自定义须继承 `DeepAgentState`(其 `DeltaChannel(snapshot_frequency=50)` 把 checkpoint 增长压到 O(N))。
 
@@ -160,6 +164,8 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | D16 | 确定性强制 | 三段式:AST 预防 + journal-divergence backstop + 引擎自持不变量;不 monkeypatch |
 | D17 | sandbox 身份/构造 | per-leaf 隔离 + journal-key 派生身份 + per-leaf backend **实例**(弃 deprecated factory) + 自建 SandboxManager |
 | D18 | 接缝②D schema 强制 | `ToolStrategy(schema, handle_errors=True)` in-loop 重试 |
+| D-G1a | roster 注册形态(schema 落地) | **callable builder**(`(*, response_format) -> Runnable`),否决"roster 持 deep-agent kwargs 自建":依赖倒置(引擎不耦合 deepagents 构造签名)+ roster 通用性(任意 `Runnable` 工厂皆可)+ 宿主稳定性(`response_format` 是构造期参数、预构造 runnable 无法事后改)。`runnable` / `builder` 互斥,前者仅 schema-less |
+| D-G1b | 构建缓存归属 | **缓存归 Roster**(`(agent_type, schema) -> Runnable` 进程级、并发安全):内聚(紧邻持有 builder 的 roster)+ 生命周期匹配(编译图跨 run 无状态,进程级正合)+ 构建期无外求 + resume 不重建。二者在"预构造 runnable 无法事后绑 `response_format`"约束下,落实了 D18 的逐次 schema 绑定 |
 | D19 | 接缝③ L2 交付节奏 | v1 = L0/L1 先行,L2 架构预留紧跟(L2-as-skill,见 02) |
 | D20 | async 后台 tool 执行 | 自建轻量后台机制(无 server / 无重依赖);v1 即含;蓝本 = omne-next 实现 + deepagents async-task API 形态。详见 [02 §3](02-architecture.md) |
 

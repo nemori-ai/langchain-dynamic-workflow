@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from langchain_core.messages import AIMessage
 
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
@@ -25,6 +27,7 @@ class _CountingLeaf:
         *,
         leaf_id: str = "",
         needs_execution: bool = False,
+        response_format: Any = None,
     ) -> LeafOutcome:
         self.calls += 1
         return LeafOutcome(

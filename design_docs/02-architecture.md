@@ -40,7 +40,7 @@ Layer 0/1 = 引擎本体（见 01）。Layer 2 在 v1 以 **skill** 形态落地
 | **① 库 core** | `run_workflow(script_or_callable, *, roster, config) -> result`(keyword-only、单函数、**无** operation-plane) | 开发者 / build-time;真相与地基 |
 | **② tool adapter** | `create_workflow_tool(roster, ...)` → 挂 host deepagent 的**多命令** tool(`run`/`status`/`resume`/`cancel`) | **agent 唯一运行时面** |
 | **③ skills** | 一套 SKILL.md(教 host agent 写脚本 + DSL + 确定性铁律 + 范式),`create_deep_agent(skills=[...])` 原生加载 | agent 行为塑形(prompt);也是 L2 落法 |
-| **④ primitives** | 注入 `agent/parallel/pipeline/phase/log/budget/workflow`(手写脚本用) | 开发者 / build-time |
+| **④ primitives** | 注入 `agent/parallel/pipeline/phase/log/budget/workflow`(手写脚本用);`agent` 支持 `schema=`(pydantic 类或 JSON-schema dict)产校验过的结构化对象 | 开发者 / build-time |
 | **⑤ middleware** | `create_workflow_middleware(roster, ...)` 打包 ②+③ + 承载 async 后台机制 | **async fire-and-notify 的交付载体**(非纯可选) |
 
 > "tool + skills"是两种不同性质:**tool 是唯一可调用面;skills 是 prompt 行为塑形**。闭环 = skills 教 → agent 写出 script → `workflow_tool(run, script)` 执行 → 只回结论。
@@ -49,7 +49,15 @@ Layer 0/1 = 引擎本体（见 01）。Layer 2 在 v1 以 **skill** 形态落地
 
 ```python
 roster = Roster()
+# 预构造 runnable:仅服务 schema-less 叶子
 roster.register("researcher", create_deep_agent(...), needs_execution=False)
+# builder 工厂:schema-capable 叶子,引擎按需以 response_format 构造结构化变体(供 agent(schema=))
+roster.register(
+    "skeptic",
+    builder=lambda *, response_format=None: create_deep_agent(
+        model=..., response_format=response_format
+    ),
+)
 
 # 纯库:开发者自己编排(无 host agent)
 result = await run_workflow(orchestrate, roster=roster, config=cfg)

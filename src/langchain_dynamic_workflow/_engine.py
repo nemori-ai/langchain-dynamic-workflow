@@ -136,8 +136,15 @@ async def run_workflow(
         *,
         leaf_id: str,
         needs_execution: bool,
+        response_format: Any = None,
     ) -> LeafOutcome:
-        entry = roster.resolve(agent_type)
+        roster.resolve(agent_type)  # fail fast on unknown agent_type
+        # Resolve the runnable bound to the requested response_format: a schema-less
+        # call (response_format=None) gets the schema-less variant; a schema call
+        # gets the builder-constructed, per-format-cached variant. needs_execution
+        # arrives as a parameter (the caller derives it from the roster entry), so
+        # the resolved runnable is all this task needs from the roster.
+        runnable = roster.runnable_for(agent_type, response_format=response_format)
         # Forward a usage callback into the leaf's config — the same callback
         # forwarding deepagents performs for its own subagents — so token usage
         # aggregates across every (possibly nested) model call the leaf makes,
@@ -157,7 +164,7 @@ async def run_workflow(
                 "callbacks": [usage_handler],
                 "configurable": configurable,
             }
-            state: dict[str, Any] = await entry.runnable.ainvoke(
+            state: dict[str, Any] = await runnable.ainvoke(
                 {"messages": [HumanMessage(content=prompt)]}, config=leaf_config
             )
             return LeafOutcome(state=state, usage=total_tokens_from_handler(usage_handler))
@@ -198,12 +205,18 @@ async def run_workflow(
         *,
         leaf_id: str = "",
         needs_execution: bool = False,
+        response_format: Any = None,
     ) -> LeafOutcome:
         # The single durable leaf path, shared by agent / parallel / pipeline.
         # The shared gate (applied inside Ctx) bounds how many of these run at
         # once across every fan-out path in this run.
         return await leaf_task(
-            agent_type, prompt, model, leaf_id=leaf_id, needs_execution=needs_execution
+            agent_type,
+            prompt,
+            model,
+            leaf_id=leaf_id,
+            needs_execution=needs_execution,
+            response_format=response_format,
         )
 
     recorded_sequence = await journal_store.get_sequence()

@@ -194,3 +194,26 @@ def make_fake_leaf() -> Callable[..., tuple[Runnable[Any, Any], _FakeLeafState]]
         return RunnableLambda(_call), state
 
     return factory
+
+
+@pytest.fixture
+def make_structured_leaf() -> Callable[..., Runnable[Any, Any]]:
+    """Return a factory for a fake leaf whose state carries a structured_response.
+
+    Stands in for a create_deep_agent built with response_format=ToolStrategy(...):
+    the leaf appends an AIMessage and attaches the given model instance as
+    ``structured_response`` so fold_structured / agent(schema=...) can extract it.
+    """
+
+    def factory(structured: Any, *, reply: str = "done") -> Runnable[Any, Any]:
+        async def _call(
+            inp: dict[str, Any], config: RunnableConfig | None = None
+        ) -> dict[str, Any]:
+            return {
+                "messages": [*inp["messages"], AIMessage(content=reply)],
+                "structured_response": structured,
+            }
+
+        return RunnableLambda(_call)
+
+    return factory

@@ -20,15 +20,22 @@ classDiagram
     +budget
   }
   class Roster {
-    +register(name, runnable, *, needs_execution, default_model)
+    -_built: dict~tuple, Runnable~
+    +register(name, runnable, *, builder, needs_execution, default_model)
     +resolve(name) RosterEntry
+    +runnable_for(name, *, response_format) Runnable
   }
   class RosterEntry {
     +name
     +description
-    +runnable: CompiledStateGraph
+    +runnable: CompiledStateGraph | None
+    +builder: Callable | None
     +needs_execution: bool
     +default_model
+  }
+  class SchemaConverter {
+    <<_schema.to_pydantic_model>>
+    +to_pydantic_model(schema) type~BaseModel~
   }
   class Journal {
     <<content-hash, success-only>>
@@ -72,6 +79,7 @@ classDiagram
   Ctx --> PipelineScheduler
   Ctx --> SandboxManager
   Ctx --> Roster
+  Ctx ..> SchemaConverter : agent(schema=) 归一
   Journal ..> JournalStore
   Roster *-- RosterEntry
   SandboxManager ..> Backend : deepagents backend 实例
@@ -88,5 +96,5 @@ classDiagram
 - **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`、`create_workflow_tool`(产 `WorkflowTool`)、`create_workflow_middleware`(产 `WorkflowMiddleware`)。
 - **agent 面(运行时)**：`WorkflowTool`(多命令)。
 - **host 后台机制**：`WorkflowMiddleware` + `BgRunManager` + `BgRunSlot` + `ResultStore`。
-- **引擎核心(不可见)**：`WorkflowEngine`、`Ctx`、`Journal`(+`JournalStore`)、`DeterminismGuard`、`PipelineScheduler`、`SandboxManager`。
+- **引擎核心(不可见)**：`WorkflowEngine`、`Ctx`、`Journal`(+`JournalStore`)、`DeterminismGuard`、`PipelineScheduler`、`SandboxManager`、`SchemaConverter`(`_schema.to_pydantic_model`,把 JSON-schema dict 归一为 pydantic 模型)。`Roster` 经 `runnable_for(response_format)` 按 `(agent_type, schema)` 缓存绑定变体,builder 条目供 `agent(schema=)`。
 - **底座**：LangGraph `@entrypoint`/`@task`/checkpointer/`BaseStore`；deepagents `CompiledSubAgent`/`AgentMiddleware`/`SkillsMiddleware`/backend。
