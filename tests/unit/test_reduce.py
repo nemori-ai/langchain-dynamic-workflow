@@ -49,8 +49,9 @@ def test_judge_panel_form_against_is_not_sound() -> None:
 
 
 def test_empty_votes_raises() -> None:
+    empty: list[_Vote | None] = []
     with pytest.raises(ValueError, match="at least one vote"):
-        survives([], against=lambda v: v.refuted, kill_at=2)
+        survives(empty, against=lambda v: v.refuted, kill_at=2)
 
 
 def test_kill_at_below_one_raises() -> None:
@@ -110,7 +111,8 @@ def test_reconcile_empty_verdicts_is_conflict() -> None:
 
 
 def test_reconcile_empty_input() -> None:
-    assert reconcile([], include=lambda s: s.keep) == Reconciled([], [], [])
+    empty: list[ReviewItem[str, _Screen]] = []
+    assert reconcile(empty, include=lambda s: s.keep) == Reconciled([], [], [])
 
 
 def test_corroborate_keeps_groups_meeting_min_support() -> None:
