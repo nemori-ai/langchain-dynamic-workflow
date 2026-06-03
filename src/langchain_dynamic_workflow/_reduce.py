@@ -11,7 +11,8 @@ so they are inherently replay-safe and never touch the journal or determinism gu
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Sequence
+from typing import Any, overload
 
 
 def survives[T](votes: Sequence[T | None], *, against: Callable[[T], bool], kill_at: int) -> bool:
@@ -39,3 +40,32 @@ def survives[T](votes: Sequence[T | None], *, against: Callable[[T], bool], kill
         raise ValueError(f"kill_at must be >= 1, got {kill_at}")
     against_count = sum(1 for vote in votes if vote is None or against(vote))
     return against_count < kill_at
+
+
+@overload
+def dedup[H: Hashable](items: Iterable[H | None], *, key: None = ...) -> list[H]: ...
+@overload
+def dedup[T, K: Hashable](items: Iterable[T | None], *, key: Callable[[T], K]) -> list[T]: ...
+def dedup(items: Iterable[Any], *, key: Callable[[Any], Hashable] | None = None) -> list[Any]:
+    """Drop ``None`` and de-duplicate, preserving first-seen order.
+
+    Args:
+        items: The leaves' outputs; ``None`` (a failed leaf) is dropped.
+        key: Maps an item to its identity (e.g. ``str.lower`` to merge case
+            variants). Without it, the item itself is the key (items must be
+            Hashable — enforced by the no-key overload, mirroring ``sorted(key=None)``).
+
+    Returns:
+        The kept items in first-seen order, one per distinct key.
+    """
+    seen: set[Hashable] = set()
+    kept: list[Any] = []
+    for item in items:
+        if item is None:
+            continue
+        identity = item if key is None else key(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        kept.append(item)
+    return kept
