@@ -115,7 +115,7 @@ async def orchestrate(ctx, args):
     return await ctx.pipeline(sorted(args["items"]), research, summarize)
 ```
 
-Structured output as the JS-handoff (schema):
+Structured output as the handoff between agents (schema):
 
 ```python
 async def orchestrate(ctx, args):
@@ -134,6 +134,192 @@ async def orchestrate(ctx, args):
     )
     return "rejected" if verdict.refuted else "stands"
 ```
+
+## Quality patterns
+
+The basics above are mechanics. These are the **author patterns** that make an
+orchestration trustworthy — borrowed from how the best hand-written workflows are
+built. Each is a complete `orchestrate` you can adapt. They lean on `schema=` and
+on doing the reduce in plain Python (the iron law still applies: iterate ordered
+collections, capture loop variables in `parallel` thunks).
+
+**Adversarial verify (refute-by-default).** Don't ask "is this right?" — ask N
+independent skeptics to *refute* it, defaulting to refuted unless they can ground
+it, and keep only what survives a majority. Catches plausible-but-wrong claims a
+single confirmer would wave through.
+
+```python
+async def orchestrate(ctx, args):
+    claims = sorted(args["claims"])
+    confirmed = []
+    for claim in claims:
+        votes = await ctx.parallel(
+            [
+                lambda c=claim: ctx.agent(
+                    f"Try to refute this claim. Default to refuted=true unless you can ground it: {c}",
+                    agent_type="skeptic",
+                    schema={
+                        "type": "object",
+                        "properties": {"refuted": {"type": "boolean"}, "reason": {"type": "string"}},
+                        "required": ["refuted", "reason"],
+                        "additionalProperties": False,
+                    },
+                )
+                for _ in range(3)
+            ]
+        )
+        refutes = sum(1 for v in votes if v is not None and v.refuted)
+        if refutes < 2:  # survives a 3-skeptic majority
+            confirmed.append(claim)
+    return confirmed
+```
+
+**Pipeline review → verify (pipeline by default; `parallel` only for a real
+barrier).** Stream each dimension through review-then-verify with no barrier, so a
+dimension's findings get adversarially checked the moment its review lands instead
+of waiting on the slowest reviewer. Reach for `parallel` only when you genuinely
+need every result together.
+
+```python
+async def orchestrate(ctx, args):
+    dimensions = sorted(args["dimensions"])
+
+    async def review(prev, dimension, i):
+        return await ctx.agent(
+            f"Review the code along the {dimension} dimension; list concrete findings.",
+            agent_type="reviewer",
+        )
+
+    async def verify(prev, dimension, i):
+        return await ctx.agent(
+            f"Which of these {dimension} findings are real? Drop the rest:\n{prev}",
+            agent_type="skeptic",
+            schema={
+                "type": "object",
+                "properties": {"confirmed": {"type": "array", "items": {"type": "string"}}},
+                "required": ["confirmed"],
+                "additionalProperties": False,
+            },
+        )
+
+    verdicts = await ctx.pipeline(dimensions, review, verify)
+    return [c for v in verdicts if v is not None for c in v.confirmed]
+```
+
+**Fan out → reduce in Python → synthesize.** The intermediate findings live in
+script variables, never in a model's context. Dedup and sort with plain Python
+before the single synthesis call.
+
+```python
+async def orchestrate(ctx, args):
+    topics = sorted(args["topics"])
+    findings = await ctx.parallel(
+        [lambda t=t: ctx.agent(f"Research {t}", agent_type="researcher") for t in topics]
+    )
+    kept = sorted({f.strip() for f in findings if f})  # reduce in plain Python
+    return await ctx.agent("Synthesize these findings:\n" + "\n".join(kept), agent_type="writer")
+```
+
+**Loop until dry, with a hard `MAX_ROUNDS` and a budget guard.** Keep hunting until
+two dry rounds in a row, but always cap the rounds so a model that keeps
+"discovering" can't loop forever. Guard the budget check with `ctx.budget.total`:
+when no budget was set, `remaining()` is infinite, so the bare check never fires.
+
+```python
+async def orchestrate(ctx, args):
+    MAX_ROUNDS = 5
+    seen = set()
+    found = []
+    dry_streak = 0
+    for round_index in range(MAX_ROUNDS):
+        if ctx.budget.total and ctx.budget.remaining() < 1000:
+            ctx.log("budget nearly exhausted; stopping the hunt early")
+            break
+        batch = await ctx.agent(
+            f"Find issues not already in this list: {sorted(seen)}",
+            agent_type="hunter",
+            schema={
+                "type": "object",
+                "properties": {"issues": {"type": "array", "items": {"type": "string"}}},
+                "required": ["issues"],
+                "additionalProperties": False,
+            },
+        )
+        fresh = [i for i in batch.issues if i not in seen]
+        if not fresh:
+            dry_streak += 1
+            if dry_streak >= 2:  # two dry rounds in a row -> converged
+                break
+            continue
+        dry_streak = 0
+        for issue in fresh:
+            seen.add(issue)
+            found.append(issue)
+    return sorted(found)
+```
+
+**Judge panel / multi-modal sweep.** Judge one artifact through several distinct
+lenses in parallel and keep it only on a majority. Diverse lenses catch failure
+modes a single reviewer (or N identical reviewers) would miss.
+
+```python
+async def orchestrate(ctx, args):
+    artifact = args["artifact"]
+    lenses = ["correctness", "security", "performance"]
+    rulings = await ctx.parallel(
+        [
+            lambda lens=lens: ctx.agent(
+                f"Judge this artifact through the {lens} lens. Is it sound?\n{artifact}",
+                agent_type="judge",
+                schema={
+                    "type": "object",
+                    "properties": {"sound": {"type": "boolean"}, "note": {"type": "string"}},
+                    "required": ["sound", "note"],
+                    "additionalProperties": False,
+                },
+            )
+            for lens in lenses
+        ]
+    )
+    passes = sum(1 for r in rulings if r is not None and r.sound)
+    return "accepted" if passes >= 2 else "rejected"
+```
+
+**Per-stage model routing (cost discipline).** Spend a cheap model on bulk triage
+and a strong one only on the survivors. `model` is part of the cache key (so it
+partitions resume correctly); `label` / `phase` are not.
+
+```python
+async def orchestrate(ctx, args):
+    items = sorted(args["items"])
+    triaged = await ctx.parallel(
+        [lambda x=x: ctx.agent(f"Quick-triage: {x}", agent_type="worker", model="haiku") for x in items]
+    )
+    interesting = sorted(x for x, t in zip(items, triaged) if t and "interesting" in t.lower())
+    return await ctx.agent(
+        "Deeply analyze:\n" + "\n".join(interesting), agent_type="worker", model="sonnet"
+    )
+```
+
+**No silent caps.** If you bound the work — top-N, sampling, a round cap — say what
+you dropped with `ctx.log`, so a truncated run never reads as a complete one.
+
+```python
+async def orchestrate(ctx, args):
+    candidates = sorted(args["candidates"])
+    LIMIT = 10
+    if len(candidates) > LIMIT:
+        ctx.log(f"capping at {LIMIT} of {len(candidates)}; {len(candidates) - LIMIT} dropped")
+    chosen = candidates[:LIMIT]
+    results = await ctx.parallel(
+        [lambda c=c: ctx.agent(f"Evaluate {c}", agent_type="evaluator") for c in chosen]
+    )
+    return [r for r in results if r is not None]
+```
+
+A judge in any of these patterns ideally cannot edit — separate the agent that
+*generates* from the one that *judges* so a hallucinated fix can't land. Register
+the judge as a read-only leaf when your roster supports it.
 
 ## Authoring a script for `run_script`
 
