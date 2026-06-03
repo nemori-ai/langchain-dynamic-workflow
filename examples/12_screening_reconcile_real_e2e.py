@@ -132,11 +132,22 @@ def _build_source(*, response_format: Any = None) -> Any:
     model = real_model()
     if model is not None:
         return create_deep_agent(model=model, response_format=response_format)
-    # Offline: every source emits the SAME claim, so it corroborates (>= 2 sources).
-    return _fake_structured_leaf(
-        Candidate(claim="Microservices trade local simplicity for operational complexity"),
-        reply="surfaced a claim",
-    )
+    # Offline: sources DISCRIMINATE so corroborate visibly drops the unsupported. Two
+    # sources agree on one claim (it clears min_support=2 and corroborates); the other
+    # two each raise a distinct claim only they hold (each below threshold, dropped). The
+    # demo then prints "corroborated 1 of 4" — the reduce genuinely working, not a no-op.
+    shared = "Microservices trade local simplicity for operational complexity"
+
+    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        prompt = inp["messages"][-1].text if inp["messages"] else ""
+        index = next((i for i, source in enumerate(SOURCES) if source in prompt), 0)
+        claim = shared if index < 2 else f"an unsupported claim only source {index} holds"
+        return {
+            "messages": [*inp["messages"], AIMessage(content="surfaced a claim")],
+            "structured_response": Candidate(claim=claim),
+        }
+
+    return RunnableLambda(_leaf)
 
 
 def _build_screener(*, response_format: Any = None) -> Any:

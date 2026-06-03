@@ -249,14 +249,20 @@ def _build_extractor(*, response_format: Any = None) -> Any:
     model = real_model()
     if model is not None:
         return create_deep_agent(model=model, response_format=response_format)
-    # Offline: emit a deterministic checkable Claim so every angle survives extraction.
-    return _fake_structured_leaf(
-        Claim(
-            text="RAG and long-context LLMs trade recall breadth for context cost",
-            checkable=True,
-        ),
-        reply="extracted a checkable claim",
-    )
+
+    # Offline: emit an ANGLE-DISTINCT checkable claim (the prompt names the angle). Each
+    # angle yields its own claim, so dedup() is honestly a no-op here — it merges only
+    # true duplicates, never distinct claims — and every angle survives to the verify
+    # fan-out, mirroring the real per-angle shape instead of collapsing to one claim.
+    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        prompt = inp["messages"][-1].text if inp["messages"] else ""
+        angle = next((a for a in ANGLES if a in prompt), "general")
+        return {
+            "messages": [*inp["messages"], AIMessage(content="extracted a checkable claim")],
+            "structured_response": Claim(text=f"a checkable claim about {angle}", checkable=True),
+        }
+
+    return RunnableLambda(_leaf)
 
 
 def _build_skeptic(*, response_format: Any = None) -> Any:
