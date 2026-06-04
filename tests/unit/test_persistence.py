@@ -23,6 +23,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import aiosqlite
+import pytest
+
 from langchain_dynamic_workflow._engine import JournalRecord
 from langchain_dynamic_workflow._persistence import SqliteWorkflowStore
 from langchain_dynamic_workflow._run_store import RunSpec, WorkflowRunStore
@@ -305,5 +308,152 @@ async def test_store_satisfies_the_protocol(tmp_path: Path) -> None:
     store = await SqliteWorkflowStore.open(db_path)
     try:
         assert isinstance(store, WorkflowRunStore)
+    finally:
+        await store.aclose()
+
+
+async def test_open_failure_after_store_conn_closes_the_store_conn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure after the store connection is opened still closes that connection.
+
+    ``open`` opens the autocommit store connection first, then opens a second
+    connection and constructs the saver. If that later work raises, the first
+    connection (a live worker thread holding a file lock) must be closed before
+    the error propagates, or the host leaks a thread and risks an exit hang.
+    """
+    db_path = tmp_path / "workflows.db"
+    real_connect = aiosqlite.connect
+    opened: list[aiosqlite.Connection] = []
+    calls = {"n": 0}
+
+    def fake_connect(*args: object, **kwargs: object) -> aiosqlite.Connection:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            conn = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+            opened.append(conn)
+            return conn
+        raise RuntimeError("simulated second-connect failure")
+
+    monkeypatch.setattr("langchain_dynamic_workflow._persistence.aiosqlite.connect", fake_connect)
+
+    with pytest.raises(RuntimeError, match="simulated second-connect failure"):
+        await SqliteWorkflowStore.open(db_path)
+
+    assert len(opened) == 1
+    store_conn = opened[0]
+    # The store connection must have been closed before the error propagated: a
+    # closed aiosqlite connection has no active connection and refuses queries.
+    assert store_conn._connection is None  # type: ignore[attr-defined]
+    with pytest.raises(ValueError, match="no active connection"):
+        await store_conn.execute("SELECT 1")
+
+
+async def test_open_failure_in_saver_closes_both_connections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure constructing the saver closes both already-opened connections.
+
+    The saver is built last, after both connections are open. If its constructor
+    raises, neither connection has an owner yet, so ``open`` must close both
+    rather than leak two worker threads.
+    """
+    db_path = tmp_path / "workflows.db"
+    real_connect = aiosqlite.connect
+    opened: list[aiosqlite.Connection] = []
+
+    def tracking_connect(*args: object, **kwargs: object) -> aiosqlite.Connection:
+        conn = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(conn)
+        return conn
+
+    def boom(_conn: object) -> object:
+        raise RuntimeError("simulated saver construction failure")
+
+    monkeypatch.setattr(
+        "langchain_dynamic_workflow._persistence.aiosqlite.connect", tracking_connect
+    )
+    monkeypatch.setattr("langchain_dynamic_workflow._persistence.AsyncSqliteSaver", boom)
+
+    with pytest.raises(RuntimeError, match="simulated saver construction failure"):
+        await SqliteWorkflowStore.open(db_path)
+
+    assert len(opened) == 2
+    for conn in opened:
+        assert conn._connection is None  # type: ignore[attr-defined]
+
+
+async def test_aclose_closes_checkpointer_even_if_store_close_raises(
+    tmp_path: Path,
+) -> None:
+    """``aclose`` closes the checkpointer connection even if the store close fails.
+
+    The two closes are independent: a failure tearing down the store connection
+    must not strand the checkpointer connection's worker thread and WAL sidecar.
+    """
+    db_path = tmp_path / "workflows.db"
+    store = await SqliteWorkflowStore.open(db_path)
+    store_conn = store._store_conn  # type: ignore[attr-defined]
+    checkpointer_conn = store._checkpointer_conn  # type: ignore[attr-defined]
+    real_store_close = store_conn.close
+
+    async def failing_close() -> None:
+        raise RuntimeError("simulated store close failure")
+
+    # Replace the store connection's close so the first teardown step fails.
+    store_conn.close = failing_close  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="simulated store close failure"):
+            await store.aclose()
+
+        # The checkpointer connection must still have been closed despite the failure.
+        assert checkpointer_conn._connection is None  # type: ignore[attr-defined]
+    finally:
+        # Restore and run the real close so the store connection's worker thread
+        # actually stops (a stubbed-out close would otherwise leak the thread).
+        store_conn.close = real_store_close  # type: ignore[method-assign]
+        await store_conn.close()
+
+
+async def test_async_context_manager_opens_and_closes(tmp_path: Path) -> None:
+    """``async with SqliteWorkflowStore.open(...)`` yields a usable, auto-closed store.
+
+    A host that uses the context-manager form must get a working store inside the
+    block and have both connections closed on exit, so it cannot forget the final
+    teardown.
+    """
+    db_path = tmp_path / "workflows.db"
+    store_ref: SqliteWorkflowStore
+    async with await SqliteWorkflowStore.open(db_path) as store:
+        store_ref = store
+        await store.save_spec("run-1", _spec())
+        assert await store.load_spec("run-1") == _spec()
+
+    # On exit both connections are closed.
+    assert store_ref._store_conn._connection is None  # type: ignore[attr-defined]
+    assert store_ref._checkpointer_conn._connection is None  # type: ignore[attr-defined]
+
+
+async def test_concurrent_puts_to_same_key_resolve_without_error(tmp_path: Path) -> None:
+    """Concurrent puts to one key settle on a single value with no error (C4).
+
+    The single store connection serializes every write through its worker thread,
+    so N racing puts to the *same* ``(run_id, key)`` with distinct values resolve
+    last-writer-wins: the final read returns one of the written values and no
+    write raises.
+    """
+    db_path = tmp_path / "workflows.db"
+    store = await SqliteWorkflowStore.open(db_path)
+    try:
+        journal = store.journal_for("run-1")
+        written = {JournalRecord(result=f"v{i}", usage=i) for i in range(50)}
+
+        async def put(index: int) -> None:
+            await journal.put("contended-key", JournalRecord(result=f"v{index}", usage=index))
+
+        await asyncio.gather(*(put(i) for i in range(50)))
+
+        final = await journal.get("contended-key")
+        assert final in written
     finally:
         await store.aclose()

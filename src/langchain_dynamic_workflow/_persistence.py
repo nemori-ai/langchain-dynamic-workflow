@@ -27,6 +27,7 @@ its single persistent loop and reuse the one instance across all runs.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from typing import Any
@@ -190,6 +191,23 @@ class _RunScopedJournal:
         )
 
 
+async def _close_quietly(conn: aiosqlite.Connection | None) -> None:
+    """Close ``conn`` if present, swallowing any close-time error.
+
+    Used only on the partial-failure cleanup path of :meth:`SqliteWorkflowStore.open`,
+    where an original exception is already in flight. Suppressing a secondary
+    close error keeps that original cause as the one re-raised, while still
+    attempting to release the connection's worker thread and file lock.
+
+    Args:
+        conn: The connection to close, or ``None`` if it was never opened.
+    """
+    if conn is None:
+        return
+    with contextlib.suppress(Exception):
+        await conn.close()
+
+
 class SqliteWorkflowStore:
     """Durable run registry, per-run journal, and checkpointer over one db file.
 
@@ -245,21 +263,31 @@ class SqliteWorkflowStore:
         """
         database = os.fspath(db_path)
         # The registry + journal connection runs in autocommit mode so every
-        # write is durable on return with no explicit commit (C2). WAL lets the
+        # write is durable on return with no explicit commit. WAL lets the
         # separate checkpointer connection read committed writes, and the busy
         # timeout absorbs brief lock contention between the two connections.
         store_conn = await aiosqlite.connect(database, isolation_level=None)
-        await store_conn.execute("PRAGMA journal_mode=WAL")
-        await store_conn.execute("PRAGMA busy_timeout=5000")
-        await store_conn.executescript(_SCHEMA_DDL)
+        checkpointer_conn: aiosqlite.Connection | None = None
+        try:
+            await store_conn.execute("PRAGMA journal_mode=WAL")
+            await store_conn.execute("PRAGMA busy_timeout=5000")
+            await store_conn.executescript(_SCHEMA_DDL)
 
-        # A SECOND, separate connection backs the checkpointer: its explicit-
-        # commit + WAL regime is incompatible with the autocommit store
-        # connection, so the two must never share a connection (C3). The saver
-        # is constructed directly over the connection (never from_conn_string,
-        # which would close it on context exit and defeat cross-process resume).
-        checkpointer_conn = await aiosqlite.connect(database)
-        checkpointer = AsyncSqliteSaver(checkpointer_conn)
+            # A SECOND, separate connection backs the checkpointer: its explicit-
+            # commit + WAL regime is incompatible with the autocommit store
+            # connection, so the two must never share a connection. The saver is
+            # constructed directly over the connection (never from_conn_string,
+            # which would close it on context exit and defeat cross-process
+            # resume).
+            checkpointer_conn = await aiosqlite.connect(database)
+            checkpointer = AsyncSqliteSaver(checkpointer_conn)
+        except BaseException:
+            # Any failure after the store connection is open leaves a live worker
+            # thread holding a file lock. Close everything already opened before
+            # re-raising so a partial open never leaks a thread or hangs exit.
+            await _close_quietly(checkpointer_conn)
+            await store_conn.close()
+            raise
 
         return cls(store_conn, checkpointer_conn, checkpointer)
 
@@ -353,12 +381,42 @@ class SqliteWorkflowStore:
         """
         return _RunScopedJournal(self._store_conn, run_id)
 
+    async def __aenter__(self) -> SqliteWorkflowStore:
+        """Return the already-opened store for ``async with`` use.
+
+        The store is opened by the :meth:`open` async factory; entering the
+        context manager performs no further I/O and simply yields ``self`` so the
+        host can write ``async with await SqliteWorkflowStore.open(db) as store``.
+
+        Returns:
+            This store instance.
+        """
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        """Close both connections on exit from an ``async with`` block.
+
+        Always runs :meth:`aclose`, whether the block exited normally or via an
+        exception, so a host using the context-manager form cannot forget the
+        final teardown.
+
+        Args:
+            *exc: The exception type, value, and traceback (all ``None`` on a
+                clean exit); unused because teardown is unconditional.
+        """
+        await self.aclose()
+
     async def aclose(self) -> None:
         """Close both connections, releasing their WAL sidecar files.
 
         Call this at host shutdown. Closing the store and checkpointer
         connections releases the ``-wal`` / ``-shm`` sidecars; leaving them open
-        can also hang the program on exit.
+        can also hang the program on exit. The two closes are independent: if
+        closing the store connection raises, the checkpointer connection is still
+        closed before the error propagates, so one failure cannot strand the
+        other's worker thread.
         """
-        await self._store_conn.close()
-        await self._checkpointer_conn.close()
+        try:
+            await self._store_conn.close()
+        finally:
+            await self._checkpointer_conn.close()
