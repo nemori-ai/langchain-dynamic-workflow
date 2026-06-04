@@ -7,9 +7,9 @@ dependencies = [
     "langgraph>=1.0",
     "langgraph-cli[inmem]>=0.1.55",
     "deepagents>=0.6",
-    "langchain-openai>=0.2",
     "langchain-dynamic-workflow",
     "langchain-openrouter>=0.2.3",
+    "langsmith>=0.1",
 ]
 
 [dependency-groups]
