@@ -23,7 +23,7 @@ from __future__ import annotations
 from functools import partial
 from typing import Any
 
-from _models import resolve_leaf_model, resolve_openrouter_key
+from _models import cache_middleware, resolve_leaf_model, resolve_openrouter_key
 from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
@@ -81,10 +81,11 @@ class Verdict(BaseModel):
 
 def _search_prompt(question: str, angle: str) -> str:
     return (
-        "You are a researcher. Investigate this question from one specific angle and "
-        "report concrete findings.\n"
+        "You are a researcher with a web_search tool. Investigate this question from one "
+        "specific angle: run web_search to find current, authoritative sources, then "
+        "report concrete findings grounded in what you found.\n"
         f"Question: {question}\nAngle: {angle}\n"
-        "Write 2-3 substantive sentences grounded in what you know. Be specific."
+        "Write 2-3 substantive sentences citing the specific facts and sources you found."
     )
 
 
@@ -99,11 +100,11 @@ def _extract_prompt(question: str, angle: str, finding: str) -> str:
 
 def _verify_prompt(question: str, claim: str, voter: int) -> str:
     return (
-        f"You are skeptic #{voter + 1} reviewing a claim for factual accuracy from your own "
-        "knowledge. Set `refuted` to true only if the claim is factually wrong, misleading, "
-        "or clearly overstated; otherwise set it to false. Give one sentence of `reason`. "
-        "These claims are reasoned rather than web-sourced, so judge correctness, not "
-        f"citation presence.\nQuestion: {question}\nClaim: {claim}"
+        f"You are skeptic #{voter + 1} fact-checking a claim. Use your web_search tool to "
+        "verify it against current, authoritative sources. Set `refuted` to true only if "
+        "the sources show the claim is factually wrong, misleading, or clearly overstated; "
+        "otherwise set it to false. Give one sentence of `reason` citing what you found.\n"
+        f"Question: {question}\nClaim: {claim}"
     )
 
 
@@ -285,7 +286,7 @@ def _fake_structured_leaf(
     return RunnableLambda(_leaf)
 
 
-def _build_text_leaf(role: str, *, api_key: str | None = None) -> Any:
+def _build_text_leaf(role: str, *, api_key: str | None = None, web_search: bool = False) -> Any:
     """Build a schema-less text leaf (researcher / refiner / writer).
 
     Args:
@@ -293,10 +294,14 @@ def _build_text_leaf(role: str, *, api_key: str | None = None) -> Any:
         api_key: The per-run OpenRouter key captured at roster-build time (or ``None``
             to fall back to the env key). Threaded into :func:`resolve_leaf_model` so a
             per-session key reaches this leaf.
+        web_search: When ``True``, the leaf model carries Anthropic's native web search
+            tool so the leaf grounds its work in live web sources. Only takes effect on
+            the online path; an offline fake leaf never searches, so determinism is
+            preserved.
     """
-    model = resolve_leaf_model(api_key=api_key)
+    model = resolve_leaf_model(api_key=api_key, web_search=web_search)
     if model is not None:
-        return create_deep_agent(model=model)
+        return create_deep_agent(model=model, middleware=cache_middleware())
     return _fake_echo_leaf(role)
 
 
@@ -310,7 +315,9 @@ def _build_extractor(*, response_format: Any = None, api_key: str | None = None)
     """
     model = resolve_leaf_model(api_key=api_key)
     if model is not None:
-        return create_deep_agent(model=model, response_format=response_format)
+        return create_deep_agent(
+            model=model, response_format=response_format, middleware=cache_middleware()
+        )
 
     # Offline: emit an ANGLE-DISTINCT checkable claim (the prompt names the angle), so
     # each angle yields a distinct claim, dedup() is honestly a no-op, and every angle
@@ -326,7 +333,9 @@ def _build_extractor(*, response_format: Any = None, api_key: str | None = None)
     return RunnableLambda(_leaf)
 
 
-def _build_skeptic(*, response_format: Any = None, api_key: str | None = None) -> Any:
+def _build_skeptic(
+    *, response_format: Any = None, api_key: str | None = None, web_search: bool = False
+) -> Any:
     """Build the ``skeptic`` leaf (a read-only judge), forwarding ``response_format``.
 
     A skeptic adversarially verifies a claim — it should only *judge*, never mutate
@@ -338,10 +347,14 @@ def _build_skeptic(*, response_format: Any = None, api_key: str | None = None) -
         response_format: The structured schema (``Verdict``) the real leaf returns.
         api_key: The per-run OpenRouter key captured at roster-build time (or ``None``
             to fall back to the env key).
+        web_search: When ``True``, the leaf model carries Anthropic's native web search
+            tool so the judge fact-checks the claim against live sources before ruling.
+            The search runs server-side and is read-only by nature, so it composes with
+            the deny-write read-only leaf. Only takes effect on the online path.
     """
-    model = resolve_leaf_model(api_key=api_key)
+    model = resolve_leaf_model(api_key=api_key, web_search=web_search)
     if model is not None:
-        return read_only_leaf(model, response_format=response_format)
+        return read_only_leaf(model, response_format=response_format, middleware=cache_middleware())
     return _fake_structured_leaf(
         Verdict(refuted=False, reason="consistent with the cited evidence"),
         reply="reviewed the claim",
@@ -366,7 +379,7 @@ def _build_capstone_skeptic(*, response_format: Any = None, api_key: str | None 
     """
     model = resolve_leaf_model(api_key=api_key)
     if model is not None:
-        return read_only_leaf(model, response_format=response_format)
+        return read_only_leaf(model, response_format=response_format, middleware=cache_middleware())
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
         prompt = inp["messages"][-1].text if inp["messages"] else ""
@@ -421,8 +434,8 @@ def make_roster() -> Roster:
         Roster()
         .register(
             "researcher",
-            _build_text_leaf("researcher", api_key=api_key),
-            description="Researches one angle.",
+            _build_text_leaf("researcher", api_key=api_key, web_search=True),
+            description="Researches one angle (web search).",
         )
         .register(
             "writer",
@@ -441,8 +454,8 @@ def make_roster() -> Roster:
         )
         .register(
             "skeptic",
-            builder=partial(_build_skeptic, api_key=api_key),
-            description="Adversarially verifies a claim.",
+            builder=partial(_build_skeptic, api_key=api_key, web_search=True),
+            description="Adversarially verifies a claim (web search fact-check).",
         )
         .register(
             "capstone_skeptic",

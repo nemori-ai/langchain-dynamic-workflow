@@ -81,9 +81,9 @@ def test_per_run_config_key_threads_into_built_openrouter_model() -> None:
 
     assert model is not None
     # The locked provider: every real call routes through OpenRouter's endpoint.
-    assert str(model.openai_api_base) == OPENROUTER_BASE_URL  # type: ignore[attr-defined]
+    assert str(model.openrouter_api_base) == OPENROUTER_BASE_URL  # type: ignore[attr-defined]
     # The per-session key threaded all the way into the model (SecretStr unwrap).
-    assert model.openai_api_key.get_secret_value() == session_key  # type: ignore[attr-defined]
+    assert model.openrouter_api_key.get_secret_value() == session_key  # type: ignore[attr-defined]
     # The fixed economical leaf model id, not a user-configured one.
     assert model.model_name == LEAF_MODEL  # type: ignore[attr-defined]
 
@@ -212,9 +212,9 @@ def test_host_model_binds_real_openrouter_backend_with_a_key() -> None:
     with _run_config({"openrouter_api_key": "sk-or-host-session"}):
         delegate = model._resolve_delegate()
 
-    # No tools bound here, so the delegate is the bare ChatOpenAI (OpenRouter) backend.
-    assert str(delegate.openai_api_base) == OPENROUTER_BASE_URL  # type: ignore[attr-defined]
-    assert delegate.openai_api_key.get_secret_value() == "sk-or-host-session"  # type: ignore[attr-defined]
+    # No tools bound here, so the delegate is the bare ChatOpenRouter (OpenRouter) backend.
+    assert str(delegate.openrouter_api_base) == OPENROUTER_BASE_URL  # type: ignore[attr-defined]
+    assert delegate.openrouter_api_key.get_secret_value() == "sk-or-host-session"  # type: ignore[attr-defined]
     assert delegate.model_name == HOST_MODEL  # type: ignore[attr-defined]
 
 
@@ -243,9 +243,9 @@ def test_roster_threads_captured_key_into_schema_aware_leaf_builders(
     captured_keys: list[str | None] = []
     real_resolve = workflows.resolve_leaf_model
 
-    def _spy_resolve(*, api_key: str | None = None) -> Any:
+    def _spy_resolve(*, api_key: str | None = None, web_search: bool = False) -> Any:
         captured_keys.append(api_key)
-        return real_resolve(api_key=api_key)
+        return real_resolve(api_key=api_key, web_search=web_search)
 
     monkeypatch.setattr(workflows, "resolve_leaf_model", _spy_resolve)
 

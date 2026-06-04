@@ -13,7 +13,7 @@ Per-session key round-trip. The host model is built once at graph-build time
 (``make_host_graph``), but the key arrives per run. :class:`LazyOpenRouterHostModel`
 bridges that gap: it is a thin :class:`BaseChatModel` wrapper that, on each
 generate call, reads the current run config via ``langgraph.config.get_config`` and
-builds the real OpenRouter-backed ``ChatOpenAI`` from that run's key — so a fresh key
+builds the real OpenRouter-backed ``ChatOpenRouter`` from that run's key — so a fresh key
 on every session threads through without rebuilding the graph. The leaf models
 (:func:`resolve_leaf_model`, used in ``workflows.make_roster``) are baked into their
 deepagents at roster-build time; since the roster is built inside the host node where
@@ -39,6 +39,7 @@ from langchain_core.callbacks import (
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_openrouter import ChatOpenRouter
 
 # ── locked provider + fixed models ───────────────────────────────────────────
 
@@ -49,15 +50,35 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # The strong host model. The host drives the demo's multi-step tool calls (launch an
 # inline preset run, compose + gate a meta script, hand a job to the background) across
 # turns, which an M1 real-model finding showed weak models (gpt-4o-mini / haiku) cannot
-# do reliably. ``claude-sonnet-4.5`` is a current OpenRouter id with strong agentic
-# tool-use; swap this constant to change the host model.
-HOST_MODEL = "anthropic/claude-sonnet-4.5"
+# do reliably. ``claude-opus-4.8`` is the most capable current OpenRouter id and matches
+# the engine examples' ``DEFAULT_OPENROUTER_MODEL``; swap this constant to change it.
+HOST_MODEL = "anthropic/claude-opus-4.8"
 
-# The economical leaf model for the research fan-out. Leaves do short, bounded research
-# / extraction / adversarial-judging work, so a cheap model is the cost-disciplined
-# choice. ``claude-haiku-4.5`` is the same current OpenRouter id the engine's real-model
-# E2E examples use for leaves; swap this constant to change the leaf model.
-LEAF_MODEL = "anthropic/claude-haiku-4.5"
+# The leaf model for the research fan-out. ``claude-sonnet-4.6`` is strong enough to
+# drive the native web-search tool reliably (haiku-class models route the search poorly)
+# while staying cheaper than the opus host; swap this constant to change the leaf model.
+LEAF_MODEL = "anthropic/claude-sonnet-4.6"
+
+# Lock OpenRouter routing to Anthropic's first-party endpoint, no fallback. REQUIRED:
+# the native web tools below and Anthropic prompt caching only work on the Anthropic
+# provider — a silent fallback to Amazon Bedrock / Google Vertex would drop both.
+ANTHROPIC_PROVIDER: dict[str, Any] = {"order": ["Anthropic"], "allow_fallbacks": False}
+
+# OpenRouter's native server-side web search. ``engine="native"`` forces the underlying
+# provider's own search; since the demo is provider-locked to Anthropic and runs
+# ``anthropic/*`` models, that is Anthropic's built-in web search — reached through
+# OpenRouter's unified ``openrouter:web_search`` tool type (the ``openrouter`` SDK that
+# backs ``ChatOpenRouter`` validates tool types and rejects the raw Anthropic
+# ``web_search_20250305`` spec, but accepts this one). The search runs server-side and
+# returns results + citations inline; the model also fetches result pages as part of the
+# search. (``openrouter:web_fetch`` is only a *result* type in the current ``openrouter``
+# SDK, not a requestable input tool, so it is not bound here — it would fail validation.)
+WEB_SEARCH_MAX_RESULTS = 5
+WEB_SEARCH_TOOL: dict[str, Any] = {
+    "type": "openrouter:web_search",
+    "parameters": {"engine": "native", "max_results": WEB_SEARCH_MAX_RESULTS},
+}
+_WEB_TOOLS: tuple[dict[str, Any], ...] = (WEB_SEARCH_TOOL,)
 
 # The run-config field carrying the per-session OpenRouter key. The frontend threads the
 # user's one key here on the LangGraph run config; it is read per run (not at graph-build
@@ -445,26 +466,48 @@ def is_offline() -> bool:
     return resolve_openrouter_key() is None
 
 
-def _build_openrouter_model(model: str, api_key: str) -> BaseChatModel:
-    """Build an OpenRouter-backed ``ChatOpenAI`` for ``model`` with ``api_key``.
+class _WebSearchChatOpenRouter(ChatOpenRouter):
+    """A ``ChatOpenRouter`` that appends OpenRouter's native web tools to every binding.
 
-    The locked-provider constructor: every real call routes through OpenRouter's
-    OpenAI-compatible endpoint (:data:`OPENROUTER_BASE_URL`) with the supplied key. The
-    import is local because ``langchain_openai`` is only needed on the online path.
+    deepagents binds its own tools onto a leaf model via ``bind_tools``; that call would
+    otherwise replace any tools set at construction, dropping web search. This appends the
+    web tools (:data:`_WEB_TOOLS`) **raw** — not through ``convert_to_openai_tool``, which
+    rewrites a tool into function-call shape and strips the ``openrouter:`` marker the
+    server needs — so the search stays available alongside deepagents' tools on every
+    request and is executed server-side by OpenRouter.
+    """
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        bound = super().bind_tools(tools, **kwargs)
+        bound_kwargs: dict[str, Any] = dict(getattr(bound, "kwargs", {}))
+        bound_kwargs["tools"] = [*bound_kwargs.get("tools", []), *_WEB_TOOLS]
+        return self.bind(**bound_kwargs)
+
+
+def _build_openrouter_model(model: str, api_key: str, *, web_search: bool = False) -> BaseChatModel:
+    """Build an OpenRouter-backed ``ChatOpenRouter`` for ``model`` with ``api_key``.
+
+    The locked-provider constructor: every real call routes through OpenRouter pinned to
+    Anthropic (:data:`ANTHROPIC_PROVIDER`) with the supplied key. ``ChatOpenRouter`` is
+    the same client the engine's runnable examples use, and the one the prompt-caching
+    middleware detects to inject Anthropic ``cache_control``.
 
     Args:
         model: The OpenRouter model id (e.g. :data:`HOST_MODEL`).
         api_key: The OpenRouter key to authenticate with.
+        web_search: When ``True``, build a :class:`_WebSearchChatOpenRouter` so the leaf
+            carries OpenRouter's native web tools (Anthropic's built-in search, reached
+            via the provider lock). Only meaningful for the ``anthropic/*`` leaf model.
 
     Returns:
         A configured :class:`~langchain_core.language_models.chat_models.BaseChatModel`.
     """
-    from langchain_openai import ChatOpenAI
-
-    return ChatOpenAI(
+    cls = _WebSearchChatOpenRouter if web_search else ChatOpenRouter
+    return cls(
         model=model,
         base_url=OPENROUTER_BASE_URL,
-        api_key=api_key,  # type: ignore[arg-type]
+        api_key=api_key,  # type: ignore[arg-type]  # str coerced to SecretStr by the alias
+        openrouter_provider=ANTHROPIC_PROVIDER,
     )
 
 
@@ -477,7 +520,7 @@ class LazyOpenRouterHostModel(BaseChatModel):
     (a)generate call, resolves the effective per-run key (:func:`resolve_openrouter_key`,
     read inside the host node where the run config is visible) and:
 
-    * with a key in force — delegates to a freshly-built OpenRouter-backed ``ChatOpenAI``
+    * with a key in force — delegates to a freshly-built OpenRouter-backed ``ChatOpenRouter``
       (:data:`HOST_MODEL`), re-applying any remembered tool binding; and
     * with no key in force — delegates to a :class:`OfflineHostModel`, so a bare
       ``langgraph dev`` boot (no ``.env`` key, no per-session key) still drives the
@@ -498,6 +541,17 @@ class LazyOpenRouterHostModel(BaseChatModel):
     @property
     def _llm_type(self) -> str:
         return "lazy-openrouter-host-model"
+
+    @property
+    def _ldw_openrouter_anthropic(self) -> bool:
+        """Marker the prompt-caching middleware reads to treat this wrapper as cacheable.
+
+        The wrapper itself is not a ``ChatOpenRouter``, but its per-call delegate is one
+        (OpenRouter pinned to Anthropic) and it forwards the middleware's
+        ``cache_control``-bearing messages straight through, so the cache breakpoints
+        still reach OpenRouter. See ``prompt_caching._is_openrouter_anthropic_model``.
+        """
+        return True
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> BaseChatModel:
         """Remember the tool binding so it can be re-applied to the per-call delegate.
@@ -593,7 +647,9 @@ def resolve_host_model() -> BaseChatModel:
     return LazyOpenRouterHostModel()
 
 
-def resolve_leaf_model(*, api_key: str | None = None) -> BaseChatModel | None:
+def resolve_leaf_model(
+    *, api_key: str | None = None, web_search: bool = False
+) -> BaseChatModel | None:
     """Return a chat model for workflow leaves, or ``None`` to run them offline.
 
     Mirrors :func:`resolve_host_model`'s key gating but signals the offline path with
@@ -611,6 +667,9 @@ def resolve_leaf_model(*, api_key: str | None = None) -> BaseChatModel | None:
         api_key: The OpenRouter key the caller captured from the run config (or ``None``
             to fall back to the per-run config / ``.env`` resolution). When supplied it
             takes precedence so a captured per-session key threads into the leaf.
+        web_search: When ``True``, the leaf model carries Anthropic's native web search
+            tool (see :func:`_build_openrouter_model`) so research / verify leaves ground
+            their work in live web sources. Has no effect on the offline path.
 
     Returns:
         A configured OpenRouter leaf model when a key is in force, else ``None``.
@@ -619,7 +678,32 @@ def resolve_leaf_model(*, api_key: str | None = None) -> BaseChatModel | None:
     if effective_key is None:
         return None
     model = os.environ.get(_LEAF_MODEL_ENV_OVERRIDE) or LEAF_MODEL
-    return _build_openrouter_model(model, effective_key)
+    return _build_openrouter_model(model, effective_key, web_search=web_search)
+
+
+def cache_middleware() -> list[Any]:
+    """Return the prompt-caching middleware to register on EVERY real demo agent.
+
+    Anthropic prompt caching via OpenRouter (:class:`~prompt_caching.PromptCachingMiddleware`):
+    it injects ``cache_control`` breakpoints so the growing system prompt and tool-call
+    history are cached across the host's turns and inside each leaf's tool loop — host and
+    leaves alike. ``pin_openrouter_provider`` is off because every model here already pins
+    the provider to Anthropic (:data:`ANTHROPIC_PROVIDER`), so cache hits are already
+    provider-stable. The import is local so the offline path (fake leaves, no middleware)
+    pulls nothing from ``prompt_caching``.
+
+    Returns:
+        A one-element middleware list to pass as ``create_deep_agent(middleware=...)``.
+    """
+    from prompt_caching import PromptCachingMiddleware
+
+    return [
+        PromptCachingMiddleware(
+            progressive=True,
+            cache_last_human_message=True,
+            pin_openrouter_provider=False,
+        )
+    ]
 
 
 __all__: Sequence[str] = [
@@ -627,8 +711,10 @@ __all__: Sequence[str] = [
     "LEAF_MODEL",
     "OPENROUTER_BASE_URL",
     "RUN_CONFIG_KEY_FIELD",
+    "WEB_SEARCH_TOOL",
     "LazyOpenRouterHostModel",
     "OfflineHostModel",
+    "cache_middleware",
     "is_offline",
     "resolve_host_model",
     "resolve_leaf_model",

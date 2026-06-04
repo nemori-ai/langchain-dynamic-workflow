@@ -107,15 +107,27 @@ changing them is a one-line edit:
 
 | Constant | Role | Why this pick |
 |----------|------|---------------|
-| `HOST_MODEL` | the host agent that drives the multi-step tool calls | a **strong** model (`anthropic/claude-sonnet-4.5`). Our earlier real-model findings showed weak/cheap models (e.g. `gpt-4o-mini`) *cannot* reliably drive the multi-step tool-calling the host needs — they stall or skip the workflow tool. The host must be strong. |
-| `LEAF_MODEL` | the research fan-out sub-agents | an **economical** model (`anthropic/claude-haiku-4.5`). Leaves do bounded, single-shot work and there are many of them in parallel, so the cheap model keeps a fan-out affordable. |
+| `HOST_MODEL` | the host agent that drives the multi-step tool calls | the most capable model (`anthropic/claude-opus-4.8`). Our earlier real-model findings showed weak/cheap models (e.g. `gpt-4o-mini`) *cannot* reliably drive the multi-step tool-calling the host needs — they stall or skip the workflow tool. The host must be strong. Matches the engine examples' default. |
+| `LEAF_MODEL` | the research fan-out sub-agents | a strong, cheaper model (`anthropic/claude-sonnet-4.6`). Leaves do bounded research / verify work in parallel; sonnet-class is needed to drive the native web-search tool reliably (haiku-class routes the search poorly) while staying below the opus host. |
 
 Both are valid OpenRouter model ids. To swap either, edit the constant — nothing
 else changes.
 
-> **OpenRouter-only by design.** The documented, default, UI path is OpenRouter +
-> one key. (A tiny internal branch may exist for other providers, but it is not a
-> headline path and the UI does not expose provider selection.)
+> **OpenRouter-only, Anthropic-locked.** The default, UI path is OpenRouter + one
+> key. Every real model is built as a `ChatOpenRouter` (the same client the engine
+> examples use) with provider routing **pinned to Anthropic** (no fallback to
+> Bedrock / Vertex) — required because the native web search and Anthropic prompt
+> caching only work on the Anthropic provider.
+
+### Web search + prompt caching
+
+Real runs are **grounded in live web sources**: the research and verify leaves
+carry OpenRouter's native `openrouter:web_search` tool (`engine="native"`, so the
+search is Anthropic's own, reached through the provider lock), executed server-side
+with citations returned inline. **Anthropic prompt caching** is registered on every
+agent (host and all leaves) via a `PromptCachingMiddleware` ported from `omne-next`,
+so the growing system prompt and tool-call history are cached across turns. Both are
+online-path only; the offline scripted path stays deterministic and credential-free.
 
 ---
 

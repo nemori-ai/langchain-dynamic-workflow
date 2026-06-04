@@ -25,7 +25,7 @@ import hashlib
 from typing import Annotated, Any
 
 from _meta_fixtures import AUTHORED_SCRIPT, META_TOPICS, REJECTED_SCRIPT
-from _models import is_offline, resolve_host_model
+from _models import cache_middleware, is_offline, resolve_host_model
 from deepagents import DeepAgentState, create_deep_agent
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import tool
@@ -609,4 +609,5 @@ def make_host_graph() -> Any:
         system_prompt=HOST_INSTRUCTIONS,
         tools=[run_hello_demo, run_live, run_meta_script, run_background],
         state_schema=HostState,
+        middleware=cache_middleware(),
     )
