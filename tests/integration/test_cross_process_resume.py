@@ -20,6 +20,9 @@ serialization and durability, not a model run.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +34,51 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from langchain_dynamic_workflow import Ctx, Roster, run_workflow
 from langchain_dynamic_workflow._context import LeafOutcome
+
+_WORKER = Path(__file__).resolve().parent / "_cross_process_worker.py"
+_RESULT_MARKER = "WORKER_RESULT "
+
+
+def _run_worker(mode: str, db_path: Path, counter_path: Path) -> dict[str, Any]:
+    """Launch the cross-process worker as a real OS process and parse its result.
+
+    Each call spawns a *separate* Python interpreter (via ``subprocess``), so the
+    run and resume halves genuinely run in different processes that share only the
+    on-disk db and counter files — there is no shared in-process state that could
+    mask a persistence gap.
+
+    Args:
+        mode: The worker mode (``run`` / ``run-fail`` / ``resume``).
+        db_path: The shared sqlite db file both processes target.
+        counter_path: The shared leaf-invocation counter file.
+
+    Returns:
+        The decoded ``WORKER_RESULT`` JSON payload the worker printed.
+    """
+    completed = subprocess.run(
+        [sys.executable, str(_WORKER), mode, str(db_path), str(counter_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"worker mode {mode!r} exited {completed.returncode}\n"
+        f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+    )
+    for line in completed.stdout.splitlines():
+        if line.startswith(_RESULT_MARKER):
+            decoded: dict[str, Any] = json.loads(line[len(_RESULT_MARKER) :])
+            return decoded
+    raise AssertionError(
+        f"worker mode {mode!r} printed no result line\nSTDOUT:\n{completed.stdout}"
+    )
+
+
+def _count_invocations(counter_path: Path) -> int:
+    """Return how many live leaf invocations the counter file has recorded."""
+    if not counter_path.exists():
+        return 0
+    return sum(1 for line in counter_path.read_text(encoding="utf-8").splitlines() if line)
 
 
 def _make_deepagent_shaped_leaf(reply: str) -> Runnable[Any, Any]:
@@ -193,3 +241,68 @@ def test_leaf_outcome_payload_is_strict_msgpack_serializable() -> None:
     ]
     assert all(isinstance(m, BaseMessage) for m in restored.state["messages"])
     assert restored.usage == 42
+
+
+def test_true_cross_process_resume_replays_leaves_at_zero_new_cost(tmp_path: Path) -> None:
+    """Two real OS processes share one db; the resume replays every leaf for free.
+
+    This is the M3 headline. Process A (a separate Python interpreter) opens a
+    ``SqliteWorkflowStore`` on a temp db, runs a two-leaf workflow whose offline
+    fakes record each live invocation to a shared counter file, persists the
+    journal and the launch spec, and exits. Process B — a brand-new interpreter —
+    reopens the store from the *same* db file, resumes the run by its ``run_id``,
+    and must add **zero** new leaf invocations (both completed leaves replay from
+    the persisted journal) while returning an identical result.
+
+    The resume side runs with ``checkpointer=None`` on purpose: the persisted
+    content-hash journal alone delivers the zero-cost replay, independently of the
+    LangGraph task cache.
+    """
+    db_path = tmp_path / "workflows.db"
+    counter_path = tmp_path / "invocations.txt"
+
+    # Process A: run to completion in its own interpreter.
+    run_result = _run_worker("run", db_path, counter_path)
+    assert run_result["result"] == "plan+draft"
+    assert run_result["error"] is None
+    # Both leaves ran live exactly once on the first run.
+    assert _count_invocations(counter_path) == 2
+
+    # Process B: a fresh interpreter resumes from the shared db file.
+    resume_result = _run_worker("resume", db_path, counter_path)
+    assert resume_result["result"] == "plan+draft"
+    assert resume_result["error"] is None
+    # Smoking gun: the resume added NO live invocations — every completed leaf was
+    # served from the persisted journal at zero new model cost.
+    assert _count_invocations(counter_path) == 2
+
+
+def test_cross_process_failed_then_retried_replays_completed_leaf_free(tmp_path: Path) -> None:
+    """A run that fails mid-flight retries with its completed leaf replayed free.
+
+    Process A runs a workflow that journals its first leaf, then raises a
+    mid-flight budget breach before the second — so only the first leaf is
+    journaled and the call sequence is never persisted (run-level state is written
+    only on a clean return). Process B reopens the same db and retries: the first
+    leaf replays from the journal at zero cost (no new invocation), and the
+    determinism guard behaves as a fresh recording run because the prior run never
+    persisted a sequence, so the same breach surfaces again rather than a spurious
+    divergence error.
+    """
+    db_path = tmp_path / "workflows.db"
+    counter_path = tmp_path / "invocations.txt"
+
+    # Process A: fail mid-flight after the first leaf journals.
+    run_result = _run_worker("run-fail", db_path, counter_path)
+    assert run_result["result"] is None
+    assert run_result["error"] == "WorkflowBudgetExceededError"
+    # Only the first leaf ran live before the breach.
+    assert _count_invocations(counter_path) == 1
+
+    # Process B: retry. The completed leaf replays free; the breach recurs.
+    retry_result = _run_worker("resume", db_path, counter_path)
+    assert retry_result["error"] == "WorkflowBudgetExceededError"
+    # The first leaf was replayed from the journal — no new live invocation — and
+    # the run failed again at the same point rather than tripping the determinism
+    # guard (the failed run never persisted a sequence to diverge from).
+    assert _count_invocations(counter_path) == 1
