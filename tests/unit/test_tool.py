@@ -20,6 +20,7 @@ from langgraph.types import Command
 
 from langchain_dynamic_workflow import Ctx, Roster
 from langchain_dynamic_workflow._background import BgRunManager, BgStatus, ResultStore
+from langchain_dynamic_workflow._run_store import InMemoryRunStore, RunSpec
 from langchain_dynamic_workflow._workflows import WorkflowRegistry
 from langchain_dynamic_workflow.tool import create_workflow_tool
 
@@ -428,6 +429,161 @@ async def test_runs_command_reports_no_runs_when_empty(
     out = await _ainvoke_command(tool, {"command": "runs"}, runtime)
     assert isinstance(out, str)
     assert "no runs" in out.lower()
+
+
+async def test_launch_saves_spec_with_run_id_label_thread_and_args(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # The store contract on launch: the tool persists a RunSpec under the SAME
+    # run_id the manager slot reports, carrying the kind/label/thread_id/args that
+    # a (possibly fresh-process) resume needs to rebuild the launch. This is the
+    # injected-store handshake — not the closure-local bookkeeping it replaces.
+    leaf, _state = make_fake_leaf("answer")
+    roster = Roster().register("researcher", leaf)
+
+    async def orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        return await ctx.agent("Q", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("wf", orchestrate)
+    manager = BgRunManager()
+    store = InMemoryRunStore()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows, store=store)
+    runtime = _runtime(thread_id="host-7")
+
+    run_out = await _ainvoke_command(
+        tool, {"command": "run", "workflow": "wf", "args": {"topic": "batteries"}}, runtime
+    )
+    run_id = _launched_run_id(run_out)
+    await manager.wait(run_id, thread_id="host-7")
+
+    # The spec was saved under the manager's run_id (run_id generated up front,
+    # before manager.start) with the full launch description.
+    spec = await store.load_spec(run_id)
+    assert spec == RunSpec(
+        kind="name",
+        name_or_source="wf",
+        args={"topic": "batteries"},
+        label="wf",
+        thread_id="host-7",
+    )
+
+
+async def test_run_script_launch_saves_a_script_spec(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # An ad-hoc script launch persists its SOURCE as the spec (kind='script') so a
+    # resume recompiles it; the label comes from the script's optional meta name.
+    leaf, _state = make_fake_leaf("the-summary")
+    roster = Roster().register("writer", leaf)
+    manager = BgRunManager()
+    store = InMemoryRunStore()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry(), store=store)
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(
+        tool,
+        {"command": "run_script", "script": _AUTHORED_SCRIPT, "args": {"topic": "batteries"}},
+        runtime,
+    )
+    run_id = _launched_run_id(out)
+    await manager.wait(run_id, thread_id="host-1")
+
+    spec = await store.load_spec(run_id)
+    assert spec is not None
+    assert spec.kind == "script"
+    assert spec.name_or_source == _AUTHORED_SCRIPT
+    assert spec.args == {"topic": "batteries"}
+    assert spec.thread_id == "host-1"
+
+
+async def test_resume_reads_spec_from_injected_store(
+    make_deep_leaf: Callable[[str], tuple[Runnable[Any, Any], Any]],
+) -> None:
+    # Cross-process simulation: a SECOND tool instance, sharing only the injected
+    # store, resumes a run launched through a FIRST tool. The resume must rebuild
+    # the callable from the store's RunSpec (not in-process closure state) and
+    # reuse the run's journal so the completed leaf replays at zero model cost.
+    leaf, model = make_deep_leaf("Paris")
+    roster = Roster().register("geographer", leaf)
+
+    async def orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        return await ctx.agent("Capital of France?", agent_type="geographer")
+
+    workflows = WorkflowRegistry().register("geo", orchestrate)
+    manager = BgRunManager()
+    store = InMemoryRunStore()
+
+    launching_tool = create_workflow_tool(roster, manager=manager, workflows=workflows, store=store)
+    runtime = _runtime(thread_id="host-1")
+    run_out = await _ainvoke_command(launching_tool, {"command": "run", "workflow": "geo"}, runtime)
+    run_id = _launched_run_id(run_out)
+    await manager.wait(run_id, thread_id="host-1")
+    calls_after_first = model.calls
+
+    # A fresh tool over the same shared store + manager (stands in for a restarted
+    # host process pointed at the same persistent store).
+    resuming_tool = create_workflow_tool(roster, manager=manager, workflows=workflows, store=store)
+    resume_out = await _ainvoke_command(
+        resuming_tool, {"command": "resume", "run_id": run_id}, runtime
+    )
+    resumed_id = _launched_run_id(resume_out)
+    await manager.wait(resumed_id, thread_id="host-1")
+
+    status = await _ainvoke_command(
+        resuming_tool, {"command": "status", "run_id": resumed_id}, runtime
+    )
+    assert "Paris" in status
+    assert model.calls == calls_after_first  # journal replayed; zero new model calls
+
+
+async def test_resume_unknown_run_id_reports_unknown(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # A resume against a run_id the store never saw is a plain refusal string, not
+    # a Command — nothing is relaunched.
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("researcher", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(tool, {"command": "resume", "run_id": "ghost"}, runtime)
+    assert isinstance(out, str)
+    assert "ghost" in out
+
+
+async def test_resume_replays_persisted_thread_id(
+    make_deep_leaf: Callable[[str], tuple[Runnable[Any, Any], Any]],
+) -> None:
+    # C9: the resume rejoins the run's ORIGINAL thread_id (read from the spec), not
+    # the resuming caller's thread_id. The relaunch slot is keyed by the persisted
+    # thread, so polling it under the original thread finds it.
+    leaf, _model = make_deep_leaf("Paris")
+    roster = Roster().register("geographer", leaf)
+
+    async def orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        return await ctx.agent("Capital of France?", agent_type="geographer")
+
+    workflows = WorkflowRegistry().register("geo", orchestrate)
+    manager = BgRunManager()
+    store = InMemoryRunStore()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows, store=store)
+
+    run_out = await _ainvoke_command(
+        tool, {"command": "run", "workflow": "geo"}, _runtime(thread_id="origin-thread")
+    )
+    run_id = _launched_run_id(run_out)
+    await manager.wait(run_id, thread_id="origin-thread")
+
+    # Resume issued from a DIFFERENT host thread; the relaunch must still land on
+    # the persisted "origin-thread" so it rejoins its checkpoint thread.
+    resume_out = await _ainvoke_command(
+        tool, {"command": "resume", "run_id": run_id}, _runtime(thread_id="other-thread")
+    )
+    resumed_id = _launched_run_id(resume_out)
+    assert manager.poll(resumed_id, thread_id="origin-thread") != BgStatus.UNKNOWN
+    assert manager.poll(resumed_id, thread_id="other-thread") == BgStatus.UNKNOWN
+    await manager.wait(resumed_id, thread_id="origin-thread")
 
 
 async def test_run_refused_when_concurrent_run_quota_full(
