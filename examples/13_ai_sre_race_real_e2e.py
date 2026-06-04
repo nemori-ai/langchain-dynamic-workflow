@@ -40,8 +40,13 @@ from langchain_dynamic_workflow import (
 )
 
 INCIDENT = (
-    "Checkout latency spiked 10x at 02:14 UTC; error rate is flat, CPU is normal, "
-    "and the spike began minutes after a routine deploy."
+    "Checkout p99 latency jumped 10x (180ms -> 1.9s) at 02:14 UTC, two minutes after "
+    "deploy v412 rolled out. Error rate is flat and CPU / memory are normal across the "
+    "fleet. Distributed traces for slow checkout requests show ~1.6s of the 1.9s spent "
+    "inside a new synchronous tax-service.calculate() call on the hot path that v412 "
+    "added — invoked serially once per line item and absent in v411. Database "
+    "connection-pool utilization, downstream payment-provider latency, and co-located "
+    "batch-job scheduling are all unchanged from before the deploy."
 )
 HYPOTHESES = [
     "a database connection-pool exhaustion",
@@ -103,31 +108,45 @@ async def diagnose(ctx: Ctx, args: dict[str, Any]) -> dict[str, Any]:
 
 # ── leaves (real deepagents when env-gated, deterministic fakes offline) ──────
 
-
-def _fake_structured_leaf(structured: BaseModel, *, reply: str) -> Any:
-    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
-        return {
-            "messages": [*inp["messages"], AIMessage(content=reply)],
-            "structured_response": structured,
-        }
-
-    return RunnableLambda(_leaf)
+# The one hypothesis the incident's trace evidence actually confirms — the deploy
+# regression. Offline, only the investigator testing THIS hypothesis clears the win
+# bar; the others stay low and lose. So the race picks it and cancels the rest — the
+# same verdict the real model reaches when LDW_DEMO_REAL_MODEL is set.
+_CONFIRMED_HYPOTHESIS = HYPOTHESES[2]
 
 
 def _build_investigator(*, response_format: Any = None) -> Any:
     model = real_model()
     if model is not None:
         return create_deep_agent(model=model, response_format=response_format)
-    # Offline: every investigator returns a high-confidence diagnosis, so the race
-    # has a clear winner (the lowest-index hypothesis, by the ascending tie-break).
-    return _fake_structured_leaf(
-        Diagnosis(
-            root_cause="synchronous call added on the hot path by the recent deploy",
-            confidence=0.9,
-            evidence="latency onset aligns with the deploy and tracks the new call",
-        ),
-        reply="investigated",
-    )
+
+    # Offline: a deterministic, hypothesis-aware fake. It reads the hypothesis out of
+    # the investigate prompt and returns a high-confidence Diagnosis only for the one
+    # the trace evidence confirms, a low-confidence one for the rest — so the race
+    # demonstrates win-predicate gating (the deploy regression wins, the others lose),
+    # not merely an ascending-index tie-break.
+    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        prompt = str(inp["messages"][0].content)
+        if _CONFIRMED_HYPOTHESIS in prompt:
+            diagnosis = Diagnosis(
+                root_cause="a synchronous tax-service.calculate() call the v412 deploy added "
+                "on the hot path, invoked once per line item",
+                confidence=0.9,
+                evidence="traces show ~1.6s of the 1.9s inside the new synchronous call, "
+                "absent in v411",
+            )
+        else:
+            diagnosis = Diagnosis(
+                root_cause="not supported as root cause by the incident's evidence",
+                confidence=0.3,
+                evidence="the implicated subsystem is unchanged from before the deploy",
+            )
+        return {
+            "messages": [*inp["messages"], AIMessage(content="investigated")],
+            "structured_response": diagnosis,
+        }
+
+    return RunnableLambda(_leaf)
 
 
 async def main() -> None:
