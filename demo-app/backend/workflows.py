@@ -52,8 +52,7 @@ TOPICS = ["alpha", "beta", "gamma", "delta"]
 SKEPTICS_PER_FINDING = 3
 
 DEFAULT_RESEARCH_QUESTION = (
-    "What are the main trade-offs between retrieval-augmented generation and "
-    "long-context LLMs?"
+    "What are the main trade-offs between retrieval-augmented generation and long-context LLMs?"
 )
 
 
@@ -358,9 +357,7 @@ def make_roster() -> Roster:
         .register(
             "extractor", builder=_build_extractor, description="Extracts a falsifiable claim."
         )
-        .register(
-            "skeptic", builder=_build_skeptic, description="Adversarially verifies a claim."
-        )
+        .register("skeptic", builder=_build_skeptic, description="Adversarially verifies a claim.")
         .register("echo", _fake_echo_leaf("echo"), description="Trivial echo leaf (hello demo).")
     )
 
