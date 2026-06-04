@@ -19,7 +19,6 @@ a strictly different scope inside ``run_workflow``.
 
 from __future__ import annotations
 
-import operator
 from typing import Annotated, Any, NotRequired
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
@@ -37,16 +36,49 @@ WORKFLOW_NOTIFICATION_TAG = "workflow_notification"
 """The XML-ish tag wrapping an injected background-run completion notice."""
 
 
+def merge_workflow_runs(
+    existing: list[dict[str, Any]] | None, incoming: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Reducer for the ``workflow_runs`` channel: upsert records by ``run_id``.
+
+    A launch writes ``{run_id, workflow, status: running}``; a later settle update
+    writes ``{run_id, status: <terminal>}``. Merging field-wise by ``run_id``
+    (rather than appending) keeps one record per run whose status tracks its
+    lifecycle, so the channel reflects the terminal status instead of staying at
+    the launch-time ``running``. First-seen order is preserved; a record for an
+    unseen ``run_id`` appends.
+
+    Args:
+        existing: The accumulated records (``None`` / empty on the first write).
+        incoming: The records to merge in.
+
+    Returns:
+        The merged records, one per ``run_id``, in first-seen order.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for record in existing or []:
+        run_id = record.get("run_id")
+        if isinstance(run_id, str):
+            merged[run_id] = dict(record)
+    for record in incoming or []:
+        run_id = record.get("run_id")
+        if not isinstance(run_id, str):
+            continue
+        merged[run_id] = {**merged[run_id], **record} if run_id in merged else dict(record)
+    return list(merged.values())
+
+
 class WorkflowState(AgentState):
     """Host agent state extended with a background-run tracking channel.
 
     Attributes:
         workflow_runs: Launched background runs (each a record carrying its
-            ``run_id`` / ``workflow`` / ``status``), accumulated across turns so
-            the record survives context compaction.
+            ``run_id`` / ``workflow`` / ``status``), upserted by ``run_id`` across
+            turns so the record survives context compaction and its status is
+            rewritten from ``running`` to the run's terminal status on settle.
     """
 
-    workflow_runs: NotRequired[Annotated[list[dict[str, Any]], operator.add]]
+    workflow_runs: NotRequired[Annotated[list[dict[str, Any]], merge_workflow_runs]]
 
 
 def _host_thread_id(config: RunnableConfig | None) -> str:
@@ -155,7 +187,19 @@ class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
         notices = self._manager.drain_notifications(thread_id)
         if not notices:
             return None
-        return {"messages": [HumanMessage(content=_render_notification(notices))]}
+        # Besides injecting the notification, rewrite each settled run's record from
+        # the launch-time `running` to its terminal status. The channel reducer
+        # (merge_workflow_runs) upserts these by run_id, so workflow_runs reflects
+        # the live outcome instead of a stale `running`. The update carries only
+        # {run_id, status}: the reducer's field-merge preserves the label the launch
+        # record already wrote. A notice for a run never recorded through the tool
+        # (e.g. launched directly on the shared manager) yields a labelless record by
+        # design — the supported launch path always writes the label first.
+        settle_updates = [{"run_id": n.run_id, "status": n.status.value} for n in notices]
+        return {
+            "messages": [HumanMessage(content=_render_notification(notices))],
+            "workflow_runs": settle_updates,
+        }
 
 
 def create_workflow_middleware(
@@ -179,16 +223,29 @@ def create_workflow_middleware(
         checkpointer: Optional checkpointer forwarded to launched runs.
         max_concurrency: Optional concurrency cap forwarded to launched runs.
         max_concurrent_runs: Optional cap on concurrent host-initiated background
-            runs. Applied only when this factory builds the default manager (it is
-            ignored when an explicit ``manager`` is supplied — configure the quota
-            on that manager directly). When the quota is full the ``run`` command
-            refuses with a clear message rather than launching unbounded.
+            runs, applied only to the default manager this factory builds when
+            ``manager`` is omitted. The quota lives on the :class:`BgRunManager`, so
+            passing both an explicit ``manager`` and ``max_concurrent_runs`` is a
+            conflict (the parameter could not take effect) and is rejected loud —
+            set the quota on your manager directly instead. When the quota is full
+            the ``run`` command refuses with a clear message rather than launching
+            unbounded.
         budget: Optional shared token ceiling forwarded to launched runs.
 
     Returns:
         A :class:`WorkflowMiddleware` contributing the workflow tool and injecting
         ``<workflow_notification>`` before the host's next model call.
+
+    Raises:
+        ValueError: If both an explicit ``manager`` and ``max_concurrent_runs`` are
+            supplied — the quota would be silently ignored, so it fails loud.
     """
+    if manager is not None and max_concurrent_runs is not None:
+        raise ValueError(
+            "max_concurrent_runs applies only to the default manager this factory "
+            "builds; it cannot be combined with an explicit `manager`. Set the quota "
+            "on that manager instead: BgRunManager(max_concurrent_runs=...)."
+        )
     return WorkflowMiddleware(
         roster=roster,
         workflows=workflows,

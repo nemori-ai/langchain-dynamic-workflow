@@ -18,6 +18,7 @@ from langchain_dynamic_workflow._background import (
     BgRunQuotaExceededError,
     BgStatus,
     ResultStore,
+    RunSnapshot,
 )
 
 
@@ -200,6 +201,68 @@ async def test_max_concurrent_runs_quota_refuses_when_full() -> None:
     assert s4.run_id == "r4"
     release.set()
     await manager.wait("r4", thread_id="t1")
+
+
+async def test_list_runs_enumerates_thread_runs_with_status() -> None:
+    # The aggregate view: list every run on a thread with its live status, so the
+    # host need not poll each run_id. A settled run carries a short summary; an
+    # in-flight run's summary is None.
+    manager = BgRunManager()
+    release = asyncio.Event()
+
+    async def slow() -> str:
+        await release.wait()
+        return "later"
+
+    async def quick() -> str:
+        return "done-value"
+
+    manager.start(slow(), run_id="r1", thread_id="t1")  # stays in flight, no label
+    manager.start(quick(), run_id="r2", thread_id="t1", label="quick-job")  # settles
+    await manager.wait("r2", thread_id="t1")
+
+    snapshots = manager.list_runs("t1")
+    assert all(isinstance(s, RunSnapshot) for s in snapshots)
+    by_id = {s.run_id: s for s in snapshots}
+    assert set(by_id) == {"r1", "r2"}
+    assert by_id["r1"].status in {BgStatus.PENDING, BgStatus.RUNNING}
+    assert by_id["r1"].summary is None  # in flight: no outcome yet
+    assert by_id["r1"].label is None  # launched without a label
+    assert by_id["r2"].status == BgStatus.DONE
+    assert by_id["r2"].summary == "done-value"  # settled: short outcome preview
+    assert by_id["r2"].label == "quick-job"  # label recorded at launch flows through
+
+    release.set()
+    await manager.wait("r1", thread_id="t1")
+
+
+async def test_list_runs_isolated_per_thread() -> None:
+    # list_runs is scoped to the host thread, mirroring the composite-key isolation.
+    manager = BgRunManager()
+
+    async def reply(value: str) -> str:
+        return value
+
+    manager.start(reply("a"), run_id="r1", thread_id="tA")
+    manager.start(reply("b"), run_id="r2", thread_id="tB")
+    await manager.wait("r1", thread_id="tA")
+    await manager.wait("r2", thread_id="tB")
+
+    assert [s.run_id for s in manager.list_runs("tA")] == ["r1"]
+    assert [s.run_id for s in manager.list_runs("tB")] == ["r2"]
+    # A thread with no runs gets an empty list.
+    assert manager.list_runs("tC") == []
+
+
+def test_max_concurrent_runs_rejects_non_positive() -> None:
+    # 0/negative is not a meaningful quota (it would refuse every run); only None
+    # (unbounded) or a positive cap are valid, rejected loud at construction.
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="positive integer or None"):
+            BgRunManager(max_concurrent_runs=bad)
+    # None and a positive cap are accepted.
+    assert BgRunManager().max_concurrent_runs is None
+    assert BgRunManager(max_concurrent_runs=1).max_concurrent_runs == 1
 
 
 async def test_unbounded_quota_is_the_default() -> None:

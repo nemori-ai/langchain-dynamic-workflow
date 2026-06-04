@@ -112,6 +112,33 @@ class RunResult:
     detail: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RunSnapshot:
+    """A read-only view of one tracked run, for the aggregate runs listing.
+
+    Returned by :meth:`BgRunManager.list_runs` so a host can see all of its runs
+    at once without polling each ``run_id``. It deliberately exposes only an
+    immutable view (never the mutable :class:`BgRunSlot`).
+
+    Attributes:
+        run_id: The run's identifier.
+        status: The run's current lifecycle status.
+        label: The run's display label (e.g. its workflow name) recorded at launch,
+            or ``None`` when the launcher supplied none.
+        summary: A short outcome preview for a settled run (result preview, error
+            text, or cancellation), or ``None`` while the run is still in flight.
+    """
+
+    run_id: str
+    status: BgStatus
+    label: str | None
+    summary: str | None
+
+
+_SNAPSHOT_SUMMARY_MAX_CHARS = 80
+"""Cap for the short per-run outcome preview in an aggregate runs listing."""
+
+
 def _summarize(text: str, *, max_chars: int) -> str:
     """Truncate ``text`` to ``max_chars`` (no ellipsis past a tiny budget)."""
     if len(text) <= max_chars:
@@ -166,6 +193,9 @@ class BgRunSlot:
         thread_id: The host thread that launched the run.
         task: The detached ``asyncio.Task`` executing the wrapped coroutine.
         status: The slot's current lifecycle status.
+        label: An opaque display label for the run (e.g. its workflow name),
+            carried so an aggregate listing can name the run without depending on
+            any caller-side bookkeeping. ``None`` when the launcher supplied none.
         created_at: Monotonic timestamp when the slot was created.
         settled_at: Monotonic timestamp when the slot reached a terminal status,
             or ``None`` while still in flight.
@@ -178,6 +208,7 @@ class BgRunSlot:
     thread_id: str
     task: asyncio.Task[Any]
     status: BgStatus = BgStatus.PENDING
+    label: str | None = None
     created_at: float = field(default_factory=time.monotonic)
     settled_at: float | None = None
     result: str | None = None
@@ -220,6 +251,14 @@ class BgRunManager:
         idle_ttl_seconds: float = 3600.0,
         max_concurrent_runs: int | None = None,
     ) -> None:
+        if max_concurrent_runs is not None and max_concurrent_runs <= 0:
+            # 0/negative is not a meaningful quota: it would refuse every run
+            # (active_run_count() >= 0 is always true). Use None for unbounded, a
+            # positive integer for a real cap — reject the ambiguous value loud.
+            raise ValueError(
+                f"max_concurrent_runs must be a positive integer or None (unbounded); "
+                f"got {max_concurrent_runs!r}, which would refuse every run"
+            )
         self._result_store = result_store if result_store is not None else ResultStore()
         self._idle_ttl_seconds = idle_ttl_seconds
         self._max_concurrent_runs = max_concurrent_runs
@@ -241,12 +280,59 @@ class BgRunManager:
         """Return how many runs are currently in flight (non-terminal)."""
         return sum(1 for slot in self._slots.values() if slot.status not in _TERMINAL_STATUSES)
 
+    def _snapshot_summary(self, slot: BgRunSlot) -> str | None:
+        """Render a short outcome preview for a settled slot, else ``None``.
+
+        In-flight runs have no outcome yet (``None``); a settled run gets a short
+        preview of its result, error, or cancellation, capped so an aggregate
+        listing stays compact.
+        """
+        if slot.status == BgStatus.DONE:
+            full = (
+                self._result_store.fetch(slot.handle)
+                if slot.handle is not None
+                else (slot.result or "")
+            )
+            return _summarize(full, max_chars=_SNAPSHOT_SUMMARY_MAX_CHARS)
+        if slot.status == BgStatus.FAILED:
+            return _summarize(slot.error or "run failed", max_chars=_SNAPSHOT_SUMMARY_MAX_CHARS)
+        if slot.status == BgStatus.CANCELLED:
+            return slot.error or "cancelled"
+        return None  # PENDING / RUNNING: no outcome yet
+
+    def list_runs(self, thread_id: str) -> list[RunSnapshot]:
+        """Return a read-only snapshot of every run tracked for ``thread_id``.
+
+        The aggregate view behind the tool's ``runs`` command: a host can see all
+        of its in-flight and settled runs in one call instead of polling each
+        ``run_id``. Runs are listed in creation order (slot insertion order); a
+        settled run carries a short ``summary``, an in-flight one carries ``None``.
+        Reclaimed slots (swept past their idle TTL) are no longer listed.
+
+        Args:
+            thread_id: The host thread whose runs to enumerate.
+
+        Returns:
+            One :class:`RunSnapshot` per tracked run on the thread, possibly empty.
+        """
+        return [
+            RunSnapshot(
+                run_id=slot.run_id,
+                status=slot.status,
+                label=slot.label,
+                summary=self._snapshot_summary(slot),
+            )
+            for (slot_thread, _run_id), slot in self._slots.items()
+            if slot_thread == thread_id
+        ]
+
     def start(
         self,
         coro: Coroutine[Any, Any, str],
         *,
         run_id: str | None = None,
         thread_id: str,
+        label: str | None = None,
     ) -> BgRunSlot:
         """Detach ``coro`` onto the event loop and return its slot immediately.
 
@@ -261,6 +347,8 @@ class BgRunManager:
             run_id: Optional explicit run id; a fresh one is generated when
                 omitted.
             thread_id: The host thread launching the run (part of the slot key).
+            label: Optional opaque display label (e.g. the workflow name) stored on
+                the slot so an aggregate listing can name the run.
 
         Returns:
             The :class:`BgRunSlot` tracking the detached run.
@@ -288,7 +376,7 @@ class BgRunManager:
         task: asyncio.Task[str] = asyncio.ensure_future(
             self._run_wrapped(coro, key=key, thread_id=thread_id)
         )
-        slot = BgRunSlot(run_id=resolved_run_id, thread_id=thread_id, task=task)
+        slot = BgRunSlot(run_id=resolved_run_id, thread_id=thread_id, task=task, label=label)
         self._slots[key] = slot
         return slot
 

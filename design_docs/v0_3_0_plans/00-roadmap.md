@@ -16,7 +16,7 @@
 |---|---|---|---|---|---|---|---|
 | **M1** | **F 跨叶归约** | CONFIRMED-GAP | 只有单叶 fold，无 vote/dedup/judge-panel 原语；跨叶归约全靠脚本手写 | 最高（6 用例） | 低–中 | G1 + G4 | ✅ 已落地 · [`01-f-cross-leaf-reduce.md`](01-f-cross-leaf-reduce.md) |
 | **M2** | **B 早退/取消（race）** | CONFIRMED-GAP | parallel 严格 barrier、无 first-wins/在飞取消 | 高 | 中 | 核心调度器 | ✅ 已落地 · [`02-b-journaled-race.md`](02-b-journaled-race.md) |
-| **M3.5** | **多并行 run 可观测性 + quota 接线** | NO-GAP（机制已全，残 ergonomics） | run/run_script 已后台并发、每 run 隔离 journal/budget/gate；缺聚合 `runs` 命令、`workflow_runs` 落定不刷新、`create_workflow_tool` 未暴露 `max_concurrent_runs` | 中（直接答需求 ②） | 低 | 现有 `BgRunManager`（无硬依赖，**可先于 M3**） | 待写 |
+| **M3.5** | **多并行 run 可观测性 + quota 接线** | NO-GAP（机制已全，残 ergonomics） | run/run_script 已后台并发、每 run 隔离 journal/budget/gate；缺聚合 `runs` 命令、`workflow_runs` 落定不刷新、quota 接线静默忽略 | 中（直接答需求 ②） | 低 | 现有 `BgRunManager`（无硬依赖，**可先于 M3**） | ✅ 已落地 · [`03-m3.5-run-observability.md`](03-m3.5-run-observability.md) |
 | **M3** | **D 跨会话持久** | CONFIRMED-GAP（与 CC 持平，未超越） | 接缝在但只有内存 store/saver、host 用进程内 dict | 高（超集赢面） | 中 | journal/checkpointer 接缝 | 待写 |
 | **M4** | **C 运行中 HITL 签核** | CONFIRMED-GAP（底座现成） | 全无 interrupt/pause；LangGraph `interrupt` 未 import 暴露 | 中–高（超集赢面） | 中 | M3（持久化）+ LangGraph interrupt | 待写 |
 | **M5** | **A 循环内可执行验证** | CONFIRMED-GAP | worktree seeding 有，但 execute 是离线 no-op echo、无真子进程/exit-code gating | 最高（Bun 旗舰案） | 高 | G2 worktree | 待写 |
@@ -195,7 +195,8 @@ M1 的真模型 E2E 过程中浮现两条值得后续处理的信号：
 - **对比阶段**：✅ 完成。10 主题逐一带 `file:line` 证据 + 置信度（证据稿 `docs/plans/2026-06-03-v0.3.0-cc-vs-port-comparison.md`）。战略定调=允许超集。
 - **M1（F 跨叶归约）**：✅ 已落地。`_reduce` 四个纯函数 `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`)经包根导出 + `run_script` 命名空间注入;SKILL.md 增补 corroborate/reconcile 范式;`examples/07` 换用 `survives`/`dedup`、`examples/12` 新增双盲复核 demo。Plan = [`01-f-cross-leaf-reduce.md`](01-f-cross-leaf-reduce.md)。
 - **M2（B race）**：✅ 已落地。`ctx.race` best-of-N 早退/取消原语 + `_race_types`（`RaceCandidate`/`RaceResult`）+ `race_key`（content-hash journal，namespaced + win_tag-folded）+ `SpanKind.RACE`；两值类型经包根导出 + `run_script` 命名空间注入；SKILL.md 增补 race quality / parallel-vs-race / win_tag footgun 范式；`examples/13` AI-SRE 多假设 race demo。真流式与混合 schema race 为明确非目标；**E（批处理人体工学）已拆出为自己的后续里程碑（待写）。** Codex 跨模型评审驱动两处修复：replay 改记 winner 的 leaf-key（杜绝与后续相同 `agent()` 调用的预算双计）、teardown 的 depth/任务创建移入 `try`（对齐 `parallel`/`pipeline`），全门 347 passed。Plan = [`02-b-journaled-race.md`](02-b-journaled-race.md)。
-- **M3.5 / M1.5（调研收敛新增）**：M3.5 多并行 run 可观测性（聚合 `runs` 命令 + `workflow_runs` 落定刷新 + `create_workflow_tool` 补 `max_concurrent_runs`）= 轻量 fast-follow，无硬依赖、可先于 M3；M1.5 多阶段 / 并行-run 作者范式 = doc-only（SKILL.md），搭车。均**待写**。
+- **M3.5（多并行 run 可观测性）**：✅ 已落地（fast-follow，先于 M3）。聚合 `runs` 命令（`BgRunManager.list_runs` → `RunSnapshot` 只读快照，工具 join workflow label）+ `workflow_runs` 落定刷新（`merge_workflow_runs` reducer 按 `run_id` upsert，`abefore_model` 落定改写终态）+ quota 接线去歧义（**偏离调研字面建议**:不往 `create_workflow_tool` 加 `max_concurrent_runs`——它不构造 manager,加了要么被忽略要么双源;改为 `create_workflow_middleware` 在显式 `manager` + `max_concurrent_runs` 同传时抛 `ValueError`,quota 归 `BgRunManager`)。`examples/14` host 多-run 聚合视图 demo + 集成测试。Plan = [`03-m3.5-run-observability.md`](03-m3.5-run-observability.md)。
+- **M1.5（多阶段 / 并行-run 作者范式，doc-only）**：**待写**。补 SKILL.md 多阶段脚本结构 / scout-then-fan-out / host 多并行 run 范式 + 作者陷阱;搭后续顺风车。
 - **M3–M7**：roadmap 已排定，impl plan 逐里程碑增补。E（批处理人体工学）从 M2 拆出，作后续里程碑待写。
 
 > **执行序列：** M1 F → M2 B(race) →〔M3.5 多并行 run 可观测性 + M1.5 doc-only，轻量 fast-follow，可先于 M3〕→ M3 D → M4 C → M5 A → M6 I → M7 H（E 批处理人体工学已从 M2 拆出，作后续里程碑待写）。F 首刀（接 G1+G4，纯编排层最干净）；B 紧随修核心原语；M3.5/M1.5 收口需求②并点亮需求①已有能力；D/C 走超集；A/I 配对成重基建 epic；H 收尾引擎机制增强（吸收需求①的命名嵌套 + DAG 残项）。

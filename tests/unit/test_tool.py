@@ -377,6 +377,59 @@ async def test_run_script_resume_recompiles_and_replays_journal(
     assert model.calls == calls_after_first  # zero additional model calls on resume
 
 
+async def test_runs_command_lists_all_runs_with_labels_and_status(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # The aggregate view: `runs` lists every run on the host thread with its
+    # workflow label and live status, so the host need not poll each run_id.
+    leaf, _state = make_fake_leaf("answer")
+    roster = Roster().register("researcher", leaf)
+    release = asyncio.Event()
+
+    async def slow(ctx: Ctx, args: dict[str, Any]) -> str:
+        await release.wait()
+        return await ctx.agent("Q", agent_type="researcher")
+
+    async def quick(ctx: Ctx, args: dict[str, Any]) -> str:
+        return await ctx.agent("Q", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("slow_wf", slow).register("quick_wf", quick)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+    runtime = _runtime(thread_id="host-1")
+
+    slow_out = await _ainvoke_command(tool, {"command": "run", "workflow": "slow_wf"}, runtime)
+    slow_id = _launched_run_id(slow_out)
+    quick_out = await _ainvoke_command(tool, {"command": "run", "workflow": "quick_wf"}, runtime)
+    quick_id = _launched_run_id(quick_out)
+    await manager.wait(quick_id, thread_id="host-1")
+
+    runs_out = await _ainvoke_command(tool, {"command": "runs"}, runtime)
+    assert isinstance(runs_out, str)
+    # Both runs appear, each with its workflow label and live status.
+    assert slow_id in runs_out and quick_id in runs_out
+    assert "slow_wf" in runs_out and "quick_wf" in runs_out
+    assert "running" in runs_out.lower() or "pending" in runs_out.lower()
+    assert "done" in runs_out.lower()
+
+    release.set()
+    await manager.wait(slow_id, thread_id="host-1")
+
+
+async def test_runs_command_reports_no_runs_when_empty(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("researcher", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(tool, {"command": "runs"}, runtime)
+    assert isinstance(out, str)
+    assert "no runs" in out.lower()
+
+
 async def test_run_refused_when_concurrent_run_quota_full(
     make_fake_leaf: FakeLeafFactory,
 ) -> None:
