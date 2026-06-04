@@ -24,8 +24,22 @@ _HELLO_TOOL_NAME = "run_hello_demo"
 _LIVE_TOOL_NAME = "run_live"
 
 # Cue words in the user's message that route the offline host to a live preset run
-# instead of the default hello smoke path.
-_LIVE_CUES = ("research", "deep", "capstone", "workflow", "scenario", "fact-check")
+# instead of the default hello smoke path. The resume cues ("pick it back up" /
+# "where you left off" / "resume") deliberately route to the SAME live tool: a second
+# live run on the same chat thread reuses the prior run's durable journal lane, so the
+# replayed leaves come back cached — the honest "pick it back up" story (journal re-run
+# replay, not a mid-flight interrupt the engine does not have).
+_LIVE_CUES = (
+    "research",
+    "deep",
+    "capstone",
+    "workflow",
+    "scenario",
+    "fact-check",
+    "pick it back up",
+    "where you left off",
+    "resume",
+)
 
 # Cue word -> preset workflow name. A request naming a preset routes the offline host
 # to THAT preset, not just the default; absent any named cue the host falls back to the

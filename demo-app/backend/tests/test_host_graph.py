@@ -151,6 +151,61 @@ async def test_run_workflow_live_resumes_cached_leaves_on_second_run() -> None:
     assert result_second == result_first, "the journal replays the recorded result"
 
 
+async def test_resume_replays_cached_leaves_across_two_host_graph_turns() -> None:
+    """Two turns on the SAME chat thread replay the first run's leaves as journal hits.
+
+    This proves the resume story is reachable end to end through the real tool layer —
+    not just at the ``run_workflow_live`` helper level (covered above). The first turn
+    drives a deep-research run on a host thread; the durable :class:`_ResumeLane` keyed
+    on that ``(thread_id, deep_research)`` persists its journal at module scope. A second
+    turn on the SAME ``configurable.thread_id`` (a "pick it back up" message that the
+    offline host also routes to ``run_live`` for the default preset) reuses that journal,
+    so every replayed leaf comes back ``cached=True`` and surfaces a ``journal_badge``.
+
+    Honest scope: this is journal re-run replay (the same persisted journal instance is
+    fed back into a second ``run_workflow``), NOT a LangGraph mid-flight interrupt/resume
+    — the engine has no mid-flight interrupt. The visible signal is the zero-cost cache
+    hit, which is exactly what the demo surfaces.
+    """
+    from host_graph import _RESUME_LANES, make_host_graph
+    from langchain_core.messages import HumanMessage
+
+    # Isolate this test's lane from any other test's module-scope lanes.
+    _RESUME_LANES.clear()
+    thread = "test-resume-two-turns"
+    graph = make_host_graph()
+
+    first = await graph.ainvoke(
+        {"messages": [HumanMessage(content="Please run a deep research workflow on RAG.")]},
+        config={"configurable": {"thread_id": thread}},
+    )
+    first_badges = [u for u in first.get("ui", []) if u.get("name") == "journal_badge"]
+    assert not first_badges, "the first (fresh) run must not surface any journal badge"
+
+    second = await graph.ainvoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "Earlier you started that research for me — please pick it back up "
+                        "where you left off rather than starting over."
+                    )
+                )
+            ]
+        },
+        config={"configurable": {"thread_id": thread}},
+    )
+    second_components = [u.get("name") for u in second.get("ui", [])]
+    assert "journal_badge" in second_components, second_components
+
+    cached_agent_spans = [
+        u
+        for u in second.get("ui", [])
+        if u.get("name") == "agent_span" and (u.get("props") or {}).get("cached") is True
+    ]
+    assert cached_agent_spans, "the second turn must replay leaves as cached agent spans"
+
+
 async def test_run_workflow_live_unknown_name_raises() -> None:
     """An unknown workflow name fails loud with the registry's KeyError."""
     from host_graph import run_workflow_live
@@ -179,6 +234,22 @@ def test_offline_host_routes_scenario_to_run_live() -> None:
     """
     assert _offline_first_tool_call("Do deep, fact-checked research on RAG.")[0] == "run_live"
     assert _offline_first_tool_call("Hi, can you show me the demo?")[0] == "run_hello_demo"
+
+
+def test_offline_host_routes_resume_message_to_run_live() -> None:
+    """A "pick it back up" message routes to ``run_live`` for the default preset.
+
+    The resume scenario is a second live run on the same chat thread: it reuses the
+    prior run's durable journal lane and replays its leaves as cache hits. So the
+    offline host must route a "pick it back up" / "where you left off" message to the
+    SAME ``run_live`` tool with no preset named (default deep_research) — the only way
+    a second turn lands on the first turn's lane.
+    """
+    name, args = _offline_first_tool_call(
+        "Earlier you started that research — pick it back up where you left off."
+    )
+    assert name == "run_live"
+    assert "workflow" not in args, "resume must hit the default preset's lane, not a named one"
 
 
 def test_offline_host_routes_named_preset_through_args() -> None:
