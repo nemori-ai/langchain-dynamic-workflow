@@ -52,6 +52,36 @@ class LeafOutcome:
     state: dict[str, Any]
     usage: int
 
+    def to_payload(self) -> dict[str, Any]:
+        """Return a msgpack-native mapping carrying this outcome's fields.
+
+        A durable ``@task`` return crosses the checkpointer, whose serializer
+        round-trips built-in containers (and registered LangChain message types
+        nested inside ``state``) without an opaque object-reconstruction hop. A
+        custom class instance, by contrast, is only revived through a deprecated
+        unregistered-type path that newer serializers block. Returning this plain
+        mapping from the task boundary keeps the persisted shape strictly
+        serializable while the engine still works with the typed
+        :class:`LeafOutcome` everywhere else.
+
+        Returns:
+            A mapping with ``state`` and ``usage`` keys.
+        """
+        return {"state": self.state, "usage": self.usage}
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> LeafOutcome:
+        """Rebuild a :class:`LeafOutcome` from a :meth:`to_payload` mapping.
+
+        Args:
+            payload: A mapping produced by :meth:`to_payload`, carrying ``state``
+                and ``usage``.
+
+        Returns:
+            The reconstructed outcome.
+        """
+        return cls(state=payload["state"], usage=int(payload["usage"]))
+
 
 class LeafRunner(Protocol):
     """Invokes a resolved leaf as a durable task and returns its outcome.
