@@ -31,7 +31,10 @@ jobs:
           node-version: "20"
 
       - name: Install dependencies
-        run: uv sync
+        # --extra sqlite installs the optional persistence backends
+        # (langgraph-checkpoint-sqlite + aiosqlite) so pyright (strict) and pytest
+        # check and exercise _persistence.py for real instead of skipping it.
+        run: uv sync --extra sqlite
 
       - name: Ruff lint
         run: uv run ruff check .
