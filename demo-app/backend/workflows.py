@@ -20,9 +20,10 @@ smoke path; it makes no leaf ``agent()`` calls.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
-from _models import resolve_leaf_model
+from _models import resolve_leaf_model, resolve_openrouter_key
 from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
@@ -284,17 +285,30 @@ def _fake_structured_leaf(
     return RunnableLambda(_leaf)
 
 
-def _build_text_leaf(role: str) -> Any:
-    """Build a schema-less text leaf (researcher / refiner / writer)."""
-    model = resolve_leaf_model()
+def _build_text_leaf(role: str, *, api_key: str | None = None) -> Any:
+    """Build a schema-less text leaf (researcher / refiner / writer).
+
+    Args:
+        role: The leaf role, used as the offline fake leaf's echo prefix.
+        api_key: The per-run OpenRouter key captured at roster-build time (or ``None``
+            to fall back to the env key). Threaded into :func:`resolve_leaf_model` so a
+            per-session key reaches this leaf.
+    """
+    model = resolve_leaf_model(api_key=api_key)
     if model is not None:
         return create_deep_agent(model=model)
     return _fake_echo_leaf(role)
 
 
-def _build_extractor(*, response_format: Any = None) -> Any:
-    """Build the ``extractor`` leaf, forwarding ``response_format`` (Claim)."""
-    model = resolve_leaf_model()
+def _build_extractor(*, response_format: Any = None, api_key: str | None = None) -> Any:
+    """Build the ``extractor`` leaf, forwarding ``response_format`` (Claim).
+
+    Args:
+        response_format: The structured schema (``Claim``) the real leaf returns.
+        api_key: The per-run OpenRouter key captured at roster-build time (or ``None``
+            to fall back to the env key).
+    """
+    model = resolve_leaf_model(api_key=api_key)
     if model is not None:
         return create_deep_agent(model=model, response_format=response_format)
 
@@ -312,15 +326,20 @@ def _build_extractor(*, response_format: Any = None) -> Any:
     return RunnableLambda(_leaf)
 
 
-def _build_skeptic(*, response_format: Any = None) -> Any:
+def _build_skeptic(*, response_format: Any = None, api_key: str | None = None) -> Any:
     """Build the ``skeptic`` leaf (a read-only judge), forwarding ``response_format``.
 
     A skeptic adversarially verifies a claim — it should only *judge*, never mutate
     state. The real path builds it with ``read_only_leaf`` (a deny-write permission)
     so even a hallucinated "fix" is refused at the tool boundary. Offline it never
     refutes, so every claim survives — a deterministic, readable demo.
+
+    Args:
+        response_format: The structured schema (``Verdict``) the real leaf returns.
+        api_key: The per-run OpenRouter key captured at roster-build time (or ``None``
+            to fall back to the env key).
     """
-    model = resolve_leaf_model()
+    model = resolve_leaf_model(api_key=api_key)
     if model is not None:
         return read_only_leaf(model, response_format=response_format)
     return _fake_structured_leaf(
@@ -329,7 +348,7 @@ def _build_skeptic(*, response_format: Any = None) -> Any:
     )
 
 
-def _build_capstone_skeptic(*, response_format: Any = None) -> Any:
+def _build_capstone_skeptic(*, response_format: Any = None, api_key: str | None = None) -> Any:
     """Build the capstone adversarial skeptic, forwarding ``response_format`` (Verdict).
 
     Like ``deep_research``'s skeptic this is a read-only judge that hands back a
@@ -339,8 +358,13 @@ def _build_capstone_skeptic(*, response_format: Any = None) -> Any:
     topic-name parity — an even-length topic name is unanimously refuted (and dies on
     the strict-majority kill), an odd-length one survives — so the survivor split is
     deterministic and the majority-vote narrative is reproducibly non-trivial.
+
+    Args:
+        response_format: The structured schema (``Verdict``) the real leaf returns.
+        api_key: The per-run OpenRouter key captured at roster-build time (or ``None``
+            to fall back to the env key).
     """
-    model = resolve_leaf_model()
+    model = resolve_leaf_model(api_key=api_key)
     if model is not None:
         return read_only_leaf(model, response_format=response_format)
 
@@ -370,26 +394,59 @@ def make_roster() -> Roster:
     Registers the roles ``deep_research`` and ``capstone`` need: ``researcher``,
     ``writer``, ``refiner``, ``extractor`` (structured), ``skeptic`` (a read-only
     adversarial judge over a claim), and ``capstone_skeptic`` (the same kind of
-    read-only judge over a refined finding). With a provider key present each leaf is a
-    real ``create_deep_agent``; with no key the roster serves deterministic fake leaves so
-    an offline run is fully reproducible. An ``echo`` leaf is also kept for
+    read-only judge over a refined finding). With an OpenRouter key in force each leaf
+    is a real ``create_deep_agent``; with no key the roster serves deterministic fake
+    leaves so an offline run is fully reproducible. An ``echo`` leaf is also kept for
     ``hello_workflow``, which makes no ``agent()`` calls but still requires a roster.
+
+    Per-session key capture. The leaf models are baked into their deepagents when this
+    roster is built. Since the roster is built inside the host node — where the run
+    config is visible — the per-run OpenRouter key is resolved ONCE here and threaded
+    into every leaf builder. The schema-aware builders (``extractor`` / ``skeptic`` /
+    ``capstone_skeptic``) are invoked LATER by the engine, deep inside the nested
+    workflow substrate where the host run config is no longer visible, so the captured
+    key is bound into them now via ``functools.partial`` rather than re-resolved at call
+    time. The eager leaves (``researcher`` / ``writer`` / ``refiner``) are built here
+    directly with the same captured key.
 
     Returns:
         A :class:`~langchain_dynamic_workflow.Roster` with every preset role.
     """
+    # Resolve the per-run OpenRouter key once, here in the host node context, so every
+    # leaf — eager or schema-aware — is built with the SAME in-force key. Resolving it
+    # inside a builder would be too late: the schema-aware builders run inside the nested
+    # engine substrate where the per-run config is not visible.
+    api_key = resolve_openrouter_key()
     return (
         Roster()
-        .register("researcher", _build_text_leaf("researcher"), description="Researches one angle.")
-        .register("writer", _build_text_leaf("writer"), description="Synthesizes the final report.")
-        .register("refiner", _build_text_leaf("refiner"), description="Refines one finding.")
         .register(
-            "extractor", builder=_build_extractor, description="Extracts a falsifiable claim."
+            "researcher",
+            _build_text_leaf("researcher", api_key=api_key),
+            description="Researches one angle.",
         )
-        .register("skeptic", builder=_build_skeptic, description="Adversarially verifies a claim.")
+        .register(
+            "writer",
+            _build_text_leaf("writer", api_key=api_key),
+            description="Synthesizes the final report.",
+        )
+        .register(
+            "refiner",
+            _build_text_leaf("refiner", api_key=api_key),
+            description="Refines one finding.",
+        )
+        .register(
+            "extractor",
+            builder=partial(_build_extractor, api_key=api_key),
+            description="Extracts a falsifiable claim.",
+        )
+        .register(
+            "skeptic",
+            builder=partial(_build_skeptic, api_key=api_key),
+            description="Adversarially verifies a claim.",
+        )
         .register(
             "capstone_skeptic",
-            builder=_build_capstone_skeptic,
+            builder=partial(_build_capstone_skeptic, api_key=api_key),
             description="Adversarially verifies a refined finding (majority vote).",
         )
         .register("echo", _fake_echo_leaf("echo"), description="Trivial echo leaf (hello demo).")

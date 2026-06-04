@@ -590,11 +590,16 @@ async def run_background(state: Annotated[dict[str, Any], InjectedState]) -> str
 def make_host_graph() -> Any:
     """Build the host deepagent graph served by ``langgraph dev``.
 
-    Resolves the host model from the environment (a real provider model when a key
-    is present, an offline scripted fallback otherwise), extends the deepagent state
-    with a ``ui`` channel, and registers the host tools so the host can drive the
-    Generative-UI round-trip (``run_hello_demo``), inline preset runs (``run_live``),
-    the meta layer (``run_meta_script``), and a background run (``run_background``).
+    Resolves the host model once at build time. The provider is locked to OpenRouter and
+    the model is fixed in code, so this is a per-call lazy model: it decides online vs.
+    offline PER TURN inside the node from the in-force OpenRouter key (a per-session
+    ``configurable.openrouter_api_key`` or the backend ``.env`` ``OPENROUTER_API_KEY``),
+    driving the real fixed host model when keyed and a scripted offline host otherwise —
+    so the same built graph serves a key-free boot and a per-session-keyed session. It
+    also extends the deepagent state with a ``ui`` channel and registers the host tools
+    so the host can drive the Generative-UI round-trip (``run_hello_demo``), inline preset
+    runs (``run_live``), the meta layer (``run_meta_script``), and a background run
+    (``run_background``).
 
     Returns:
         The compiled deepagent host graph (a runnable LangGraph graph).

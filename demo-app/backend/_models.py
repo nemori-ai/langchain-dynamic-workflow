@@ -1,11 +1,29 @@
-"""Host model resolution for the demo backend (BYO-key with an offline fallback).
+"""Host model resolution for the demo backend (OpenRouter BYO-key, offline fallback).
 
-The demo follows the project's offline-first discipline: with a real model key in
-the environment the host runs against that model, but with no key the graph must
-still build and register so ``langgraph dev`` boots and the Gen-UI round-trip is
-demonstrable without any credentials. When no key is present this returns a
-deterministic offline host model that drives the same tool-call turn logic a real
-model would, with the turn logic encoded in code rather than a prompt.
+The provider is LOCKED to OpenRouter and the models are FIXED in code: there is no
+user-facing model configuration. A single OpenRouter API key — supplied per session
+through the run config (``config.configurable.openrouter_api_key``) or, failing that,
+the backend ``.env`` ``OPENROUTER_API_KEY`` — is all that is needed to go online. With
+no key anywhere the graph must still build and register so ``langgraph dev`` boots and
+the Gen-UI round-trip is demonstrable without any credentials; in that case the host
+falls back to a deterministic scripted model that drives the same tool-call turn logic
+a real model would, with the turn logic encoded in code rather than a prompt.
+
+Per-session key round-trip. The host model is built once at graph-build time
+(``make_host_graph``), but the key arrives per run. :class:`LazyOpenRouterHostModel`
+bridges that gap: it is a thin :class:`BaseChatModel` wrapper that, on each
+generate call, reads the current run config via ``langgraph.config.get_config`` and
+builds the real OpenRouter-backed ``ChatOpenAI`` from that run's key — so a fresh key
+on every session threads through without rebuilding the graph. The leaf models
+(:func:`resolve_leaf_model`, used in ``workflows.make_roster``) are baked into their
+deepagents at roster-build time; since the roster is built inside the host node where
+the run config is visible, the per-run key is captured there and passed in explicitly.
+
+Fixed models. ``HOST_MODEL`` is a strong model that must reliably drive multi-step
+tool calls (an M1 real-model finding showed weak models such as ``gpt-4o-mini`` /
+``haiku`` cannot sustain the host's multi-turn orchestration); ``LEAF_MODEL`` is an
+economical model for the research fan-out. Both are module constants so they are
+trivially swappable.
 """
 
 from __future__ import annotations
@@ -14,10 +32,44 @@ import os
 from collections.abc import Sequence
 from typing import Any
 
-from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForLLMRun,
+    CallbackManagerForLLMRun,
+)
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+
+# ── locked provider + fixed models ───────────────────────────────────────────
+
+# The single OpenRouter base URL the demo routes every real call through. The provider
+# is LOCKED to OpenRouter; there is no other real provider in the headline path.
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# The strong host model. The host drives the demo's multi-step tool calls (launch an
+# inline preset run, compose + gate a meta script, hand a job to the background) across
+# turns, which an M1 real-model finding showed weak models (gpt-4o-mini / haiku) cannot
+# do reliably. ``claude-sonnet-4.5`` is a current OpenRouter id with strong agentic
+# tool-use; swap this constant to change the host model.
+HOST_MODEL = "anthropic/claude-sonnet-4.5"
+
+# The economical leaf model for the research fan-out. Leaves do short, bounded research
+# / extraction / adversarial-judging work, so a cheap model is the cost-disciplined
+# choice. ``claude-haiku-4.5`` is the same current OpenRouter id the engine's real-model
+# E2E examples use for leaves; swap this constant to change the leaf model.
+LEAF_MODEL = "anthropic/claude-haiku-4.5"
+
+# The run-config field carrying the per-session OpenRouter key. The frontend threads the
+# user's one key here on the LangGraph run config; it is read per run (not at graph-build
+# time) so each session uses its own key. Named explicitly so it is NOT a secret-logged
+# field — the value is a credential and must never be echoed into logs or UI.
+RUN_CONFIG_KEY_FIELD = "openrouter_api_key"
+
+# Optional internal escape hatch (NOT the headline path): an operator can pin a different
+# model id via these env vars for local experiments. The default — and the only path the
+# UI / docs describe — is the fixed HOST_MODEL / LEAF_MODEL constants above.
+_HOST_MODEL_ENV_OVERRIDE = "LDW_DEMO_HOST_MODEL"
+_LEAF_MODEL_ENV_OVERRIDE = "LDW_DEMO_LEAF_MODEL"
 
 # Tools the offline host can call to drive the Gen-UI + inline-run round-trips.
 _HELLO_TOOL_NAME = "run_hello_demo"
@@ -318,76 +370,267 @@ class OfflineHostModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
-def is_offline() -> bool:
-    """Return whether the demo is running without a provider key (offline mode).
+# ── per-session OpenRouter key resolution ─────────────────────────────────────
 
-    The single source of truth for the demo's online/offline state, gating on the same
-    keys :func:`resolve_host_model` and :func:`resolve_leaf_model` consult. With neither
-    ``OPENAI_API_KEY`` nor ``OPENROUTER_API_KEY`` present the host falls back to the
-    scripted :class:`OfflineHostModel` and the roster swaps in fake leaves, so this is
-    the honest signal the frontend uses to show its offline banner.
+
+def _run_config_openrouter_key() -> str | None:
+    """Return the per-run OpenRouter key from the current run config, if present.
+
+    The frontend threads the user's key onto the LangGraph run config under
+    ``configurable.openrouter_api_key`` (:data:`RUN_CONFIG_KEY_FIELD`). This reads it
+    via ``langgraph.config.get_config``, which resolves the *current* runnable
+    context's config. It is callable only inside a runnable context (a graph node, or
+    the host model's generate call, which runs inside the host node); outside one
+    ``get_config`` raises ``RuntimeError`` and there is simply no per-run key, so this
+    returns ``None`` and the caller falls back to the environment.
+
+    The import is local on purpose: ``langgraph.config`` is only meaningful inside a
+    running graph, and keeping the dependency at the call boundary lets the resolvers
+    be exercised in a plain unit test without a node context.
 
     Returns:
-        ``True`` when no provider key is present (offline), ``False`` otherwise.
+        The per-run OpenRouter key when the run config carries one, else ``None``.
     """
-    return not (os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY"))
+    try:
+        from langgraph.config import get_config
+
+        config = get_config()
+    except (RuntimeError, ImportError):
+        # No runnable context (RuntimeError) or langgraph unavailable (ImportError):
+        # there is no per-run config to read, so there is no per-run key.
+        return None
+    configurable = config.get("configurable") or {}
+    key = configurable.get(RUN_CONFIG_KEY_FIELD)
+    return key if isinstance(key, str) and key else None
 
 
-def resolve_host_model() -> BaseChatModel:
-    """Return the host chat model: a real provider model, or the offline fallback.
+def resolve_openrouter_key(*, api_key: str | None = None) -> str | None:
+    """Resolve the effective OpenRouter key, honoring the demo's key precedence.
 
-    Reads the already-loaded environment. With ``OPENAI_API_KEY`` present the host
-    runs against ``gpt-4o-mini``; with only ``OPENROUTER_API_KEY`` present it routes
-    through OpenRouter; with neither it returns :class:`OfflineHostModel` so the
-    graph still builds and ``langgraph dev`` boots without credentials.
+    The single source of truth for "which OpenRouter key (if any) is in force". The
+    precedence is: an explicitly supplied ``api_key`` (captured by the caller from the
+    run config at the right moment — e.g. the roster builder), then the per-run config
+    key (:func:`_run_config_openrouter_key`), then the backend ``.env``
+    ``OPENROUTER_API_KEY``. With none of those present the demo is offline.
+
+    Args:
+        api_key: An OpenRouter key the caller already resolved (e.g. a leaf builder that
+            captured the per-run key inside the host node). Takes precedence over every
+            other source so a captured per-session key always wins.
+
+    Returns:
+        The effective OpenRouter key, or ``None`` when no key is available (offline).
+    """
+    if api_key:
+        return api_key
+    run_key = _run_config_openrouter_key()
+    if run_key:
+        return run_key
+    env_key = os.environ.get("OPENROUTER_API_KEY")
+    return env_key if env_key else None
+
+
+def is_offline() -> bool:
+    """Return whether the demo is running without an OpenRouter key (offline mode).
+
+    The single source of truth for the demo's online/offline state, gating on the same
+    key sources the model resolvers consult: a per-run ``configurable.openrouter_api_key``
+    or the backend ``.env`` ``OPENROUTER_API_KEY``. With neither present the host falls
+    back to the scripted :class:`OfflineHostModel` and the roster swaps in fake leaves,
+    so this is the honest signal the frontend uses to show its offline banner.
+
+    Returns:
+        ``True`` when no OpenRouter key is available (offline), ``False`` otherwise.
+    """
+    return resolve_openrouter_key() is None
+
+
+def _build_openrouter_model(model: str, api_key: str) -> BaseChatModel:
+    """Build an OpenRouter-backed ``ChatOpenAI`` for ``model`` with ``api_key``.
+
+    The locked-provider constructor: every real call routes through OpenRouter's
+    OpenAI-compatible endpoint (:data:`OPENROUTER_BASE_URL`) with the supplied key. The
+    import is local because ``langchain_openai`` is only needed on the online path.
+
+    Args:
+        model: The OpenRouter model id (e.g. :data:`HOST_MODEL`).
+        api_key: The OpenRouter key to authenticate with.
 
     Returns:
         A configured :class:`~langchain_core.language_models.chat_models.BaseChatModel`.
     """
-    if os.environ.get("OPENAI_API_KEY"):
-        from langchain_openai import ChatOpenAI
+    from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(model="gpt-4o-mini")
-    if os.environ.get("OPENROUTER_API_KEY"):
-        from langchain_openai import ChatOpenAI
-
-        return ChatOpenAI(
-            model=os.environ.get("LDW_DEMO_HOST_MODEL", "openai/gpt-4o-mini"),
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],  # type: ignore[arg-type]
-        )
-    return OfflineHostModel()
+    return ChatOpenAI(
+        model=model,
+        base_url=OPENROUTER_BASE_URL,
+        api_key=api_key,  # type: ignore[arg-type]
+    )
 
 
-def resolve_leaf_model() -> BaseChatModel | None:
-    """Return a chat model for workflow leaves, or ``None`` to run them offline.
+class LazyOpenRouterHostModel(BaseChatModel):
+    """A host model that resolves its backend per call from the in-force OpenRouter key.
 
-    Mirrors :func:`resolve_host_model`'s BYO-key gating but signals the offline path
-    with ``None`` instead of a scripted model: a leaf is a real ``create_deep_agent``
-    only when a provider key is present, otherwise the roster swaps in a deterministic
-    fake leaf so an offline run stays reproducible and needs no credentials.
+    The host graph builds its model once at graph-build time, but the OpenRouter key
+    arrives per run on the run config. This thin wrapper bridges that gap so the graph
+    never has to be rebuilt to go online: it carries no key itself and, on each
+    (a)generate call, resolves the effective per-run key (:func:`resolve_openrouter_key`,
+    read inside the host node where the run config is visible) and:
+
+    * with a key in force — delegates to a freshly-built OpenRouter-backed ``ChatOpenAI``
+      (:data:`HOST_MODEL`), re-applying any remembered tool binding; and
+    * with no key in force — delegates to a :class:`OfflineHostModel`, so a bare
+      ``langgraph dev`` boot (no ``.env`` key, no per-session key) still drives the
+      scripted demo turn logic and the graph stays bootable.
+
+    This makes online/offline an HONEST per-turn decision: a session that supplies a
+    per-run ``configurable.openrouter_api_key`` goes online even when the graph was built
+    with no operator key, and a session with no key anywhere stays on the scripted host —
+    exactly what :func:`is_offline` reports for that turn.
+
+    Tool bindings are remembered and re-applied to the freshly-built delegate on each
+    call, so deepagents' per-request ``bind_tools`` is honored against the real backend.
+    """
+
+    bound_tools: tuple[Any, ...] = ()
+    bind_kwargs: dict[str, Any] = {}  # noqa: RUF012 — pydantic field default, not mutated in place
+
+    @property
+    def _llm_type(self) -> str:
+        return "lazy-openrouter-host-model"
+
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> BaseChatModel:
+        """Remember the tool binding so it can be re-applied to the per-call delegate.
+
+        deepagents binds the host's tools onto the model per request. Returning a copy
+        that records the tools (rather than the SDK's ``RunnableBinding``) keeps this a
+        :class:`LazyOpenRouterHostModel`, so the per-call delegate resolution still runs
+        and the tools are re-bound onto the freshly-built backend.
+
+        Args:
+            tools: The tools to bind on each delegate.
+            **kwargs: Extra bind kwargs (e.g. ``tool_choice``) forwarded to the delegate.
+
+        Returns:
+            A copy of this wrapper carrying the remembered tools and kwargs.
+        """
+        return self.model_copy(update={"bound_tools": tuple(tools), "bind_kwargs": dict(kwargs)})
+
+    def _resolve_delegate(self) -> BaseChatModel:
+        """Resolve this call's backend: OpenRouter when a key is in force, else offline.
+
+        Re-applies any remembered tool binding to the resolved delegate so deepagents'
+        per-request ``bind_tools`` is honored on whichever backend is selected.
+        """
+        api_key = resolve_openrouter_key()
+        if api_key is None:
+            # No key in force this turn: drive the scripted offline host so the graph
+            # stays bootable and a key-free session still demonstrates the round-trip.
+            delegate: BaseChatModel = OfflineHostModel()
+        else:
+            model = os.environ.get(_HOST_MODEL_ENV_OVERRIDE) or HOST_MODEL
+            delegate = _build_openrouter_model(model, api_key)
+        if self.bound_tools:
+            return delegate.bind_tools(list(self.bound_tools), **self.bind_kwargs)  # type: ignore[return-value]
+        return delegate
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        result = self._resolve_delegate().invoke(messages, stop=stop, **kwargs)
+        return ChatResult(generations=[ChatGeneration(message=_as_ai_message(result))])
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        result = await self._resolve_delegate().ainvoke(messages, stop=stop, **kwargs)
+        return ChatResult(generations=[ChatGeneration(message=_as_ai_message(result))])
+
+
+def _as_ai_message(result: Any) -> AIMessage:
+    """Coerce an invoke result into an :class:`AIMessage` for a ``ChatResult``.
+
+    A bound model's ``invoke`` already returns an ``AIMessage`` (the tools were bound
+    via :meth:`LazyOpenRouterHostModel.bind_tools`), so this is an identity passthrough
+    in practice; the guard keeps the wrapper honest if a delegate ever returns a bare
+    ``BaseMessage``.
+
+    Args:
+        result: The value returned by the delegate's invoke/ainvoke.
 
     Returns:
-        A configured chat model when a key is present, else ``None``.
+        The result as an :class:`AIMessage`.
     """
-    if os.environ.get("OPENAI_API_KEY"):
-        from langchain_openai import ChatOpenAI
+    if isinstance(result, AIMessage):
+        return result
+    return AIMessage(content=getattr(result, "content", str(result)))
 
-        return ChatOpenAI(model=os.environ.get("LDW_DEMO_LEAF_MODEL", "gpt-4o-mini"))
-    if os.environ.get("OPENROUTER_API_KEY"):
-        from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(
-            model=os.environ.get("LDW_DEMO_LEAF_MODEL", "openai/gpt-4o-mini"),
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],  # type: ignore[arg-type]
-        )
-    return None
+def resolve_host_model() -> BaseChatModel:
+    """Return the host chat model: always the per-call lazy OpenRouter/offline model.
+
+    Called once at graph-build time, where no run is in flight and the per-session key
+    is not yet visible. Rather than freeze the online/offline decision at build time
+    (which would strand a per-session-keyed session on the offline model when the graph
+    was built with no operator ``.env`` key), this always returns a
+    :class:`LazyOpenRouterHostModel`. That wrapper decides online vs. offline PER TURN
+    inside the host node, where the run config is visible: with a key in force it drives
+    the real :data:`HOST_MODEL` over OpenRouter, with none it drives the scripted
+    :class:`OfflineHostModel`. So the same built graph serves a key-free ``langgraph
+    dev`` boot and a per-session-keyed session honestly.
+
+    Returns:
+        A :class:`LazyOpenRouterHostModel` that self-resolves its backend per call.
+    """
+    return LazyOpenRouterHostModel()
+
+
+def resolve_leaf_model(*, api_key: str | None = None) -> BaseChatModel | None:
+    """Return a chat model for workflow leaves, or ``None`` to run them offline.
+
+    Mirrors :func:`resolve_host_model`'s key gating but signals the offline path with
+    ``None`` instead of a scripted model: a leaf is a real ``create_deep_agent`` only
+    when an OpenRouter key is in force, otherwise the roster swaps in a deterministic
+    fake leaf so an offline run stays reproducible and needs no credentials.
+
+    Unlike the host model, a leaf model is baked into its deepagent at roster-build time
+    (deepagents resolves the leaf model once, not per request). The roster is built
+    inside the host node, where the run config is visible, so the caller (``make_roster``)
+    captures the per-run key there and passes it as ``api_key`` — and the leaf is built
+    eagerly with that exact key.
+
+    Args:
+        api_key: The OpenRouter key the caller captured from the run config (or ``None``
+            to fall back to the per-run config / ``.env`` resolution). When supplied it
+            takes precedence so a captured per-session key threads into the leaf.
+
+    Returns:
+        A configured OpenRouter leaf model when a key is in force, else ``None``.
+    """
+    effective_key = resolve_openrouter_key(api_key=api_key)
+    if effective_key is None:
+        return None
+    model = os.environ.get(_LEAF_MODEL_ENV_OVERRIDE) or LEAF_MODEL
+    return _build_openrouter_model(model, effective_key)
 
 
 __all__: Sequence[str] = [
+    "HOST_MODEL",
+    "LEAF_MODEL",
+    "OPENROUTER_BASE_URL",
+    "RUN_CONFIG_KEY_FIELD",
+    "LazyOpenRouterHostModel",
     "OfflineHostModel",
     "is_offline",
     "resolve_host_model",
     "resolve_leaf_model",
+    "resolve_openrouter_key",
 ]

@@ -304,14 +304,16 @@ def test_offline_host_routes_named_preset_through_args() -> None:
     assert "workflow" not in default_args
 
 
-def test_is_offline_reflects_provider_key_presence(
+def test_is_offline_reflects_openrouter_key_presence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``is_offline`` gates on the same provider keys the model resolvers consult.
+    """``is_offline`` gates on the OpenRouter key alone (provider is locked to it).
 
-    This is the honest signal the frontend's offline banner renders from, so it must
-    be ``True`` only when no key is present and flip ``False`` as soon as either
-    provider key appears — never a hardcoded constant.
+    This is the honest signal the frontend's offline banner renders from. The provider
+    is LOCKED to OpenRouter, so it must be ``True`` only when no OpenRouter key is in
+    force and flip ``False`` as soon as the ``.env`` ``OPENROUTER_API_KEY`` appears —
+    never a hardcoded constant. An ``OPENAI_API_KEY`` is NOT a headline path and must
+    NOT flip the demo online (OpenAI was dropped as a real provider).
     """
     from _models import is_offline
 
@@ -319,10 +321,11 @@ def test_is_offline_reflects_provider_key_presence(
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert is_offline() is True
 
+    # OpenAI is no longer a real provider: its key must not flip the demo online.
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    assert is_offline() is False
+    assert is_offline() is True
 
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # The OpenRouter .env key is the operator/local online source.
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-test")
     assert is_offline() is False
 
@@ -346,7 +349,7 @@ def test_run_status_emitted_once_per_turn_with_real_offline_flag(
     _emit_run_status(lambda comp, props: events.append((comp, dict(props))))
     assert events == [("run_status", {"offline": True, "event_id": "run-status-1"})]
 
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test")
     events.clear()
     _emit_run_status(lambda comp, props: events.append((comp, dict(props))))
     assert events == [("run_status", {"offline": False, "event_id": "run-status-1"})]
