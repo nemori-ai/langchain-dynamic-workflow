@@ -1,16 +1,15 @@
 /**
- * Local persistence for a bring-your-own provider key (OpenAI / OpenRouter).
+ * Local persistence + per-run wiring for a bring-your-own OpenRouter key.
  *
- * IMPORTANT — local-demo limitation, not a security gap left open by accident:
- * In this `langgraph dev` setup the provider key the host actually uses lives in the
- * BACKEND process environment (`OPENAI_API_KEY` / `OPENROUTER_API_KEY`, read by
- * `_models.resolve_host_model` / `resolve_leaf_model`). A browser cannot set a backend
- * env var, and the backend exposes no endpoint to receive a key, so a key pasted into
- * the settings panel is persisted to localStorage for convenience (so it survives
- * reloads and a future round-trip could pick it up) but does NOT flow to the backend
- * on its own. To run live, set the env var where `langgraph dev` runs and restart the
- * backend. This is deliberately not faked: the offline banner stays accurate to the
- * backend's real key state regardless of what is typed here.
+ * The user pastes one OpenRouter key in the settings panel; it is kept in this browser's
+ * localStorage. On every run the saved key is threaded into the LangGraph run config as
+ * `config.configurable.openrouter_api_key` (see {@link buildProviderRunConfig}), the
+ * contract field the backend reads off the runtime config for that run to build the live
+ * OpenRouter model. The key is never stored server-side: it only rides along each run.
+ *
+ * If no key is saved here, the backend falls back to its own `OPENROUTER_API_KEY` env
+ * (local/operator mode); if neither is present the backend stays in its deterministic
+ * offline scripted host and the run-status banner reflects that real state.
  *
  * Lives under components/workflow (not src/lib) because the repo's .gitignore ignores
  * `lib/`, leaving the vendored src/lib helpers untracked; co-locating this demo helper
@@ -21,6 +20,14 @@
  */
 
 const PROVIDER_KEY_STORAGE = "ldw:demo:providerApiKey";
+
+/**
+ * Contract field name the backend reads off `config.configurable` for each run.
+ *
+ * Keeping it as a single named constant makes the frontend/backend contract explicit
+ * and the field trivially greppable on both sides.
+ */
+export const OPENROUTER_CONFIGURABLE_KEY = "openrouter_api_key" as const;
 
 export function getProviderKey(): string {
   try {
@@ -42,4 +49,20 @@ export function setProviderKey(key: string): void {
   } catch {
     // no-op: persistence is best-effort convenience only.
   }
+}
+
+/**
+ * Builds the run-config fragment that carries the saved OpenRouter key to the backend.
+ *
+ * Returns `{ config: { configurable: { openrouter_api_key } } }` when a key is saved,
+ * suitable for spreading into the `useStream` `submit` options' `config`. When no key
+ * is saved it returns `undefined`, so the backend keeps its own env/offline fallback
+ * and the run config carries nothing — the offline banner stays accurate.
+ */
+export function buildProviderRunConfig():
+  | { configurable: { [OPENROUTER_CONFIGURABLE_KEY]: string } }
+  | undefined {
+  const key = getProviderKey().trim();
+  if (!key) return undefined;
+  return { configurable: { [OPENROUTER_CONFIGURABLE_KEY]: key } };
 }

@@ -4,14 +4,12 @@ import { PasswordInput } from "@/components/ui/password-input";
 import { getProviderKey, setProviderKey } from "./provider-key";
 
 /**
- * Bring-your-own provider-key input for the demo.
+ * Bring-your-own OpenRouter-key input for the demo.
  *
- * A user can paste an OpenAI / OpenRouter key here; it is persisted to localStorage
- * (see `./provider-key.ts`). Per that module's documented limitation, the key the
- * host actually uses lives in the BACKEND environment in this `langgraph dev` setup,
- * so a pasted key does not flow to the backend on its own — running live still
- * requires setting the env var where the backend runs. The panel says exactly that
- * rather than implying the key takes effect immediately.
+ * A user pastes a single OpenRouter key here; it is kept in this browser's localStorage
+ * (see `./provider-key.ts`) and threaded into every run's config so the backend can build
+ * the live model for that run. The panel copy states exactly that — the key takes effect
+ * on the next run, with no server-side storage and no env-var/restart step.
  */
 export function SettingsPanel() {
   const [key, setKey] = useState<string>(() => getProviderKey());
@@ -29,13 +27,13 @@ export function SettingsPanel() {
       className="flex flex-col gap-2"
     >
       <span className="text-xs font-semibold tracking-wide text-gray-500 uppercase">
-        Provider key
+        OpenRouter key
       </span>
       <PasswordInput
         value={key}
         onChange={(e) => setKey(e.target.value)}
-        placeholder="sk-... or sk-or-..."
-        aria-label="Provider API key"
+        placeholder="sk-or-..."
+        aria-label="OpenRouter API key"
       />
       <div className="flex items-center gap-2">
         <Button
@@ -50,8 +48,8 @@ export function SettingsPanel() {
         {saved && <span className="text-xs text-emerald-600">Saved</span>}
       </div>
       <p className="text-xs leading-snug text-gray-400">
-        Stored in this browser only. For a live run, set the key in the backend
-        environment and restart it.
+        Your OpenRouter key is sent with each run to drive the live model. Kept
+        in this browser only; never stored server-side.
       </p>
     </div>
   );

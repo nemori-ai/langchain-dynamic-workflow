@@ -41,6 +41,7 @@ import { useFileUpload } from "@/hooks/use-file-upload";
 import { ContentBlocksPreview } from "./ContentBlocksPreview";
 import { ScenarioPanel } from "@/components/workflow/ScenarioPanel";
 import { SettingsPanel } from "@/components/workflow/SettingsPanel";
+import { buildProviderRunConfig } from "@/components/workflow/provider-key";
 import {
   useArtifactOpen,
   ArtifactContent,
@@ -218,12 +219,18 @@ export function Thread() {
     const context =
       Object.keys(artifactContext).length > 0 ? artifactContext : undefined;
 
+    // Thread the saved OpenRouter key (if any) into the run config so the backend can
+    // build the live model for this run. Read at submit time so a key saved mid-session
+    // takes effect on the next run; absent a key the backend keeps its env/offline path.
+    const providerConfig = buildProviderRunConfig();
+
     stream.submit(
       { messages: [...toolMessages, newHumanMessage], context },
       {
         streamMode: ["values"],
         streamSubgraphs: true,
         streamResumable: true,
+        ...(providerConfig && { config: providerConfig }),
         optimisticValues: (prev) => ({
           ...prev,
           context,
@@ -251,11 +258,14 @@ export function Thread() {
     // Do this so the loading state is correct
     prevMessageLength.current = prevMessageLength.current - 1;
     setFirstTokenReceived(false);
+    // Regenerate is also a run, so it must carry the same OpenRouter key.
+    const providerConfig = buildProviderRunConfig();
     stream.submit(undefined, {
       checkpoint: parentCheckpoint,
       streamMode: ["values"],
       streamSubgraphs: true,
       streamResumable: true,
+      ...(providerConfig && { config: providerConfig }),
     });
   };
 
