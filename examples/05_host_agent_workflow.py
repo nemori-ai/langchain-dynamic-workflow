@@ -27,7 +27,7 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -96,9 +96,9 @@ def _call(command: str, **args: str) -> ChatResult:
 
 
 def _build_leaf() -> Any:
-    model = real_model()
+    model = real_leaf_model(web_search=True)
     if model is not None:
-        return create_deep_agent(model=model)
+        return create_deep_agent(model=model, middleware=demo_cache_middleware())
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
         last = inp["messages"][-1].text if inp["messages"] else ""
@@ -123,7 +123,9 @@ async def main() -> None:
     manager = BgRunManager()
     middleware = create_workflow_middleware(roster, workflows=workflows, manager=manager)
 
-    host = create_deep_agent(model=ScriptedHost(), middleware=[middleware])
+    host = create_deep_agent(
+        model=ScriptedHost(), middleware=[middleware, *demo_cache_middleware()]
+    )
     config: RunnableConfig = {"configurable": {"thread_id": "demo-5"}}
 
     # Turn 1: host launches the background workflow and ends its turn (non-blocking).

@@ -37,7 +37,7 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
 from deepagents import create_deep_agent
 from deepagents.backends.filesystem import FilesystemBackend
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -234,19 +234,21 @@ def _fake_structured_leaf(structured: BaseModel, *, reply: str) -> Any:
     return RunnableLambda(_leaf)
 
 
-def _build_leaf(role: str) -> Any:
+def _build_leaf(role: str, *, web_search: bool = False) -> Any:
     """Build a schema-less text leaf (researcher / writer)."""
-    model = real_model()
+    model = real_leaf_model(web_search=web_search)
     if model is not None:
-        return create_deep_agent(model=model)
+        return create_deep_agent(model=model, middleware=demo_cache_middleware())
     return _fake_echo_leaf(role)
 
 
 def _build_extractor(*, response_format: Any = None) -> Any:
     """Builder for the ``extractor`` leaf, forwarding ``response_format`` (Claim)."""
-    model = real_model()
+    model = real_leaf_model()
     if model is not None:
-        return create_deep_agent(model=model, response_format=response_format)
+        return create_deep_agent(
+            model=model, response_format=response_format, middleware=demo_cache_middleware()
+        )
 
     # Offline: emit an ANGLE-DISTINCT checkable claim (the prompt names the angle). Each
     # angle yields its own claim, so dedup() is honestly a no-op here — it merges only
@@ -274,9 +276,11 @@ def _build_skeptic(*, response_format: Any = None) -> Any:
     workflow: register the builder, and ``ctx.agent(agent_type="skeptic", schema=...)``
     yields a structured, read-only verdict.
     """
-    model = real_model()
+    model = real_leaf_model(web_search=True)
     if model is not None:
-        return read_only_leaf(model, response_format=response_format)
+        return read_only_leaf(
+            model, response_format=response_format, middleware=demo_cache_middleware()
+        )
     # Offline skeptics never refute, so every claim survives — a deterministic,
     # readable demo. The real path exercises genuine adversarial refutation.
     return _fake_structured_leaf(
@@ -360,7 +364,11 @@ async def main() -> None:
     host_model = real_model()
     roster = (
         Roster()
-        .register("researcher", _build_leaf("researcher"), description="Researches one angle")
+        .register(
+            "researcher",
+            _build_leaf("researcher", web_search=True),
+            description="Researches one angle",
+        )
         .register("extractor", builder=_build_extractor, description="Extracts a falsifiable claim")
         .register("skeptic", builder=_build_skeptic, description="Adversarially verifies a claim")
         .register("writer", _build_leaf("writer"), description="Synthesizes the final report")
@@ -369,7 +377,7 @@ async def main() -> None:
     manager = BgRunManager()
     middleware = create_workflow_middleware(roster, workflows=workflows, manager=manager)
 
-    host_kwargs: dict[str, Any] = {"middleware": [middleware]}
+    host_kwargs: dict[str, Any] = {"middleware": [middleware, *demo_cache_middleware()]}
     if host_model is not None:
         # Real host: a live OpenRouter agent that reads the skill and drives the tool.
         host_kwargs["model"] = host_model

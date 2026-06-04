@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
 from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
@@ -158,9 +158,11 @@ async def code_review(ctx: Any, args: dict[str, Any]) -> list[str]:
 
 def _fake_reviewer_builder(*, response_format: Any = None) -> Any:
     """Offline reviewer: always surfaces one real bug + one bait; the loop dedups."""
-    model = real_model()
+    model = real_leaf_model()
     if model is not None:
-        return create_deep_agent(model=model, response_format=response_format)
+        return create_deep_agent(
+            model=model, response_format=response_format, middleware=demo_cache_middleware()
+        )
     schema: Any = response_format.schema if response_format is not None else ReviewBatch
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
@@ -188,9 +190,11 @@ def _fake_reviewer_builder(*, response_format: Any = None) -> Any:
 
 def _fake_skeptic_builder(*, response_format: Any = None) -> Any:
     """Offline skeptic: refutes the bait (its title carries the marker), keeps the rest."""
-    model = real_model()
+    model = real_leaf_model()
     if model is not None:
-        return create_deep_agent(model=model, response_format=response_format)
+        return create_deep_agent(
+            model=model, response_format=response_format, middleware=demo_cache_middleware()
+        )
     schema: Any = response_format.schema if response_format is not None else Verdict
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:

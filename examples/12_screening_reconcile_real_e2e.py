@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Literal
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
 from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
@@ -150,9 +150,11 @@ def _fake_structured_leaf(structured: BaseModel, *, reply: str) -> Any:
 
 
 def _build_source(*, response_format: Any = None) -> Any:
-    model = real_model()
+    model = real_leaf_model(web_search=True)
     if model is not None:
-        return create_deep_agent(model=model, response_format=response_format)
+        return create_deep_agent(
+            model=model, response_format=response_format, middleware=demo_cache_middleware()
+        )
 
     # Offline: sources DISCRIMINATE on aspect so corroborate visibly drops the unsupported.
     # Two sources flag the same aspect (it clears min_support=2 and corroborates); the other
@@ -171,9 +173,11 @@ def _build_source(*, response_format: Any = None) -> Any:
 
 
 def _build_screener(*, response_format: Any = None) -> Any:
-    model = real_model()
+    model = real_leaf_model()
     if model is not None:
-        return create_deep_agent(model=model, response_format=response_format)
+        return create_deep_agent(
+            model=model, response_format=response_format, middleware=demo_cache_middleware()
+        )
     # Offline screeners both include, so the corroborated claim is unanimously kept.
     return _fake_structured_leaf(
         Screen(keep=True, reason="specific and defensible"), reply="screened"

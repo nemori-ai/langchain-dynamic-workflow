@@ -21,7 +21,7 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -57,8 +57,8 @@ class _ScriptedModel(BaseChatModel):
         return self
 
 
-def _build_model(prefix: str) -> Any:
-    return real_model() or _ScriptedModel(prefix=prefix)
+def _build_model(prefix: str, *, web_search: bool = False) -> Any:
+    return real_leaf_model(web_search=web_search) or _ScriptedModel(prefix=prefix)
 
 
 async def main() -> None:
@@ -66,12 +66,15 @@ async def main() -> None:
     roster = Roster()
     roster.register(
         "researcher",
-        create_deep_agent(model=_build_model("research")),
+        create_deep_agent(
+            model=_build_model("research", web_search=True),
+            middleware=demo_cache_middleware(),
+        ),
         description="Researches a single topic",
     )
     roster.register(
         "summarizer",
-        create_deep_agent(model=_build_model("summary")),
+        create_deep_agent(model=_build_model("summary"), middleware=demo_cache_middleware()),
         description="Condenses research into a brief",
     )
 

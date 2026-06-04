@@ -1,0 +1,38 @@
+[project]
+name = "ldw-demo-backend"
+version = "0.0.0"
+description = "Host deepagent graph for the interactive dynamic-workflow demo, served via langgraph dev."
+requires-python = ">=3.12"
+dependencies = [
+    "langgraph>=1.0",
+    "langgraph-cli[inmem]>=0.1.55",
+    "deepagents>=0.6",
+    "langchain-dynamic-workflow",
+    "langchain-openrouter>=0.2.3",
+    "langsmith>=0.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+# The demo backend is not an installable package itself: langgraph dev loads the
+# graph from host_graph.py by path. uv still needs a build backend declaration to
+# treat this as a project, but we mark the package as virtual-only.
+[tool.uv]
+package = false
+
+# Resolve the orchestration engine from the repository checkout (this worktree),
+# not PyPI, so the demo always exercises the in-tree engine.
+[tool.uv.sources]
+langchain-dynamic-workflow = { path = "../..", editable = true }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# The backend modules (host_graph, workflows, _models) are loaded by path by
+# langgraph dev, not installed as a package, so put the backend dir on sys.path
+# for the test run to import them the same way.
+pythonpath = ["."]

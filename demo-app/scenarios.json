@@ -1,0 +1,25 @@
+{
+  "_comment": "Canonical wording for the demo's preset-scenario buttons. The frontend ScenarioPanel hardcodes the same four messages (it does not read this file at runtime), and the backend doc-sync test (tests/test_doc_sync.py) pins the two copies byte-for-byte so they cannot drift. Messages are a real user's words (the why/when of the task) — never tool mechanics.",
+  "scenarios": [
+    {
+      "label": "Deep research",
+      "hint": "hard, multi-source question",
+      "message": "I need a thorough, fact-checked answer on the main trade-offs between retrieval-augmented generation and long-context LLMs. Please dig into it from several angles, cross-check the findings, and give me a clear writeup."
+    },
+    {
+      "label": "Pick it back up",
+      "hint": "resume a long-running task",
+      "message": "Earlier you started looking into that research question for me. Can you pick it back up where you left off rather than starting over from scratch?"
+    },
+    {
+      "label": "Novel task",
+      "hint": "no ready-made procedure",
+      "message": "There's no standard playbook for this one, so I'd like you to work out a procedure yourself: research a few topics, refine them, have skeptics challenge each finding, and then synthesize what survives."
+    },
+    {
+      "label": "Delegate heavy work",
+      "hint": "hand off a multi-step job",
+      "message": "This is a heavy, multi-step research job — I don't want to babysit every step. Please take it off my hands and run the whole thing in the background; just let me know how it went once it's done."
+    }
+  ]
+}

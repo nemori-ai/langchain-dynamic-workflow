@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
 from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
@@ -149,9 +149,11 @@ async def fix_swarm(ctx: Any, args: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _fixer_builder(*, response_format: Any = None) -> Any:
     """Fixer leaf: reads its seeded worktree, returns a Patch for its target file."""
-    model = real_model()
+    model = real_leaf_model()
     if model is not None:
-        return create_deep_agent(model=model, response_format=response_format)
+        return create_deep_agent(
+            model=model, response_format=response_format, middleware=demo_cache_middleware()
+        )
     schema: Any = response_format.schema if response_format is not None else Patch
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
@@ -179,9 +181,11 @@ def _fixer_builder(*, response_format: Any = None) -> Any:
 
 def _reviewer_builder(*, response_format: Any = None) -> Any:
     """Reviewer leaf: approves a patch (offline always approves)."""
-    model = real_model()
+    model = real_leaf_model()
     if model is not None:
-        return create_deep_agent(model=model, response_format=response_format)
+        return create_deep_agent(
+            model=model, response_format=response_format, middleware=demo_cache_middleware()
+        )
     schema: Any = response_format.schema if response_format is not None else Vote
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:

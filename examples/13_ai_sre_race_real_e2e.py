@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
 from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
@@ -116,9 +116,11 @@ _CONFIRMED_HYPOTHESIS = HYPOTHESES[2]
 
 
 def _build_investigator(*, response_format: Any = None) -> Any:
-    model = real_model()
+    model = real_leaf_model()
     if model is not None:
-        return create_deep_agent(model=model, response_format=response_format)
+        return create_deep_agent(
+            model=model, response_format=response_format, middleware=demo_cache_middleware()
+        )
 
     # Offline: a deterministic, hypothesis-aware fake. It reads the hypothesis out of
     # the investigate prompt and returns a high-confidence Diagnosis only for the one

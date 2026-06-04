@@ -1,0 +1,35 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# LangGraph API
+.langgraph_api
+.env
+# The demo's frontend .env carries only public NEXT_PUBLIC_* config (the local backend
+# URL + assistant id) and an empty LANGSMITH_API_KEY — no secrets — so it is committed
+# on purpose: a fresh clone is preconfigured to reach the local backend with no setup
+# form. (The backend .env stays ignored because it may hold an OPENROUTER_API_KEY.)
+!.env
+.next/
+next-env.d.ts

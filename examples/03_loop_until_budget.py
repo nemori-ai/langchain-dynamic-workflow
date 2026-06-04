@@ -23,7 +23,7 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -80,7 +80,7 @@ class _UsageModel(BaseChatModel):
 
 
 def _build_model() -> Any:
-    return real_model() or _UsageModel()
+    return real_leaf_model(web_search=True) or _UsageModel()
 
 
 async def orchestrate(ctx: Ctx) -> dict[str, Any]:
@@ -104,7 +104,7 @@ async def main() -> None:
     roster = Roster()
     roster.register(
         "researcher",
-        create_deep_agent(model=_build_model()),
+        create_deep_agent(model=_build_model(), middleware=demo_cache_middleware()),
         description="Researches a single topic",
     )
     journal = InMemoryJournalStore()
