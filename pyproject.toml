@@ -34,6 +34,15 @@ dependencies = [
     "pydantic>=2.7",
 ]
 
+# Cross-session / cross-process persistence. Opt-in so the base install stays
+# dependency-free and behavior-identical with the in-memory default. Pulls
+# langgraph-checkpoint-sqlite (AsyncSqliteSaver) and aiosqlite (autocommit + WAL
+# store); transitively brings langgraph-checkpoint>=4.1,<5 and sqlite-vec (a
+# compiled extension). Install with `uv sync --extra sqlite` or
+# `pip install langchain-dynamic-workflow[sqlite]`.
+[project.optional-dependencies]
+sqlite = ["langgraph-checkpoint-sqlite>=3.1,<4", "aiosqlite>=0.22"]
+
 # NOTE: adjust the org/owner once the GitHub repository is created.
 [project.urls]
 Homepage = "https://github.com/OWNER/langchain-dynamic-workflow"
@@ -48,6 +57,11 @@ dev = [
     "pyright>=1.1.380",
     "import-linter>=2.11",
     "pytest-cov>=7.1.0",
+    # Mirror the [sqlite] extra into the dev group so a local `uv sync` installs
+    # the persistence backends — pyright (strict) and pytest then check and run
+    # _persistence.py for real rather than skipping it as an absent optional dep.
+    "langgraph-checkpoint-sqlite>=3.1,<4",
+    "aiosqlite>=0.22",
 ]
 # Optional extras for driving the runnable examples against a real model with
 # tracing. The examples run fully offline with fake models on the base install;
@@ -157,6 +171,8 @@ source_modules = [
     "langchain_dynamic_workflow.middleware",
     "langchain_dynamic_workflow._background",
     "langchain_dynamic_workflow._codegen",
+    "langchain_dynamic_workflow._run_store",
+    "langchain_dynamic_workflow._persistence",
 ]
 forbidden_modules = [
     "langchain_dynamic_workflow._journal",
@@ -193,3 +209,28 @@ name = "Background run substrate stays independent of the engine"
 type = "forbidden"
 source_modules = ["langchain_dynamic_workflow._background"]
 forbidden_modules = ["langchain_dynamic_workflow._engine"]
+
+# The sqlite persistence backend lives behind the optional `[sqlite]` extra, so it
+# must never be pulled in by merely importing the package or the engine: a base
+# install without the extra would then fail at import time. Importing `_persistence`
+# is the deliberate, lazy act of a host that opted into sqlite (the package exposes
+# `SqliteWorkflowStore` only through a TYPE_CHECKING hint + a lazy `__getattr__`).
+# The sources are the runtime modules a bare `import langchain_dynamic_workflow`
+# eagerly loads — the engine plus the host-facing surface and run-store — none of
+# which may reach `_persistence`. `allow_indirect_imports` stays at its default so
+# the whole reachable import graph from each source is checked, catching an eager
+# reach through any chain. The package root itself is intentionally not a source:
+# its only references to `_persistence` are the lazy paths above, and sourcing the
+# root subtree would both wrongly count those and overlap the forbidden module.
+[[tool.importlinter.contracts]]
+name = "Package and engine must not eagerly import the optional sqlite backend"
+type = "forbidden"
+source_modules = [
+    "langchain_dynamic_workflow._engine",
+    "langchain_dynamic_workflow._run_store",
+    "langchain_dynamic_workflow._codegen",
+    "langchain_dynamic_workflow._background",
+    "langchain_dynamic_workflow.tool",
+    "langchain_dynamic_workflow.middleware",
+]
+forbidden_modules = ["langchain_dynamic_workflow._persistence"]

@@ -16,10 +16,13 @@ from typing import Any
 
 import pytest
 from langchain_core.runnables import Runnable, RunnableConfig
+from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.runtime import Runtime
+from langgraph.types import Command
 
 from langchain_dynamic_workflow import Ctx, Roster
 from langchain_dynamic_workflow._background import BgRunManager
+from langchain_dynamic_workflow._run_store import InMemoryRunStore
 from langchain_dynamic_workflow._workflows import WorkflowRegistry
 from langchain_dynamic_workflow.middleware import (
     WORKFLOW_NOTIFICATION_TAG,
@@ -177,6 +180,50 @@ def test_middleware_default_manager_honors_quota() -> None:
     workflows = WorkflowRegistry()
     middleware = create_workflow_middleware(roster, workflows=workflows, max_concurrent_runs=3)
     assert middleware.manager.max_concurrent_runs == 3
+
+
+async def test_middleware_forwards_injected_store_to_the_tool(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # The middleware threads an injected run store through to the tool factory, so
+    # a launch persists its spec into that store (the cross-process persistence
+    # seam wired at the host edge).
+    leaf, _state = make_fake_leaf("answer")
+    roster = Roster().register("researcher", leaf)
+
+    async def orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        return await ctx.agent("Q", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("wf", orchestrate)
+    manager = BgRunManager()
+    store = InMemoryRunStore()
+    middleware = create_workflow_middleware(
+        roster, workflows=workflows, manager=manager, store=store
+    )
+
+    tool: Any = middleware.tools[0]
+    runtime: ToolRuntime[Any, Any] = ToolRuntime(
+        state={"messages": []},
+        context=None,
+        config={"configurable": {"thread_id": "host-1"}},
+        stream_writer=lambda _chunk: None,
+        tool_call_id="call-1",
+        store=None,
+    )
+    out = await tool.coroutine(runtime=runtime, command="run", workflow="wf")
+    assert isinstance(out, Command)
+    update: dict[str, Any] = out.update or {}
+    runs: list[dict[str, Any]] = update["workflow_runs"]
+    run_id = runs[-1]["run_id"]
+    assert isinstance(run_id, str)
+    await manager.wait(run_id, thread_id="host-1")
+
+    spec = await store.load_spec(run_id)
+    assert spec is not None
+    assert spec.name_or_source == "wf"
+    # The host thread is not persisted; the canonical journal lineage is the run's
+    # own id so a resume keys the same journal regardless of the resuming thread.
+    assert spec.journal_run_id == run_id
 
 
 async def orchestrate_runner(roster: Roster) -> str:

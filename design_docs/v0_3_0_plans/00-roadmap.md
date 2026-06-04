@@ -17,7 +17,7 @@
 | **M1** | **F 跨叶归约** | CONFIRMED-GAP | 只有单叶 fold，无 vote/dedup/judge-panel 原语；跨叶归约全靠脚本手写 | 最高（6 用例） | 低–中 | G1 + G4 | ✅ 已落地 · [`01-f-cross-leaf-reduce.md`](01-f-cross-leaf-reduce.md) |
 | **M2** | **B 早退/取消（race）** | CONFIRMED-GAP | parallel 严格 barrier、无 first-wins/在飞取消 | 高 | 中 | 核心调度器 | ✅ 已落地 · [`02-b-journaled-race.md`](02-b-journaled-race.md) |
 | **M3.5** | **多并行 run 可观测性 + quota 接线** | NO-GAP（机制已全，残 ergonomics） | run/run_script 已后台并发、每 run 隔离 journal/budget/gate；缺聚合 `runs` 命令、`workflow_runs` 落定不刷新、quota 接线静默忽略 | 中（直接答需求 ②） | 低 | 现有 `BgRunManager`（无硬依赖，**可先于 M3**） | ✅ 已落地 · [`03-m3.5-run-observability.md`](03-m3.5-run-observability.md) |
-| **M3** | **D 跨会话持久** | CONFIRMED-GAP（与 CC 持平，未超越） | 接缝在但只有内存 store/saver、host 用进程内 dict | 高（超集赢面） | 中 | journal/checkpointer 接缝 | 待写 |
+| **M3** | **D 跨会话持久** | CONFIRMED-GAP（超集赢面：跨进程零成本 resume，CC 仅同会话） | 接缝在但只有内存 store/saver、host 用进程内 dict | 高（超集赢面） | 中 | journal/checkpointer 接缝 | ✅ 已落地 · [`04-m3-cross-session-persistence.md`](04-m3-cross-session-persistence.md) |
 | **M4** | **C 运行中 HITL 签核** | CONFIRMED-GAP（底座现成） | 全无 interrupt/pause；LangGraph `interrupt` 未 import 暴露 | 中–高（超集赢面） | 中 | M3（持久化）+ LangGraph interrupt | 待写 |
 | **M5** | **A 循环内可执行验证** | CONFIRMED-GAP | worktree seeding 有，但 execute 是离线 no-op echo、无真子进程/exit-code gating | 最高（Bun 旗舰案） | 高 | G2 worktree | 待写 |
 | **M6** | **I 真 git worktree + 分支/PR** | CONFIRMED-GAP（接缝预留） | 只有 InMemoryWorktreeProvider；无真 git/分支/PR | 高 | 高 | M5（真执行） | 待写 |
@@ -108,9 +108,11 @@
 
 **依赖：** 无硬依赖（纯增量面叠在现有 `BgRunManager` + 工具上）。与 M3（D 持久化）天然配对（都碰 run 注册表），但**可独立先行、甚至先于 M3**。与下方"M1 实测发现"的 backlog 项 **K**（host 无法按名发现已注册工作流）相邻——K 是发现"已注册 workflow 名"，M3.5 是发现"在飞 run"，可一并收。
 
-### M3 · D — 跨会话 / 多日持久（超集）
+### M3 · D — 跨会话 / 多日持久（超集）【✅ 已落地】
 
 **目标：** 让 resume/replay **跨进程/跨会话**存活——超越 CC（CC 仅同会话）。
+
+**落地形态（as-built）：** `WorkflowRunStore` 协议 + `RunSpec`（携规范 `journal_run_id` 谱系）+ `InMemoryRunStore`（默认、零依赖）+ `SqliteWorkflowStore`（`[sqlite]` extra：一个统一 sqlite db 文件、run_id 命名空间化四表 + 第二连接上的持久 `AsyncSqliteSaver`）。**零成本重放由持久 journal 交付**（checkpointer 是 durable add-on，resume 侧 `checkpointer=None` 亦可证）。两连接（autocommit store + explicit-commit saver，皆 WAL）一个 db 文件；`AsyncSqliteSaver` 构造期绑 event loop（宿主单一持久 loop 内构造 + 复用同一实例）；per-run 规范 id 同 key journal 谱系与 checkpoint thread（host thread 仅 key manager slot）；save-before-start + quota 拒入回滚；schema-version guard fail-loud。机制详见 [`design_docs/01-engine-mechanism.md`](../01-engine-mechanism.md) §13b，接线见 [`design_docs/02-architecture.md`](../02-architecture.md) §10，时序见 [`design_docs/uml/03-sequence.md`](../uml/03-sequence.md) D 图。真模型 + 真子进程 E2E（`examples/15`）钉死头条；离线子进程测试钉死零派发不变量。
 
 **对比证据（现状）：** 接缝齐备但**空**：`JournalStore` Protocol（`_journal.py:75-109`）可注入，checkpointer 参数可接持久 saver 但默认 `InMemorySaver`（`_engine.py:117`）；只有 `InMemoryJournalStore`（`_journal.py:112`）；host 用进程内 dict（`tool.py:143,147,225,265,319`）。"可能已超 CC"假设**已证伪**。
 
@@ -196,7 +198,8 @@ M1 的真模型 E2E 过程中浮现两条值得后续处理的信号：
 - **M1（F 跨叶归约）**：✅ 已落地。`_reduce` 四个纯函数 `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`)经包根导出 + `run_script` 命名空间注入;SKILL.md 增补 corroborate/reconcile 范式;`examples/07` 换用 `survives`/`dedup`、`examples/12` 新增双盲复核 demo。Plan = [`01-f-cross-leaf-reduce.md`](01-f-cross-leaf-reduce.md)。
 - **M2（B race）**：✅ 已落地。`ctx.race` best-of-N 早退/取消原语 + `_race_types`（`RaceCandidate`/`RaceResult`）+ `race_key`（content-hash journal，namespaced + win_tag-folded）+ `SpanKind.RACE`；两值类型经包根导出 + `run_script` 命名空间注入；SKILL.md 增补 race quality / parallel-vs-race / win_tag footgun 范式；`examples/13` AI-SRE 多假设 race demo。真流式与混合 schema race 为明确非目标；**E（批处理人体工学）已拆出为自己的后续里程碑（待写）。** Codex 跨模型评审驱动两处修复：replay 改记 winner 的 leaf-key（杜绝与后续相同 `agent()` 调用的预算双计）、teardown 的 depth/任务创建移入 `try`（对齐 `parallel`/`pipeline`），全门 347 passed。Plan = [`02-b-journaled-race.md`](02-b-journaled-race.md)。
 - **M3.5（多并行 run 可观测性）**：✅ 已落地（fast-follow，先于 M3）。聚合 `runs` 命令（`BgRunManager.list_runs` → `RunSnapshot` 只读快照，工具 join workflow label）+ `workflow_runs` 落定刷新（`merge_workflow_runs` reducer 按 `run_id` upsert，`abefore_model` 落定改写终态）+ quota 接线去歧义（**偏离调研字面建议**:不往 `create_workflow_tool` 加 `max_concurrent_runs`——它不构造 manager,加了要么被忽略要么双源;改为 `create_workflow_middleware` 在显式 `manager` + `max_concurrent_runs` 同传时抛 `ValueError`,quota 归 `BgRunManager`)。`examples/14` host 多-run 聚合视图 demo + 集成测试。Plan = [`03-m3.5-run-observability.md`](03-m3.5-run-observability.md)。
+- **M3（D 跨会话持久）**：✅ 已落地（超集 CC）。`WorkflowRunStore` 协议 + `RunSpec`（携规范 `journal_run_id` 谱系）+ `InMemoryRunStore`（默认、零依赖）+ `SqliteWorkflowStore`（`[sqlite]` extra：一个统一 sqlite db 文件、run_id 命名空间化四表 `run_specs`/`journal_records`/`journal_sequence`/`journal_progress`，外加第二条连接上的持久 `AsyncSqliteSaver` checkpointer），包根 lazy 导出、base 安装保持零依赖。头条——**全新进程指向同一 db 文件按 `run_id` resume、完成叶从持久 journal 零模型成本重放**——已交付且真模型 + 真子进程 E2E 钉死（journal 交付零成本、checkpointer 是 durable add-on）。评审驱动的硬化：journal-lineage 规范 id（`journal_run_id` 同 key journal 谱系与 checkpoint thread，host thread 仅 key manager slot，distinct run 不撞、resume 重接原 thread）、per-run checkpoint thread、save-before-start（spec 先于 `manager.start` 持久、quota 拒入则 `delete_spec` 回滚）、schema-version guard（`PRAGMA user_version` fail-loud on incompatible）、strict-msgpack 诚实（叶子状态保持 msgpack-friendly）。Plan = [`04-m3-cross-session-persistence.md`](04-m3-cross-session-persistence.md)。
 - **M1.5（多阶段 / 并行-run 作者范式，doc-only）**：**待写**。补 SKILL.md 多阶段脚本结构 / scout-then-fan-out / host 多并行 run 范式 + 作者陷阱;搭后续顺风车。
-- **M3–M7**：roadmap 已排定，impl plan 逐里程碑增补。E（批处理人体工学）从 M2 拆出，作后续里程碑待写。
+- **M4–M7**：roadmap 已排定，impl plan 逐里程碑增补。E（批处理人体工学）从 M2 拆出，作后续里程碑待写。
 
-> **执行序列：** M1 F → M2 B(race) →〔M3.5 多并行 run 可观测性 + M1.5 doc-only，轻量 fast-follow，可先于 M3〕→ M3 D → M4 C → M5 A → M6 I → M7 H（E 批处理人体工学已从 M2 拆出，作后续里程碑待写）。F 首刀（接 G1+G4，纯编排层最干净）；B 紧随修核心原语；M3.5/M1.5 收口需求②并点亮需求①已有能力；D/C 走超集；A/I 配对成重基建 epic；H 收尾引擎机制增强（吸收需求①的命名嵌套 + DAG 残项）。
+> **执行序列：** M1 F ✅ → M2 B(race) ✅ →〔M3.5 多并行 run 可观测性 ✅ + M1.5 doc-only（待写），轻量 fast-follow，可先于 M3〕→ M3 D ✅ → M4 C → M5 A → M6 I → M7 H（E 批处理人体工学已从 M2 拆出，作后续里程碑待写）。F 首刀（接 G1+G4，纯编排层最干净）；B 紧随修核心原语；M3.5/M1.5 收口需求②并点亮需求①已有能力；D 已落地（跨进程零成本 resume，超集 CC）；C 承 M3 持久化走超集；A/I 配对成重基建 epic；H 收尾引擎机制增强（吸收需求①的命名嵌套 + DAG 残项）。

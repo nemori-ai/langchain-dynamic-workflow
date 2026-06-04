@@ -20,8 +20,12 @@ flowchart TB
   subgraph DEV["开发者 build-time 接线(非 agent 面)"]
     RW["«facade» run_workflow(script, *, roster, config)"]
     RO["Roster (CompiledSubAgent 注册表)"]
+    ST["«WorkflowRunStore» run 注册表 + per-run journal<br/>InMemoryRunStore (默认, 零依赖) /<br/>SqliteWorkflowStore (M3, [sqlite] extra)"]
   end
   BG -- asyncio.create_task --> RW
+  BG -- "save_spec/load_spec/journal_for (run_id)" --> ST
+  ST -. "journal_for(canonical run_id)" .-> JN
+  ST -. "SqliteWorkflowStore.checkpointer (第二连接)" .-> EP
   subgraph ENG["«subsystem» Engine L0/L1 (agent 不可见)"]
     CTX["Ctx primitives<br/>agent/parallel/pipeline/phase/log/budget"]
     JN["Journal content-hash, success-only"]
@@ -46,3 +50,7 @@ flowchart TB
 
 - **host 面后台 tool 包装**(MW):让 host agent 不被 `run_workflow` 阻塞。
 - **引擎内部 durable execution**(ENG):`@task`/parallel/journal/sandbox,在 `run_workflow` 内部、与 host middleware 不同 scope。
+
+## 跨会话持久化（M3）
+
+`WorkflowRunStore`(DEV 子图)是 workflow tool 的 run 注册表持久化边界:默认 `InMemoryRunStore`(零依赖、同会话);`SqliteWorkflowStore`(`[sqlite]` extra)用一个统一 sqlite db 文件 + **两条连接**——autocommit store 连接背 registry + per-run journal、第二条连接背持久 `AsyncSqliteSaver` checkpointer。**零成本重放由持久 journal 交付**(checkpointer 是 durable add-on)。per-run 规范 id(`journal_run_id`)同 key journal 谱系与 checkpoint thread;host thread 仅 key manager slot。详见 [01 §13b](../01-engine-mechanism.md)、接线见 [02 §10](../02-architecture.md)。

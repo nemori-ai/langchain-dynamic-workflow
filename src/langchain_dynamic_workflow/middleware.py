@@ -29,6 +29,7 @@ from langgraph.runtime import Runtime
 
 from ._background import BgRunManager, BgStatus, Notice
 from ._roster import Roster
+from ._run_store import WorkflowRunStore
 from ._workflows import WorkflowRegistry
 from .tool import create_workflow_tool
 
@@ -130,6 +131,9 @@ class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
         checkpointer: Optional checkpointer forwarded to launched runs.
         max_concurrency: Optional concurrency cap forwarded to launched runs.
         budget: Optional shared token ceiling forwarded to launched runs.
+        store: Optional run registry forwarded to the workflow tool; defaults to
+            the tool's in-memory store. Inject a sqlite-backed store to make
+            ``resume`` survive a process restart.
     """
 
     state_schema = WorkflowState
@@ -143,6 +147,7 @@ class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
         checkpointer: BaseCheckpointSaver[Any] | None = None,
         max_concurrency: int | None = None,
         budget: int | None = None,
+        store: WorkflowRunStore | None = None,
     ) -> None:
         super().__init__()
         self._manager = manager
@@ -154,6 +159,7 @@ class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
                 checkpointer=checkpointer,
                 max_concurrency=max_concurrency,
                 budget=budget,
+                store=store,
             )
         ]
 
@@ -211,6 +217,7 @@ def create_workflow_middleware(
     max_concurrency: int | None = None,
     max_concurrent_runs: int | None = None,
     budget: int | None = None,
+    store: WorkflowRunStore | None = None,
 ) -> WorkflowMiddleware:
     """Build the workflow middleware (tool + completion-notice injection).
 
@@ -231,6 +238,9 @@ def create_workflow_middleware(
             the ``run`` command refuses with a clear message rather than launching
             unbounded.
         budget: Optional shared token ceiling forwarded to launched runs.
+        store: Optional run registry forwarded to the workflow tool; defaults to the
+            tool's in-memory store. Inject a sqlite-backed store to make ``resume``
+            survive a process restart.
 
     Returns:
         A :class:`WorkflowMiddleware` contributing the workflow tool and injecting
@@ -257,4 +267,5 @@ def create_workflow_middleware(
         checkpointer=checkpointer,
         max_concurrency=max_concurrency,
         budget=budget,
+        store=store,
     )
