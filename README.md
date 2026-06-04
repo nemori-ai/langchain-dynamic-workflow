@@ -44,11 +44,11 @@ Reach for it when a task is **fan-out heavy** (research N angles, grade M candid
 
 - **Deterministic control flow** — loops, branching, and fan-out live in code, not in the model's head.
 - **Context quarantine** — each leaf runs in a fresh, discarded deepagents context; only its folded result returns.
-- **Parallel and pipeline fan-out** — `parallel()` (blocking barrier) and `pipeline()` (no-barrier streaming) over a shared concurrency gate.
+- **Parallel, pipeline, and race fan-out** — `parallel()` (blocking barrier), `pipeline()` (no-barrier streaming), and `race()` (best-of-N early exit: the first result satisfying `win` wins, in-flight losers are cancelled, the decision is journaled so resume reproduces the winner) over a shared concurrency gate.
 - **Resumable by content hash** — a success-only journal replays completed leaves on resume at zero model cost.
 - **Fail-loud determinism guard** — a replay whose `agent()` call sequence diverges raises rather than serving a positionally misaligned cache entry.
 - **Shared token budget** — one ceiling across every leaf, with a `loop-until-budget` idiom.
-- **Observability by default** — every `agent` / `parallel` / `pipeline` call emits a span to an opt-in sink (zero cost when unset).
+- **Observability by default** — every `agent` / `parallel` / `pipeline` / `race` call emits a span to an opt-in sink (zero cost when unset).
 - **Per-leaf sandbox isolation** — execution leaves lease isolated backends; a `/shared/` route enables explicit producer→consumer hand-off.
 - **Meta layer** — a host agent authors an orchestration script at runtime; an AST gate validates it before a single restricted `exec`.
 - **Strict engineering** — Python 3.12, async-first, pyright `strict`, and Layer 0/1/2 boundaries enforced by import-linter.
@@ -58,7 +58,7 @@ Reach for it when a task is **fan-out heavy** (research N angles, grade M candid
 Three layers, with a one-directional dependency (Layer 2 → Layer 1 → Layer 0) that import-linter enforces mechanically:
 
 - **Layer 0 — substrate**: LangGraph durable execution (`@entrypoint` + `@task` + checkpointer). Provides resume, replay, and cached-result skip.
-- **Layer 1 — orchestration runtime**: the primitives — `agent()`, `parallel()` (barrier), `pipeline()` (no barrier), `phase()`, `log()`, `budget`, `workflow()` — plus the two patches LangGraph lacks: a **content-hash journal** (LangGraph's native cache is index-based) and a **fail-loud determinism guard** (LangGraph treats determinism as convention).
+- **Layer 1 — orchestration runtime**: the primitives — `agent()`, `parallel()` (barrier), `pipeline()` (no barrier), `race()` (best-of-N early exit), `phase()`, `log()`, `budget`, `workflow()` — plus the two patches LangGraph lacks: a **content-hash journal** (LangGraph's native cache is index-based) and a **fail-loud determinism guard** (LangGraph treats determinism as convention).
 - **Layer 2 — meta layer**: an LLM authors a Python orchestration script; an **AST gate** validates it (no imports, dunders, or banned names) before a restricted-builtins `exec`.
 
 Leaf `agent()` calls resolve a named deepagent from a **registry (roster)** and invoke it as a `@task`, reusing deepagents' context quarantine and sandbox backends.
@@ -169,9 +169,10 @@ The stable, public surface is exported from the package root and follows semanti
 - **Meta layer** — `compile_workflow_source` / `run_workflow_from_source` / `extract_meta`: compile and run an LLM-authored source string through the AST gate.
 - **Registries** — `Roster` / `RosterEntry`, `WorkflowRegistry`.
 - **Host-facing** — `create_workflow_tool`, `create_workflow_middleware`, `skills_path` / `skill_files`.
-- **Primitives** — exposed on the `Ctx` handed to your script: `agent` / `parallel` / `pipeline` / `phase` / `log` / `budget` / `workflow`.
+- **Primitives** — exposed on the `Ctx` handed to your script: `agent` / `parallel` / `pipeline` / `race` / `phase` / `log` / `budget` / `workflow`. `ctx.race(candidates, *, win, win_tag="")` runs `RaceCandidate` specs concurrently and returns a `RaceResult` for the first whose result satisfies `win`, cancelling the rest; the decision is journaled (content-hash, `win_tag`-keyed) so resume reproduces the winner and dispatches nothing.
 - **Cross-leaf reduce** — pure helpers that fold the result lists `parallel` / `pipeline` hand back: `survives` (refute-by-default vote), `dedup`, `reconcile` (dual-blind reviewer reconciliation), `corroborate` (cross-leaf corroboration), plus the `ReviewItem` / `Reconciled` / `Consensus` result types. Also injected into the `run_script` namespace, so a host-authored script calls them by name without an import.
-- **Types and errors** — `Budget`, `JournalStore` / `InMemoryJournalStore` / `JournalRecord`, `SandboxManager`, `Span` / `SpanKind` / `SpanSink`, the `BgRunManager` family, and the `Workflow*Error` exceptions (including `WorkflowScriptError`).
+- **Race value types** — `RaceCandidate` (one content-hashable agent-call spec, mirroring an `agent()` call) and `RaceResult` (the winner, its index, and `.won`). Both are injected into the `run_script` namespace, so a host-authored script constructs and reads them by name without an import.
+- **Types and errors** — `Budget`, `JournalStore` / `InMemoryJournalStore` / `JournalRecord` / `race_key`, `SandboxManager`, `Span` / `SpanKind` / `SpanSink`, the `BgRunManager` family, and the `Workflow*Error` exceptions (including `WorkflowScriptError`).
 
 Public signatures are stable; new parameters are added keyword-only with defaults. Names prefixed with `_` (modules and members) are internal and may change without notice.
 

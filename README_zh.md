@@ -44,11 +44,11 @@
 
 - **确定性控制流** —— 循环、分支、扇出写在代码里，而非模型脑中。
 - **上下文隔离** —— 每个叶子跑在全新、用完即弃的 deepagents 上下文里，只回吐折叠后的结果。
-- **parallel 与 pipeline 扇出** —— `parallel()`（阻塞 barrier）与 `pipeline()`（无 barrier 流式），共享一道并发闸门。
+- **parallel、pipeline 与 race 扇出** —— `parallel()`（阻塞 barrier）、`pipeline()`（无 barrier 流式）与 `race()`（best-of-N 早退：首个令 `win` 为真者胜、在飞 loser 全数 cancel、决策内容哈希 journal 故 resume 复现胜者），共享一道并发闸门。
 - **按内容哈希续跑** —— success-only 的 journal 在续跑时以零模型成本重放已完成的叶子。
 - **fail-loud 确定性 guard** —— 重放时 `agent()` 调用序列一旦分叉即抛错，绝不喂回错位的缓存。
 - **共享 token 预算** —— 一道上限管住所有叶子，配套 `loop-until-budget` 范式。
-- **默认可观测** —— 每个 `agent` / `parallel` / `pipeline` 调用都向可选 sink 发一个 span（不接 sink 时零成本）。
+- **默认可观测** —— 每个 `agent` / `parallel` / `pipeline` / `race` 调用都向可选 sink 发一个 span（不接 sink 时零成本）。
 - **per-leaf sandbox 隔离** —— 执行类叶子各租一个隔离 backend，`/shared/` 路由支持显式的 producer→consumer 交接。
 - **meta 层** —— host agent 运行时当场写编排脚本，经 AST gate 校验后才进入单点受限 `exec`。
 - **工程从严** —— Python 3.12、async-first、pyright `strict`，Layer 0/1/2 边界由 import-linter 机械守护。
@@ -58,7 +58,7 @@
 三层，依赖单向（Layer 2 → Layer 1 → Layer 0），由 import-linter 机械守护：
 
 - **Layer 0 —— 底座**：LangGraph 持久化执行（`@entrypoint` + `@task` + checkpointer），自带续跑、重放、命中缓存跳过。
-- **Layer 1 —— 编排运行时**：核心原语 —— `agent()`、`parallel()`（barrier）、`pipeline()`（无 barrier）、`phase()`、`log()`、`budget`、`workflow()` —— 外加两个 LangGraph 缺失的补丁：**内容哈希 journal**（原生缓存是 index-based）与 **fail-loud 确定性 guard**（原生把确定性当约定而非不变量）。
+- **Layer 1 —— 编排运行时**：核心原语 —— `agent()`、`parallel()`（barrier）、`pipeline()`（无 barrier）、`race()`（best-of-N 早退）、`phase()`、`log()`、`budget`、`workflow()` —— 外加两个 LangGraph 缺失的补丁：**内容哈希 journal**（原生缓存是 index-based）与 **fail-loud 确定性 guard**（原生把确定性当约定而非不变量）。
 - **Layer 2 —— meta 层**：由 LLM 编写 Python 编排脚本；进入受限 builtins 的 `exec` 之前，先经 **AST gate** 校验（禁 import、dunder、禁用名）。
 
 叶子 `agent()` 调用从一个**命名注册表（roster）**中解析出对应的 deepagent，并作为 `@task` 调起，复用 deepagents 的上下文隔离与 sandbox backend。
@@ -168,9 +168,10 @@ LDW_DEMO_REAL_MODEL=anthropic/claude-opus-4.8 uv run python examples/07_deep_res
 - **meta 层** —— `compile_workflow_source` / `run_workflow_from_source` / `extract_meta`：把 LLM 当场写的源码经 AST gate 编译并运行。
 - **注册表** —— `Roster` / `RosterEntry`、`WorkflowRegistry`。
 - **host 面** —— `create_workflow_tool`、`create_workflow_middleware`、`skills_path` / `skill_files`。
-- **原语** —— 挂在传给脚本的 `Ctx` 上：`agent` / `parallel` / `pipeline` / `phase` / `log` / `budget` / `workflow`。
+- **原语** —— 挂在传给脚本的 `Ctx` 上：`agent` / `parallel` / `pipeline` / `race` / `phase` / `log` / `budget` / `workflow`。`ctx.race(candidates, *, win, win_tag="")` 把若干 `RaceCandidate` 并发跑起，返回第一个令 `win` 为真者的 `RaceResult`，其余 cancel；决策内容哈希 journal（`win_tag` 折进 key），故 resume 复现胜者且零派发。
 - **跨叶归约** —— 折叠 `parallel` / `pipeline` 返回的结果列表的纯函数：`survives`（refute-by-default 投票）、`dedup`、`reconcile`（双盲复核调解）、`corroborate`（跨叶相互印证），外加 `ReviewItem` / `Reconciled` / `Consensus` 结果类型。同时注入 `run_script` 命名空间——host 当场写的脚本无需 import 即可按名调用。
-- **类型与异常** —— `Budget`、`JournalStore` / `InMemoryJournalStore` / `JournalRecord`、`SandboxManager`、`Span` / `SpanKind` / `SpanSink`、`BgRunManager` 家族，以及 `Workflow*Error` 系列异常（含 `WorkflowScriptError`）。
+- **race 值类型** —— `RaceCandidate`（一份可内容哈希的 agent 调用规格，镜像 `agent()` 调用）与 `RaceResult`（胜者、其下标、`.won`）。两者同样注入 `run_script` 命名空间——host 当场写的脚本无需 import 即可按名构造和读取。
+- **类型与异常** —— `Budget`、`JournalStore` / `InMemoryJournalStore` / `JournalRecord` / `race_key`、`SandboxManager`、`Span` / `SpanKind` / `SpanSink`、`BgRunManager` 家族，以及 `Workflow*Error` 系列异常（含 `WorkflowScriptError`）。
 
 公开签名稳定；新增参数一律 keyword-only 带默认值。以 `_` 开头的模块和成员属于内部实现，可能随时变动。
 

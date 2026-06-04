@@ -63,3 +63,21 @@ def test_default_recorder_is_a_silent_noop() -> None:
     with recorder.span(SpanKind.PIPELINE, "refine") as span:
         span.set("item_count", 3)
     # No sink, no collection, no error — the recorder is a clean no-op.
+
+
+def test_recorder_emits_a_race_span() -> None:
+    emitted: list[Span] = []
+    recorder = SpanRecorder(sink=emitted.append)
+
+    with recorder.span(SpanKind.RACE, "high-confidence-root-cause") as span:
+        span.set("candidate_count", 4)
+        span.set("replayed", False)
+        span.set("won", True)
+        span.set("winner_index", 1)
+
+    assert len(emitted) == 1
+    completed = emitted[0]
+    assert completed.kind == SpanKind.RACE
+    assert completed.attributes["candidate_count"] == 4
+    assert completed.attributes["won"] is True
+    assert completed.attributes["winner_index"] == 1

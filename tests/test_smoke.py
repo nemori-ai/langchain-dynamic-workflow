@@ -30,3 +30,11 @@ def test_reduce_helpers_exported_from_package_root() -> None:
     ):
         assert name in ldw.__all__, f"{name} missing from __all__"
         assert hasattr(ldw, name), f"{name} not importable from the package root"
+
+
+def test_race_surface_exported_from_package_root() -> None:
+    import langchain_dynamic_workflow as ldw
+
+    for name in ("RaceCandidate", "RaceResult", "race_key"):
+        assert name in ldw.__all__, f"{name} missing from __all__"
+        assert hasattr(ldw, name), f"{name} not importable from the package root"
