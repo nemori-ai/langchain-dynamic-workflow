@@ -19,7 +19,6 @@ a strictly different scope inside ``run_workflow``.
 
 from __future__ import annotations
 
-import operator
 from typing import Annotated, Any, NotRequired
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
@@ -37,16 +36,49 @@ WORKFLOW_NOTIFICATION_TAG = "workflow_notification"
 """The XML-ish tag wrapping an injected background-run completion notice."""
 
 
+def _merge_workflow_runs(
+    existing: list[dict[str, Any]] | None, incoming: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Reducer for the ``workflow_runs`` channel: upsert records by ``run_id``.
+
+    A launch writes ``{run_id, workflow, status: running}``; a later settle update
+    writes ``{run_id, status: <terminal>}``. Merging field-wise by ``run_id``
+    (rather than appending) keeps one record per run whose status tracks its
+    lifecycle, so the channel reflects the terminal status instead of staying at
+    the launch-time ``running``. First-seen order is preserved; a record for an
+    unseen ``run_id`` appends.
+
+    Args:
+        existing: The accumulated records (``None`` / empty on the first write).
+        incoming: The records to merge in.
+
+    Returns:
+        The merged records, one per ``run_id``, in first-seen order.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for record in existing or []:
+        run_id = record.get("run_id")
+        if isinstance(run_id, str):
+            merged[run_id] = dict(record)
+    for record in incoming or []:
+        run_id = record.get("run_id")
+        if not isinstance(run_id, str):
+            continue
+        merged[run_id] = {**merged[run_id], **record} if run_id in merged else dict(record)
+    return list(merged.values())
+
+
 class WorkflowState(AgentState):
     """Host agent state extended with a background-run tracking channel.
 
     Attributes:
         workflow_runs: Launched background runs (each a record carrying its
-            ``run_id`` / ``workflow`` / ``status``), accumulated across turns so
-            the record survives context compaction.
+            ``run_id`` / ``workflow`` / ``status``), upserted by ``run_id`` across
+            turns so the record survives context compaction and its status is
+            rewritten from ``running`` to the run's terminal status on settle.
     """
 
-    workflow_runs: NotRequired[Annotated[list[dict[str, Any]], operator.add]]
+    workflow_runs: NotRequired[Annotated[list[dict[str, Any]], _merge_workflow_runs]]
 
 
 def _host_thread_id(config: RunnableConfig | None) -> str:
@@ -155,7 +187,15 @@ class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
         notices = self._manager.drain_notifications(thread_id)
         if not notices:
             return None
-        return {"messages": [HumanMessage(content=_render_notification(notices))]}
+        # Besides injecting the notification, rewrite each settled run's record from
+        # the launch-time `running` to its terminal status. The channel reducer
+        # (_merge_workflow_runs) upserts these by run_id, so workflow_runs reflects
+        # the live outcome instead of a stale `running`.
+        settle_updates = [{"run_id": n.run_id, "status": n.status.value} for n in notices]
+        return {
+            "messages": [HumanMessage(content=_render_notification(notices))],
+            "workflow_runs": settle_updates,
+        }
 
 
 def create_workflow_middleware(
