@@ -30,9 +30,17 @@ from ._context import Ctx, LeafOutcome, WorkflowResolver
 from ._determinism import CallSequenceGuard
 
 # Re-exported on the engine's public core entry so the host-facing surface
-# (tool / middleware) constructs per-run journal stores through `run_workflow`'s
-# module rather than reaching directly into the engine-internal `_journal`.
-from ._journal import InMemoryJournalStore, JournalStore
+# (tool / middleware / persistence) constructs per-run journal stores and reads
+# journal records through `run_workflow`'s module rather than reaching directly
+# into the engine-internal `_journal`. ``JournalRecord`` is re-exported here so a
+# Layer-2 persistent store can type its rows against the public wall.
+from ._journal import (
+    InMemoryJournalStore,
+    JournalStore,
+)
+from ._journal import (
+    JournalRecord as JournalRecord,  # re-exported for Layer-2 persistence on the public wall
+)
 from ._observability import SpanRecorder, SpanSink
 from ._progress import ProgressEntry, ProgressLog, ProgressSink
 from ._roster import Roster
@@ -138,7 +146,20 @@ async def run_workflow(
         needs_execution: bool,
         response_format: Any = None,
         isolation: str = "shared",
-    ) -> LeafOutcome:
+    ) -> dict[str, Any]:
+        # A durable @task return crosses the checkpointer, whose serializer
+        # round-trips built-in containers (and the registered LangChain message
+        # types nested in the leaf state) but only revives a custom class through
+        # a deprecated unregistered-type path that newer serializers block. So
+        # this task returns the LeafOutcome's msgpack-native payload mapping; the
+        # caller rebuilds the typed LeafOutcome, keeping the engine's public
+        # behavior identical. The strict-safe shape covers the wrapper and the
+        # registered (message/container) state only: a structured-output leaf's
+        # state['structured_response'] is an unregistered user pydantic model that
+        # degrades to a plain dict under strict msgpack. That is a documented
+        # serialization boundary, not a replay defect — the zero-cost replay reads
+        # the content-hash journal (which stores the folded result string), never
+        # this checkpoint state, so the degraded model never reaches the script.
         roster.resolve(agent_type)  # fail fast on unknown agent_type
         # Resolve the runnable bound to the requested response_format: a schema-less
         # call (response_format=None) gets the schema-less variant; a schema call
@@ -160,7 +181,7 @@ async def run_workflow(
             # so the override is a consistent cache-partitioning knob in either case.
             configurable["model"] = model
 
-        async def _invoke() -> LeafOutcome:
+        async def _invoke() -> dict[str, Any]:
             leaf_config: RunnableConfig = {
                 "callbacks": [usage_handler],
                 "configurable": configurable,
@@ -168,7 +189,9 @@ async def run_workflow(
             state: dict[str, Any] = await runnable.ainvoke(
                 {"messages": [HumanMessage(content=prompt)]}, config=leaf_config
             )
-            return LeafOutcome(state=state, usage=total_tokens_from_handler(usage_handler))
+            return LeafOutcome(
+                state=state, usage=total_tokens_from_handler(usage_handler)
+            ).to_payload()
 
         if sandbox_manager is None:
             # No sandbox admission configured: invoke the leaf directly without
@@ -211,8 +234,10 @@ async def run_workflow(
     ) -> LeafOutcome:
         # The single durable leaf path, shared by agent / parallel / pipeline.
         # The shared gate (applied inside Ctx) bounds how many of these run at
-        # once across every fan-out path in this run.
-        return await leaf_task(
+        # once across every fan-out path in this run. The task returns the
+        # checkpointer-safe payload mapping; rebuild the typed LeafOutcome here so
+        # the context layer keeps working with .state / .usage unchanged.
+        payload = await leaf_task(
             agent_type,
             prompt,
             model,
@@ -221,6 +246,7 @@ async def run_workflow(
             response_format=response_format,
             isolation=isolation,
         )
+        return LeafOutcome.from_payload(payload)
 
     recorded_sequence = await journal_store.get_sequence()
     delivered_progress = await journal_store.get_progress_count()

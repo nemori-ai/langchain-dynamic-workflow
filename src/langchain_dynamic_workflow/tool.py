@@ -16,6 +16,8 @@ resolves named workflows through a
 
 from __future__ import annotations
 
+import dataclasses
+import uuid
 from typing import Any, Literal
 
 from langchain_core.messages import ToolMessage
@@ -32,13 +34,18 @@ from ._background import BgRunManager, BgRunQuotaExceededError, BgStatus
 # source string through them. They never reach the engine internals directly.
 from ._codegen import compile_workflow_source, extract_meta
 
-# Journal-store types are imported from the engine's public core entry (not the
+# The journal-store type is imported from the engine's public core entry (not the
 # internal `_journal`) so the host-facing tool depends only on the `run_workflow`
 # surface, preserving the one-directional Layer 2 -> Layer 0/1 boundary that
 # import-linter mechanically guards.
-from ._engine import InMemoryJournalStore, JournalStore, run_workflow
+from ._engine import JournalStore, run_workflow
 from ._errors import WorkflowScriptError
 from ._roster import Roster
+
+# The run registry (spec persistence + per-run journals) is injected as a
+# WorkflowRunStore; the in-memory default keeps the base install dependency-free
+# while a sqlite-backed store extends durability across process restarts.
+from ._run_store import InMemoryRunStore, RunSpec, WorkflowRunStore
 from ._workflows import WorkflowFn, WorkflowRegistry
 
 # The tool is agnostic to the host's concrete context/state types, so the runtime
@@ -58,7 +65,7 @@ class WorkflowToolSchema(BaseModel):
     is never advertised to the model; the model supplies only these fields.
     """
 
-    command: Literal["run", "run_script", "status", "resume", "cancel"] = Field(
+    command: Literal["run", "run_script", "status", "resume", "cancel", "runs"] = Field(
         description="Which workflow operation to perform."
     )
     workflow: str | None = Field(
@@ -101,6 +108,9 @@ Commands (pass `command`):
 - `resume`: given a finished or interrupted `run_id`, re-run the same workflow
     against its journal so completed steps replay at zero cost. Returns a new run.
 - `cancel`: given a `run_id`, stop an in-flight run.
+- `runs`: list every run you launched on this thread with its workflow label and
+    live status (and a short outcome preview once settled), so you can see all of
+    them at once instead of polling each `run_id`. Takes no arguments.
 """
 
 
@@ -120,6 +130,7 @@ def create_workflow_tool(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     max_concurrency: int | None = None,
     budget: int | None = None,
+    store: WorkflowRunStore | None = None,
 ) -> StructuredTool:
     """Build the multi-command background workflow tool for a host agent.
 
@@ -133,18 +144,20 @@ def create_workflow_tool(
         checkpointer: Optional LangGraph checkpointer for launched runs.
         max_concurrency: Optional explicit concurrency cap forwarded to runs.
         budget: Optional shared token ceiling forwarded to runs.
+        store: Optional run registry persisting each launch's spec and per-run
+            journal. Defaults to a fresh :class:`InMemoryRunStore` (dependency-free,
+            same-session only); inject a sqlite-backed store to make ``resume``
+            survive a process restart.
 
     Returns:
         A :class:`StructuredTool` exposing the ``run`` / ``status`` / ``resume`` /
         ``cancel`` commands.
     """
-    # Per-run journals so `resume` can re-run a workflow against the journal its
-    # first run populated — completed leaves replay from cache at zero model cost.
-    journals: dict[str, JournalStore] = {}
-    # How each run can be re-launched on `resume`, as a tagged spec
-    # ``(kind, name_or_source, args)`` where ``kind`` is "name" (a registered
-    # workflow re-resolved by name) or "script" (an ad-hoc source recompiled).
-    run_specs: dict[str, tuple[str, str, dict[str, Any]]] = {}
+    # The run registry persists each launch's spec (so `resume` can rebuild the
+    # original callable, label, and thread) and hands out a per-run journal (so
+    # completed leaves replay from cache at zero model cost). The default is the
+    # in-memory store; a sqlite-backed store extends both across a process restart.
+    run_store = store if store is not None else InMemoryRunStore()
 
     def _label_for_script(source: str) -> str:
         """Best-effort run label from a script's optional top-level ``meta['name']``."""
@@ -158,28 +171,71 @@ def create_workflow_tool(
                 return name
         return "ad-hoc-script"
 
-    def _resolve_spec(spec: tuple[str, str, dict[str, Any]]) -> tuple[WorkflowFn, dict[str, Any]]:
-        """Rebuild a run's orchestration callable + args from its resume spec.
+    def _resolve_spec(spec: RunSpec) -> WorkflowFn:
+        """Rebuild a run's orchestration callable from its persisted spec.
 
-        A "name" spec re-resolves the registered workflow; a "script" spec
+        A ``"name"`` spec re-resolves the registered workflow; a ``"script"`` spec
         recompiles the persisted source (it passed the gate on first launch, so the
         recompile succeeds), realizing "the callable is transient, the source is
         durable".
         """
-        kind, name_or_source, args = spec
-        if kind == "script":
-            return compile_workflow_source(name_or_source), args
-        return workflows.resolve(name_or_source), args
+        if spec.kind == "script":
+            return compile_workflow_source(spec.name_or_source)
+        return workflows.resolve(spec.name_or_source)
 
-    def _launch(
+    async def _launch(
         *,
         workflow_fn: WorkflowFn,
-        args: dict[str, Any],
-        spec: tuple[str, str, dict[str, Any]],
-        thread_id: str,
-        journal: JournalStore,
+        spec: RunSpec,
+        host_thread_id: str,
     ) -> str:
-        """Detach a workflow run onto the background manager; return its run_id."""
+        """Detach a workflow run onto the background manager; return its run_id.
+
+        The run id is minted up front (before ``manager.start``) so the spec and the
+        manager slot are both keyed by the *same* id, keeping the registry
+        consistent for a later (possibly cross-process) ``resume``.
+
+        Identity is split deliberately. The ``host_thread_id`` is the current
+        caller's thread; it keys the background manager slot so the caller who
+        issued the launch can poll its run. The canonical origin id — the spec's
+        ``journal_run_id`` when set, else this run's own freshly minted id — keys
+        both the per-run journal (so a resume replays completed leaves for free)
+        and the per-run LangGraph checkpoint thread (so a resume rejoins its
+        checkpoint), independent of the host thread. A fresh launch stamps its own
+        id as the canonical origin on the saved spec; a resume inherits the
+        origin from the spec it relaunches.
+
+        The spec is persisted *before* the run is admitted to the manager, so a
+        crash between admission and save can never strand a run with no spec. If
+        admission is refused at the concurrency quota, the pre-saved spec is
+        deleted so the refusal leaves no unresumable orphan.
+
+        Args:
+            workflow_fn: The orchestration callable to run.
+            spec: The launch description persisted under the new run id.
+            host_thread_id: The current caller's host thread; keys the background
+                manager slot so the caller can poll the launched run.
+
+        Returns:
+            The newly minted run id.
+
+        Raises:
+            BgRunQuotaExceededError: If admission is refused at the concurrency
+                quota; the pre-saved spec is deleted before the error propagates.
+        """
+        run_id = uuid.uuid4().hex
+        # The canonical origin id keys both the journal and the checkpoint thread.
+        # A resume inherits it from the spec; a fresh launch adopts its own run id.
+        canonical = spec.journal_run_id or run_id
+        spec_to_save = (
+            spec if spec.journal_run_id else dataclasses.replace(spec, journal_run_id=run_id)
+        )
+        # The per-run journal must be obtained before the coroutine starts so the
+        # launched run records into the same journal a resume will replay from. A
+        # resume points this at the origin run's journal; a fresh launch uses its
+        # own (still-empty) journal keyed by its own id.
+        journal: JournalStore = run_store.journal_for(canonical)
+        args = spec.args
 
         async def _orchestrate(ctx: Any) -> Any:
             return await workflow_fn(ctx, args)
@@ -190,7 +246,10 @@ def create_workflow_tool(
                 roster=roster,
                 journal=journal,
                 checkpointer=checkpointer,
-                thread_id=thread_id,
+                # The CHECKPOINT thread is the per-run canonical id, not the host
+                # thread, so distinct runs on one host thread never collapse onto
+                # one checkpoint thread and a resume rejoins the origin's thread.
+                thread_id=canonical,
                 max_concurrency=max_concurrency,
                 budget=budget,
                 # Wire the same registry so a launched workflow may inline another
@@ -199,30 +258,42 @@ def create_workflow_tool(
             )
             return result if isinstance(result, str) else str(result)
 
-        slot = manager.start(_coro(), thread_id=thread_id)
-        journals[slot.run_id] = journal
-        run_specs[slot.run_id] = spec
-        return slot.run_id
+        # Persist the spec BEFORE admission so an admitted run always has a spec.
+        await run_store.save_spec(run_id, spec_to_save)
+        # The label travels with the manager slot so the `runs` listing can name the
+        # run authoritatively, not via this tool's bookkeeping. The slot is keyed by
+        # the current caller's host thread so the caller can poll the run.
+        try:
+            manager.start(_coro(), run_id=run_id, thread_id=host_thread_id, label=spec.label)
+        except BgRunQuotaExceededError:
+            # The run was refused before it could run: roll back the spec we saved
+            # above so a refused launch leaves no unresumable orphan in the registry.
+            await run_store.delete_spec(run_id)
+            raise
+        return run_id
 
     def _launch_record(run_id: str, *, label: str) -> dict[str, str]:
         """The ``workflow_runs`` state record for a freshly launched run."""
         return {"run_id": run_id, "workflow": label, "status": BgStatus.RUNNING.value}
 
-    def _run_command(
+    async def _run_command(
         runtime: _ToolRuntime, *, workflow: str | None, args: dict[str, Any] | None
     ) -> str | _Command:
         if not workflow:
             return "run: the 'workflow' name is required."
         if workflow not in workflows:
             return f"run: unknown workflow {workflow!r}; nothing was launched."
-        thread_id = _host_thread_id(runtime)
         try:
-            run_id = _launch(
+            run_id = await _launch(
                 workflow_fn=workflows.resolve(workflow),
-                args=args or {},
-                spec=("name", workflow, args or {}),
-                thread_id=thread_id,
-                journal=InMemoryJournalStore(),
+                spec=RunSpec(
+                    kind="name",
+                    name_or_source=workflow,
+                    args=args or {},
+                    label=workflow,
+                    journal_run_id=None,
+                ),
+                host_thread_id=_host_thread_id(runtime),
             )
         except BgRunQuotaExceededError as exc:
             # The manager's concurrent-run quota is full: surface it as a clear
@@ -242,7 +313,7 @@ def create_workflow_tool(
             }
         )
 
-    def _run_script_command(
+    async def _run_script_command(
         runtime: _ToolRuntime, *, script: str | None, args: dict[str, Any] | None
     ) -> str | _Command:
         if not script:
@@ -255,14 +326,17 @@ def create_workflow_tool(
         except WorkflowScriptError as exc:
             return f"run_script: the script was rejected and nothing was launched.\n{exc}"
         label = _label_for_script(script)
-        thread_id = _host_thread_id(runtime)
         try:
-            run_id = _launch(
+            run_id = await _launch(
                 workflow_fn=workflow_fn,
-                args=args or {},
-                spec=("script", script, args or {}),
-                thread_id=thread_id,
-                journal=InMemoryJournalStore(),
+                spec=RunSpec(
+                    kind="script",
+                    name_or_source=script,
+                    args=args or {},
+                    label=label,
+                    journal_run_id=None,
+                ),
+                host_thread_id=_host_thread_id(runtime),
             )
         except BgRunQuotaExceededError as exc:
             return f"run_script: {exc}"
@@ -301,22 +375,24 @@ def create_workflow_tool(
             )
         return f"status: run {run_id!r} done.\nresult: {result.value}"
 
-    def _resume_command(runtime: _ToolRuntime, *, run_id: str | None) -> str | _Command:
+    async def _resume_command(runtime: _ToolRuntime, *, run_id: str | None) -> str | _Command:
         if not run_id:
             return "resume: a 'run_id' is required."
-        if run_id not in run_specs:
+        spec = await run_store.load_spec(run_id)
+        if spec is None:
             return f"resume: unknown run_id {run_id!r}; nothing to resume."
-        thread_id = _host_thread_id(runtime)
-        spec = run_specs[run_id]
-        workflow_fn, args = _resolve_spec(spec)
-        label = _label_for_script(spec[1]) if spec[0] == "script" else spec[1]
-        # Re-run against the same journal so completed leaves replay from cache.
-        new_run_id = _launch(
+        workflow_fn = _resolve_spec(spec)
+        label = spec.label
+        # The spec carries the canonical origin (journal_run_id), so the relaunch
+        # rejoins the ORIGIN's journal (completed leaves replay from cache) and the
+        # ORIGIN's checkpoint thread — even when resuming a resume-issued run_id,
+        # because each saved spec inherits the same origin. The manager slot is
+        # keyed by the CURRENT caller's host thread so the caller who issued the
+        # resume can poll the new run.
+        new_run_id = await _launch(
             workflow_fn=workflow_fn,
-            args=args,
             spec=spec,
-            thread_id=thread_id,
-            journal=journals[run_id],
+            host_thread_id=_host_thread_id(runtime),
         )
         message = (
             f"Resumed {label!r} from run {run_id!r} against its journal. "
@@ -328,6 +404,25 @@ def create_workflow_tool(
                 WORKFLOW_RUNS_STATE_KEY: [_launch_record(new_run_id, label=label)],
             }
         )
+
+    def _runs_command(runtime: _ToolRuntime) -> str:
+        """List every run on the host thread with its label and live status.
+
+        The label is read from the run's own manager slot (recorded at launch), so
+        it is authoritative regardless of which tool instance launched the run; a
+        run launched outside this surface with no label renders as ``?``.
+        """
+        thread_id = _host_thread_id(runtime)
+        snapshots = manager.list_runs(thread_id)
+        if not snapshots:
+            return "runs: no runs on this thread yet."
+        lines: list[str] = []
+        for snap in snapshots:
+            line = f"- {snap.run_id} · {snap.label or '?'} · {snap.status.value}"
+            if snap.summary:
+                line += f" · {snap.summary}"
+            lines.append(line)
+        return f"runs: {len(snapshots)} run(s) on this thread:\n" + "\n".join(lines)
 
     async def _cancel_command(runtime: _ToolRuntime, *, run_id: str | None) -> str:
         if not run_id:
@@ -353,18 +448,20 @@ def create_workflow_tool(
         part of the model-facing schema.
         """
         if command == "run":
-            return _run_command(runtime, workflow=workflow, args=args)
+            return await _run_command(runtime, workflow=workflow, args=args)
         if command == "run_script":
-            return _run_script_command(runtime, script=script, args=args)
+            return await _run_script_command(runtime, script=script, args=args)
         if command == "status":
             return _status_command(runtime, run_id=run_id)
         if command == "resume":
-            return _resume_command(runtime, run_id=run_id)
+            return await _resume_command(runtime, run_id=run_id)
         if command == "cancel":
             return await _cancel_command(runtime, run_id=run_id)
+        if command == "runs":
+            return _runs_command(runtime)
         return (
             f"unknown command {command!r}; expected one of: "
-            "run, run_script, status, resume, cancel."
+            "run, run_script, status, resume, cancel, runs."
         )
 
     # Under ``from __future__ import annotations`` the ``runtime`` annotation is a

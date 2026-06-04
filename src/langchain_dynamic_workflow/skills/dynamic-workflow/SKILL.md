@@ -55,6 +55,15 @@ correct one yourself.
   `(prev_result, original_item, index) -> next_result`. A stage that raises drops
   that item to `None` and skips its remaining stages. Results come back in input
   order.
+- `await ctx.race(candidates, *, win, win_tag="")` — run several `RaceCandidate`
+  specs concurrently and return a `RaceResult` for the **first** whose result
+  satisfies `win(result)`; the in-flight losers are cancelled. `RaceCandidate(prompt,
+  agent_type, schema=None, model=None, isolation="shared")` mirrors an `agent()`
+  call; all candidates must be homogeneous (all schema-less, or all the same
+  `schema`). Read `result.won` / `result.winner` / `result.winner_index`. Use this
+  over `parallel` when you only need the first good-enough answer and want to stop
+  the rest (e.g. multi-hypothesis diagnosis). `win_tag` distinguishes the win
+  criterion in the resume journal — see the footgun note in the race pattern below.
 - `await ctx.workflow(name, args)` — inline another registered workflow, exactly
   one level deep. The inner workflow shares this run's journal and budget. A
   second nesting level is refused.
@@ -387,6 +396,50 @@ The reduce helpers — `survives`, `dedup`, `reconcile`, `corroborate` (and the
 `run_script` script (injected into the namespace); you do not import them. They are
 pure functions over the result list `ctx.parallel` / `ctx.pipeline` hands back, so
 the fan-out stays explicit and the reduce stays correct.
+
+**Race to the first good-enough answer (`ctx.race`).** When several independent
+attempts could each solve a task and you only need the first that clears a bar,
+race them and cancel the rest the moment one wins — far cheaper than waiting for a
+`parallel` barrier when the slow attempts are wasted work. The classic case is
+multi-hypothesis diagnosis: investigate every hypothesis at once, confirm the root
+cause on the first high-confidence result, drop the others.
+
+```python
+async def orchestrate(ctx, args):
+    hypotheses = sorted(args["hypotheses"])
+    result = await ctx.race(
+        [
+            RaceCandidate(
+                prompt=f"Investigate whether the incident root cause is: {h}",
+                agent_type="investigator",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "root_cause": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["root_cause", "confidence"],
+                    "additionalProperties": False,
+                },
+            )
+            for h in hypotheses
+        ],
+        win=lambda d: d.confidence >= 0.8,
+        win_tag="high-confidence-root-cause",
+    )
+    if result.won:
+        return result.winner.root_cause  # the other hypotheses were cancelled
+    ctx.log("no hypothesis reached high confidence")
+    return None
+```
+
+`race` journals its decision, so a resume reproduces the same winner and re-runs
+nothing. **Footgun — always set a distinct `win_tag` when you reuse the same
+candidates with a different `win`.** The journal key folds in `win_tag` but not the
+predicate, so two races over identical candidates with the same tag share one cached
+decision: the second silently replays the first's winner instead of applying your
+new criterion. A race that finds **no** winner is not journaled (a resume may retry
+it); if you want every result regardless of a bar, use `parallel`, not `race`.
 
 ## Authoring a script for `run_script`
 

@@ -40,11 +40,13 @@ class SpanKind(StrEnum):
         AGENT: A single leaf ``agent()`` invocation (or a journal hit).
         PARALLEL: A ``parallel()`` blocking-barrier fan-out.
         PIPELINE: A ``pipeline()`` no-barrier streaming fan-out.
+        RACE: A ``race()`` best-of-N early-exit fan-out (or a journaled-decision replay).
     """
 
     AGENT = "agent"
     PARALLEL = "parallel"
     PIPELINE = "pipeline"
+    RACE = "race"
 
 
 @dataclass(slots=True)

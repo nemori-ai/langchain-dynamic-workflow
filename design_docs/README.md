@@ -6,7 +6,7 @@
 
 | # | 文档 | 内容 |
 |---|---|---|
-| 1 | [01-engine-mechanism.md](01-engine-mechanism.md) | **引擎机制设计**：控制流反转、七原语、骑 LangGraph 的两补丁（content-hash journal / 确定性 guard）、脚本执行模型、叶子调用契约、sandbox 机制、pipeline 调度、budget、Decision Log。即"引擎内部怎么算对"。 |
+| 1 | [01-engine-mechanism.md](01-engine-mechanism.md) | **引擎机制设计**：控制流反转、八原语、骑 LangGraph 的两补丁（content-hash journal / 确定性 guard）、脚本执行模型、叶子调用契约、sandbox 机制、pipeline 调度、race 早退、budget、Decision Log。即"引擎内部怎么算对"。 |
 | 2 | [02-architecture.md](02-architecture.md) | **架构设计**：三层架构、对外软件形态（消费者=AI agent，只能 tool call）、五个消费面（库 core / tool adapter / skills / primitives / middleware）、自建 async 后台 tool 执行机制、L2-as-skill、build-vs-buy 账本、v1 范围。即"软件长什么样、怎么接入 agent"。 |
 | 3 | [03-authoring-patterns.md](03-authoring-patterns.md) | **作者模式库**：编排脚本的作者智慧（adversarial-verify、pipeline-by-default、fan-out-reduce-synth、loop-until-dry、judge-panel、model-routing、no-silent-caps）的理据、频率、何时用、确定性适配，及与 Claude Code 的差异点。`skills/dynamic-workflow/SKILL.md` 是其面向 agent 的可运行投影。即"写得好该怎么写"。 |
 | 4 | [uml/](uml/) | **UML**：[组件图](uml/01-component.md)、[类图](uml/02-class.md)、[时序图](uml/03-sequence.md)。 |

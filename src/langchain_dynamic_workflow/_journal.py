@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -67,6 +68,32 @@ def journal_key(
         "model": model,
         "schema": schema.model_json_schema() if schema is not None else None,
         "isolation": isolation,
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def race_key(*, candidate_keys: Sequence[str], win_tag: str) -> str:
+    """Compute the content-hash key for a ``ctx.race`` decision.
+
+    The key is the SHA-256 of a canonical JSON encoding of the candidates' leaf
+    keys (in order) plus the win tag, under a ``"race"`` namespace marker so it can
+    never collide with a leaf :func:`journal_key`. ``win_tag`` is folded in
+    deliberately: two races over the *same* candidates but with *different* win
+    predicates must use different tags, or the second race replays the first's
+    decision and silently bypasses the changed predicate.
+
+    Args:
+        candidate_keys: Each candidate's leaf journal key, in candidate order.
+        win_tag: A caller-supplied label distinguishing this race's win criterion.
+
+    Returns:
+        A hex SHA-256 digest uniquely identifying this race decision.
+    """
+    payload: dict[str, Any] = {
+        "kind": "race",
+        "candidates": list(candidate_keys),
+        "win_tag": win_tag,
     }
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

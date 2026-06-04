@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeVar, overload
+from typing import Any, Protocol, TypeVar, cast, overload
 
 from langchain.agents.structured_output import ToolStrategy
 from pydantic import BaseModel
@@ -27,10 +28,11 @@ from ._errors import (
     WorkflowDeterminismError,
     WorkflowNestingError,
 )
-from ._journal import JournalRecord, JournalStore, journal_key
+from ._journal import JournalRecord, JournalStore, journal_key, race_key
 from ._observability import SpanKind, SpanRecorder
 from ._pipeline import Stage, run_pipeline
 from ._progress import ProgressKind, ProgressLog
+from ._race_types import RaceCandidate, RaceResult
 from ._result import fold_result, fold_structured
 from ._roster import Roster
 from ._sandbox import leaf_id_from_key
@@ -49,6 +51,48 @@ class LeafOutcome:
 
     state: dict[str, Any]
     usage: int
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return a msgpack-native mapping carrying this outcome's fields.
+
+        A durable ``@task`` return crosses the checkpointer, whose serializer
+        round-trips built-in containers (and registered LangChain message types
+        nested inside ``state``) without an opaque object-reconstruction hop. A
+        custom class instance, by contrast, is only revived through a deprecated
+        unregistered-type path that newer serializers block. Returning this plain
+        mapping from the task boundary keeps the wrapper itself strictly
+        serializable while the engine still works with the typed
+        :class:`LeafOutcome` everywhere else.
+
+        The strict-safe guarantee is scoped to the :class:`LeafOutcome` wrapper
+        and the *registered* state it carries (the LangChain message and container
+        types nested in ``state``). It does NOT extend to an unregistered user
+        type: a structured-output leaf leaves its validated pydantic model under
+        ``state['structured_response']``, and under strict msgpack that model dumps
+        fine but loads back as a plain ``dict`` (the unregistered-type revival path
+        is blocked). This is a documented serialization boundary, not a replay
+        defect: the headline zero-cost replay reads the content-hash journal, which
+        stores the folded result *string* (a schema-bound leaf stores its
+        ``model_dump_json``), never the checkpoint state — so a degraded
+        ``structured_response`` in a persisted checkpoint never reaches the script.
+
+        Returns:
+            A mapping with ``state`` and ``usage`` keys.
+        """
+        return {"state": self.state, "usage": self.usage}
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> LeafOutcome:
+        """Rebuild a :class:`LeafOutcome` from a :meth:`to_payload` mapping.
+
+        Args:
+            payload: A mapping produced by :meth:`to_payload`, carrying ``state``
+                and ``usage``.
+
+        Returns:
+            The reconstructed outcome.
+        """
+        return cls(state=payload["state"], usage=payload["usage"])
 
 
 class LeafRunner(Protocol):
@@ -582,3 +626,242 @@ class Ctx:
                 _FANOUT_DEPTH.reset(token)
             span.set("surviving_count", sum(1 for r in results if r is not None))
             return results
+
+    async def _run_race_candidate(self, candidate: RaceCandidate) -> Any:
+        """Dispatch one race candidate by reusing ``agent()`` verbatim.
+
+        Forwarding through ``agent()`` (rather than re-implementing the leaf path)
+        reuses the journal dedup, budget metering, sandbox admission, and span the
+        leaf path already provides. The candidate runs at fan-out depth > 0 (the
+        race frame is entered before this task is created), so it is excluded from
+        the determinism sequence exactly like a ``parallel`` / ``pipeline`` leaf.
+        """
+        # Any-typed so the call is not matched against agent()'s overloads, which
+        # are written per concrete schema type and do not accept the union the
+        # candidate carries; the runtime forwarding is the same either way.
+        agent_call: Any = self.agent
+        return await agent_call(
+            candidate.prompt,
+            agent_type=candidate.agent_type,
+            schema=candidate.schema,
+            model=candidate.model,
+            isolation=candidate.isolation,
+        )
+
+    async def race[T](
+        self,
+        candidates: Sequence[RaceCandidate],
+        *,
+        win: Callable[[T], bool],
+        win_tag: str = "",
+    ) -> RaceResult[T]:
+        """Run candidates concurrently; the first whose result satisfies ``win`` wins.
+
+        Best-of-N early exit: every candidate is dispatched via ``agent()`` at the
+        same time, and the first to produce a result for which ``win`` returns
+        ``True`` becomes the winner. The in-flight losers are then cancelled. When
+        several candidates finish in the same scheduler wakeup the lowest input
+        index wins, so the winner never depends on completion order.
+
+        The decision is **journaled** under a content-hash race-key so resume is
+        deterministic: a replayed race reproduces the recorded winner and dispatches
+        **nothing** (the losers never re-run, so a resumed race is cheaper than the
+        first one — by design). A race that produced no winner is **not** journaled,
+        so a resume may retry it; use ``parallel`` when you want every result
+        regardless of a predicate.
+
+        All candidates must be homogeneous — either all schema-less (their results
+        are ``str``) or all bound to the same schema (their results are that model)
+        — so the winner's type is unambiguous.
+
+        ``win_tag`` is folded into the race-key. Two races over the *same* candidates
+        but with *different* win predicates **must** pass different ``win_tag``
+        values; otherwise the second race replays the first's journaled decision and
+        silently bypasses the changed predicate.
+
+        Args:
+            candidates: The agent-call specs to race; must be non-empty and
+                homogeneous.
+            win: Predicate over a candidate's result deciding whether it wins.
+            win_tag: A label distinguishing this race's win criterion in the
+                journal key (see the footgun note above). Defaults to ``""``.
+
+        Returns:
+            A :class:`RaceResult` carrying the winner and its index, or both
+            ``None`` when no candidate satisfied ``win``.
+
+        Raises:
+            ValueError: If ``candidates`` is empty or not homogeneous.
+            KeyError: If a candidate's ``agent_type`` is not registered.
+            WorkflowBudgetExceededError: If a candidate's ``agent()`` trips the
+                budget cap (re-raised after the in-flight losers are torn down).
+            WorkflowDeterminismError: If the race-key diverges from the recorded
+                replay sequence.
+            Exception: Whatever ``win`` raises, re-raised after teardown (the
+                predicate is script logic; a raise is a bug, not a leaf failure).
+        """
+        if not candidates:
+            raise ValueError("race() requires at least one candidate; got an empty sequence")
+
+        # Prelude (all synchronous, all before any dispatch): resolve each candidate
+        # exactly as agent() will, derive its leaf key, and enforce homogeneity.
+        leaf_keys: list[str] = []
+        schema_signatures: set[str | None] = set()
+        schema_model: type[BaseModel] | None = None
+        for candidate in candidates:
+            entry = self._roster.resolve(candidate.agent_type)  # fail fast on unknown agent_type
+            if candidate.isolation == "worktree" and not entry.needs_execution:
+                raise ValueError(
+                    f"isolation='worktree' requires agent_type {candidate.agent_type!r} to be "
+                    "registered with needs_execution=True (a worktree is seeded into an execution "
+                    "sandbox; a reasoning leaf has none)"
+                )
+            candidate_model = (
+                to_pydantic_model(candidate.schema) if candidate.schema is not None else None
+            )
+            effective_model = (
+                candidate.model if candidate.model is not None else entry.default_model
+            )
+            leaf_keys.append(
+                journal_key(
+                    prompt=candidate.prompt,
+                    agent_type=candidate.agent_type,
+                    model=effective_model,
+                    schema=candidate_model,
+                    isolation=candidate.isolation,
+                )
+            )
+            signature = (
+                None
+                if candidate_model is None
+                else json.dumps(candidate_model.model_json_schema(), sort_keys=True)
+            )
+            schema_signatures.add(signature)
+            schema_model = candidate_model
+        if len(schema_signatures) != 1:
+            raise ValueError(
+                "race() candidates must be homogeneous: either all schema-less (text) or all "
+                "bound to the same schema; got a mix, which would make RaceResult.winner's type "
+                "ambiguous"
+            )
+
+        rkey = race_key(candidate_keys=leaf_keys, win_tag=win_tag)
+
+        with self._spans.span(SpanKind.RACE, win_tag or "race") as span:
+            span.set("candidate_count", len(candidates))
+            # The race decision is one sequential step: its content-stable key is
+            # recorded / validated once at depth 0. The candidate agent() calls run
+            # at depth > 0 and are excluded from the sequence (their completion order
+            # varies run to run), mirroring leaves inside parallel() / pipeline().
+            if _FANOUT_DEPTH.get() == 0:
+                self._sequence_guard.observe(rkey)
+
+            # Replay: a journaled race decision reproduces the winner deterministically
+            # and dispatches NOTHING — the losers never re-run, so a resumed race is
+            # cheaper than the first (correct: the decision is already made). The
+            # envelope is self-contained so replay needs no candidate leaf entry.
+            cached = await self._journal.get(rkey)
+            if cached is not None:
+                decision = json.loads(cached.result)
+                cached_index = int(decision["winner_index"])
+                cached_result_str = decision["result"]
+                # Reconstruct the winner's spend under its OWN leaf key — the key the
+                # fresh run counted it under — NOT the race-key. The journal hit on
+                # rkey guarantees identical candidates (rkey is derived from their leaf
+                # keys), so leaf_keys[cached_index] is the winner's key. Recording per
+                # leaf key keeps spend reconstructable AND idempotent: a later agent()
+                # with the winner's exact params hits the same key and is not
+                # double-counted (recording under rkey would, since rkey != leaf_key).
+                self._budget.record(leaf_keys[cached_index], cached.usage)
+                decoded: Any = (
+                    schema_model.model_validate_json(cached_result_str)
+                    if schema_model is not None
+                    else cached_result_str
+                )
+                span.set("replayed", True)
+                span.set("won", True)
+                span.set("winner_index", cached_index)
+                return RaceResult[T](winner=cast(T, decoded), winner_index=cached_index)
+            span.set("replayed", False)
+
+            # Fresh run: dispatch all candidates concurrently; first to satisfy wins.
+            # The depth is incremented just before the try and the tasks are created
+            # INSIDE it, so the finally always tears the tasks down and resets the
+            # depth even if task creation raises — mirroring parallel()/pipeline().
+            winner_index: int | None = None
+            winner_result: Any = None
+            to_raise: BaseException | None = None
+            tasks: list[asyncio.Task[Any]] = []
+            token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
+            try:
+                tasks = [
+                    asyncio.ensure_future(self._run_race_candidate(candidate))
+                    for candidate in candidates
+                ]
+                index_of = {task: index for index, task in enumerate(tasks)}
+                remaining = set(tasks)
+                while remaining and winner_index is None and to_raise is None:
+                    done, remaining = await asyncio.wait(
+                        remaining, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    # Deterministic tie-break: decide same-wakeup completions in
+                    # ascending candidate index, never set-iteration order.
+                    for task in sorted(done, key=lambda finished: index_of[finished]):
+                        error = task.exception()
+                        if error is not None:
+                            if isinstance(
+                                error, (WorkflowBudgetExceededError, WorkflowDeterminismError)
+                            ):
+                                # Engine control-flow signal: fail loud, never mask.
+                                to_raise = error
+                                break
+                            # Ordinary leaf failure: this candidate is out; others go on.
+                            continue
+                        candidate_result = task.result()
+                        try:
+                            satisfied = win(cast(T, candidate_result))
+                        except Exception as predicate_error:
+                            # Predicate raise is a script bug: fail loud after teardown.
+                            to_raise = predicate_error
+                            break
+                        if satisfied:
+                            winner_index = index_of[task]
+                            winner_result = candidate_result
+                            break
+            finally:
+                # Teardown: cancel every still-running loser and await all tasks so
+                # none is orphaned and every gate slot is released. return_exceptions
+                # absorbs the CancelledErrors (and any loser exception) raised here.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                _FANOUT_DEPTH.reset(token)
+
+            if to_raise is not None:
+                raise to_raise
+
+            if winner_index is None:
+                # No winner: do NOT journal a decision (a resume may retry the race).
+                span.set("won", False)
+                span.set("winner_index", None)
+                return RaceResult[T](winner=None, winner_index=None)
+
+            # Journal a self-contained decision under the namespaced race-key: the
+            # winner index plus the canonical result string agent() produced, carrying
+            # the winner's usage so resume rebuilds spend. The winner's own leaf entry
+            # already recorded its usage under its leaf key on this fresh run, so the
+            # race-key is NOT re-recorded into the budget (that would double-count).
+            winner_record = await self._journal.get(leaf_keys[winner_index])
+            winner_usage = winner_record.usage if winner_record is not None else 0
+            if schema_model is not None:
+                winner_result_str = cast(BaseModel, winner_result).model_dump_json(
+                    by_alias=True, round_trip=True
+                )
+            else:
+                winner_result_str = cast(str, winner_result)
+            envelope = json.dumps({"winner_index": winner_index, "result": winner_result_str})
+            await self._journal.put(rkey, JournalRecord(result=envelope, usage=winner_usage))
+            span.set("won", True)
+            span.set("winner_index", winner_index)
+            return RaceResult[T](winner=cast(T, winner_result), winner_index=winner_index)

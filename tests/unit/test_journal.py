@@ -5,7 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from langchain_dynamic_workflow import InMemoryJournalStore, journal_key
-from langchain_dynamic_workflow._journal import JournalRecord
+from langchain_dynamic_workflow._journal import JournalRecord, race_key
 
 
 class _Schema(BaseModel):
@@ -62,3 +62,27 @@ async def test_journal_record_roundtrips_result_and_usage() -> None:
     assert record is not None
     assert record.result == "answer"
     assert record.usage == 42
+
+
+def test_race_key_is_stable_for_identical_inputs() -> None:
+    a = race_key(candidate_keys=["k0", "k1"], win_tag="t")
+    b = race_key(candidate_keys=["k0", "k1"], win_tag="t")
+    assert a == b
+
+
+def test_race_key_changes_with_candidates_and_tag() -> None:
+    base = race_key(candidate_keys=["k0", "k1"], win_tag="t")
+    # Order matters (a different candidate ordering is a different race).
+    assert race_key(candidate_keys=["k1", "k0"], win_tag="t") != base
+    # A different candidate set is a different race.
+    assert race_key(candidate_keys=["k0", "k2"], win_tag="t") != base
+    # The win tag is folded in: same candidates, different criterion -> different key.
+    assert race_key(candidate_keys=["k0", "k1"], win_tag="other") != base
+
+
+def test_race_key_never_collides_with_a_leaf_key() -> None:
+    # A race over a single candidate must not hash to that candidate's own leaf key:
+    # the "race" namespace marker keeps the two key spaces disjoint, so a race
+    # decision can never alias a leaf result (or vice versa).
+    leaf = journal_key(prompt="hi", agent_type="x", model=None, schema=None, isolation="shared")
+    assert race_key(candidate_keys=[leaf], win_tag="") != leaf

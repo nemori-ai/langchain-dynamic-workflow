@@ -30,6 +30,7 @@ from typing import Any, cast
 from ._ast_gate import validate_workflow_source
 from ._engine import run_workflow
 from ._errors import WorkflowScriptError
+from ._race_types import RaceCandidate, RaceResult
 from ._reduce import (
     Consensus,
     Reconciled,
@@ -96,6 +97,14 @@ _SCRIPT_REDUCE_API: dict[str, Any] = {
 """Cross-leaf reduce helpers injected as script globals so a host-authored script
 calls them by name without an import (the AST gate forbids imports)."""
 
+_SCRIPT_RACE_API: dict[str, Any] = {
+    "RaceCandidate": RaceCandidate,
+    "RaceResult": RaceResult,
+}
+"""Race value types injected as script globals so a host-authored script constructs
+``RaceCandidate`` specs and reads ``RaceResult`` by name without an import (the AST
+gate forbids imports). ``ctx.race`` is a method, so it needs no injection."""
+
 
 def compile_workflow_source(source: str) -> WorkflowFn:
     """Validate, compile, and execute an untrusted script into an orchestration callable.
@@ -125,7 +134,11 @@ def compile_workflow_source(source: str) -> WorkflowFn:
     # __builtins__ untouched), so the executed module — and the orchestrate closure
     # it defines, whose __globals__ is this namespace — can never reach the real
     # builtins.
-    namespace: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS, **_SCRIPT_REDUCE_API}
+    namespace: dict[str, Any] = {
+        "__builtins__": _SAFE_BUILTINS,
+        **_SCRIPT_REDUCE_API,
+        **_SCRIPT_RACE_API,
+    }
     exec(code, namespace)
 
     orchestrate = namespace.get("orchestrate")
