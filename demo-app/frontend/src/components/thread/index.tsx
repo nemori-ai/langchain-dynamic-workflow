@@ -39,6 +39,8 @@ import {
 } from "../ui/tooltip";
 import { useFileUpload } from "@/hooks/use-file-upload";
 import { ContentBlocksPreview } from "./ContentBlocksPreview";
+import { ScenarioPanel } from "@/components/workflow/ScenarioPanel";
+import { SettingsPanel } from "@/components/workflow/SettingsPanel";
 import {
   useArtifactOpen,
   ArtifactContent,
@@ -194,18 +196,20 @@ export function Thread() {
     prevMessageLength.current = messages.length;
   }, [messages]);
 
-  const handleSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    if ((input.trim().length === 0 && contentBlocks.length === 0) || isLoading)
-      return;
+  // The shared submit core: build a human message from text + any attached content
+  // blocks and send it through the stream. Both the composer form and the preset
+  // scenario buttons drive this, so a preset launches through the exact same path a
+  // typed message takes (the buttons just supply the text as the user's words).
+  const sendMessage = (text: string, blocks: typeof contentBlocks = []) => {
+    if ((text.trim().length === 0 && blocks.length === 0) || isLoading) return;
     setFirstTokenReceived(false);
 
     const newHumanMessage: Message = {
       id: uuidv4(),
       type: "human",
       content: [
-        ...(input.trim().length > 0 ? [{ type: "text", text: input }] : []),
-        ...contentBlocks,
+        ...(text.trim().length > 0 ? [{ type: "text", text }] : []),
+        ...blocks,
       ] as Message["content"],
     };
 
@@ -234,6 +238,11 @@ export function Thread() {
 
     setInput("");
     setContentBlocks([]);
+  };
+
+  const handleSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    sendMessage(input, contentBlocks);
   };
 
   const handleRegenerate = (
@@ -444,6 +453,16 @@ export function Thread() {
                   )}
 
                   <ScrollToBottom className="animate-in fade-in-0 zoom-in-95 absolute bottom-full left-1/2 mb-4 -translate-x-1/2" />
+
+                  <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-6 px-1 md:grid-cols-[1fr_auto]">
+                    <ScenarioPanel
+                      onLaunch={(message) => sendMessage(message)}
+                      disabled={isLoading}
+                    />
+                    <div className="md:w-64">
+                      <SettingsPanel />
+                    </div>
+                  </div>
 
                   <div
                     ref={dropRef}
