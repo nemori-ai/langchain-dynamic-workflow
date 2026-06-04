@@ -31,3 +31,7 @@ langchain-dynamic-workflow = { path = "../..", editable = true }
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The backend modules (host_graph, workflows, _models) are loaded by path by
+# langgraph dev, not installed as a package, so put the backend dir on sys.path
+# for the test run to import them the same way.
+pythonpath = ["."]

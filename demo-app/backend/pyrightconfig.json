@@ -1,0 +1,9 @@
+{
+  "include": ["."],
+  "exclude": ["**/.venv", "**/__pycache__", "**/.langgraph_api"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportMissingTypeStubs": false
+}

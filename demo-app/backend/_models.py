@@ -23,11 +23,6 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 _DEMO_TOOL_NAME = "run_hello_demo"
 
 
-def _has_model_key() -> bool:
-    """Whether any provider key the demo understands is present in the environment."""
-    return bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY"))
-
-
 class OfflineHostModel(BaseChatModel):
     """A deterministic, key-free host model for the offline demo path.
 
@@ -41,6 +36,14 @@ class OfflineHostModel(BaseChatModel):
     @property
     def _llm_type(self) -> str:
         return "offline-host-model"
+
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> BaseChatModel:
+        """Accept tool bindings as a no-op.
+
+        deepagents binds the host's tools onto the model. The offline host already
+        hardcodes its single tool call, so binding is a no-op that returns ``self``.
+        """
+        return self
 
     def _generate(
         self,
