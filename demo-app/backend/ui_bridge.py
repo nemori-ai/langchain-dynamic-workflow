@@ -64,12 +64,23 @@ def make_host_ui_emit(*, anchor: AIMessage | None) -> UiEmit:
     anchor_kwargs: dict[str, Any] = {"message": anchor} if anchor is not None else {}
 
     def emit(component_name: str, props: dict[str, Any]) -> None:
+        # Thread the adapter's stable event_id into the SDK ui-message id. The SDK's
+        # uiMessageReducer keys on the ui-message id (ui.id === event.id) and the
+        # frontend's React render key is that same id — so passing event_id as id is
+        # what makes the documented dedupe real: a same-turn re-emit of an identical
+        # event collapses onto one ui message instead of minting a fresh random UUID
+        # (push_ui_message defaults id to str(uuid4()) when none is given) and
+        # rendering a duplicate. Without an event_id we let the SDK mint its own id.
+        id_kwargs: dict[str, Any] = {}
+        event_id = props.get("event_id")
+        if isinstance(event_id, str) and event_id:
+            id_kwargs["id"] = event_id
         # Rebind the host config so push_ui_message resolves the HOST writer and
         # ui-channel send, then restore whatever was active (the inner engine
         # graph's config) so the engine's own streaming is untouched.
         token = var_child_runnable_config.set(host_config)
         try:
-            push_ui_message(component_name, props, **anchor_kwargs)
+            push_ui_message(component_name, props, **id_kwargs, **anchor_kwargs)
         except Exception:
             # Red line: the engine calls progress sinks directly; a raising sink
             # would break orchestration. Swallow and continue.

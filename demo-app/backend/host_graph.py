@@ -27,13 +27,16 @@ from _models import is_offline, resolve_host_model
 from deepagents import DeepAgentState, create_deep_agent
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import tool
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.config import get_config
 from langgraph.graph.ui import AnyUIMessage, ui_message_reducer
 from langgraph.prebuilt import InjectedState
 from ui_adapter import UiAdapter
 from ui_bridge import UiEmit, make_host_ui_emit
 from workflows import hello_workflow, make_roster, make_workflows
 
-from langchain_dynamic_workflow import Ctx, run_workflow
+from langchain_dynamic_workflow import Ctx, InMemoryJournalStore, JournalStore, run_workflow
 
 HOST_INSTRUCTIONS = (
     "You are a thorough assistant for the dynamic-workflow demo. A hard, multi-step "
@@ -49,6 +52,85 @@ HOST_INSTRUCTIONS = (
 # fan-out-heavy scenario than the hello smoke path, so the demo shows real
 # control-flow inversion out of the box.
 DEFAULT_LIVE_WORKFLOW = "deep_research"
+
+
+class _ResumeLane:
+    """A per-(host-thread, workflow) durable lane for a resumable preset run.
+
+    A preset run is a single :func:`run_workflow` invocation, and the engine's
+    content-hash journal only yields cache hits when the *same* journal instance is
+    reused across calls. To make "pick it back up" a real behavior — a second turn on
+    the same host thread replaying the first run's leaves as zero-cost journal hits —
+    the host must persist the journal (and its checkpointer + durable ``thread_id``)
+    and feed it back into the next ``run_workflow`` on that lane.
+
+    The lane is keyed on ``(host_thread_id, workflow_name)`` rather than the host
+    thread alone: each preset records its own ordered leaf-call sequence in the
+    journal, and the engine's determinism backstop replays that sequence on resume —
+    so two different presets sharing one journal would trip a false divergence. A
+    dedicated lane per workflow keeps each preset independently resumable.
+
+    Attributes:
+        journal: The persisted content-hash journal whose recorded leaf results the
+            next run on this lane replays as cache hits.
+        checkpointer: The persisted LangGraph checkpointer for the lane's durable
+            ``@entrypoint`` thread.
+        thread_id: The engine ``thread_id`` for the lane's durable run (distinct from
+            the host graph's own thread id).
+    """
+
+    __slots__ = ("checkpointer", "journal", "thread_id")
+
+    def __init__(self, thread_id: str) -> None:
+        self.journal: JournalStore = InMemoryJournalStore()
+        self.checkpointer: BaseCheckpointSaver[Any] = InMemorySaver()
+        self.thread_id = thread_id
+
+
+# Durable lanes keyed on "<host_thread_id>::<workflow_name>". Held at module scope so
+# they survive across host turns within a process: the second turn on the same host
+# thread reuses the first turn's journal and replays its leaves as cache hits. A fresh
+# process (a server restart) starts empty, which is the honest in-memory-store bound.
+_RESUME_LANES: dict[str, _ResumeLane] = {}
+
+
+def _host_thread_id() -> str:
+    """Return the host graph's durable thread id from the current node config.
+
+    ``langgraph dev`` runs each chat thread under a ``configurable.thread_id``; that
+    id keys the resume lanes so a follow-up turn on the *same* chat thread reuses its
+    prior run's journal. Must be called from within the host node context. Falls back
+    to ``"default"`` when no thread id is configured (e.g. a bare unit-test invocation).
+
+    Returns:
+        The host graph's configured thread id, or ``"default"`` when absent.
+    """
+    config = get_config()
+    configurable = config.get("configurable") or {}
+    thread_id = configurable.get("thread_id")
+    return str(thread_id) if thread_id else "default"
+
+
+def _resume_lane(workflow: str) -> _ResumeLane:
+    """Return the durable resume lane for ``workflow`` on the current host thread.
+
+    Creates the lane on first use and reuses it on every later turn for the same
+    ``(host_thread_id, workflow)`` pair, so a second run replays the first run's
+    journaled leaves. Must be called from within the host node context (it reads the
+    host thread id from the node config).
+
+    Args:
+        workflow: The preset workflow name whose lane to resolve.
+
+    Returns:
+        The persisted :class:`_ResumeLane` for this host thread and workflow.
+    """
+    key = f"{_host_thread_id()}::{workflow}"
+    lane = _RESUME_LANES.get(key)
+    if lane is None:
+        lane = _ResumeLane(thread_id=key)
+        _RESUME_LANES[key] = lane
+    return lane
 
 
 class HostState(DeepAgentState):
@@ -140,7 +222,9 @@ async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str
     return f"Demo workflow finished: {result}"
 
 
-async def run_workflow_live(name: str, args: dict[str, Any], *, adapter: UiAdapter) -> str:
+async def run_workflow_live(
+    name: str, args: dict[str, Any], *, adapter: UiAdapter, lane: _ResumeLane | None = None
+) -> str:
     """Resolve a named preset workflow and run it inline, streaming via ``adapter``.
 
     This is the engine-facing core of the :func:`run_live` host tool, kept free of
@@ -151,12 +235,20 @@ async def run_workflow_live(name: str, args: dict[str, Any], *, adapter: UiAdapt
     wired to ``on_progress`` / ``on_span``. The same registry is also passed as
     ``workflows=`` so a preset that nests ``ctx.workflow(...)`` resolves too.
 
+    When a ``lane`` is supplied its persisted journal / checkpointer / ``thread_id``
+    are threaded into ``run_workflow`` so a second run on the same lane replays the
+    first run's leaves as journal hits (the resume / "pick it back up" story). When
+    omitted, the run uses the engine's per-call in-memory defaults (no resume), which
+    keeps the helper directly testable without lane wiring.
+
     Args:
         name: The registered preset workflow name (e.g. ``"deep_research"``).
         args: Arguments forwarded to the workflow (an empty mapping is fine; presets
             fall back to their own defaults).
         adapter: The :class:`~ui_adapter.UiAdapter` whose sinks receive the run's
             progress and span events.
+        lane: Optional durable :class:`_ResumeLane` whose journal / checkpointer /
+            ``thread_id`` make this run resumable on a later turn.
 
     Returns:
         The workflow's result, coerced to ``str`` for the tool's text reply.
@@ -171,12 +263,20 @@ async def run_workflow_live(name: str, args: dict[str, Any], *, adapter: UiAdapt
     async def _orchestrate(ctx: Ctx) -> Any:
         return await workflow_fn(ctx, args)
 
+    # Thread the durable lane so a follow-up run replays cached leaves; absent a lane
+    # the engine falls back to its per-call in-memory journal (no cross-turn resume).
+    durable: dict[str, Any] = (
+        {"journal": lane.journal, "checkpointer": lane.checkpointer, "thread_id": lane.thread_id}
+        if lane is not None
+        else {}
+    )
     result = await run_workflow(
         _orchestrate,
         roster=make_roster(),
         on_progress=adapter.on_progress,
         on_span=adapter.on_span,
         workflows=workflows,
+        **durable,
     )
     return str(result)
 
@@ -185,7 +285,7 @@ async def run_workflow_live(name: str, args: dict[str, Any], *, adapter: UiAdapt
 async def run_live(
     state: Annotated[dict[str, Any], InjectedState],
     workflow: str = DEFAULT_LIVE_WORKFLOW,
-    args: dict[str, Any] | None = None,
+    workflow_args: dict[str, Any] | None = None,
 ) -> str:
     """Run a named preset workflow live, streaming its orchestration into the UI.
 
@@ -197,11 +297,21 @@ async def run_live(
     content ``event_id`` for dedupe, and pushes it live from inside the same node
     context — so the chat shows the control-flow inversion as it happens.
 
+    The run is threaded through a durable :class:`_ResumeLane` keyed on this host
+    thread and the workflow name, so a second turn on the same thread (e.g. "pick it
+    back up") reuses the first run's journal: every replayed leaf comes back
+    ``cached=True`` and surfaces a ``journal_badge``, making the zero-cost resume
+    visible rather than re-running the work.
+
     Args:
         state: Injected graph state (used to anchor UI events to the host turn).
         workflow: The preset workflow to run; defaults to ``deep_research``.
-        args: Optional workflow arguments (e.g. ``{"question": "..."}``). When
-            omitted the preset uses its own defaults.
+        workflow_args: Optional workflow arguments (e.g. ``{"question": "..."}``).
+            When omitted the preset uses its own defaults. Named ``workflow_args``
+            rather than ``args`` on purpose: LangChain's tool-schema generation mangles
+            a parameter literally named ``args`` into ``v__args`` (typed as an array),
+            and then passes that mangled keyword back on invocation, raising
+            ``unexpected keyword argument 'v__args'``. A non-reserved name avoids it.
 
     Returns:
         A short human-readable summary including the workflow's result.
@@ -210,7 +320,8 @@ async def run_live(
     emit = make_host_ui_emit(anchor=anchor)
     _emit_run_status(emit)
     adapter = UiAdapter(emit=emit)
-    result = await run_workflow_live(workflow, args or {}, adapter=adapter)
+    lane = _resume_lane(workflow)
+    result = await run_workflow_live(workflow, workflow_args or {}, adapter=adapter, lane=lane)
     return f"Workflow {workflow!r} finished: {result}"
 
 

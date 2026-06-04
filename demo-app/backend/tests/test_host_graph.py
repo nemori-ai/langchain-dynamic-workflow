@@ -40,6 +40,50 @@ def test_host_graph_builds_with_ui_channel_and_tools() -> None:
     assert run_live.name == "run_live"
 
 
+def test_run_live_tool_schema_has_no_mangled_args() -> None:
+    """The ``run_live`` tool param must not be named ``args``.
+
+    LangChain's tool-schema generation mangles a parameter literally named ``args``
+    into ``v__args`` (typed as an array) and then passes that keyword back on
+    invocation, raising ``unexpected keyword argument 'v__args'``. The param is named
+    ``workflow_args`` to avoid the reserved name; this guards the regression at the
+    schema level, where a unit test that calls the ``run_workflow_live`` helper
+    directly (bypassing the ``@tool`` schema) would miss it.
+    """
+    from host_graph import run_live
+
+    fields = set(run_live.get_input_schema().model_fields)
+    assert "v__args" not in fields, f"param 'args' got mangled to v__args: {sorted(fields)}"
+    assert "workflow_args" in fields
+
+
+async def test_run_live_executes_through_tool_layer_via_host_graph() -> None:
+    """A scenario message drives ``run_live`` through the real tool-invocation layer.
+
+    The other tests call ``run_workflow_live`` directly, bypassing the LangChain
+    ``@tool`` schema path — which is exactly where a parameter named ``args`` was
+    mangled to ``v__args`` and crashed the tool call. This runs the full offline host
+    graph so ``run_live`` is invoked the way ``langgraph dev`` invokes it, proving the
+    tool executes end to end and streams the deep-research event vocabulary (phases +
+    parallel fan-out) into the ``ui`` channel.
+    """
+    from host_graph import make_host_graph
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    graph = make_host_graph()
+    out = await graph.ainvoke(
+        {"messages": [HumanMessage(content="please run a deep research workflow on RAG")]},
+        config={"configurable": {"thread_id": "test-run-live-tool-layer"}},
+    )
+
+    tool_messages = [m for m in out["messages"] if isinstance(m, ToolMessage)]
+    assert any("finished" in m.content for m in tool_messages), "run_live did not execute"
+
+    components = [u.get("name") for u in out.get("ui", [])]
+    assert "phase_timeline" in components
+    assert "fanout_graph" in components, components
+
+
 async def test_run_workflow_live_streams_named_preset_with_fanout() -> None:
     """The generic live runner resolves a named preset and streams its events.
 
@@ -69,6 +113,42 @@ async def test_run_workflow_live_streams_named_preset_with_fanout() -> None:
         if comp == "phase_timeline" and props["kind"] == ProgressKind.PHASE.value
     ]
     assert phase_titles == ["search", "extract", "verify", "synthesize"]
+
+
+async def test_run_workflow_live_resumes_cached_leaves_on_second_run() -> None:
+    """A second run on the same resume lane replays leaves as journal hits.
+
+    This is the "pick it back up" headline: the host persists a per-(thread, workflow)
+    :class:`_ResumeLane` whose journal / checkpointer / thread_id are threaded into
+    ``run_workflow``. The first run executes every leaf fresh (no ``journal_badge``,
+    every ``agent_span`` ``cached=False``); a second run on the SAME lane must replay
+    each recorded leaf from the journal — every ``agent_span`` comes back
+    ``cached=True`` and a ``journal_badge`` is newly emitted — proving the cached
+    ``agent_span`` branch and the ``journal_badge`` component are reachable at runtime,
+    not dead paths. The result is identical across runs (the journal replays it).
+    """
+    from host_graph import _ResumeLane, run_workflow_live
+
+    lane = _ResumeLane(thread_id="t-resume::deep_research")
+
+    first: list[tuple[str, dict[str, Any]]] = []
+    adapter_first = UiAdapter(emit=lambda comp, props: first.append((comp, dict(props))))
+    result_first = await run_workflow_live("deep_research", {}, adapter=adapter_first, lane=lane)
+
+    fresh_spans = [p for c, p in first if c == "agent_span"]
+    assert fresh_spans, "first run must emit agent spans"
+    assert all(p["cached"] is False for p in fresh_spans)
+    assert not [c for c, _ in first if c == "journal_badge"], "fresh run emits no journal badge"
+
+    second: list[tuple[str, dict[str, Any]]] = []
+    adapter_second = UiAdapter(emit=lambda comp, props: second.append((comp, dict(props))))
+    result_second = await run_workflow_live("deep_research", {}, adapter=adapter_second, lane=lane)
+
+    cached_spans = [p for c, p in second if c == "agent_span" and p["cached"] is True]
+    badges = [c for c, _ in second if c == "journal_badge"]
+    assert len(cached_spans) == len(fresh_spans), "resume must replay every leaf as cached"
+    assert len(badges) == len(fresh_spans), "each cached leaf surfaces a journal badge"
+    assert result_second == result_first, "the journal replays the recorded result"
 
 
 async def test_run_workflow_live_unknown_name_raises() -> None:

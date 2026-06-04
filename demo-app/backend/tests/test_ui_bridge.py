@@ -26,7 +26,7 @@ honest.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import ui_bridge
@@ -135,6 +135,55 @@ async def test_emit_from_inside_nested_run_workflow_routes_to_host_writer() -> N
     sent_props = [evt["props"] for _state_key, evt in host_send_pairs]
     assert [p["event_id"] for p in sent_props] == ["p-1", "p-2", "p-3", "p-4"]
     assert sent_props[0]["message"] == "greeting"
+
+
+def test_emit_threads_event_id_into_ui_message_id_so_reducer_dedupes() -> None:
+    """A stable ``event_id`` becomes the SDK ui-message id, so the reducer dedupes.
+
+    The documented same-turn / resume dedup lives at the SDK layer: ``uiMessageReducer``
+    keys on the ui-message ``id`` (``ui.id === event.id``) and the frontend's React
+    render key is that same id. ``push_ui_message`` mints a fresh ``str(uuid4())`` when
+    no ``id`` is passed, so unless ``emit`` threads the adapter's ``event_id`` into
+    ``id=`` every re-emit becomes a distinct ui message and renders as a duplicate.
+
+    This drives the *real* ``ui_bridge.emit`` (not a stand-in): two emits carrying the
+    SAME ``event_id`` (a same-turn re-emit, second one with a flipped field) and one
+    with a distinct id. Folding the sent ``("ui", evt)`` pairs through the real
+    ``ui_message_reducer`` — exactly as the frontend does — must collapse the two
+    same-id events onto a single ui message (the re-emit replacing the first) while the
+    distinct id stays separate. A regression that drops ``id=`` (random UUIDs) leaves
+    three messages and fails here.
+    """
+    host_writer_events: list[UIMessage] = []
+    host_send_pairs: list[tuple[str, UIMessage]] = []
+    host_config = _make_host_config(writer_sink=host_writer_events, send_sink=host_send_pairs)
+
+    token = var_child_runnable_config.set(host_config)
+    try:
+        emit = make_host_ui_emit(anchor=None)
+    finally:
+        var_child_runnable_config.reset(token)
+
+    emit("agent_span", {"name": "r", "cached": False, "event_id": "span-abc"})
+    emit("agent_span", {"name": "r", "cached": True, "event_id": "span-abc"})  # re-emit
+    emit("agent_span", {"name": "q", "cached": False, "event_id": "span-xyz"})  # distinct
+
+    # The ui-message id is the threaded event_id, not a random UUID.
+    assert [evt["id"] for evt in host_writer_events] == ["span-abc", "span-abc", "span-xyz"]
+
+    # Fold the sent pairs through the real reducer, as Stream.tsx's onCustomEvent does.
+    channel: list[AnyUIMessage] = []
+    for _state_key, evt in host_send_pairs:
+        channel = ui_message_reducer(channel, evt)
+
+    # The two same-id events collapsed to one; the re-emit replaced the first (cached
+    # now True), and the distinct id stayed a separate message.
+    assert [msg["id"] for msg in channel] == ["span-abc", "span-xyz"]
+    collapsed = next(msg for msg in channel if msg["id"] == "span-abc")
+    # The reducer returns AnyUIMessage (UIMessage | RemoveUIMessage); the collapsed
+    # agent_span is a UIMessage — assert that, then read its props type-safely.
+    assert collapsed["type"] == "ui", "collapsed message should be a UIMessage, not a removal"
+    assert cast(UIMessage, collapsed)["props"]["cached"] is True
 
 
 async def test_emit_swallows_push_failure_and_resets_contextvar(
