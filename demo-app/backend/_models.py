@@ -25,6 +25,32 @@ _LIVE_TOOL_NAME = "run_live"
 _META_TOOL_NAME = "run_meta_script"
 _BACKGROUND_TOOL_NAME = "run_background"
 
+# Post-tool final replies, branched on which tool ran (the most recent ToolMessage's
+# ``name``). The offline demo's whole discipline is honesty, so this final sentence must
+# match what each tool actually did: the inline tools (run_live / run_hello_demo) and a
+# gate-PASS meta run DO stream live progress into the panel; a run_background detaches and
+# streams NOTHING live (lifecycle + result only); a gate-FAIL meta run executes nothing.
+# A ToolMessage whose content marks the rejected-gate path is detected by content because
+# both meta outcomes share the ``run_meta_script`` tool name.
+_REPLY_LIVE_STREAMED = (
+    "Done — the workflow ran and streamed its progress into the panel above "
+    "(offline demo mode; set a model key for live model runs)."
+)
+_REPLY_BACKGROUND = (
+    "Done — the background run finished off-thread; I reported its lifecycle status and "
+    "the final result above. A detached background run can't stream its progress live "
+    "into the panel (offline demo mode; set a model key for live model runs)."
+)
+_REPLY_META_REJECTED = (
+    "The AST gate rejected the script I composed, so nothing ran — the rejection reason "
+    "is shown above (offline demo mode; set a model key for live model runs)."
+)
+
+# Marker in a ``run_meta_script`` ToolMessage that distinguishes the gate-FAIL outcome
+# from the gate-PASS one (both share the tool name). Kept in sync with the tool's
+# rejection return text in ``host_graph.run_meta_script_live``.
+_META_REJECTED_MARKER = "rejected by the ast gate"
+
 # Cue words in the user's message that route the offline host to a live preset run
 # instead of the default hello smoke path. The resume cues ("pick it back up" /
 # "where you left off" / "resume") deliberately route to the SAME live tool: a second
@@ -53,6 +79,19 @@ _WORKFLOW_CUES: dict[str, str] = {"capstone": "capstone"}
 # the live cues so a "no playbook, work out a procedure (research a few topics...)"
 # request reaches the meta tool rather than a preset, even though it mentions "research".
 _META_CUES = ("no standard playbook", "no playbook", "work out a procedure", "novel task")
+
+# Cue phrases routing the offline host to the meta layer's gate-FAIL path: the user wants
+# to SEE the AST gate reject an unsafe script. Routes to the same ``run_meta_script`` tool
+# but with ``submit_rejected=True``, so the import-bearing fixture is submitted, the gate
+# rejects it, and nothing runs. Checked among the meta cues; a match makes ``_wants_meta_run``
+# true (so meta wins over live) and flips the tool's ``submit_rejected`` arg on.
+_REJECTED_META_CUES = (
+    "rejected script",
+    "blocked script",
+    "unsafe script",
+    "gate reject",
+    "show me a rejected",
+)
 
 # Cue phrases routing the offline host to a background run (run_background): the user
 # wants a heavy job taken off their hands to run while they do other things. Checked
@@ -94,11 +133,26 @@ def _wants_meta_run(messages: Sequence[BaseMessage]) -> bool:
 
     A "no ready-made playbook, work out a procedure" request is the meta-layer cue: the
     host should author an orchestration script on the spot rather than launch a preset.
-    Checked before the live cue so such a request reaches ``run_meta_script`` even when
-    it also mentions "research".
+    A "show me a rejected/blocked script" request is also a meta cue (the gate-FAIL
+    variant). Checked before the live cue so such a request reaches ``run_meta_script``
+    even when it also mentions "research".
     """
     text = _latest_user_text(messages)
-    return text is not None and any(cue in text for cue in _META_CUES)
+    if text is None:
+        return False
+    return any(cue in text for cue in (*_META_CUES, *_REJECTED_META_CUES))
+
+
+def _wants_rejected_meta(messages: Sequence[BaseMessage]) -> bool:
+    """Return whether the latest user turn asks to SEE the AST gate reject a script.
+
+    This is the meta-layer gate-FAIL cue ("show me a rejected/blocked/unsafe script"):
+    the host submits the import-bearing fixture so the gate rejects it and nothing runs.
+    Routes to the same ``run_meta_script`` tool as :func:`_wants_meta_run`, but flips its
+    ``submit_rejected`` arg on so the rejected fixture (not the clean one) is submitted.
+    """
+    text = _latest_user_text(messages)
+    return text is not None and any(cue in text for cue in _REJECTED_META_CUES)
 
 
 def _wants_background_run(messages: Sequence[BaseMessage]) -> bool:
@@ -111,6 +165,48 @@ def _wants_background_run(messages: Sequence[BaseMessage]) -> bool:
     """
     text = _latest_user_text(messages)
     return text is not None and any(cue in text for cue in _BACKGROUND_CUES)
+
+
+def _latest_tool_message(messages: Sequence[BaseMessage]) -> ToolMessage | None:
+    """Return the most recent :class:`ToolMessage` in the turn, if any.
+
+    Its presence means a tool has already run this turn, so the host should emit its
+    final answer rather than another tool call; its ``name``/content drive which honest
+    post-tool reply :func:`_post_tool_reply` returns.
+    """
+    for message in reversed(messages):
+        if isinstance(message, ToolMessage):
+            return message
+    return None
+
+
+def _post_tool_reply(tool_message: ToolMessage) -> str:
+    """Return the honest final reply for the tool that just ran.
+
+    The reply must match what the tool actually did — the demo's discipline is offline
+    honesty, so a blanket "streamed its progress into the panel" sentence would lie for
+    two of the four tools. Branching on the most recent :class:`ToolMessage`:
+
+    * ``run_background`` — the detached run streams NOTHING live, so the reply says the
+      lifecycle status and final result were reported (no live stream).
+    * ``run_meta_script`` gate-FAIL — detected by the rejection marker in the tool's
+      content (both meta outcomes share the tool name); the reply says the gate rejected
+      the script and nothing ran.
+    * ``run_live`` / ``run_hello_demo`` / ``run_meta_script`` gate-PASS — these do stream
+      live, so the reply keeps the "streamed into the panel" wording.
+
+    Args:
+        tool_message: The most recent tool result in the conversation.
+
+    Returns:
+        The honest final-answer text for the tool that ran.
+    """
+    if tool_message.name == _BACKGROUND_TOOL_NAME:
+        return _REPLY_BACKGROUND
+    content = str(tool_message.content).lower()
+    if tool_message.name == _META_TOOL_NAME and _META_REJECTED_MARKER in content:
+        return _REPLY_META_REJECTED
+    return _REPLY_LIVE_STREAMED
 
 
 def _requested_workflow(messages: Sequence[BaseMessage]) -> str | None:
@@ -158,21 +254,30 @@ class OfflineHostModel(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        already_ran_tool = any(isinstance(m, ToolMessage) for m in messages)
-        if already_ran_tool:
-            message = AIMessage(
-                content=(
-                    "Done — the workflow ran and streamed its progress into the panel "
-                    "above (offline demo mode; set a model key for live model runs)."
-                )
-            )
+        latest_tool = _latest_tool_message(messages)
+        if latest_tool is not None:
+            message = AIMessage(content=_post_tool_reply(latest_tool))
         elif _wants_meta_run(messages):
             # No ready-made playbook: author a script and submit it through the meta
-            # layer (gate-pass fixture). Checked before the live cue so a "work out a
-            # procedure (research...)" request reaches the meta tool, not a preset.
+            # layer. A "show me a rejected/blocked script" cue flips submit_rejected on
+            # (gate-FAIL fixture, nothing runs); otherwise the clean gate-PASS fixture is
+            # submitted. Checked before the live cue so a "work out a procedure
+            # (research...)" request reaches the meta tool, not a preset.
+            rejected = _wants_rejected_meta(messages)
+            content = (
+                "You want to see the gate stop an unsafe script — submitting one now."
+                if rejected
+                else "No ready-made procedure fits — composing one and running it now."
+            )
             message = AIMessage(
-                content="No ready-made procedure fits — composing one and running it now.",
-                tool_calls=[{"name": _META_TOOL_NAME, "args": {}, "id": "meta-call-1"}],
+                content=content,
+                tool_calls=[
+                    {
+                        "name": _META_TOOL_NAME,
+                        "args": {"submit_rejected": rejected},
+                        "id": "meta-call-1",
+                    }
+                ],
             )
         elif _wants_background_run(messages):
             # Heavy job to hand off: launch it in the background and report its
