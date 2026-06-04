@@ -252,6 +252,42 @@ def test_offline_host_routes_resume_message_to_run_live() -> None:
     assert "workflow" not in args, "resume must hit the default preset's lane, not a named one"
 
 
+def test_offline_host_fires_a_new_tool_on_the_second_turn_of_an_accumulated_thread() -> None:
+    """A second scenario on the SAME chat thread must still fire its tool.
+
+    Under ``langgraph dev`` the thread state ACCUMULATES messages, so after turn 1
+    completes (human -> ai+tool_call -> tool -> ai) the prior ``ToolMessage`` lingers in
+    history. The offline host must decide "did a tool run THIS turn" from the messages
+    AFTER the latest human turn, not from the whole history — otherwise every turn after
+    the first emits a canned reply and never runs a tool, so a second scenario (e.g.
+    resume) on the same thread silently does nothing. This builds that accumulated
+    history explicitly (the single-message-per-turn unit helper above cannot catch it,
+    nor can an in-process two-``ainvoke`` test that starts each turn from fresh state)
+    and asserts the host issues a NEW ``run_live`` tool call on the second human turn.
+    """
+    from _models import OfflineHostModel
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    accumulated: list[Any] = [
+        HumanMessage(content="Do a thorough deep research on RAG trade-offs."),
+        AIMessage(
+            content="Running the deep-research workflow now.",
+            tool_calls=[{"name": "run_live", "args": {}, "id": "live-call-1"}],
+        ),
+        ToolMessage(
+            content="Workflow 'deep_research' finished: <report>",
+            tool_call_id="live-call-1",
+            name="run_live",
+        ),
+        AIMessage(content="Done — the workflow streamed its progress into the panel above."),
+        HumanMessage(content="Can you pick it back up where you left off, instead of restarting?"),
+    ]
+    result = OfflineHostModel()._generate(accumulated)
+    message = result.generations[0].message
+    assert message.tool_calls, "second turn must issue a NEW tool call, not a canned reply"  # type: ignore[attr-defined]
+    assert message.tool_calls[0]["name"] == "run_live"  # type: ignore[attr-defined]
+
+
 def test_offline_host_routes_named_preset_through_args() -> None:
     """A request that names a preset runs THAT preset, not the default deep_research.
 

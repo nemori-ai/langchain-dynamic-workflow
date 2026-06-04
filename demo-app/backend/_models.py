@@ -167,14 +167,28 @@ def _wants_background_run(messages: Sequence[BaseMessage]) -> bool:
     return text is not None and any(cue in text for cue in _BACKGROUND_CUES)
 
 
-def _latest_tool_message(messages: Sequence[BaseMessage]) -> ToolMessage | None:
-    """Return the most recent :class:`ToolMessage` in the turn, if any.
+def _tool_message_this_turn(messages: Sequence[BaseMessage]) -> ToolMessage | None:
+    """Return the :class:`ToolMessage` produced for the CURRENT user turn, if any.
 
-    Its presence means a tool has already run this turn, so the host should emit its
-    final answer rather than another tool call; its ``name``/content drive which honest
-    post-tool reply :func:`_post_tool_reply` returns.
+    A tool ran for THIS turn only if a ``ToolMessage`` appears AFTER the most recent
+    ``HumanMessage``. Scanning the whole history instead is a multi-turn trap: under
+    ``langgraph dev`` the thread state ACCUMULATES messages, so turn 1's ``ToolMessage``
+    lingers forever — and a whole-history check would then make the host emit its canned
+    final reply on every later turn, so a second scenario on the same thread would never
+    fire its tool. (In-process tests that pass a fresh single-message list per turn, or
+    call the run helper directly, do not accumulate and so mask this.) Scoping to the
+    messages after the last human turn fixes it: each turn independently runs its tool,
+    then replies.
+
+    Its presence means a tool already ran this turn, so the host emits its final answer
+    rather than another tool call; its ``name`` / content drive which honest post-tool
+    reply :func:`_post_tool_reply` returns.
     """
-    for message in reversed(messages):
+    last_human = -1
+    for index, message in enumerate(messages):
+        if isinstance(message, HumanMessage):
+            last_human = index
+    for message in messages[last_human + 1 :]:
         if isinstance(message, ToolMessage):
             return message
     return None
@@ -254,9 +268,9 @@ class OfflineHostModel(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        latest_tool = _latest_tool_message(messages)
-        if latest_tool is not None:
-            message = AIMessage(content=_post_tool_reply(latest_tool))
+        this_turn_tool = _tool_message_this_turn(messages)
+        if this_turn_tool is not None:
+            message = AIMessage(content=_post_tool_reply(this_turn_tool))
         elif _wants_meta_run(messages):
             # No ready-made playbook: author a script and submit it through the meta
             # layer. A "show me a rejected/blocked script" cue flips submit_rejected on
