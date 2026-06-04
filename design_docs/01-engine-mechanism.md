@@ -82,8 +82,9 @@ key = sha256(canonical_json({prompt, agent_type, model,
 
 （附:原生 cache 命中还会丢自定义 stream 数据 `#6265`。）
 
-- `JournalStore` Protocol:v1 交付 **in-memory 实现（默认，进程内）**;LangGraph `BaseStore`-backed 持久化(跨会话 resume 的底座,namespaced KV)是 Protocol 之后的**文档化扩展点,未交付**。故默认 resume 是同进程语义,跨会话需接一个持久 `JournalStore`。
+- `JournalStore` Protocol:默认 **in-memory 实现（进程内、零依赖）**;**跨会话/跨进程持久化已落地(M3)**——`SqliteWorkflowStore` 经可选 `[sqlite]` extra 给出 run_id 命名空间化的持久 journal（详见 §13b）。故默认 resume 是同进程语义,接一个持久 store 即可跨进程 resume。
 - 命中后若有 `schema`,以 `model_validate_json` 把缓存 JSON 重新校验回归一后的 pydantic 模型实例(`to_pydantic_model` 的等值-dict 同类缓存保证 `model_json_schema()` 逐字节稳定 → resume 不静默重跑)。
+- **journal-key 跨进程稳定**:`journal_key` 哈希 `model_json_schema()` + `json.dumps(sort_keys=True)`,对 pydantic 模型与 L2 dict-schema 在不同 `PYTHONHASHSEED` 下逐字节不变,故 A 进程写的叶子键 B 进程逐字节命中(实证,跨子进程回归测试钉死)。
 
 ## 5. 补丁② · 确定性 fail-loud guard（三段式）
 
@@ -162,7 +163,7 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | D5 | `pipeline()` | 进 v1 |
 | D6 | `workflow()` 嵌套 | `@task`/subgraph 实现 |
 | D7 | `agent()` 解析 | R1 纯命名 roster |
-| D8 | journal 存储 | `JournalStore` Protocol;v1 交付 in-memory 实现(默认、进程内);`BaseStore` 持久化(跨会话)是文档化扩展点,未交付 |
+| D8 | journal 存储 | `JournalStore` Protocol;默认 in-memory 实现(进程内、零依赖);**跨会话/跨进程持久化已落地(M3)**——`SqliteWorkflowStore`（经 `[sqlite]` extra,统一 sqlite db、run_id 命名空间化 journal + 第二连接上的持久 `AsyncSqliteSaver`,见 §13b） |
 | D9 | 确定性实现 | import-ban + 受限 builtins + 教 LLM `sorted()`/忌迭代 set |
 | D10 | pipeline 背压 | bounded `asyncio.Queue` |
 | D11 | Layer 2 codegen | 一次过:AST 校验通过即执行(违规重试),不做 dry-run |
@@ -179,6 +180,7 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | D-G4 | read-only judge 形态 | **库级辅助**(`read_only_leaf` / `read_only_builder`)+ deny-write `FilesystemPermission` + `needs_execution=False`,否决"引擎内建只读 agentType":引擎不构造叶(宿主构造),只读是工具面属性归宿主侧;deepagents 无 execute 权限维度,靠不分配 sandbox 禁执行 + deny-write 禁写,叠加才是真只读;builder 形态复用 G1,只读 + 结构化裁决一行可得 |
 | D19 | 接缝③ L2 交付节奏 | v1 = L0/L1 先行,L2 架构预留紧跟(L2-as-skill,见 02) |
 | D20 | async 后台 tool 执行 | 自建轻量后台机制(无 server / 无重依赖);v1 即含;蓝本 = omne-next 实现 + deepagents async-task API 形态。详见 [02 §3](02-architecture.md) |
+| D21 | 跨会话持久化形态(M3) | **一个统一 sqlite db 文件**,run_id 命名空间化四表(registry + journal),**两条连接**(autocommit store + explicit-commit `AsyncSqliteSaver`,皆 WAL)。否决"分文件 / 复用单连接":隔离 regime 不兼容须分连接、同文件保单一持久单元。**journal(非 checkpointer)交付零成本重放**,checkpointer 是 durable add-on。`[sqlite]` 可选 extra 把守,base 安装零依赖。per-run 规范 id(`journal_run_id`)同 key journal 谱系与 checkpoint thread;host thread 仅 key manager slot。schema-version guard(`PRAGMA user_version`)fail-loud。详见 §13b |
 
 ## 13. 实现待核实清单（开工前/中逐条钉测试）
 
@@ -190,6 +192,31 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 6. **`-O` 风险**:生产开 `PYTHONOPTIMIZE` 时底座唯一 determinism assert 蒸发——再证 guard 必自建。
 7. **单叶子内 deepagents 是否并发调工具**:决定 per-leaf sandbox 是否需内部串行化。
 8. **硬契约逐条钉测试**:journal-key 派生身份 / retry 时 thread_id 稳定 / 路径规范化防穿越 / pipeline 异常不死锁。
+
+## 13b. 跨会话持久化（M3,已落地——超集 Claude Code）
+
+跨进程 resume 是 D（跨会话持久）里程碑的交付:**一个全新进程指向同一 sqlite 文件,按 `run_id` resume 一个 run,完成过的叶子从持久 journal 零模型成本重放**。Claude Code 仅同会话,本端口经可选 `[sqlite]` extra 跨进程存活。
+
+### 三个公共面（皆 Layer 2 host-wiring,不碰 L0/L1 内部）
+
+- **`WorkflowRunStore` Protocol**(`_run_store`):workflow tool 的 run 注册表持久化边界——`save_spec` / `delete_spec` / `load_spec`(async)+ `journal_for(run_id) -> JournalStore`(sync,launch 前同步接线)。`RunSpec`(frozen+slots)携 `kind`("name"|"script")/ `name_or_source` / `args`(须 JSON-可序列化)/ `label` / **`journal_run_id`**(规范来源 id 谱系,见下)。
+- **`InMemoryRunStore`**(默认,零依赖):specs 进 dict、每个 `run_id` 缓存恰一个 `InMemoryJournalStore`(repeated `journal_for` 返同一实例 → 同会话 resume 复用原 journal)。base 安装行为不变。
+- **`SqliteWorkflowStore`**(`_persistence`,经 `[sqlite]` extra):一个统一 sqlite db 文件、按 `run_id` 命名空间化的四表(`run_specs` / `journal_records` / `journal_sequence` / `journal_progress`)+ 一个跑在**第二条连接**上的持久 `AsyncSqliteSaver` checkpointer。async 工厂 `await SqliteWorkflowStore.open(db_path)` 构造;`store.checkpointer` 取 saver;`await store.aclose()`(或 `async with`)收口。
+
+### 载重不变量（非显然、经评审硬化——逐条违反会静默砸碎卖点或挂死宿主）
+
+| # | 不变量 | 为何载重 |
+|---|---|---|
+| (a) | **journal(非 checkpointer)交付零成本重放** | 原生 checkpointer 是 **index-based**、同 thread 重调会重跑叶子;LangGraph 每次 `.ainvoke` 把 `@entrypoint` body 整体重执行。是**内容哈希 journal** 让完成的叶子重放免费。"全新进程零模型成本 resume"由 journal **独立**交付(resume 侧 `checkpointer=None` 亦可证),checkpointer 是**鲁棒性 add-on**(durable `@task` cache + 单 run 内 interrupt/resume + 跨进程按 thread_id resume)。 |
+| (b) | **两条连接、一个 db 文件** | store 连接(autocommit,`isolation_level=None`,WAL,busy_timeout)与 `AsyncSqliteSaver`(explicit-commit + 自有 WAL regime)**隔离 regime 不兼容**,必须**分两条** `aiosqlite.Connection` 指同一文件;WAL 下跨连接读见已提交写。autocommit 让每个 `put()` 返回即持久、零显式 `commit`(default deferred 模式会在 close/crash 回滚未提交 DML → 丢光每条已 journal 的叶子)。 |
+| (c) | **`AsyncSqliteSaver` 绑定 event loop** | 其 `__init__` 调 `asyncio.get_running_loop()` 绑定;**循环外构造**抛 `RuntimeError('no running event loop')`,跨**不同**循环复用一个实例(如两次 `asyncio.run()`)**挂死**。宿主须在其**单一持久 loop 内**构造、并在该 loop 上跨所有后台 run / thread_id **复用同一实例**(实证:3 并发 + 2 顺序于一实例全对)。直接 `AsyncSqliteSaver(conn)` 构造,**绝不**用 `from_conn_string`(它是 `@asynccontextmanager`,`__aexit__` 关连接,毁掉跨进程 resume)。 |
+| (d) | **per-run 规范 id 同时 key journal 谱系与 checkpoint thread** | 每个 run 一个规范来源 id(`RunSpec.journal_run_id`,fresh launch 采自身 `run_id`、resume 从 spec 继承),它**既** key per-run journal(零成本重放谱系)**又** key per-run LangGraph checkpoint thread。**host thread 是另一回事**——只 key BgRunManager 的 manager slot,让发起 launch 的 caller 能 poll。这条切分让一个 host thread 上的多个 run 不塌进同一 checkpoint thread,且 resume 鲁棒地重接原 run 的 thread。 |
+| (e) | **`[sqlite]` 可选 extra 把守持久化** | base 安装零依赖、行为不变(回落 `InMemoryRunStore`)。`SqliteWorkflowStore` 经包根 lazy `__getattr__` 暴露——`import langchain_dynamic_workflow` 不触发 sqlite import;缺 extra 时模块顶 `try/except ImportError` 抛清晰"装 `[sqlite]`"消息。`_persistence` / `_run_store` 入 import-linter Contract 1 `source_modules`,只从 `._engine`(公共墙)import `JournalStore`/`JournalRecord`,**绝不**碰 `._journal`。 |
+| (f) | **schema-version guard(fail-loud)** | `PRAGMA user_version`:`0`(fresh/未追踪)→ 跑 DDL + stamp `_SCHEMA_VERSION`;等于当前版本 → 幂等 proceed;其它非零值 = 不兼容 schema → 立即抛 `IncompatibleSchemaError`,把静默 shape-drift 升成 loud、可诉的失败。 |
+
+旁注:**save-before-start**——`_launch` 先 `save_spec`(spec 携 stamped `journal_run_id`)**再** `manager.start`,故被准入的 run 总有可 resume 的 spec;quota 拒入(`BgRunQuotaExceededError`)则 `delete_spec` 回滚,refused launch 不留 unresumable 孤儿。**strict-msgpack 诚实**:`AsyncSqliteSaver` 对**每个** `@task` 返回值 msgpack 序列化,叶子状态须保持 msgpack-friendly 形状(经早期 spike 钉死,见下游 plan)。`race()` 无胜者**不** journal → 跨进程 resume 会重派候选(新成本),是记录在案的已知边界。
+
+接线:`create_workflow_middleware(roster, workflows=wf, store=store, checkpointer=store.checkpointer, ...)`(或 `create_workflow_tool` 同 `store=`/`checkpointer=` kwargs);`store=` 省略时回落 `InMemoryRunStore`。详细 host 接线见 [02 §10](02-architecture.md),时序见 [uml/03-sequence.md](uml/03-sequence.md) D 图。
 
 ---
 
