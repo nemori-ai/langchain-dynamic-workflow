@@ -123,6 +123,21 @@ class OfflineHostModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
+def is_offline() -> bool:
+    """Return whether the demo is running without a provider key (offline mode).
+
+    The single source of truth for the demo's online/offline state, gating on the same
+    keys :func:`resolve_host_model` and :func:`resolve_leaf_model` consult. With neither
+    ``OPENAI_API_KEY`` nor ``OPENROUTER_API_KEY`` present the host falls back to the
+    scripted :class:`OfflineHostModel` and the roster swaps in fake leaves, so this is
+    the honest signal the frontend uses to show its offline banner.
+
+    Returns:
+        ``True`` when no provider key is present (offline), ``False`` otherwise.
+    """
+    return not (os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY"))
+
+
 def resolve_host_model() -> BaseChatModel:
     """Return the host chat model: a real provider model, or the offline fallback.
 
@@ -175,4 +190,9 @@ def resolve_leaf_model() -> BaseChatModel | None:
     return None
 
 
-__all__: Sequence[str] = ["OfflineHostModel", "resolve_host_model", "resolve_leaf_model"]
+__all__: Sequence[str] = [
+    "OfflineHostModel",
+    "is_offline",
+    "resolve_host_model",
+    "resolve_leaf_model",
+]

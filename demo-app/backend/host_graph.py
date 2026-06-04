@@ -23,14 +23,14 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from _models import resolve_host_model
+from _models import is_offline, resolve_host_model
 from deepagents import DeepAgentState, create_deep_agent
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import tool
 from langgraph.graph.ui import AnyUIMessage, ui_message_reducer
 from langgraph.prebuilt import InjectedState
 from ui_adapter import UiAdapter
-from ui_bridge import make_host_ui_emit
+from ui_bridge import UiEmit, make_host_ui_emit
 from workflows import hello_workflow, make_roster, make_workflows
 
 from langchain_dynamic_workflow import Ctx, run_workflow
@@ -83,6 +83,26 @@ def _anchor_message(messages: list[BaseMessage]) -> AIMessage | None:
     return None
 
 
+# Component name for the one-time run-status banner the host emits each turn. Carries
+# the real offline state (no provider key) so the frontend can surface its offline
+# banner from a true backend signal rather than a hardcoded flag.
+_RUN_STATUS = "run_status"
+
+
+def _emit_run_status(emit: UiEmit) -> None:
+    """Emit a one-time ``run_status`` UI event carrying the real offline state.
+
+    The offline flag is resolved by :func:`~_models.is_offline` (the same provider-key
+    gate :func:`~_models.resolve_host_model` uses), so the frontend's offline banner
+    reflects true backend state. The ``event_id`` is fixed so a re-emit on the same
+    turn dedupes via the SDK's ui-message reducer.
+
+    Args:
+        emit: The host-bound, non-blocking UI emit (rebinds the host node context).
+    """
+    emit(_RUN_STATUS, {"offline": is_offline(), "event_id": "run-status-1"})
+
+
 @tool
 async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str:
     """Run the demo workflow, streaming its progress into the UI as it goes.
@@ -103,6 +123,7 @@ async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str
     # engine run still target the host graph's stream and ``ui`` channel.
     anchor = _anchor_message(state.get("messages", []))
     emit = make_host_ui_emit(anchor=anchor)
+    _emit_run_status(emit)
 
     # Round-trip 1: a trivial local component renders from the node context.
     emit("hello_ui", {"text": "hello from backend", "event_id": "hello-1"})
@@ -187,6 +208,7 @@ async def run_live(
     """
     anchor = _anchor_message(state.get("messages", []))
     emit = make_host_ui_emit(anchor=anchor)
+    _emit_run_status(emit)
     adapter = UiAdapter(emit=emit)
     result = await run_workflow_live(workflow, args or {}, adapter=adapter)
     return f"Workflow {workflow!r} finished: {result}"

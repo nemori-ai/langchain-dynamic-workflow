@@ -117,6 +117,54 @@ def test_offline_host_routes_named_preset_through_args() -> None:
     assert "workflow" not in default_args
 
 
+def test_is_offline_reflects_provider_key_presence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``is_offline`` gates on the same provider keys the model resolvers consult.
+
+    This is the honest signal the frontend's offline banner renders from, so it must
+    be ``True`` only when no key is present and flip ``False`` as soon as either
+    provider key appears — never a hardcoded constant.
+    """
+    from _models import is_offline
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    assert is_offline() is True
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    assert is_offline() is False
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test")
+    assert is_offline() is False
+
+
+def test_run_status_emitted_once_per_turn_with_real_offline_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host emits a single ``run_status`` event carrying the true offline flag.
+
+    Drives the shared ``_emit_run_status`` helper the tools call right after capturing
+    the host-bound emit. The banner the frontend renders must reflect real backend key
+    state, so with no key present the event reports ``offline=True``; with a key it
+    reports ``offline=False``. The stable ``event_id`` lets a same-turn re-emit dedupe.
+    """
+    from host_graph import _emit_run_status
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    _emit_run_status(lambda comp, props: events.append((comp, dict(props))))
+    assert events == [("run_status", {"offline": True, "event_id": "run-status-1"})]
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    events.clear()
+    _emit_run_status(lambda comp, props: events.append((comp, dict(props))))
+    assert events == [("run_status", {"offline": False, "event_id": "run-status-1"})]
+
+
 async def test_run_workflow_live_runs_capstone_majority_vote() -> None:
     """The live runner drives the capstone preset to its non-trivial survivor split.
 
