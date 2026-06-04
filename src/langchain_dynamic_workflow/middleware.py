@@ -36,7 +36,7 @@ WORKFLOW_NOTIFICATION_TAG = "workflow_notification"
 """The XML-ish tag wrapping an injected background-run completion notice."""
 
 
-def _merge_workflow_runs(
+def merge_workflow_runs(
     existing: list[dict[str, Any]] | None, incoming: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Reducer for the ``workflow_runs`` channel: upsert records by ``run_id``.
@@ -78,7 +78,7 @@ class WorkflowState(AgentState):
             rewritten from ``running`` to the run's terminal status on settle.
     """
 
-    workflow_runs: NotRequired[Annotated[list[dict[str, Any]], _merge_workflow_runs]]
+    workflow_runs: NotRequired[Annotated[list[dict[str, Any]], merge_workflow_runs]]
 
 
 def _host_thread_id(config: RunnableConfig | None) -> str:
@@ -189,7 +189,7 @@ class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
             return None
         # Besides injecting the notification, rewrite each settled run's record from
         # the launch-time `running` to its terminal status. The channel reducer
-        # (_merge_workflow_runs) upserts these by run_id, so workflow_runs reflects
+        # (merge_workflow_runs) upserts these by run_id, so workflow_runs reflects
         # the live outcome instead of a stale `running`.
         settle_updates = [{"run_id": n.run_id, "status": n.status.value} for n in notices]
         return {
@@ -219,16 +219,29 @@ def create_workflow_middleware(
         checkpointer: Optional checkpointer forwarded to launched runs.
         max_concurrency: Optional concurrency cap forwarded to launched runs.
         max_concurrent_runs: Optional cap on concurrent host-initiated background
-            runs. Applied only when this factory builds the default manager (it is
-            ignored when an explicit ``manager`` is supplied — configure the quota
-            on that manager directly). When the quota is full the ``run`` command
-            refuses with a clear message rather than launching unbounded.
+            runs, applied only to the default manager this factory builds when
+            ``manager`` is omitted. The quota lives on the :class:`BgRunManager`, so
+            passing both an explicit ``manager`` and ``max_concurrent_runs`` is a
+            conflict (the parameter could not take effect) and is rejected loud —
+            set the quota on your manager directly instead. When the quota is full
+            the ``run`` command refuses with a clear message rather than launching
+            unbounded.
         budget: Optional shared token ceiling forwarded to launched runs.
 
     Returns:
         A :class:`WorkflowMiddleware` contributing the workflow tool and injecting
         ``<workflow_notification>`` before the host's next model call.
+
+    Raises:
+        ValueError: If both an explicit ``manager`` and ``max_concurrent_runs`` are
+            supplied — the quota would be silently ignored, so it fails loud.
     """
+    if manager is not None and max_concurrent_runs is not None:
+        raise ValueError(
+            "max_concurrent_runs applies only to the default manager this factory "
+            "builds; it cannot be combined with an explicit `manager`. Set the quota "
+            "on that manager instead: BgRunManager(max_concurrent_runs=...)."
+        )
     return WorkflowMiddleware(
         roster=roster,
         workflows=workflows,
