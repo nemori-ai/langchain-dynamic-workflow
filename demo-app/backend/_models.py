@@ -27,6 +27,19 @@ _LIVE_TOOL_NAME = "run_live"
 # instead of the default hello smoke path.
 _LIVE_CUES = ("research", "deep", "capstone", "workflow", "scenario", "fact-check")
 
+# Cue word -> preset workflow name. A request naming a preset routes the offline host
+# to THAT preset, not just the default; absent any named cue the host falls back to the
+# tool's own default workflow (so the args stay empty and the preset is chosen there).
+_WORKFLOW_CUES: dict[str, str] = {"capstone": "capstone"}
+
+
+def _latest_user_text(messages: Sequence[BaseMessage]) -> str | None:
+    """Return the most recent human message's lowercased text, if any."""
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return message.text.lower()
+    return None
+
 
 def _wants_live_run(messages: Sequence[BaseMessage]) -> bool:
     """Return whether the latest user turn asks for a live preset run.
@@ -36,11 +49,22 @@ def _wants_live_run(messages: Sequence[BaseMessage]) -> bool:
     inspected for scenario cue words; absent any, the host stays on the default
     hello path.
     """
-    for message in reversed(messages):
-        if isinstance(message, HumanMessage):
-            text = message.text.lower()
-            return any(cue in text for cue in _LIVE_CUES)
-    return False
+    text = _latest_user_text(messages)
+    return text is not None and any(cue in text for cue in _LIVE_CUES)
+
+
+def _requested_workflow(messages: Sequence[BaseMessage]) -> str | None:
+    """Return the preset workflow the latest user turn names, if any.
+
+    A request that names a preset (e.g. "run the capstone scenario") must actually run
+    THAT preset offline, not silently fall through to the default. The most recent human
+    message is scanned for a workflow cue; absent any, ``None`` lets the live tool pick
+    its own default.
+    """
+    text = _latest_user_text(messages)
+    if text is None:
+        return None
+    return next((name for cue, name in _WORKFLOW_CUES.items() if cue in text), None)
 
 
 class OfflineHostModel(BaseChatModel):
@@ -83,9 +107,13 @@ class OfflineHostModel(BaseChatModel):
                 )
             )
         elif _wants_live_run(messages):
+            # Route to the preset the user named (e.g. capstone); absent a named cue,
+            # leave args empty so the live tool runs its own default workflow.
+            requested = _requested_workflow(messages)
+            live_args: dict[str, Any] = {"workflow": requested} if requested else {}
             message = AIMessage(
-                content="Running the deep-research workflow now.",
-                tool_calls=[{"name": _LIVE_TOOL_NAME, "args": {}, "id": "live-call-1"}],
+                content=f"Running the {requested or 'deep-research'} workflow now.",
+                tool_calls=[{"name": _LIVE_TOOL_NAME, "args": live_args, "id": "live-call-1"}],
             )
         else:
             message = AIMessage(

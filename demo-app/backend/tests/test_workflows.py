@@ -96,3 +96,55 @@ async def test_deep_research_offline_completes_with_fanout_and_ordered_phases() 
         if comp == "phase_timeline" and props["kind"] == ProgressKind.LOG.value
     ]
     assert log_messages, "expected at least one log narration line"
+
+
+async def test_capstone_offline_runs_majority_vote_with_nontrivial_survivors() -> None:
+    """Offline capstone really runs its parallel majority vote, with a non-trivial split.
+
+    Capstone's headline story is the full primitive stack ending in a strict-majority
+    adversarial vote: a finding survives unless a majority of its skeptics refute it.
+    The offline ``capstone_skeptic`` refutes by topic-name parity, so the default topics
+    split deterministically — ``beta`` (even length) is unanimously refuted and dies,
+    while ``alpha`` / ``gamma`` / ``delta`` (odd length) survive — giving THREE
+    survivors. A trivial-always-0 (or always-4) result would mean the vote never fired.
+    """
+    adapter, events = _capture_adapter()
+
+    result = await run_workflow(
+        lambda ctx: capstone(ctx, {}),
+        roster=make_roster(),
+        workflows=make_workflows(),
+        on_progress=adapter.on_progress,
+        on_span=adapter.on_span,
+    )
+
+    assert isinstance(result, str)
+    # The exact survivor set proves the majority vote ran and the parity split landed.
+    assert result.startswith("synthesized 3 surviving findings:"), result
+    assert "alpha:" in result and "gamma:" in result and "delta:" in result
+    assert "beta:" not in result, "the even-length topic must be voted down"
+
+    # A real parallel fan-out happened (research barrier + per-finding skeptic barriers).
+    fanout = [props for comp, props in events if comp == "fanout_graph"]
+    assert any(props.get("thunk_count", 0) >= 2 for props in fanout), (
+        "expected a parallel barrier spanning multiple thunks"
+    )
+
+    # The four capstone phases arrive in orchestration order.
+    phase_titles = [
+        props["message"]
+        for comp, props in events
+        if comp == "phase_timeline" and props["kind"] == ProgressKind.PHASE.value
+    ]
+    assert phase_titles == ["research", "refine", "verify", "synthesize"]
+
+
+async def test_capstone_offline_is_deterministic_across_reruns() -> None:
+    """Two offline capstone runs return byte-identical output (reproducible vote)."""
+    first = await run_workflow(
+        lambda ctx: capstone(ctx, {}), roster=make_roster(), workflows=make_workflows()
+    )
+    second = await run_workflow(
+        lambda ctx: capstone(ctx, {}), roster=make_roster(), workflows=make_workflows()
+    )
+    assert first == second

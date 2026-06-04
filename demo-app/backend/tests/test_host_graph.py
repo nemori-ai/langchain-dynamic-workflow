@@ -80,14 +80,15 @@ async def test_run_workflow_live_unknown_name_raises() -> None:
         await run_workflow_live("does_not_exist", {}, adapter=adapter)
 
 
-def _offline_first_tool_call(prompt: str) -> str:
-    """Drive the offline host one turn on ``prompt`` and return the called tool name."""
+def _offline_first_tool_call(prompt: str) -> tuple[str, dict[str, Any]]:
+    """Drive the offline host one turn on ``prompt``; return the tool name and its args."""
     from _models import OfflineHostModel
     from langchain_core.messages import HumanMessage
 
     result = OfflineHostModel()._generate([HumanMessage(content=prompt)])
     message = result.generations[0].message
-    return message.tool_calls[0]["name"]  # type: ignore[attr-defined]
+    call = message.tool_calls[0]  # type: ignore[attr-defined]
+    return call["name"], call["args"]
 
 
 def test_offline_host_routes_scenario_to_run_live() -> None:
@@ -96,8 +97,39 @@ def test_offline_host_routes_scenario_to_run_live() -> None:
     Lets a key-free user trigger a preset live run (not only the hello smoke path),
     while keeping ``run_hello_demo`` as the default for any non-scenario message.
     """
-    assert _offline_first_tool_call("Do deep, fact-checked research on RAG.") == "run_live"
-    assert _offline_first_tool_call("Hi, can you show me the demo?") == "run_hello_demo"
+    assert _offline_first_tool_call("Do deep, fact-checked research on RAG.")[0] == "run_live"
+    assert _offline_first_tool_call("Hi, can you show me the demo?")[0] == "run_hello_demo"
+
+
+def test_offline_host_routes_named_preset_through_args() -> None:
+    """A request that names a preset runs THAT preset, not the default deep_research.
+
+    The offline host must forward the named workflow through the ``run_live`` tool args
+    so a key-free "run the capstone scenario" actually reaches capstone; an unnamed
+    scenario request leaves args empty so the tool picks its own default.
+    """
+    name, args = _offline_first_tool_call("Run the capstone scenario end to end.")
+    assert name == "run_live"
+    assert args.get("workflow") == "capstone"
+
+    # An unnamed scenario request leaves the workflow to the tool default (empty args).
+    _name, default_args = _offline_first_tool_call("Do deep, fact-checked research on RAG.")
+    assert "workflow" not in default_args
+
+
+async def test_run_workflow_live_runs_capstone_majority_vote() -> None:
+    """The live runner drives the capstone preset to its non-trivial survivor split.
+
+    Closes the gap the offline routing now opens: capstone must be reachable AND
+    correct through the same engine-facing path the host tool uses, ending in the
+    strict-majority adversarial vote (three survivors, beta voted down).
+    """
+    from host_graph import run_workflow_live
+
+    adapter = UiAdapter(emit=lambda _comp, _props: None)
+    result = await run_workflow_live("capstone", {}, adapter=adapter)
+    assert result.startswith("synthesized 3 surviving findings:"), result
+    assert "beta:" not in result
 
 
 async def test_inline_run_emits_ordered_progress() -> None:

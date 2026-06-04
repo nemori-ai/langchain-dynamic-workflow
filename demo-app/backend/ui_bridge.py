@@ -13,9 +13,19 @@ host node context) and, for each engine event, rebinds that contextvar to the
 captured host config for the duration of a single ``push_ui_message`` call. The UI
 event is then emitted against the host graph's writer and ``ui`` channel, so it
 streams to the frontend even though the sink fires deep inside the nested engine
-run. The emit is wrapped so a failure is swallowed and never blocks — progress
-sinks are called directly inside the engine, where a raising or blocking sink would
-break orchestration.
+run.
+
+Delivery is **synchronous and inline by necessity**, not by oversight. The engine's
+progress/span sinks are plain synchronous callables (``Callable[[Span], None]``), and
+``push_ui_message`` resolves and writes the *current* graph's stream writer from a
+contextvar — so the emit must run inline, in the rebound host context, on the engine's
+own call stack. Deferring it to a background task would both lose the host context and
+require an awaitable sink the engine does not offer. The transport itself is a fast,
+in-memory stream-writer append (it does no I/O and does not await), so an inline emit
+adds bounded, near-constant work per event rather than a blocking call. The one failure
+mode the inline path must defend against is a *raising* sink — the engine calls sinks
+directly, so an exception would unwind the orchestration — and the emit swallows every
+exception to neutralize exactly that.
 """
 
 from __future__ import annotations

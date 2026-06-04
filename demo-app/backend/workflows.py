@@ -47,9 +47,11 @@ ANGLES = [
 SKEPTICS_PER_CLAIM = 3
 REFUTATIONS_TO_KILL = 2
 
-# Capstone source topics + its skeptic fan-out width.
+# Capstone source topics + its skeptic fan-out width. Two refutations out of three
+# voters kill a finding (strict-majority adversarial vote), mirroring deep_research.
 TOPICS = ["alpha", "beta", "gamma", "delta"]
 SKEPTICS_PER_FINDING = 3
+CAPSTONE_KILL_AT = 2
 
 DEFAULT_RESEARCH_QUESTION = (
     "What are the main trade-offs between retrieval-augmented generation and long-context LLMs?"
@@ -187,6 +189,14 @@ async def deep_research(ctx: Ctx, args: dict[str, Any]) -> str:
 # ── capstone orchestration ────────────────────────────────────────────────────
 
 
+def _capstone_challenge_prompt(topic: str) -> str:
+    return (
+        "You are an adversarial skeptic. Decide whether the refined finding below holds "
+        "up. Set `refuted` to true only if it is unsupported, incoherent, or overstated; "
+        f"otherwise set it to false. Give one sentence of `reason`.\nFinding: {topic}"
+    )
+
+
 async def capstone(ctx: Ctx, args: dict[str, Any]) -> str:
     """research -> refine -> adversarial verify (majority survives) -> synthesize.
 
@@ -225,12 +235,15 @@ async def capstone(ctx: Ctx, args: dict[str, Any]) -> str:
     for topic, refined_text in refined:
         verdicts = await ctx.parallel(
             [
-                lambda t=topic: ctx.agent(f"Challenge {t}", agent_type="skeptic")
+                lambda t=topic: ctx.agent(
+                    _capstone_challenge_prompt(t), agent_type="capstone_skeptic", schema=Verdict
+                )
                 for _ in range(SKEPTICS_PER_FINDING)
             ]
         )
-        valid_votes = sum(1 for v in verdicts if v == "valid")
-        survived = valid_votes * 2 > SKEPTICS_PER_FINDING  # strict majority survives
+        # A finding survives unless a majority of skeptics refute it: with three voters,
+        # two refutations kill it (strict-majority adversarial vote over typed Verdicts).
+        survived = survives(verdicts, against=lambda v: v.refuted, kill_at=CAPSTONE_KILL_AT)
         ctx.log(f"finding {'kept' if survived else 'killed'}: {topic}")
         if survived:
             survivors.append(f"{topic}:{refined_text}")
@@ -316,21 +329,36 @@ def _build_skeptic(*, response_format: Any = None) -> Any:
     )
 
 
-def _build_verdict_leaf() -> RunnableLambda[dict[str, Any], dict[str, Any]]:
-    """Build the capstone skeptic: votes ``valid``/``invalid`` by topic-name parity.
+def _build_capstone_skeptic(*, response_format: Any = None) -> Any:
+    """Build the capstone adversarial skeptic, forwarding ``response_format`` (Verdict).
 
-    Kept deterministic (fake even on the real path) so the majority split is
-    reproducible: an odd-length topic name survives (all skeptics vote ``valid``), an
-    even-length one is rejected.
+    Like ``deep_research``'s skeptic this is a read-only judge that hands back a
+    schema-validated :class:`Verdict`, so the majority vote is plain Python over typed
+    data on both paths. The real path is a ``read_only_leaf`` (a deny-write permission)
+    so even a hallucinated "fix" is refused at the tool boundary. Offline it refutes by
+    topic-name parity — an even-length topic name is unanimously refuted (and dies on
+    the strict-majority kill), an odd-length one survives — so the survivor split is
+    deterministic and the majority-vote narrative is reproducibly non-trivial.
     """
+    model = resolve_leaf_model()
+    if model is not None:
+        return read_only_leaf(model, response_format=response_format)
 
-    async def _call(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
         prompt = inp["messages"][-1].text if inp["messages"] else ""
         topic = prompt.split()[-1] if prompt.split() else ""
-        verdict = "valid" if len(topic) % 2 == 1 else "invalid"
-        return {"messages": [*inp["messages"], AIMessage(content=verdict)]}
+        refuted = len(topic) % 2 == 0
+        return {
+            "messages": [*inp["messages"], AIMessage(content="reviewed the finding")],
+            "structured_response": Verdict(
+                refuted=refuted,
+                reason="even-length topic name fails the parity check"
+                if refuted
+                else "consistent with the refined finding",
+            ),
+        }
 
-    return RunnableLambda(_call)
+    return RunnableLambda(_leaf)
 
 
 # ── roster + registry ─────────────────────────────────────────────────────────
@@ -340,9 +368,10 @@ def make_roster() -> Roster:
     """Build the demo leaf roster shared by both preset workflows.
 
     Registers the roles ``deep_research`` and ``capstone`` need: ``researcher``,
-    ``writer``, ``refiner``, ``extractor`` (structured), and ``skeptic`` (a read-only
-    adversarial judge). With a provider key present each leaf is a real
-    ``create_deep_agent``; with no key the roster serves deterministic fake leaves so
+    ``writer``, ``refiner``, ``extractor`` (structured), ``skeptic`` (a read-only
+    adversarial judge over a claim), and ``capstone_skeptic`` (the same kind of
+    read-only judge over a refined finding). With a provider key present each leaf is a
+    real ``create_deep_agent``; with no key the roster serves deterministic fake leaves so
     an offline run is fully reproducible. An ``echo`` leaf is also kept for
     ``hello_workflow``, which makes no ``agent()`` calls but still requires a roster.
 
@@ -358,6 +387,11 @@ def make_roster() -> Roster:
             "extractor", builder=_build_extractor, description="Extracts a falsifiable claim."
         )
         .register("skeptic", builder=_build_skeptic, description="Adversarially verifies a claim.")
+        .register(
+            "capstone_skeptic",
+            builder=_build_capstone_skeptic,
+            description="Adversarially verifies a refined finding (majority vote).",
+        )
         .register("echo", _fake_echo_leaf("echo"), description="Trivial echo leaf (hello demo).")
     )
 
