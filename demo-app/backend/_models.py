@@ -36,6 +36,7 @@ from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
 )
+from langchain_core.language_models import LangSmithParams
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -466,15 +467,57 @@ def is_offline() -> bool:
     return resolve_openrouter_key() is None
 
 
-class _WebSearchChatOpenRouter(ChatOpenRouter):
-    """A ``ChatOpenRouter`` that appends OpenRouter's native web tools to every binding.
+# LangSmith cost tracking keys on Anthropic's official, HYPHENATED model ids
+# (``claude-opus-4-8``), but OpenRouter slugs are DOT-separated and provider-prefixed
+# (``anthropic/claude-opus-4.8``), so the two never match and a traced run shows no cost.
+# This maps the dot-version (provider prefix stripped) to the hyphen-version. Ported from
+# omne-next's RoutedChatOpenRouter ``LANGSMITH_MODEL_NAME_MAP``; extend it when adding a
+# model whose OpenRouter id carries a dot in its version. Unknown ids pass through as-is.
+_LANGSMITH_MODEL_NAME_MAP: dict[str, str] = {
+    "claude-opus-4.8": "claude-opus-4-8",
+    "claude-opus-4.7": "claude-opus-4-7",
+    "claude-opus-4.6": "claude-opus-4-6",
+    "claude-opus-4.5": "claude-opus-4-5",
+    "claude-opus-4.1": "claude-opus-4-1",
+    "claude-sonnet-4.6": "claude-sonnet-4-6",
+    "claude-sonnet-4.5": "claude-sonnet-4-5",
+    "claude-haiku-4.5": "claude-haiku-4-5",
+    "claude-3.7-sonnet": "claude-3-7-sonnet",
+    "claude-3.5-sonnet": "claude-3-5-sonnet",
+    "claude-3.5-haiku": "claude-3-5-haiku",
+}
+
+
+class _RoutedChatOpenRouter(ChatOpenRouter):
+    """A ``ChatOpenRouter`` that reports Anthropic's official model id to LangSmith.
+
+    The base client traces ``ls_provider="openrouter"`` / ``ls_model_name="anthropic/
+    claude-opus-4.8"``, which LangSmith's pricing table (keyed on Anthropic's hyphenated
+    ids) cannot match, so a traced run records no cost. This strips the ``provider/``
+    prefix and maps the dot-version to the hyphen-version (:data:`_LANGSMITH_MODEL_NAME_MAP`)
+    so cost tracking lines up. Ported from omne-next's RoutedChatOpenRouter.
+    """
+
+    def _get_ls_params(self, stop: list[str] | None = None, **kwargs: Any) -> LangSmithParams:
+        params = super()._get_ls_params(stop=stop, **kwargs)
+        raw = params.get("ls_model_name") or self.model_name or ""
+        provider, sep, model = raw.partition("/")
+        if sep and provider and model:
+            params["ls_provider"] = provider
+            params["ls_model_name"] = _LANGSMITH_MODEL_NAME_MAP.get(model, model)
+        return params
+
+
+class _WebSearchChatOpenRouter(_RoutedChatOpenRouter):
+    """A routed ``ChatOpenRouter`` that appends OpenRouter's native web tools per binding.
 
     deepagents binds its own tools onto a leaf model via ``bind_tools``; that call would
     otherwise replace any tools set at construction, dropping web search. This appends the
     web tools (:data:`_WEB_TOOLS`) **raw** — not through ``convert_to_openai_tool``, which
     rewrites a tool into function-call shape and strips the ``openrouter:`` marker the
     server needs — so the search stays available alongside deepagents' tools on every
-    request and is executed server-side by OpenRouter.
+    request and is executed server-side by OpenRouter. Inherits the LangSmith model-id
+    normalization from :class:`_RoutedChatOpenRouter`.
     """
 
     def bind_tools(self, tools: Any, **kwargs: Any) -> Any:  # type: ignore[override]
@@ -502,7 +545,7 @@ def _build_openrouter_model(model: str, api_key: str, *, web_search: bool = Fals
     Returns:
         A configured :class:`~langchain_core.language_models.chat_models.BaseChatModel`.
     """
-    cls = _WebSearchChatOpenRouter if web_search else ChatOpenRouter
+    cls = _WebSearchChatOpenRouter if web_search else _RoutedChatOpenRouter
     return cls(
         model=model,
         base_url=OPENROUTER_BASE_URL,

@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from langchain_core.language_models import LangSmithParams
 from langchain_core.language_models.chat_models import BaseChatModel
 
 DEFAULT_OPENROUTER_MODEL = "anthropic/claude-opus-4.8"
@@ -55,6 +56,70 @@ WEB_SEARCH_TOOL: dict[str, Any] = {
     "type": "openrouter:web_search",
     "parameters": {"engine": "native", "max_results": 5},
 }
+
+# LangSmith cost tracking keys on Anthropic's official, hyphenated model ids
+# (``claude-opus-4-8``), but OpenRouter slugs are dot-separated and provider-prefixed
+# (``anthropic/claude-opus-4.8``), so a traced run would record no cost. Map the
+# dot-version (prefix stripped) to the hyphen-version. Ported from omne-next's
+# RoutedChatOpenRouter; unknown ids pass through unchanged.
+_LANGSMITH_MODEL_NAME_MAP: dict[str, str] = {
+    "claude-opus-4.8": "claude-opus-4-8",
+    "claude-opus-4.7": "claude-opus-4-7",
+    "claude-opus-4.6": "claude-opus-4-6",
+    "claude-opus-4.5": "claude-opus-4-5",
+    "claude-opus-4.1": "claude-opus-4-1",
+    "claude-sonnet-4.6": "claude-sonnet-4-6",
+    "claude-sonnet-4.5": "claude-sonnet-4-5",
+    "claude-haiku-4.5": "claude-haiku-4-5",
+    "claude-3.7-sonnet": "claude-3-7-sonnet",
+    "claude-3.5-sonnet": "claude-3-5-sonnet",
+    "claude-3.5-haiku": "claude-3-5-haiku",
+}
+
+
+def _build_routed_openrouter(model_slug: str, *, web_search: bool) -> BaseChatModel:
+    """Build a ChatOpenRouter that normalizes its LangSmith model id, optionally with search.
+
+    The subclasses are defined locally so this module imports no OpenRouter dependency at
+    load time (examples run offline by default, without the demo dependency group). The
+    routed base rewrites ``ls_provider`` / ``ls_model_name`` so LangSmith cost tracking
+    matches Anthropic's pricing table; the web-search variant additionally appends the
+    native web tool on every ``bind_tools`` (surviving deepagents' own binding).
+
+    Args:
+        model_slug: The OpenRouter model slug (e.g. ``anthropic/claude-opus-4.8``).
+        web_search: When ``True``, return the web-search-enabled variant.
+
+    Returns:
+        A configured ``ChatOpenRouter`` subclass instance.
+    """
+    from langchain_openrouter import ChatOpenRouter
+
+    class _RoutedChatOpenRouter(ChatOpenRouter):
+        """Reports Anthropic's hyphenated model id to LangSmith for cost matching."""
+
+        def _get_ls_params(self, stop: list[str] | None = None, **kwargs: Any) -> LangSmithParams:
+            params = super()._get_ls_params(stop=stop, **kwargs)
+            raw = params.get("ls_model_name") or self.model_name or ""
+            provider, sep, model = raw.partition("/")
+            if sep and provider and model:
+                params["ls_provider"] = provider
+                params["ls_model_name"] = _LANGSMITH_MODEL_NAME_MAP.get(model, model)
+            return params
+
+    if not web_search:
+        return _RoutedChatOpenRouter(model=model_slug, openrouter_provider=ANTHROPIC_PROVIDER)
+
+    class _WebSearchChatOpenRouter(_RoutedChatOpenRouter):
+        """Routed model that also keeps the native web search tool on every binding."""
+
+        def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+            bound = super().bind_tools(tools, **kwargs)
+            bound_kwargs: dict[str, Any] = dict(getattr(bound, "kwargs", {}))
+            bound_kwargs["tools"] = [*bound_kwargs.get("tools", []), WEB_SEARCH_TOOL]
+            return self.bind(**bound_kwargs)
+
+    return _WebSearchChatOpenRouter(model=model_slug, openrouter_provider=ANTHROPIC_PROVIDER)
 
 
 def load_demo_env() -> None:
@@ -87,10 +152,8 @@ def real_model() -> BaseChatModel | None:
     gate = os.environ.get(_REAL_MODEL_ENV)
     if not gate:
         return None
-    from langchain_openrouter import ChatOpenRouter
-
     model_slug = gate if "/" in gate else DEFAULT_OPENROUTER_MODEL
-    return ChatOpenRouter(model=model_slug, openrouter_provider=ANTHROPIC_PROVIDER)
+    return _build_routed_openrouter(model_slug, web_search=False)
 
 
 def real_leaf_model(*, web_search: bool = False) -> BaseChatModel | None:
@@ -111,27 +174,7 @@ def real_leaf_model(*, web_search: bool = False) -> BaseChatModel | None:
     """
     if not os.environ.get(_REAL_MODEL_ENV):
         return None
-    from langchain_openrouter import ChatOpenRouter
-
-    if not web_search:
-        return ChatOpenRouter(model=DEFAULT_LEAF_MODEL, openrouter_provider=ANTHROPIC_PROVIDER)
-
-    class _WebSearchChatOpenRouter(ChatOpenRouter):
-        """ChatOpenRouter that appends the native web search tool to every binding.
-
-        Defined locally so this module imports no OpenRouter dependency at load time
-        (the offline path must run without the demo dependency group installed).
-        """
-
-        def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
-            bound = super().bind_tools(tools, **kwargs)
-            bound_kwargs: dict[str, Any] = dict(getattr(bound, "kwargs", {}))
-            bound_kwargs["tools"] = [*bound_kwargs.get("tools", []), WEB_SEARCH_TOOL]
-            return self.bind(**bound_kwargs)
-
-    return _WebSearchChatOpenRouter(
-        model=DEFAULT_LEAF_MODEL, openrouter_provider=ANTHROPIC_PROVIDER
-    )
+    return _build_routed_openrouter(DEFAULT_LEAF_MODEL, web_search=web_search)
 
 
 def demo_cache_middleware() -> list[Any]:

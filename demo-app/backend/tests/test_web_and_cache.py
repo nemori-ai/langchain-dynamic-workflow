@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from _models import (
     ANTHROPIC_PROVIDER,
+    HOST_MODEL,
     LEAF_MODEL,
     WEB_SEARCH_TOOL,
     LazyOpenRouterHostModel,
@@ -76,6 +77,22 @@ def test_build_model_pins_anthropic_provider_and_gates_web_search() -> None:
     assert isinstance(searcher, _WebSearchChatOpenRouter)
     for model in (plain, searcher):
         assert model.openrouter_provider == ANTHROPIC_PROVIDER  # type: ignore[attr-defined]
+
+
+def test_langsmith_model_name_normalized_to_anthropic_hyphenated() -> None:
+    """Built models report Anthropic's hyphenated id to LangSmith, not the OpenRouter slug.
+
+    LangSmith's pricing table keys on Anthropic's official ``claude-opus-4-8``; the raw
+    OpenRouter slug ``anthropic/claude-opus-4.8`` would miss it and a traced run would show
+    no cost. The routed subclass rewrites ``ls_provider`` / ``ls_model_name`` in
+    ``_get_ls_params`` (dot-version -> hyphen-version), and the web-search leaf inherits it.
+    """
+    host_params = _build_openrouter_model(HOST_MODEL, "sk-fake")._get_ls_params()
+    assert host_params.get("ls_provider") == "anthropic"
+    assert host_params.get("ls_model_name") == "claude-opus-4-8"
+
+    leaf_params = _build_openrouter_model(LEAF_MODEL, "sk-fake", web_search=True)._get_ls_params()
+    assert leaf_params.get("ls_model_name") == "claude-sonnet-4-6"
 
 
 def test_resolve_leaf_model_web_search_gated_on_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
