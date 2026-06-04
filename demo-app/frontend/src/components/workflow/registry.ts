@@ -1,5 +1,6 @@
 import type React from "react";
 import { HelloUI } from "./HelloUI";
+import { PhaseTimeline } from "./PhaseTimeline";
 
 /**
  * Local Generative-UI component map for the dynamic-workflow demo.
@@ -16,4 +17,5 @@ export const workflowComponents: Record<
   // Server-pushed props are typed per component for authoring, but arrive untyped
   // at runtime, so widen to the SDK's prop-less component type at the map boundary.
   hello_ui: HelloUI as React.FunctionComponent,
+  phase_timeline: PhaseTimeline as React.FunctionComponent,
 };
