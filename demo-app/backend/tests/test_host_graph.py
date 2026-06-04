@@ -2,8 +2,10 @@
 
 These exercise the engine-facing contract directly (no model, no langgraph dev):
 
-* the host graph builds with a ``ui`` state channel and the ``run_hello_demo`` tool;
-* an inline ``run_workflow`` drives the progress sink in emission order; and
+* the host graph builds with a ``ui`` state channel and the demo tools;
+* an inline ``run_workflow`` drives the progress sink in emission order;
+* the generic ``run_workflow_live`` helper resolves a named preset workflow, runs it
+  inline, and streams its progress/span events through a :class:`UiAdapter`; and
 * the red line — a raising progress sink must never break orchestration.
 
 Visual/Gen-UI rendering is verified separately in the browser.
@@ -12,8 +14,10 @@ Visual/Gen-UI rendering is verified separately in the browser.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import pytest
+from ui_adapter import UiAdapter
 from workflows import hello_workflow, make_roster
 
 from langchain_dynamic_workflow import ProgressEntry, ProgressKind, run_workflow
@@ -26,13 +30,74 @@ def _no_model_keys() -> None:
         os.environ.pop(key, None)
 
 
-def test_host_graph_builds_with_ui_channel_and_tool() -> None:
-    from host_graph import HostState, make_host_graph, run_hello_demo
+def test_host_graph_builds_with_ui_channel_and_tools() -> None:
+    from host_graph import HostState, make_host_graph, run_hello_demo, run_live
 
     graph = make_host_graph()
     assert graph is not None
     assert "ui" in HostState.__annotations__
     assert run_hello_demo.name == "run_hello_demo"
+    assert run_live.name == "run_live"
+
+
+async def test_run_workflow_live_streams_named_preset_with_fanout() -> None:
+    """The generic live runner resolves a named preset and streams its events.
+
+    ``run_workflow_live`` is the engine-facing core of the ``run_live`` host tool,
+    extracted so it can be tested without a node context (the contextvar rebind is
+    covered separately in ``test_ui_bridge``). Driving the offline ``deep_research``
+    preset through it must: resolve the workflow by name, run it inline, return a
+    non-empty result, and feed a real parallel fan-out plus ordered phases through the
+    supplied :class:`UiAdapter`.
+    """
+    from host_graph import run_workflow_live
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    adapter = UiAdapter(emit=lambda comp, props: events.append((comp, dict(props))))
+
+    result = await run_workflow_live("deep_research", {"question": "Q?"}, adapter=adapter)
+
+    assert isinstance(result, str)
+    assert result.strip()
+
+    components = [comp for comp, _ in events]
+    assert any(comp == "fanout_graph" for comp in components), components
+
+    phase_titles = [
+        props["message"]
+        for comp, props in events
+        if comp == "phase_timeline" and props["kind"] == ProgressKind.PHASE.value
+    ]
+    assert phase_titles == ["search", "extract", "verify", "synthesize"]
+
+
+async def test_run_workflow_live_unknown_name_raises() -> None:
+    """An unknown workflow name fails loud with the registry's KeyError."""
+    from host_graph import run_workflow_live
+
+    adapter = UiAdapter(emit=lambda _comp, _props: None)
+    with pytest.raises(KeyError):
+        await run_workflow_live("does_not_exist", {}, adapter=adapter)
+
+
+def _offline_first_tool_call(prompt: str) -> str:
+    """Drive the offline host one turn on ``prompt`` and return the called tool name."""
+    from _models import OfflineHostModel
+    from langchain_core.messages import HumanMessage
+
+    result = OfflineHostModel()._generate([HumanMessage(content=prompt)])
+    message = result.generations[0].message
+    return message.tool_calls[0]["name"]  # type: ignore[attr-defined]
+
+
+def test_offline_host_routes_scenario_to_run_live() -> None:
+    """A scenario request drives ``run_live``; a generic ask stays on the hello path.
+
+    Lets a key-free user trigger a preset live run (not only the hello smoke path),
+    while keeping ``run_hello_demo`` as the default for any non-scenario message.
+    """
+    assert _offline_first_tool_call("Do deep, fact-checked research on RAG.") == "run_live"
+    assert _offline_first_tool_call("Hi, can you show me the demo?") == "run_hello_demo"
 
 
 async def test_inline_run_emits_ordered_progress() -> None:

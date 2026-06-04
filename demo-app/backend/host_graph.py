@@ -3,13 +3,20 @@
 ``langgraph dev`` loads :func:`make_host_graph` (registered under the ``host`` graph
 id in ``langgraph.json``) and serves it on the local API. The host carries a ``ui``
 state channel (reduced by ``ui_message_reducer``) so Generative-UI components render
-in the chat, and a ``run_hello_demo`` tool that proves two round-trips:
+in the chat, and two tools that drive inline workflow runs whose progress/span hooks
+flow through a :class:`~ui_adapter.UiAdapter`:
 
-* pushing a trivial ``hello_ui`` component from inside the node context, and
-* running a workflow inline whose progress/span hooks flow through a
-  :class:`~ui_adapter.UiAdapter`, which maps each engine event to a Gen-UI
-  component (``phase_timeline`` / ``fanout_graph`` / ``agent_span`` /
-  ``journal_badge``) and pushes it live from within the same node context.
+* ``run_hello_demo`` — runs the trivial ``hello_workflow`` and also pushes a
+  ``hello_ui`` component, proving the Generative-UI round-trip from a node context.
+* ``run_live`` — the generic entry: resolves a named preset workflow
+  (``deep_research`` / ``capstone``) from :func:`~workflows.make_workflows`, runs it
+  inline against the real roster, and streams its phase / fan-out / span events live.
+
+Both tools capture the host node context up front (``ui_bridge.make_host_ui_emit``)
+so events emitted from deep inside the nested engine run still target the host
+graph's stream and ``ui`` channel. The shared inline-run mechanics live in
+:func:`run_workflow_live`, which is decoupled from the tool decorator so it can be
+tested without a node context.
 """
 
 from __future__ import annotations
@@ -24,15 +31,24 @@ from langgraph.graph.ui import AnyUIMessage, ui_message_reducer
 from langgraph.prebuilt import InjectedState
 from ui_adapter import UiAdapter
 from ui_bridge import make_host_ui_emit
-from workflows import hello_workflow, make_roster
+from workflows import hello_workflow, make_roster, make_workflows
 
-from langchain_dynamic_workflow import run_workflow
+from langchain_dynamic_workflow import Ctx, run_workflow
 
 HOST_INSTRUCTIONS = (
-    "You are a helpful assistant for the dynamic-workflow demo. "
-    "When the user wants to see the demo workflow run, call run_hello_demo. "
-    "Otherwise answer the user's questions directly and concisely."
+    "You are a thorough assistant for the dynamic-workflow demo. A hard, multi-step "
+    "task is best tackled by decomposing it into independent sub-work, investigating "
+    "those parts in parallel, cross-checking the findings before committing to them, "
+    "and only then synthesizing a clear answer — and that heavier orchestration runs "
+    "as a workflow rather than being crammed into a single pass. When the user wants "
+    "to drive a preset scenario live, run it through the live workflow tool and let "
+    "its progress stream into the panel. Otherwise answer directly and concisely."
 )
+
+# The preset the offline host (and a key-free user) triggers by default. A richer,
+# fan-out-heavy scenario than the hello smoke path, so the demo shows real
+# control-flow inversion out of the box.
+DEFAULT_LIVE_WORKFLOW = "deep_research"
 
 
 class HostState(DeepAgentState):
@@ -103,13 +119,86 @@ async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str
     return f"Demo workflow finished: {result}"
 
 
+async def run_workflow_live(name: str, args: dict[str, Any], *, adapter: UiAdapter) -> str:
+    """Resolve a named preset workflow and run it inline, streaming via ``adapter``.
+
+    This is the engine-facing core of the :func:`run_live` host tool, kept free of
+    the node-context machinery so it can be exercised directly in tests. It resolves
+    ``name`` from :func:`~workflows.make_workflows`, wraps the two-argument
+    ``WorkflowFn`` into the single-argument orchestrator ``run_workflow`` expects
+    (binding ``args``), and runs it against the real roster with the adapter's sinks
+    wired to ``on_progress`` / ``on_span``. The same registry is also passed as
+    ``workflows=`` so a preset that nests ``ctx.workflow(...)`` resolves too.
+
+    Args:
+        name: The registered preset workflow name (e.g. ``"deep_research"``).
+        args: Arguments forwarded to the workflow (an empty mapping is fine; presets
+            fall back to their own defaults).
+        adapter: The :class:`~ui_adapter.UiAdapter` whose sinks receive the run's
+            progress and span events.
+
+    Returns:
+        The workflow's result, coerced to ``str`` for the tool's text reply.
+
+    Raises:
+        KeyError: If ``name`` is not a registered preset (the registry lists the
+            available names).
+    """
+    workflows = make_workflows()
+    workflow_fn = workflows.resolve(name)  # fail-loud on an unknown name
+
+    async def _orchestrate(ctx: Ctx) -> Any:
+        return await workflow_fn(ctx, args)
+
+    result = await run_workflow(
+        _orchestrate,
+        roster=make_roster(),
+        on_progress=adapter.on_progress,
+        on_span=adapter.on_span,
+        workflows=workflows,
+    )
+    return str(result)
+
+
+@tool
+async def run_live(
+    state: Annotated[dict[str, Any], InjectedState],
+    workflow: str = DEFAULT_LIVE_WORKFLOW,
+    args: dict[str, Any] | None = None,
+) -> str:
+    """Run a named preset workflow live, streaming its orchestration into the UI.
+
+    Resolves ``workflow`` (e.g. ``deep_research`` or ``capstone``) from the preset
+    registry and runs it inline against the real roster. Each engine progress/span
+    event flows through a :class:`~ui_adapter.UiAdapter`, which maps it to a Gen-UI
+    component (``phase_timeline`` for phases/logs, ``fanout_graph`` for parallel /
+    pipeline fan-out, ``agent_span`` / ``journal_badge`` for leaves) with a stable
+    content ``event_id`` for dedupe, and pushes it live from inside the same node
+    context — so the chat shows the control-flow inversion as it happens.
+
+    Args:
+        state: Injected graph state (used to anchor UI events to the host turn).
+        workflow: The preset workflow to run; defaults to ``deep_research``.
+        args: Optional workflow arguments (e.g. ``{"question": "..."}``). When
+            omitted the preset uses its own defaults.
+
+    Returns:
+        A short human-readable summary including the workflow's result.
+    """
+    anchor = _anchor_message(state.get("messages", []))
+    emit = make_host_ui_emit(anchor=anchor)
+    adapter = UiAdapter(emit=emit)
+    result = await run_workflow_live(workflow, args or {}, adapter=adapter)
+    return f"Workflow {workflow!r} finished: {result}"
+
+
 def make_host_graph() -> Any:
     """Build the host deepagent graph served by ``langgraph dev``.
 
     Resolves the host model from the environment (a real provider model when a key
     is present, an offline scripted fallback otherwise), extends the deepagent state
-    with a ``ui`` channel, and registers the ``run_hello_demo`` tool so the host can
-    drive the Generative-UI + inline-run round-trips.
+    with a ``ui`` channel, and registers the ``run_hello_demo`` and ``run_live`` tools
+    so the host can drive the Generative-UI round-trip and inline preset runs.
 
     Returns:
         The compiled deepagent host graph (a runnable LangGraph graph).
@@ -117,6 +206,6 @@ def make_host_graph() -> Any:
     return create_deep_agent(
         model=resolve_host_model(),
         system_prompt=HOST_INSTRUCTIONS,
-        tools=[run_hello_demo],
+        tools=[run_hello_demo, run_live],
         state_schema=HostState,
     )
