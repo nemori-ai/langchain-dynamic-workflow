@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "host": "./host_graph.py:make_host_graph"
+  },
+  "env": ".env"
+}
