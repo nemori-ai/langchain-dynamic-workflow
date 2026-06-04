@@ -58,7 +58,7 @@ class WorkflowToolSchema(BaseModel):
     is never advertised to the model; the model supplies only these fields.
     """
 
-    command: Literal["run", "run_script", "status", "resume", "cancel"] = Field(
+    command: Literal["run", "run_script", "status", "resume", "cancel", "runs"] = Field(
         description="Which workflow operation to perform."
     )
     workflow: str | None = Field(
@@ -101,6 +101,9 @@ Commands (pass `command`):
 - `resume`: given a finished or interrupted `run_id`, re-run the same workflow
     against its journal so completed steps replay at zero cost. Returns a new run.
 - `cancel`: given a `run_id`, stop an in-flight run.
+- `runs`: list every run you launched on this thread with its workflow label and
+    live status (and a short outcome preview once settled), so you can see all of
+    them at once instead of polling each `run_id`. Takes no arguments.
 """
 
 
@@ -329,6 +332,28 @@ def create_workflow_tool(
             }
         )
 
+    def _label_for_run_id(run_id: str) -> str:
+        """Best-effort workflow label for a tracked run from its resume spec."""
+        spec = run_specs.get(run_id)
+        if spec is None:
+            return "?"
+        kind, name_or_source, _args = spec
+        return _label_for_script(name_or_source) if kind == "script" else name_or_source
+
+    def _runs_command(runtime: _ToolRuntime) -> str:
+        """List every run on the host thread with its label and live status."""
+        thread_id = _host_thread_id(runtime)
+        snapshots = manager.list_runs(thread_id)
+        if not snapshots:
+            return "runs: no runs on this thread yet."
+        lines: list[str] = []
+        for snap in snapshots:
+            line = f"- {snap.run_id} · {_label_for_run_id(snap.run_id)} · {snap.status.value}"
+            if snap.summary:
+                line += f" · {snap.summary}"
+            lines.append(line)
+        return f"runs: {len(snapshots)} run(s) on this thread:\n" + "\n".join(lines)
+
     async def _cancel_command(runtime: _ToolRuntime, *, run_id: str | None) -> str:
         if not run_id:
             return "cancel: a 'run_id' is required."
@@ -362,9 +387,11 @@ def create_workflow_tool(
             return _resume_command(runtime, run_id=run_id)
         if command == "cancel":
             return await _cancel_command(runtime, run_id=run_id)
+        if command == "runs":
+            return _runs_command(runtime)
         return (
             f"unknown command {command!r}; expected one of: "
-            "run, run_script, status, resume, cancel."
+            "run, run_script, status, resume, cancel, runs."
         )
 
     # Under ``from __future__ import annotations`` the ``runtime`` annotation is a
