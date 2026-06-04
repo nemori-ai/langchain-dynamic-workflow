@@ -94,4 +94,30 @@ def resolve_host_model() -> BaseChatModel:
     return OfflineHostModel()
 
 
-__all__: Sequence[str] = ["OfflineHostModel", "resolve_host_model"]
+def resolve_leaf_model() -> BaseChatModel | None:
+    """Return a chat model for workflow leaves, or ``None`` to run them offline.
+
+    Mirrors :func:`resolve_host_model`'s BYO-key gating but signals the offline path
+    with ``None`` instead of a scripted model: a leaf is a real ``create_deep_agent``
+    only when a provider key is present, otherwise the roster swaps in a deterministic
+    fake leaf so an offline run stays reproducible and needs no credentials.
+
+    Returns:
+        A configured chat model when a key is present, else ``None``.
+    """
+    if os.environ.get("OPENAI_API_KEY"):
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(model=os.environ.get("LDW_DEMO_LEAF_MODEL", "gpt-4o-mini"))
+    if os.environ.get("OPENROUTER_API_KEY"):
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=os.environ.get("LDW_DEMO_LEAF_MODEL", "openai/gpt-4o-mini"),
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.environ["OPENROUTER_API_KEY"],  # type: ignore[arg-type]
+        )
+    return None
+
+
+__all__: Sequence[str] = ["OfflineHostModel", "resolve_host_model", "resolve_leaf_model"]
