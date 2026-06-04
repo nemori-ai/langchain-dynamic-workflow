@@ -137,7 +137,9 @@ const StreamSession = ({
 
 // Default values for the form
 const DEFAULT_API_URL = "http://localhost:2024";
-const DEFAULT_ASSISTANT_ID = "agent";
+// DEMO PATCH: the backend registers its host graph as "host" in langgraph.json,
+// so the setup-form default points there (upstream ships "agent").
+const DEFAULT_ASSISTANT_ID = "host";
 const AGENT_BUILDER_AUTH_SCHEME = "langsmith-api-key";
 
 export const StreamProvider: React.FC<{ children: ReactNode }> = ({

@@ -22,8 +22,9 @@ removed on copy; the tree is committed directly into this repository.
   Gen-UI workflow components physically separated from the vendored upstream
   tree so future upstream re-syncs (re-copy at a newer SHA) stay mechanical.
 - **Touching vendored files is allowed only at the documented injection points
-  below** (the Gen-UI local component-map wiring). Keep those edits minimal and
-  greppable; everything else of ours goes in `src/components/workflow/`.
+  below** (the Gen-UI local component-map wiring, and the assistant-id default in
+  `Stream.tsx`). Keep those edits minimal and greppable; everything else of ours
+  goes in `src/components/workflow/`.
 - To update upstream: re-clone at a newer SHA, re-copy the tree, re-apply the
   injection-point edits, bump the SHA + date in this file.
 
@@ -52,7 +53,8 @@ the vendored SHA above.
   - `NEXT_PUBLIC_AUTH_SCHEME` (optional)
   - API key comes from `localStorage` key `lg:chat:apiKey` via `getApiKey()`.
 - Built-in defaults (lines 139–141): `DEFAULT_API_URL = "http://localhost:2024"`,
-  `DEFAULT_ASSISTANT_ID = "agent"`.
+  `DEFAULT_ASSISTANT_ID` (upstream ships `"agent"`; the demo overrides it to
+  `"host"` — see injection point 4 below).
 - If `finalApiUrl` or `finalAssistantId` is missing, a setup **form** renders
   (lines 185–303) instead of the chat — to skip it, set the env vars in
   `.env` (see `.env.example`).
@@ -112,6 +114,27 @@ import { workflowComponents } from "@/components/workflow";
 This one-line `components={...}` addition at lines 36–41 is the **only** edit to
 a vendored file the Gen-UI integration requires; the component implementations
 themselves stay under `src/components/workflow/` per the patch policy above.
+
+### 4. Assistant-id default must match the backend graph id
+
+**File: `src/providers/Stream.tsx`, `DEFAULT_ASSISTANT_ID`.**
+
+Upstream ships `DEFAULT_ASSISTANT_ID = "agent"`, but the demo backend registers
+its host graph under **`host`** in `backend/langgraph.json`
+(`"host": "./host_graph.py:make_host_graph"`). Connection resolution is
+`finalAssistantId = (URL ?assistantId param) || NEXT_PUBLIC_ASSISTANT_ID`, with
+`DEFAULT_ASSISTANT_ID` used only as the setup-form's pre-filled default. So two
+things must point at `host` for the copy-paste getting-started path to connect to
+a graph that exists:
+
+- `NEXT_PUBLIC_ASSISTANT_ID=host` in `.env.example` (demo-owned — the value that
+  actually drives the connection once `.env` is copied), and
+- `DEFAULT_ASSISTANT_ID = "host"` in `Stream.tsx` (vendored — the form default a
+  user sees when they fill the setup form manually with no `.env`).
+
+Both are set in this vendored snapshot. On an upstream re-sync, re-apply the
+`Stream.tsx` default so it keeps matching the backend graph id (or rename the
+backend graph to `agent` and revert both — pick one and make them agree).
 
 ## Dev server
 
