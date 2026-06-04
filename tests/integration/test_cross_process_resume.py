@@ -31,12 +31,30 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from pydantic import BaseModel
 
 from langchain_dynamic_workflow import Ctx, Roster, run_workflow
 from langchain_dynamic_workflow._context import LeafOutcome
 
 _WORKER = Path(__file__).resolve().parent / "_cross_process_worker.py"
 _RESULT_MARKER = "WORKER_RESULT "
+
+
+class _StructuredAnswer(BaseModel):
+    """A user-defined structured-output schema, unregistered with the serializer.
+
+    Stands in for the pydantic model a structured-output leaf leaves under
+    ``state['structured_response']``. Defined at module scope (not nested in a
+    test) so it has a real import path, exactly as a deployed user model would —
+    which is what the strict serde checks against its allow-list.
+
+    Attributes:
+        city: The answered city name.
+        temperature_c: The answered temperature in Celsius.
+    """
+
+    city: str
+    temperature_c: int
 
 
 def _run_worker(mode: str, db_path: Path, counter_path: Path) -> dict[str, Any]:
@@ -241,6 +259,57 @@ def test_leaf_outcome_payload_is_strict_msgpack_serializable() -> None:
     ]
     assert all(isinstance(m, BaseMessage) for m in restored.state["messages"])
     assert restored.usage == 42
+
+
+def test_strict_msgpack_degrades_structured_response_to_a_plain_dict() -> None:
+    """An unregistered ``structured_response`` model degrades to a dict under strict mode.
+
+    The strict-safe guarantee covers the :class:`LeafOutcome` wrapper and the
+    *registered* state it carries (LangChain messages / containers), but not an
+    unregistered user type. A structured-output leaf leaves its validated pydantic
+    model under ``state['structured_response']``; under the strict serde
+    (``allowed_msgpack_modules=None``) that model dumps fine but loads back as a
+    plain ``dict``, because the unregistered-type revival path is blocked.
+
+    This pins that boundary as an honest, executable contract rather than a silent
+    gap. It is *not* a replay defect: the headline zero-cost replay reads the
+    content-hash journal (which stores the folded result *string* — a schema-bound
+    leaf stores ``model_dump_json``), never this checkpoint state, so a degraded
+    ``structured_response`` never reaches the orchestration script.
+    """
+    strict_serde = JsonPlusSerializer(allowed_msgpack_modules=None)
+
+    answer = _StructuredAnswer(city="Paris", temperature_c=18)
+    outcome = LeafOutcome(
+        state={
+            "messages": [HumanMessage(content="Weather in Paris?"), AIMessage(content="done")],
+            "structured_response": answer,
+        },
+        usage=11,
+    )
+
+    payload_type, payload_blob = strict_serde.dumps_typed(outcome.to_payload())
+    revived = strict_serde.loads_typed((payload_type, payload_blob))
+    restored = LeafOutcome.from_payload(revived)
+
+    # The registered message types survive the strict round trip unchanged...
+    assert [type(m).__name__ for m in restored.state["messages"]] == [
+        "HumanMessage",
+        "AIMessage",
+    ]
+    assert all(isinstance(m, BaseMessage) for m in restored.state["messages"])
+
+    # ...but the unregistered structured_response model degrades to a plain dict:
+    # the strict serde blocks its revival path, so it is NOT the original model.
+    degraded = restored.state["structured_response"]
+    assert not isinstance(degraded, _StructuredAnswer)
+    assert isinstance(degraded, dict)
+    # Its field VALUES are preserved (the degradation is type-only, lossless data):
+    # the original model is reconstructable from this dict were it ever needed.
+    assert degraded == {"city": "Paris", "temperature_c": 18}
+    assert _StructuredAnswer.model_validate(degraded) == answer
+    # usage round-trips as a real int (no lossy cast on the from_payload path).
+    assert restored.usage == 11
 
 
 def test_true_cross_process_resume_replays_leaves_at_zero_new_cost(tmp_path: Path) -> None:

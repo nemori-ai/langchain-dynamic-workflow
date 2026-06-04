@@ -60,9 +60,21 @@ class LeafOutcome:
         nested inside ``state``) without an opaque object-reconstruction hop. A
         custom class instance, by contrast, is only revived through a deprecated
         unregistered-type path that newer serializers block. Returning this plain
-        mapping from the task boundary keeps the persisted shape strictly
+        mapping from the task boundary keeps the wrapper itself strictly
         serializable while the engine still works with the typed
         :class:`LeafOutcome` everywhere else.
+
+        The strict-safe guarantee is scoped to the :class:`LeafOutcome` wrapper
+        and the *registered* state it carries (the LangChain message and container
+        types nested in ``state``). It does NOT extend to an unregistered user
+        type: a structured-output leaf leaves its validated pydantic model under
+        ``state['structured_response']``, and under strict msgpack that model dumps
+        fine but loads back as a plain ``dict`` (the unregistered-type revival path
+        is blocked). This is a documented serialization boundary, not a replay
+        defect: the headline zero-cost replay reads the content-hash journal, which
+        stores the folded result *string* (a schema-bound leaf stores its
+        ``model_dump_json``), never the checkpoint state — so a degraded
+        ``structured_response`` in a persisted checkpoint never reaches the script.
 
         Returns:
             A mapping with ``state`` and ``usage`` keys.
@@ -80,7 +92,7 @@ class LeafOutcome:
         Returns:
             The reconstructed outcome.
         """
-        return cls(state=payload["state"], usage=int(payload["usage"]))
+        return cls(state=payload["state"], usage=payload["usage"])
 
 
 class LeafRunner(Protocol):

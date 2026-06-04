@@ -153,7 +153,13 @@ async def run_workflow(
         # a deprecated unregistered-type path that newer serializers block. So
         # this task returns the LeafOutcome's msgpack-native payload mapping; the
         # caller rebuilds the typed LeafOutcome, keeping the engine's public
-        # behavior identical while the persisted shape stays strictly serializable.
+        # behavior identical. The strict-safe shape covers the wrapper and the
+        # registered (message/container) state only: a structured-output leaf's
+        # state['structured_response'] is an unregistered user pydantic model that
+        # degrades to a plain dict under strict msgpack. That is a documented
+        # serialization boundary, not a replay defect — the zero-cost replay reads
+        # the content-hash journal (which stores the folded result string), never
+        # this checkpoint state, so the degraded model never reaches the script.
         roster.resolve(agent_type)  # fail fast on unknown agent_type
         # Resolve the runnable bound to the requested response_format: a schema-less
         # call (response_format=None) gets the schema-less variant; a schema call
