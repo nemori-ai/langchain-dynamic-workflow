@@ -6,8 +6,10 @@ state channel (reduced by ``ui_message_reducer``) so Generative-UI components re
 in the chat, and a ``run_hello_demo`` tool that proves two round-trips:
 
 * pushing a trivial ``hello_ui`` component from inside the node context, and
-* running a workflow inline with a progress sink that pushes ``phase_timeline``
-  components live, from within the same node context.
+* running a workflow inline whose progress/span hooks flow through a
+  :class:`~ui_adapter.UiAdapter`, which maps each engine event to a Gen-UI
+  component (``phase_timeline`` / ``fanout_graph`` / ``agent_span`` /
+  ``journal_badge``) and pushes it live from within the same node context.
 """
 
 from __future__ import annotations
@@ -20,10 +22,11 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import tool
 from langgraph.graph.ui import AnyUIMessage, ui_message_reducer
 from langgraph.prebuilt import InjectedState
+from ui_adapter import UiAdapter
 from ui_bridge import make_host_ui_emit
 from workflows import hello_workflow, make_roster
 
-from langchain_dynamic_workflow import ProgressEntry, run_workflow
+from langchain_dynamic_workflow import run_workflow
 
 HOST_INSTRUCTIONS = (
     "You are a helpful assistant for the dynamic-workflow demo. "
@@ -69,10 +72,13 @@ async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str
     """Run the demo workflow, streaming its progress into the UI as it goes.
 
     Pushes a trivial ``hello_ui`` component to confirm the Generative-UI round-trip,
-    then runs ``hello_workflow`` inline with a progress sink that pushes a
-    ``phase_timeline`` component for each phase/log entry live (from within this node
-    context). The sink swallows every exception and never blocks, so a UI push
-    failure can never break orchestration.
+    then runs ``hello_workflow`` inline, feeding the engine's progress/span hooks
+    through a :class:`~ui_adapter.UiAdapter`. The adapter maps each engine event to a
+    Gen-UI component (``phase_timeline`` for progress, ``fanout_graph`` /
+    ``agent_span`` / ``journal_badge`` for spans), stamps a stable content-based
+    ``event_id`` so re-emits dedupe, and swallows transport failures so a UI push can
+    never break orchestration. The host-bound ``emit`` rebinds the captured node
+    context so events stream live from inside the nested engine run.
 
     Returns:
         A short human-readable summary of what ran.
@@ -85,21 +91,14 @@ async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str
     # Round-trip 1: a trivial local component renders from the node context.
     emit("hello_ui", {"text": "hello from backend", "event_id": "hello-1"})
 
-    # Round-trip 2: inline workflow run with a live, non-blocking progress sink.
-    seq = 0
-
-    def on_progress(entry: ProgressEntry) -> None:
-        nonlocal seq
-        seq += 1
-        emit(
-            "phase_timeline",
-            {"kind": entry.kind.value, "message": entry.message, "event_id": f"p-{seq}"},
-        )
-
+    # Round-trip 2: inline workflow run whose progress/span hooks flow through the
+    # adapter (event mapping + stable-id dedupe + non-blocking emit).
+    adapter = UiAdapter(emit=emit)
     result = await run_workflow(
         hello_workflow,
         roster=make_roster(),
-        on_progress=on_progress,
+        on_progress=adapter.on_progress,
+        on_span=adapter.on_span,
     )
     return f"Demo workflow finished: {result}"
 
