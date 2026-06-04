@@ -190,7 +190,11 @@ class WorkflowMiddleware(AgentMiddleware[WorkflowState, Any, Any]):
         # Besides injecting the notification, rewrite each settled run's record from
         # the launch-time `running` to its terminal status. The channel reducer
         # (merge_workflow_runs) upserts these by run_id, so workflow_runs reflects
-        # the live outcome instead of a stale `running`.
+        # the live outcome instead of a stale `running`. The update carries only
+        # {run_id, status}: the reducer's field-merge preserves the label the launch
+        # record already wrote. A notice for a run never recorded through the tool
+        # (e.g. launched directly on the shared manager) yields a labelless record by
+        # design — the supported launch path always writes the label first.
         settle_updates = [{"run_id": n.run_id, "status": n.status.value} for n in notices]
         return {
             "messages": [HumanMessage(content=_render_notification(notices))],

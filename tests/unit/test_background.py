@@ -217,8 +217,8 @@ async def test_list_runs_enumerates_thread_runs_with_status() -> None:
     async def quick() -> str:
         return "done-value"
 
-    manager.start(slow(), run_id="r1", thread_id="t1")  # stays in flight
-    manager.start(quick(), run_id="r2", thread_id="t1")  # settles
+    manager.start(slow(), run_id="r1", thread_id="t1")  # stays in flight, no label
+    manager.start(quick(), run_id="r2", thread_id="t1", label="quick-job")  # settles
     await manager.wait("r2", thread_id="t1")
 
     snapshots = manager.list_runs("t1")
@@ -227,8 +227,10 @@ async def test_list_runs_enumerates_thread_runs_with_status() -> None:
     assert set(by_id) == {"r1", "r2"}
     assert by_id["r1"].status in {BgStatus.PENDING, BgStatus.RUNNING}
     assert by_id["r1"].summary is None  # in flight: no outcome yet
+    assert by_id["r1"].label is None  # launched without a label
     assert by_id["r2"].status == BgStatus.DONE
     assert by_id["r2"].summary == "done-value"  # settled: short outcome preview
+    assert by_id["r2"].label == "quick-job"  # label recorded at launch flows through
 
     release.set()
     await manager.wait("r1", thread_id="t1")
@@ -250,6 +252,17 @@ async def test_list_runs_isolated_per_thread() -> None:
     assert [s.run_id for s in manager.list_runs("tB")] == ["r2"]
     # A thread with no runs gets an empty list.
     assert manager.list_runs("tC") == []
+
+
+def test_max_concurrent_runs_rejects_non_positive() -> None:
+    # 0/negative is not a meaningful quota (it would refuse every run); only None
+    # (unbounded) or a positive cap are valid, rejected loud at construction.
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="positive integer or None"):
+            BgRunManager(max_concurrent_runs=bad)
+    # None and a positive cap are accepted.
+    assert BgRunManager().max_concurrent_runs is None
+    assert BgRunManager(max_concurrent_runs=1).max_concurrent_runs == 1
 
 
 async def test_unbounded_quota_is_the_default() -> None:

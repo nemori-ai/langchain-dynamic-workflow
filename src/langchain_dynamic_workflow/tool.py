@@ -181,6 +181,7 @@ def create_workflow_tool(
         spec: tuple[str, str, dict[str, Any]],
         thread_id: str,
         journal: JournalStore,
+        label: str,
     ) -> str:
         """Detach a workflow run onto the background manager; return its run_id."""
 
@@ -202,7 +203,9 @@ def create_workflow_tool(
             )
             return result if isinstance(result, str) else str(result)
 
-        slot = manager.start(_coro(), thread_id=thread_id)
+        # The label travels with the manager slot so the `runs` listing can name the
+        # run authoritatively, not via this tool's closure-local bookkeeping.
+        slot = manager.start(_coro(), thread_id=thread_id, label=label)
         journals[slot.run_id] = journal
         run_specs[slot.run_id] = spec
         return slot.run_id
@@ -226,6 +229,7 @@ def create_workflow_tool(
                 spec=("name", workflow, args or {}),
                 thread_id=thread_id,
                 journal=InMemoryJournalStore(),
+                label=workflow,
             )
         except BgRunQuotaExceededError as exc:
             # The manager's concurrent-run quota is full: surface it as a clear
@@ -266,6 +270,7 @@ def create_workflow_tool(
                 spec=("script", script, args or {}),
                 thread_id=thread_id,
                 journal=InMemoryJournalStore(),
+                label=label,
             )
         except BgRunQuotaExceededError as exc:
             return f"run_script: {exc}"
@@ -320,6 +325,7 @@ def create_workflow_tool(
             spec=spec,
             thread_id=thread_id,
             journal=journals[run_id],
+            label=label,
         )
         message = (
             f"Resumed {label!r} from run {run_id!r} against its journal. "
@@ -332,23 +338,20 @@ def create_workflow_tool(
             }
         )
 
-    def _label_for_run_id(run_id: str) -> str:
-        """Best-effort workflow label for a tracked run from its resume spec."""
-        spec = run_specs.get(run_id)
-        if spec is None:
-            return "?"
-        kind, name_or_source, _args = spec
-        return _label_for_script(name_or_source) if kind == "script" else name_or_source
-
     def _runs_command(runtime: _ToolRuntime) -> str:
-        """List every run on the host thread with its label and live status."""
+        """List every run on the host thread with its label and live status.
+
+        The label is read from the run's own manager slot (recorded at launch), so
+        it is authoritative regardless of which tool instance launched the run; a
+        run launched outside this surface with no label renders as ``?``.
+        """
         thread_id = _host_thread_id(runtime)
         snapshots = manager.list_runs(thread_id)
         if not snapshots:
             return "runs: no runs on this thread yet."
         lines: list[str] = []
         for snap in snapshots:
-            line = f"- {snap.run_id} · {_label_for_run_id(snap.run_id)} · {snap.status.value}"
+            line = f"- {snap.run_id} · {snap.label or '?'} · {snap.status.value}"
             if snap.summary:
                 line += f" · {snap.summary}"
             lines.append(line)
