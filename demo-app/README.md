@@ -66,10 +66,12 @@ pnpm install     # first run only
 pnpm dev
 ```
 
-Open **http://localhost:3000**. The frontend is preconfigured (`frontend/.env`,
-copied from `frontend/.env.example`) to talk to the backend at
-`http://localhost:2024` with assistant id `host`, so the chat connects without a
-setup form.
+Open **http://localhost:3000**. The frontend ships a committed `frontend/.env` (it
+carries only public `NEXT_PUBLIC_*` values — the local backend URL and assistant id
+`host`, no secrets), so a fresh clone connects to the backend at
+`http://localhost:2024` without a setup form. (The backend needs no `.env` to boot
+offline — see [Bring your own key](#bring-your-own-key-byo-key) if you want to supply
+an OpenRouter key for a real-model run.)
 
 > The frontend's `NEXT_PUBLIC_ASSISTANT_ID` and the backend graph id must agree —
 > both are `host` here. If you rename the backend graph in `langgraph.json`,
@@ -105,8 +107,8 @@ changing them is a one-line edit:
 
 | Constant | Role | Why this pick |
 |----------|------|---------------|
-| `HOST_MODEL` | the host agent that drives the multi-step tool calls | a **strong** model (`anthropic/claude-3.5-sonnet`). Our earlier real-model findings showed weak/cheap models (`gpt-4o-mini`, `haiku`) *cannot* reliably drive the multi-step tool-calling the host needs — they stall or skip the workflow tool. The host must be strong. |
-| `LEAF_MODEL` | the research fan-out sub-agents | an **economical** model (`openai/gpt-4o-mini`). Leaves do bounded, single-shot work and there are many of them in parallel, so the cheap model keeps a fan-out affordable. |
+| `HOST_MODEL` | the host agent that drives the multi-step tool calls | a **strong** model (`anthropic/claude-sonnet-4.5`). Our earlier real-model findings showed weak/cheap models (e.g. `gpt-4o-mini`) *cannot* reliably drive the multi-step tool-calling the host needs — they stall or skip the workflow tool. The host must be strong. |
+| `LEAF_MODEL` | the research fan-out sub-agents | an **economical** model (`anthropic/claude-haiku-4.5`). Leaves do bounded, single-shot work and there are many of them in parallel, so the cheap model keeps a fan-out affordable. |
 
 Both are valid OpenRouter model ids. To swap either, edit the constant — nothing
 else changes.
@@ -119,9 +121,11 @@ else changes.
 
 ## The four scenarios
 
-The chat ships four preset buttons (defined once in `scenarios.json`). Each is
-phrased as a real user's request, not a tool instruction — click one, or type
-your own. Here is what each one is built to *show*:
+The chat ships four preset buttons. Their canonical wording lives in
+`scenarios.json`; the frontend's `ScenarioPanel` carries the same four messages, and
+a backend doc-sync test pins the two copies byte-for-byte so they cannot drift. Each
+is phrased as a real user's request, not a tool instruction — click one, or type your
+own. Here is what each one is built to *show*:
 
 ### 1. Deep research — a hard, multi-source question
 > *"I need a thorough, fact-checked answer on the main trade-offs between

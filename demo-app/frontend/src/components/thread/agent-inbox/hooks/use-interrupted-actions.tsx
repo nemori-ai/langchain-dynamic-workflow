@@ -13,6 +13,7 @@ import {
 } from "react";
 import { Decision, DecisionWithEdits, HITLRequest, SubmitType } from "../types";
 import { buildDecisionFromState, createDefaultHumanResponse } from "../utils";
+import { withProviderRunConfig } from "@/components/workflow/provider-key";
 
 interface UseInterruptedActionsInput {
   interrupt: Interrupt<HITLRequest>;
@@ -86,15 +87,16 @@ export default function useInterruptedActions({
 
   const resumeRun = (decisions: Decision[]): boolean => {
     try {
+      // Resuming an interrupt is a run too, so it must carry the saved OpenRouter key.
       thread.submit(
         {},
-        {
+        withProviderRunConfig({
           command: {
             resume: {
               decisions,
             },
           },
-        },
+        }),
       );
       return true;
     } catch (error) {
@@ -188,13 +190,14 @@ export default function useInterruptedActions({
     initialHumanInterruptEditValue.current = {};
 
     try {
+      // Resolving (goto END) re-enters the graph, so carry the saved OpenRouter key.
       thread.submit(
         {},
-        {
+        withProviderRunConfig({
           command: {
             goto: END,
           },
-        },
+        }),
       );
 
       toast("Success", {

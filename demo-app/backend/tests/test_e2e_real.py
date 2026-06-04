@@ -111,6 +111,21 @@ async def test_deep_research_real_model_streams_headline_fanout_inline() -> None
     assert result.strip(), "the real run produced an empty report"
     assert len(result.strip()) > 40, f"suspiciously short report: {result!r}"
 
+    # 1b. NOT the offline fake writer leaf's output. The offline writer is a
+    #     `_fake_echo_leaf("writer")` that returns `writer: <trimmed synthesize prompt>`,
+    #     so a silent fallback would echo the prompt back behind a "writer:" prefix and
+    #     carry the prompt's own instruction text. A real model never produces that. This
+    #     is a second, content-level guard so a fallback cannot pass even if the offline
+    #     gate above ever regresses — the assertions below (fan-out, phases, inline) are
+    #     all satisfiable by the offline fake roster, so the model identity must be pinned
+    #     on the produced CONTENT, not only on the run shape.
+    assert not result.lstrip().lower().startswith("writer:"), (
+        f"report carries the offline fake writer leaf's echo prefix (fell back offline): {result!r}"
+    )
+    assert "write a concise research report" not in result.lower(), (
+        f"report echoes the synthesize PROMPT verbatim (offline fake echo leaf): {result!r}"
+    )
+
     components = [comp for _ts, comp, _props in events]
 
     # 2. A real parallel fan-out actually happened (the search phase fans out researchers).

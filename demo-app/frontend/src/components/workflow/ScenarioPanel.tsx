@@ -7,7 +7,7 @@
  *
  * The four presets exercise the headline capabilities: a hard multi-source research
  * task, picking a long-running task back up, a task with no ready-made procedure, and
- * handing off a heavy multi-step job that streams its progress as it runs.
+ * handing off a heavy multi-step job to run detached in the background.
  */
 
 interface Scenario {
@@ -48,8 +48,8 @@ const SCENARIOS: readonly Scenario[] = [
     hint: "hand off a multi-step job",
     message:
       "This is a heavy, multi-step research job — I don't want to babysit every " +
-      "step. Please take it off my hands and run the whole workflow end to end, " +
-      "showing me the progress as it goes.",
+      "step. Please take it off my hands and run the whole thing in the " +
+      "background; just let me know how it went once it's done.",
   },
 ];
 

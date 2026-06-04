@@ -66,3 +66,40 @@ export function buildProviderRunConfig():
   if (!key) return undefined;
   return { configurable: { [OPENROUTER_CONFIGURABLE_KEY]: key } };
 }
+
+/**
+ * Merges the saved OpenRouter key into a `useStream` `submit` options object so EVERY
+ * run carries the per-session key.
+ *
+ * The key must ride along on every submit path — typed/scenario sends, regenerate,
+ * edited-message reruns, and every interrupt resume/approve. Threading the config by
+ * hand at each call site is easy to forget (and was: several paths shipped without it),
+ * so this is the single choke point: pass any submit options through here and the saved
+ * key is spread onto `config.configurable.openrouter_api_key` for that run. With no key
+ * saved the options are returned untouched, so the backend keeps its env/offline path
+ * and the run config carries nothing.
+ *
+ * It is read at submit time (not memoized) so a key saved mid-session takes effect on
+ * the next run without a reload.
+ *
+ * The generic is unconstrained so TypeScript preserves the caller's exact (literal)
+ * option types — e.g. `streamMode: ["values"]` must stay a `StreamMode[]`, not widen to
+ * `string[]` — and the merged `config` shape is added on top of whatever `T` is.
+ *
+ * @param options - The `submit` options to augment (may be omitted for a bare resume).
+ * @returns The same options with the provider `config` merged in when a key is saved.
+ */
+export function withProviderRunConfig<T>(
+  options?: T,
+): T & {
+  config?: { configurable: { [OPENROUTER_CONFIGURABLE_KEY]: string } };
+} {
+  type WithConfig = T & {
+    config?: { configurable: { [OPENROUTER_CONFIGURABLE_KEY]: string } };
+  };
+  const base = (options ?? {}) as T;
+  const providerConfig = buildProviderRunConfig();
+  // No saved key: return the options unchanged (the optional `config` is simply absent).
+  if (!providerConfig) return base as WithConfig;
+  return { ...base, config: providerConfig };
+}

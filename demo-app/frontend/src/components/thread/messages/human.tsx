@@ -7,6 +7,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { BranchSwitcher, CommandBar } from "./shared";
 import { MultimodalPreview } from "@/components/thread/MultimodalPreview";
 import { isBase64ContentBlock } from "@/lib/multimodal-utils";
+import { withProviderRunConfig } from "@/components/workflow/provider-key";
 
 function EditableContent({
   value,
@@ -53,9 +54,11 @@ export function HumanMessage({
     setIsEditing(false);
 
     const newMessage: Message = { type: "human", content: value };
+    // An edited-message rerun is a real run, so it must carry the saved OpenRouter key
+    // like every other submit path; withProviderRunConfig merges it in when present.
     thread.submit(
       { messages: [newMessage] },
-      {
+      withProviderRunConfig({
         checkpoint: parentCheckpoint,
         streamMode: ["values"],
         streamSubgraphs: true,
@@ -69,7 +72,7 @@ export function HumanMessage({
             messages: [...(values.messages ?? []), newMessage],
           };
         },
-      },
+      }),
     );
   };
 

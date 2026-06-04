@@ -41,7 +41,7 @@ import { useFileUpload } from "@/hooks/use-file-upload";
 import { ContentBlocksPreview } from "./ContentBlocksPreview";
 import { ScenarioPanel } from "@/components/workflow/ScenarioPanel";
 import { SettingsPanel } from "@/components/workflow/SettingsPanel";
-import { buildProviderRunConfig } from "@/components/workflow/provider-key";
+import { withProviderRunConfig } from "@/components/workflow/provider-key";
 import {
   useArtifactOpen,
   ArtifactContent,
@@ -222,15 +222,12 @@ export function Thread() {
     // Thread the saved OpenRouter key (if any) into the run config so the backend can
     // build the live model for this run. Read at submit time so a key saved mid-session
     // takes effect on the next run; absent a key the backend keeps its env/offline path.
-    const providerConfig = buildProviderRunConfig();
-
     stream.submit(
       { messages: [...toolMessages, newHumanMessage], context },
-      {
+      withProviderRunConfig({
         streamMode: ["values"],
         streamSubgraphs: true,
         streamResumable: true,
-        ...(providerConfig && { config: providerConfig }),
         optimisticValues: (prev) => ({
           ...prev,
           context,
@@ -240,7 +237,7 @@ export function Thread() {
             newHumanMessage,
           ],
         }),
-      },
+      }),
     );
 
     setInput("");
@@ -259,14 +256,15 @@ export function Thread() {
     prevMessageLength.current = prevMessageLength.current - 1;
     setFirstTokenReceived(false);
     // Regenerate is also a run, so it must carry the same OpenRouter key.
-    const providerConfig = buildProviderRunConfig();
-    stream.submit(undefined, {
-      checkpoint: parentCheckpoint,
-      streamMode: ["values"],
-      streamSubgraphs: true,
-      streamResumable: true,
-      ...(providerConfig && { config: providerConfig }),
-    });
+    stream.submit(
+      undefined,
+      withProviderRunConfig({
+        checkpoint: parentCheckpoint,
+        streamMode: ["values"],
+        streamSubgraphs: true,
+        streamResumable: true,
+      }),
+    );
   };
 
   const chatStarted = !!threadId || !!messages.length;

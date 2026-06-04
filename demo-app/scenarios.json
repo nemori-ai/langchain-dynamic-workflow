@@ -1,5 +1,5 @@
 {
-  "_comment": "Single source of truth for the demo's preset-scenario buttons. The frontend ScenarioPanel renders these and the backend offline-routing test asserts each message routes to a real fan-out run (run_live), so this file is the one place the user-facing scenario words live and drift is caught on both sides. Messages are a real user's words (the why/when of the task) — never tool mechanics.",
+  "_comment": "Canonical wording for the demo's preset-scenario buttons. The frontend ScenarioPanel hardcodes the same four messages (it does not read this file at runtime), and the backend doc-sync test (tests/test_doc_sync.py) pins the two copies byte-for-byte so they cannot drift. Messages are a real user's words (the why/when of the task) — never tool mechanics.",
   "scenarios": [
     {
       "label": "Deep research",

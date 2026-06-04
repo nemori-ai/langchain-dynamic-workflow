@@ -10,6 +10,7 @@ import { useQueryState } from "nuqs";
 import { constructOpenInStudioURL, buildDecisionFromState } from "../utils";
 import { Decision, HITLRequest, DecisionType, ActionRequest } from "../types";
 import { useStreamContext } from "@/providers/Stream";
+import { withProviderRunConfig } from "@/components/workflow/provider-key";
 
 interface ThreadActionsViewProps {
   interrupt: Interrupt<HITLRequest>;
@@ -175,13 +176,14 @@ export function ThreadActionsView({
         type: "approve",
       }));
 
+      // Approving all is a run too, so carry the saved OpenRouter key with it.
       stream.submit(
         {},
-        {
+        withProviderRunConfig({
           command: {
             resume: { decisions: allDecisions },
           },
-        },
+        }),
       );
 
       toast("Success", {
@@ -222,13 +224,14 @@ export function ThreadActionsView({
         return decision;
       });
 
+      // Submitting all decisions is a run too, so carry the saved OpenRouter key.
       stream.submit(
         {},
-        {
+        withProviderRunConfig({
           command: {
             resume: { decisions: allDecisions },
           },
-        },
+        }),
       );
 
       toast("Success", {
