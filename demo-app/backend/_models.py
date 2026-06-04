@@ -22,6 +22,8 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 # Tools the offline host can call to drive the Gen-UI + inline-run round-trips.
 _HELLO_TOOL_NAME = "run_hello_demo"
 _LIVE_TOOL_NAME = "run_live"
+_META_TOOL_NAME = "run_meta_script"
+_BACKGROUND_TOOL_NAME = "run_background"
 
 # Cue words in the user's message that route the offline host to a live preset run
 # instead of the default hello smoke path. The resume cues ("pick it back up" /
@@ -46,6 +48,26 @@ _LIVE_CUES = (
 # tool's own default workflow (so the args stay empty and the preset is chosen there).
 _WORKFLOW_CUES: dict[str, str] = {"capstone": "capstone"}
 
+# Cue phrases routing the offline host to the meta layer (run_meta_script): the user has
+# no ready-made procedure and wants the host to compose one on the spot. Checked BEFORE
+# the live cues so a "no playbook, work out a procedure (research a few topics...)"
+# request reaches the meta tool rather than a preset, even though it mentions "research".
+_META_CUES = ("no standard playbook", "no playbook", "work out a procedure", "novel task")
+
+# Cue phrases routing the offline host to a background run (run_background): the user
+# wants a heavy job taken off their hands to run while they do other things. Checked
+# BEFORE the live cues so a "take it off my hands / run it in the background" request
+# reaches the background tool rather than an inline preset run.
+_BACKGROUND_CUES = (
+    "off my hands",
+    "take it off",
+    "in the background",
+    "don't want to babysit",
+    "do not want to babysit",
+    "without babysitting",
+    "delegate",
+)
+
 
 def _latest_user_text(messages: Sequence[BaseMessage]) -> str | None:
     """Return the most recent human message's lowercased text, if any."""
@@ -65,6 +87,30 @@ def _wants_live_run(messages: Sequence[BaseMessage]) -> bool:
     """
     text = _latest_user_text(messages)
     return text is not None and any(cue in text for cue in _LIVE_CUES)
+
+
+def _wants_meta_run(messages: Sequence[BaseMessage]) -> bool:
+    """Return whether the latest user turn asks the host to compose a procedure itself.
+
+    A "no ready-made playbook, work out a procedure" request is the meta-layer cue: the
+    host should author an orchestration script on the spot rather than launch a preset.
+    Checked before the live cue so such a request reaches ``run_meta_script`` even when
+    it also mentions "research".
+    """
+    text = _latest_user_text(messages)
+    return text is not None and any(cue in text for cue in _META_CUES)
+
+
+def _wants_background_run(messages: Sequence[BaseMessage]) -> bool:
+    """Return whether the latest user turn asks to hand a heavy job off to the background.
+
+    A "take it off my hands / run it in the background / don't want to babysit" request
+    is the background cue: the host should launch the run detached and report its
+    lifecycle status rather than block the turn on an inline run. Checked before the
+    live cue so such a request reaches ``run_background``.
+    """
+    text = _latest_user_text(messages)
+    return text is not None and any(cue in text for cue in _BACKGROUND_CUES)
 
 
 def _requested_workflow(messages: Sequence[BaseMessage]) -> str | None:
@@ -119,6 +165,22 @@ class OfflineHostModel(BaseChatModel):
                     "Done — the workflow ran and streamed its progress into the panel "
                     "above (offline demo mode; set a model key for live model runs)."
                 )
+            )
+        elif _wants_meta_run(messages):
+            # No ready-made playbook: author a script and submit it through the meta
+            # layer (gate-pass fixture). Checked before the live cue so a "work out a
+            # procedure (research...)" request reaches the meta tool, not a preset.
+            message = AIMessage(
+                content="No ready-made procedure fits — composing one and running it now.",
+                tool_calls=[{"name": _META_TOOL_NAME, "args": {}, "id": "meta-call-1"}],
+            )
+        elif _wants_background_run(messages):
+            # Heavy job to hand off: launch it in the background and report its
+            # lifecycle. Checked before the live cue so a "take it off my hands" request
+            # reaches the background tool rather than an inline preset run.
+            message = AIMessage(
+                content="Taking it off your hands — launching it in the background now.",
+                tool_calls=[{"name": _BACKGROUND_TOOL_NAME, "args": {}, "id": "bg-call-1"}],
             )
         elif _wants_live_run(messages):
             # Route to the preset the user named (e.g. capstone); absent a named cue,

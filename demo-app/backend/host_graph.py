@@ -21,8 +21,10 @@ tested without a node context.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Annotated, Any
 
+from _meta_fixtures import AUTHORED_SCRIPT, META_TOPICS, REJECTED_SCRIPT
 from _models import is_offline, resolve_host_model
 from deepagents import DeepAgentState, create_deep_agent
 from langchain_core.messages import AIMessage, BaseMessage
@@ -36,7 +38,17 @@ from ui_adapter import UiAdapter
 from ui_bridge import UiEmit, make_host_ui_emit
 from workflows import hello_workflow, make_roster, make_workflows
 
-from langchain_dynamic_workflow import Ctx, InMemoryJournalStore, JournalStore, run_workflow
+from langchain_dynamic_workflow import (
+    BgRunManager,
+    BgStatus,
+    Ctx,
+    InMemoryJournalStore,
+    JournalStore,
+    WorkflowScriptError,
+    compile_workflow_source,
+    run_workflow,
+    run_workflow_from_source,
+)
 
 HOST_INSTRUCTIONS = (
     "You are a thorough assistant for the dynamic-workflow demo. A hard, multi-step "
@@ -185,6 +197,97 @@ def _emit_run_status(emit: UiEmit) -> None:
     emit(_RUN_STATUS, {"offline": is_offline(), "event_id": "run-status-1"})
 
 
+# Component name for the meta-layer viewer: the authored orchestration source plus the
+# AST-gate verdict. The frontend's MetaScriptViewer renders these props exactly —
+# ``source`` / ``gate`` ("passed" | "failed") / optional ``reason`` / ``event_id`` — so
+# the keys and the gate values here must match it byte-for-byte.
+_META_SCRIPT = "meta_script"
+_GATE_PASSED = "passed"
+_GATE_FAILED = "failed"
+
+
+def _emit_meta_script(emit: UiEmit, *, source: str, gate: str, reason: str | None) -> None:
+    """Emit a ``meta_script`` UI event carrying the authored source and gate verdict.
+
+    Pushed through the host-bound ``emit`` directly (not via the :class:`UiAdapter`,
+    whose vocabulary is the engine's progress/span events). The props match the
+    frontend MetaScriptViewer contract: ``source`` (the generated script), ``gate``
+    (``"passed"`` or ``"failed"``), an optional ``reason`` present only on a failed
+    gate, and a stable ``event_id``. The id is derived from the gate verdict and a short
+    hash of the source so an honest same-turn re-emit of the identical verdict dedupes
+    while a different verdict (a rejected attempt then a corrected one) gets its own id.
+
+    Args:
+        emit: The host-bound, non-blocking UI emit (rebinds the host node context).
+        source: The orchestration script source the meta layer authored.
+        gate: The AST-gate verdict, ``"passed"`` or ``"failed"``.
+        reason: The line-numbered rejection message when the gate failed, else ``None``.
+    """
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
+    props: dict[str, Any] = {
+        "source": source,
+        "gate": gate,
+        "event_id": f"meta-{gate}-{digest}",
+    }
+    if reason is not None:
+        props["reason"] = reason
+    emit(_META_SCRIPT, props)
+
+
+async def run_meta_script_live(*, submit_rejected: bool, adapter: UiAdapter, emit: UiEmit) -> str:
+    """Author a script, gate it, and (when admitted) run it — streaming via ``adapter``.
+
+    The engine-facing core of the :func:`run_meta_script` host tool, kept free of the
+    node-context machinery so it can be exercised directly in tests. It selects one of
+    the two demo fixtures and crosses the engine's AST security gate before anything
+    runs:
+
+    * Gate-pass (``submit_rejected=False``): the clean authored script. The gate admits
+      it (verified via :func:`compile_workflow_source`), a ``meta_script`` event reports
+      ``gate="passed"``, then the script runs via :func:`run_workflow_from_source` with
+      the adapter's sinks wired to ``on_progress`` / ``on_span`` so its phases and
+      parallel fan-out stream live, and its result is returned.
+    * Gate-fail (``submit_rejected=True``): the import-bearing script. The gate raises
+      :class:`WorkflowScriptError`; a ``meta_script`` event reports ``gate="failed"``
+      with the exception's line-numbered ``reason``, and NOTHING executes — the tool
+      returns a short rejection notice.
+
+    Security boundary: the gate stops an accidental slip, not a determined adversary —
+    an in-process restricted ``exec`` is not a security sandbox.
+
+    Args:
+        submit_rejected: Select the gate-fail fixture when ``True``, else the gate-pass
+            fixture. The offline host drives the pass path; a real model decides for
+            itself.
+        adapter: The :class:`~ui_adapter.UiAdapter` whose sinks receive the admitted
+            run's progress and span events (gate-pass path only).
+        emit: The host-bound UI emit used to push the ``meta_script`` verdict event
+            directly (the adapter handles only the engine's progress/span vocabulary).
+
+    Returns:
+        The authored script's result on the gate-pass path, or a short rejection notice
+        on the gate-fail path.
+    """
+    source = REJECTED_SCRIPT if submit_rejected else AUTHORED_SCRIPT
+    try:
+        # Validate first so the verdict reflects the gate, not a downstream runtime
+        # error: compile_workflow_source runs the AST gate and returns the WorkflowFn.
+        compile_workflow_source(source)
+    except WorkflowScriptError as exc:
+        _emit_meta_script(emit, source=source, gate=_GATE_FAILED, reason=str(exc))
+        return f"The authored script was rejected by the AST gate and nothing ran.\n{exc}"
+
+    _emit_meta_script(emit, source=source, gate=_GATE_PASSED, reason=None)
+    result = await run_workflow_from_source(
+        source,
+        roster=make_roster(),
+        args={"topics": META_TOPICS},
+        on_progress=adapter.on_progress,
+        on_span=adapter.on_span,
+    )
+    return str(result)
+
+
 @tool
 async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str:
     """Run the demo workflow, streaming its progress into the UI as it goes.
@@ -325,13 +428,173 @@ async def run_live(
     return f"Workflow {workflow!r} finished: {result}"
 
 
+@tool
+async def run_meta_script(
+    state: Annotated[dict[str, Any], InjectedState],
+    submit_rejected: bool = False,
+) -> str:
+    """Author an orchestration script on the spot, gate it, and run it if admitted.
+
+    Demonstrates the engine's meta layer: rather than launching a pre-registered
+    preset, the host authors an ``async def orchestrate(ctx, args)`` and submits the
+    *source* across the AST security gate before it ever runs. A ``meta_script`` Gen-UI
+    event surfaces the script and the gate verdict so the chat shows exactly what was
+    authored and whether it was admitted.
+
+    On the gate-pass path the admitted script runs live — its phases and parallel
+    fan-out stream into the panel through the same :class:`~ui_adapter.UiAdapter` the
+    preset tools use — and its result is returned. On the gate-fail path the gate
+    rejects the script, the ``meta_script`` event reports the line-numbered violation,
+    and nothing executes.
+
+    Security boundary: the gate stops an accidental slip, not a determined adversary —
+    an in-process restricted ``exec`` is not a security sandbox.
+
+    Args:
+        state: Injected graph state (used to anchor UI events to the host turn).
+        submit_rejected: When ``True`` submit the import-bearing fixture to show the
+            gate reject it and run nothing; when ``False`` (the default) submit the
+            clean authored fixture, which the gate admits and runs.
+
+    Returns:
+        The authored script's result on the gate-pass path, or a short rejection notice
+        on the gate-fail path.
+    """
+    anchor = _anchor_message(state.get("messages", []))
+    emit = make_host_ui_emit(anchor=anchor)
+    _emit_run_status(emit)
+    adapter = UiAdapter(emit=emit)
+    return await run_meta_script_live(submit_rejected=submit_rejected, adapter=adapter, emit=emit)
+
+
+# A single process-wide background-run manager, shared by every ``run_background`` call
+# (and by any middleware that drives the same run/status/notify loop) — the engine keys
+# its run slots on a composite ``(thread_id, run_id)``, so one manager safely serves all
+# host threads. Held at module scope so a launched run survives across host turns within
+# a process; a fresh process starts empty (the honest in-memory-store bound, matching the
+# resume lanes). HONEST LIMITATION: ``BgRunManager.start`` runs the coroutine in a
+# DETACHED asyncio task that does NOT carry the host node context, and
+# ``push_ui_message`` requires that context — so a background run CANNOT push live
+# progress/fan-out to the host ``ui`` channel. The background scenario deliberately
+# surfaces lifecycle status plus the final result only; it never wires the run's
+# progress/span sinks to a host emit (that would silently no-op from the detached task).
+_BG_MANAGER = BgRunManager()
+
+# The preset a background run launches by default — the same fan-out-heavy deep-research
+# scenario the inline path uses, so the background story runs real orchestration.
+DEFAULT_BACKGROUND_WORKFLOW = "deep_research"
+
+
+def launch_background_run(
+    manager: BgRunManager, *, thread_id: str, workflow: str = DEFAULT_BACKGROUND_WORKFLOW
+) -> str:
+    """Launch a preset workflow in the background and return its run id immediately.
+
+    Resolves ``workflow`` from the preset registry and submits a coroutine that runs it
+    to completion (coercing the result to ``str``, which :meth:`BgRunManager.start`
+    requires) onto ``manager`` as a DETACHED asyncio task. The call returns at once with
+    the run's id so the host turn is not blocked on the work — the caller then polls
+    :meth:`BgRunManager.poll` for lifecycle status and :meth:`BgRunManager.get_result`
+    for the settled result.
+
+    The detached task intentionally receives NO progress/span sinks: it does not carry
+    the host node context, so a ``push_ui_message`` from inside it would target the wrong
+    (or no) stream. Live streaming is the inline tools' job; the background path surfaces
+    lifecycle status and the final result.
+
+    Args:
+        manager: The shared :class:`~langchain_dynamic_workflow.BgRunManager` to launch on.
+        thread_id: The host thread id; the manager keys run slots on ``(thread_id,
+            run_id)`` so concurrent host threads stay isolated.
+        workflow: The preset workflow name to run; defaults to ``deep_research``.
+
+    Returns:
+        The launched run's id, usable with ``manager.poll`` / ``manager.get_result``.
+    """
+    workflows = make_workflows()
+    workflow_fn = workflows.resolve(workflow)  # fail-loud on an unknown name
+
+    async def _run() -> str:
+        async def _orchestrate(ctx: Ctx) -> Any:
+            return await workflow_fn(ctx, {})
+
+        result = await run_workflow(_orchestrate, roster=make_roster(), workflows=workflows)
+        return str(result)
+
+    slot = manager.start(_run(), thread_id=thread_id)
+    return slot.run_id
+
+
+async def run_background_live(
+    manager: BgRunManager, *, thread_id: str, workflow: str = DEFAULT_BACKGROUND_WORKFLOW
+) -> str:
+    """Launch a background run, await its settlement, and summarize its lifecycle + result.
+
+    The engine-facing core of the :func:`run_background` host tool, kept free of the
+    node-context machinery so it can be exercised directly in tests. It launches the run
+    via :func:`launch_background_run` (returning immediately with a run id), then — for
+    the demo's bounded offline two-turn shape — awaits settlement and folds the lifecycle
+    and final result into one summary string. A real-model host would instead return the
+    run id right away and follow up across turns via status polling and completion
+    notifications; that fuller loop is out of scope for the scripted offline host.
+
+    Args:
+        manager: The shared :class:`~langchain_dynamic_workflow.BgRunManager`.
+        thread_id: The host thread id keying the run slot.
+        workflow: The preset workflow name to run; defaults to ``deep_research``.
+
+    Returns:
+        A human-readable summary naming the run id, its settled status, and the result
+        (or the failure detail when the run did not complete).
+    """
+    run_id = launch_background_run(manager, thread_id=thread_id, workflow=workflow)
+    await manager.wait(run_id, thread_id=thread_id)
+    status = manager.poll(run_id, thread_id=thread_id)
+    if status is not BgStatus.DONE:
+        result = manager.get_result(run_id, thread_id=thread_id)
+        return f"Background run {run_id} ended with status {status.value} ({result.detail})."
+    result = manager.get_result(run_id, thread_id=thread_id)
+    payload = result.value if result.value is not None else result.summary
+    return f"Background run {run_id} status=done. Result:\n{payload}"
+
+
+@tool
+async def run_background(state: Annotated[dict[str, Any], InjectedState]) -> str:
+    """Launch a heavy workflow in the background and report its lifecycle and result.
+
+    Hands a multi-step job off to run on its own: it launches the preset on the shared
+    background-run manager (returning the host turn immediately rather than blocking on
+    the work), then reports the run's lifecycle status and, once it settles, the final
+    result.
+
+    Honest limitation: a background run executes in a DETACHED task that does not carry
+    the host node context, so it CANNOT push live progress into the chat panel —
+    ``push_ui_message`` needs that context. The background scenario therefore surfaces
+    lifecycle status and the final result, not the live phase/fan-out stream the inline
+    tools show. (The scripted offline host drives the bounded two-turn shape — launch,
+    settle, summarize — within this one tool; a real model follows up across turns via
+    status and completion notifications.)
+
+    Args:
+        state: Injected graph state (used to anchor UI events to the host turn).
+
+    Returns:
+        A short summary naming the run id, its settled status, and the result.
+    """
+    anchor = _anchor_message(state.get("messages", []))
+    emit = make_host_ui_emit(anchor=anchor)
+    _emit_run_status(emit)
+    return await run_background_live(_BG_MANAGER, thread_id=_host_thread_id())
+
+
 def make_host_graph() -> Any:
     """Build the host deepagent graph served by ``langgraph dev``.
 
     Resolves the host model from the environment (a real provider model when a key
     is present, an offline scripted fallback otherwise), extends the deepagent state
-    with a ``ui`` channel, and registers the ``run_hello_demo`` and ``run_live`` tools
-    so the host can drive the Generative-UI round-trip and inline preset runs.
+    with a ``ui`` channel, and registers the host tools so the host can drive the
+    Generative-UI round-trip (``run_hello_demo``), inline preset runs (``run_live``),
+    the meta layer (``run_meta_script``), and a background run (``run_background``).
 
     Returns:
         The compiled deepagent host graph (a runnable LangGraph graph).
@@ -339,6 +602,6 @@ def make_host_graph() -> Any:
     return create_deep_agent(
         model=resolve_host_model(),
         system_prompt=HOST_INSTRUCTIONS,
-        tools=[run_hello_demo, run_live],
+        tools=[run_hello_demo, run_live, run_meta_script, run_background],
         state_schema=HostState,
     )
