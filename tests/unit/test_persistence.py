@@ -35,7 +35,7 @@ def _spec() -> RunSpec:
         name_or_source="incident_triage",
         args={"severity": "high", "alerts": [1, 2, 3]},
         label="Incident triage",
-        thread_id="thread-abc",
+        journal_run_id="origin-run-id",
     )
 
 
@@ -74,12 +74,86 @@ async def test_save_spec_upserts_in_place(tmp_path: Path) -> None:
             name_or_source="async def main(ctx): return 'ok'",
             args={"x": 1},
             label="Authored run",
-            thread_id="thread-xyz",
+            journal_run_id="another-origin",
         )
         await store.save_spec("run-1", updated)
 
         loaded = await store.load_spec("run-1")
         assert loaded == updated
+    finally:
+        await store.aclose()
+
+
+async def test_save_spec_preserves_null_journal_lineage(tmp_path: Path) -> None:
+    """A spec with no journal lineage round-trips with ``journal_run_id`` ``None``.
+
+    A fresh launch persists ``journal_run_id=None`` (the tool stamps the canonical
+    origin only when relaunching a resume), so the nullable column must survive the
+    db round-trip rather than coercing to a string.
+    """
+    db_path = tmp_path / "workflows.db"
+    fresh = RunSpec(
+        kind="name",
+        name_or_source="wf",
+        args={"x": 1},
+        label="wf",
+        journal_run_id=None,
+    )
+    store = await SqliteWorkflowStore.open(db_path)
+    try:
+        await store.save_spec("run-1", fresh)
+        loaded = await store.load_spec("run-1")
+        assert loaded == fresh
+        assert loaded is not None
+        assert loaded.journal_run_id is None
+    finally:
+        await store.aclose()
+
+
+async def test_delete_spec_removes_the_run_specs_row(tmp_path: Path) -> None:
+    """``delete_spec`` deletes the persisted row so a later load misses.
+
+    This backs the orphan-cleanup contract: a launch persists its spec before the
+    background manager admits it, so a quota refusal must be able to delete that
+    spec and leave no unresumable orphan in the durable registry.
+    """
+    db_path = tmp_path / "workflows.db"
+    store = await SqliteWorkflowStore.open(db_path)
+    try:
+        await store.save_spec("run-1", _spec())
+        assert await store.load_spec("run-1") is not None
+
+        await store.delete_spec("run-1")
+        assert await store.load_spec("run-1") is None
+
+        # Deleting an absent row is silent, not an error.
+        await store.delete_spec("never-saved")
+    finally:
+        await store.aclose()
+
+
+async def test_save_spec_round_trips_unicode_args_faithfully(tmp_path: Path) -> None:
+    """Unicode keys and values in ``args`` survive the JSON round-trip exactly.
+
+    ``args`` originate from the model as a JSON object, so JSON-native values are
+    the documented contract. This pins the realistic case — non-ASCII keys and
+    values — round-tripping through ``json.dumps``/``json.loads`` byte-for-byte.
+    """
+    db_path = tmp_path / "workflows.db"
+    spec = RunSpec(
+        kind="name",
+        name_or_source="résumé_workflow",
+        args={"主题": "电池技术", "note": "naïve café — façade", "emoji": "🚀"},
+        label="Unicode launch",
+        journal_run_id=None,
+    )
+    store = await SqliteWorkflowStore.open(db_path)
+    try:
+        await store.save_spec("run-1", spec)
+        loaded = await store.load_spec("run-1")
+        assert loaded == spec
+        assert loaded is not None
+        assert loaded.args == {"主题": "电池技术", "note": "naïve café — façade", "emoji": "🚀"}
     finally:
         await store.aclose()
 

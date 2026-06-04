@@ -149,7 +149,7 @@ async def _run(db_path: Path, counter_path: Path, *, failing: bool) -> dict[str,
                 name_or_source="cross_process_demo",
                 args={"failing": failing},
                 label="Cross-process demo",
-                thread_id=_THREAD_ID,
+                journal_run_id=_RUN_ID,
             ),
         )
         return {"run_id": _RUN_ID, "result": result, "error": error}
@@ -178,7 +178,7 @@ async def _resume(db_path: Path, counter_path: Path) -> dict[str, Any]:
                 roster=_roster(counter_path),
                 journal=journal,
                 checkpointer=None,
-                thread_id=spec.thread_id,
+                thread_id=spec.journal_run_id or _RUN_ID,
             )
             return {"run_id": _RUN_ID, "result": result, "error": None}
         except WorkflowBudgetExceededError as exc:

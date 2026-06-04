@@ -58,16 +58,14 @@ def test_run_store_surface_exported_eagerly() -> None:
 
 
 def test_sqlite_store_is_lazily_resolved_not_eagerly_imported() -> None:
-    """``SqliteWorkflowStore`` is in ``__all__`` but resolves only on access.
+    """``SqliteWorkflowStore`` resolves only on access, via the package getattr.
 
     A bare ``import langchain_dynamic_workflow`` must not eagerly import the
     optional-dependency ``_persistence`` module, so the base install stays
-    dependency-free. The symbol is declared in ``__all__`` for discoverability and
-    materialized lazily through the package ``__getattr__`` on first access.
+    dependency-free. The symbol is materialized lazily through the package
+    ``__getattr__`` on first access.
     """
     import langchain_dynamic_workflow as ldw
-
-    assert "SqliteWorkflowStore" in ldw.__all__
 
     # In-process, the lazy attribute resolves to the concrete sqlite store class
     # (the [sqlite] extra is installed in dev/CI), exercising the __getattr__ hop.
@@ -85,6 +83,51 @@ def test_sqlite_store_is_lazily_resolved_not_eagerly_imported() -> None:
         "assert 'langchain_dynamic_workflow._persistence' in sys.modules, "
         "'attribute access did not import _persistence'; "
         "assert store_cls.__name__ == 'SqliteWorkflowStore'"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_sqlite_store_excluded_from_all_so_import_star_stays_base_safe() -> None:
+    """``SqliteWorkflowStore`` is absent from ``__all__`` so ``import *`` is safe.
+
+    A base install without the ``[sqlite]`` extra resolves ``import *`` through the
+    package ``__getattr__``; were ``SqliteWorkflowStore`` listed in ``__all__``,
+    the star import would trigger its lazy resolution and raise the optional-dep
+    ``ImportError``, breaking a dependency-free install. Keeping it out of
+    ``__all__`` (while leaving the ``__getattr__`` alias for explicit access and
+    IDE discoverability) makes ``import *`` base-safe.
+    """
+    import langchain_dynamic_workflow as ldw
+
+    assert "SqliteWorkflowStore" not in ldw.__all__
+    # The lazy alias still resolves on explicit attribute access (the [sqlite]
+    # extra is present in dev/CI), so discoverability is preserved.
+    assert ldw.SqliteWorkflowStore.__name__ == "SqliteWorkflowStore"
+
+
+def test_import_star_does_not_pull_persistence_eagerly() -> None:
+    """``from langchain_dynamic_workflow import *`` leaves ``_persistence`` unloaded.
+
+    Standing in for a base (no ``[sqlite]``) install: a star import must bind only
+    the eager, dependency-free surface and must NOT materialize the optional
+    sqlite module. A fresh subprocess proves ``_persistence`` is absent from
+    ``sys.modules`` after the star import, so the same import on a base install
+    would not hit the optional-dep ``ImportError``.
+    """
+    probe = (
+        "import sys; "
+        "ns: dict = {}; "
+        "exec('from langchain_dynamic_workflow import *', ns); "
+        "assert 'langchain_dynamic_workflow._persistence' not in sys.modules, "
+        "'import * pulled _persistence eagerly'; "
+        "assert 'SqliteWorkflowStore' not in ns, 'SqliteWorkflowStore leaked via import *'; "
+        "assert 'RunSpec' in ns and 'InMemoryRunStore' in ns, 'base surface missing'"
     )
     completed = subprocess.run(
         [sys.executable, "-c", probe],

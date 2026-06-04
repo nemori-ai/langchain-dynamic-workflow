@@ -16,6 +16,7 @@ resolves named workflows through a
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from typing import Any, Literal
 
@@ -186,34 +187,55 @@ def create_workflow_tool(
         *,
         workflow_fn: WorkflowFn,
         spec: RunSpec,
-        journal_run_id: str | None = None,
+        host_thread_id: str,
     ) -> str:
         """Detach a workflow run onto the background manager; return its run_id.
 
         The run id is minted up front (before ``manager.start``) so the spec and the
         manager slot are both keyed by the *same* id, keeping the registry
-        consistent for a later (possibly cross-process) ``resume``. The spec's
-        ``thread_id`` is authoritative for the launch.
+        consistent for a later (possibly cross-process) ``resume``.
+
+        Identity is split deliberately. The ``host_thread_id`` is the current
+        caller's thread; it keys the background manager slot so the caller who
+        issued the launch can poll its run. The canonical origin id — the spec's
+        ``journal_run_id`` when set, else this run's own freshly minted id — keys
+        both the per-run journal (so a resume replays completed leaves for free)
+        and the per-run LangGraph checkpoint thread (so a resume rejoins its
+        checkpoint), independent of the host thread. A fresh launch stamps its own
+        id as the canonical origin on the saved spec; a resume inherits the
+        origin from the spec it relaunches.
+
+        The spec is persisted *before* the run is admitted to the manager, so a
+        crash between admission and save can never strand a run with no spec. If
+        admission is refused at the concurrency quota, the pre-saved spec is
+        deleted so the refusal leaves no unresumable orphan.
 
         Args:
             workflow_fn: The orchestration callable to run.
             spec: The launch description persisted under the new run id.
-            journal_run_id: The run id whose journal the run records into. A fresh
-                launch uses its own new id (a clean journal); a ``resume`` passes
-                the original run's id so the relaunch replays the leaves that run
-                recorded at zero model cost.
+            host_thread_id: The current caller's host thread; keys the background
+                manager slot so the caller can poll the launched run.
 
         Returns:
             The newly minted run id.
+
+        Raises:
+            BgRunQuotaExceededError: If admission is refused at the concurrency
+                quota; the pre-saved spec is deleted before the error propagates.
         """
         run_id = uuid.uuid4().hex
+        # The canonical origin id keys both the journal and the checkpoint thread.
+        # A resume inherits it from the spec; a fresh launch adopts its own run id.
+        canonical = spec.journal_run_id or run_id
+        spec_to_save = (
+            spec if spec.journal_run_id else dataclasses.replace(spec, journal_run_id=run_id)
+        )
         # The per-run journal must be obtained before the coroutine starts so the
         # launched run records into the same journal a resume will replay from. A
-        # resume points this at the original run's journal; a fresh launch uses its
-        # own (still-empty) journal.
-        journal: JournalStore = run_store.journal_for(journal_run_id or run_id)
+        # resume points this at the origin run's journal; a fresh launch uses its
+        # own (still-empty) journal keyed by its own id.
+        journal: JournalStore = run_store.journal_for(canonical)
         args = spec.args
-        thread_id = spec.thread_id
 
         async def _orchestrate(ctx: Any) -> Any:
             return await workflow_fn(ctx, args)
@@ -224,7 +246,10 @@ def create_workflow_tool(
                 roster=roster,
                 journal=journal,
                 checkpointer=checkpointer,
-                thread_id=thread_id,
+                # The CHECKPOINT thread is the per-run canonical id, not the host
+                # thread, so distinct runs on one host thread never collapse onto
+                # one checkpoint thread and a resume rejoins the origin's thread.
+                thread_id=canonical,
                 max_concurrency=max_concurrency,
                 budget=budget,
                 # Wire the same registry so a launched workflow may inline another
@@ -233,11 +258,18 @@ def create_workflow_tool(
             )
             return result if isinstance(result, str) else str(result)
 
+        # Persist the spec BEFORE admission so an admitted run always has a spec.
+        await run_store.save_spec(run_id, spec_to_save)
         # The label travels with the manager slot so the `runs` listing can name the
-        # run authoritatively, not via this tool's bookkeeping. The run id is passed
-        # explicitly so the manager slot and the saved spec agree.
-        manager.start(_coro(), run_id=run_id, thread_id=thread_id, label=spec.label)
-        await run_store.save_spec(run_id, spec)
+        # run authoritatively, not via this tool's bookkeeping. The slot is keyed by
+        # the current caller's host thread so the caller can poll the run.
+        try:
+            manager.start(_coro(), run_id=run_id, thread_id=host_thread_id, label=spec.label)
+        except BgRunQuotaExceededError:
+            # The run was refused before it could run: roll back the spec we saved
+            # above so a refused launch leaves no unresumable orphan in the registry.
+            await run_store.delete_spec(run_id)
+            raise
         return run_id
 
     def _launch_record(run_id: str, *, label: str) -> dict[str, str]:
@@ -251,7 +283,6 @@ def create_workflow_tool(
             return "run: the 'workflow' name is required."
         if workflow not in workflows:
             return f"run: unknown workflow {workflow!r}; nothing was launched."
-        thread_id = _host_thread_id(runtime)
         try:
             run_id = await _launch(
                 workflow_fn=workflows.resolve(workflow),
@@ -260,8 +291,9 @@ def create_workflow_tool(
                     name_or_source=workflow,
                     args=args or {},
                     label=workflow,
-                    thread_id=thread_id,
+                    journal_run_id=None,
                 ),
+                host_thread_id=_host_thread_id(runtime),
             )
         except BgRunQuotaExceededError as exc:
             # The manager's concurrent-run quota is full: surface it as a clear
@@ -294,7 +326,6 @@ def create_workflow_tool(
         except WorkflowScriptError as exc:
             return f"run_script: the script was rejected and nothing was launched.\n{exc}"
         label = _label_for_script(script)
-        thread_id = _host_thread_id(runtime)
         try:
             run_id = await _launch(
                 workflow_fn=workflow_fn,
@@ -303,8 +334,9 @@ def create_workflow_tool(
                     name_or_source=script,
                     args=args or {},
                     label=label,
-                    thread_id=thread_id,
+                    journal_run_id=None,
                 ),
+                host_thread_id=_host_thread_id(runtime),
             )
         except BgRunQuotaExceededError as exc:
             return f"run_script: {exc}"
@@ -351,14 +383,16 @@ def create_workflow_tool(
             return f"resume: unknown run_id {run_id!r}; nothing to resume."
         workflow_fn = _resolve_spec(spec)
         label = spec.label
-        # Re-run against the ORIGINAL run's journal (keyed by the original run_id) so
-        # completed leaves replay from cache, and on the run's ORIGINAL thread_id
-        # (carried in the persisted spec) so it rejoins its checkpoint thread —
-        # independent of which host thread issued the resume.
+        # The spec carries the canonical origin (journal_run_id), so the relaunch
+        # rejoins the ORIGIN's journal (completed leaves replay from cache) and the
+        # ORIGIN's checkpoint thread — even when resuming a resume-issued run_id,
+        # because each saved spec inherits the same origin. The manager slot is
+        # keyed by the CURRENT caller's host thread so the caller who issued the
+        # resume can poll the new run.
         new_run_id = await _launch(
             workflow_fn=workflow_fn,
             spec=spec,
-            journal_run_id=run_id,
+            host_thread_id=_host_thread_id(runtime),
         )
         message = (
             f"Resumed {label!r} from run {run_id!r} against its journal. "

@@ -16,10 +16,17 @@ class RunSpec:
     """An immutable description of a launched workflow run.
 
     Carries everything needed to replay a launch on resume, including across a
-    process restart: the journal that delivers zero-cost replay is keyed by
-    ``run_id`` elsewhere, while this record preserves the label shown in run
-    listings and the LangGraph ``thread_id`` so the resumed run rejoins its
-    original checkpoint thread.
+    process restart. The host thread that issued the launch is deliberately not
+    persisted: it belongs to the current caller and is supplied at launch time.
+    The canonical origin id, ``journal_run_id``, is the durable identity that
+    keys both the per-run journal that delivers zero-cost replay and the per-run
+    LangGraph checkpoint thread, so a resume rejoins both regardless of which host
+    thread issued it.
+
+    The ``args`` mapping must be JSON-serializable: it originates from the model
+    as a JSON object, and the persistent store round-trips it through JSON. Values
+    that are not JSON-native (e.g. tuples, non-string mapping keys) do not survive
+    the durable round trip faithfully.
 
     Attributes:
         kind: How to resolve the workflow callable: ``"name"`` for a registered
@@ -27,17 +34,19 @@ class RunSpec:
             orchestration source compiled on demand.
         name_or_source: The registered workflow name when ``kind == "name"``,
             otherwise the orchestration script source when ``kind == "script"``.
-        args: The keyword arguments passed to the workflow at launch.
+        args: The JSON-serializable keyword arguments passed to the workflow at
+            launch.
         label: The human-readable label surfaced in run listings.
-        thread_id: The LangGraph thread id this run was launched on; replayed on
-            resume so the run rejoins its original checkpoint thread.
+        journal_run_id: The canonical origin id keying both the per-run journal
+            and the per-run checkpoint thread, or ``None`` for a fresh launch that
+            has not yet been stamped with its origin.
     """
 
     kind: str
     name_or_source: str
     args: dict[str, Any]
     label: str
-    thread_id: str
+    journal_run_id: str | None = None
 
 
 @runtime_checkable
@@ -45,10 +54,10 @@ class WorkflowRunStore(Protocol):
     """Persistence boundary for the workflow tool's run registry.
 
     Implementations map a ``run_id`` to both its launch ``RunSpec`` (so a resume
-    can rebuild the original workflow callable, label, and thread) and its
-    per-run journal (so completed leaves replay for free). The in-memory default
-    keeps the base install dependency-free; the sqlite-backed implementation
-    extends durability across process restarts.
+    can rebuild the original workflow callable, label, and journal lineage) and
+    its per-run journal (so completed leaves replay for free). The in-memory
+    default keeps the base install dependency-free; the sqlite-backed
+    implementation extends durability across process restarts.
     """
 
     async def save_spec(self, run_id: str, spec: RunSpec) -> None:
@@ -57,6 +66,18 @@ class WorkflowRunStore(Protocol):
         Args:
             run_id: The unique identifier of the launched run.
             spec: The launch description to persist.
+        """
+        ...
+
+    async def delete_spec(self, run_id: str) -> None:
+        """Remove the launch spec for ``run_id`` if present.
+
+        Used to roll back a spec persisted before a run was admitted, so a refused
+        admission leaves no unresumable orphan. Deleting an unknown ``run_id`` is a
+        no-op rather than an error.
+
+        Args:
+            run_id: The identifier of the run whose spec should be removed.
         """
         ...
 
@@ -111,6 +132,18 @@ class InMemoryRunStore:
             spec: The launch description to persist.
         """
         self._specs[run_id] = spec
+
+    async def delete_spec(self, run_id: str) -> None:
+        """Drop the launch spec (and any cached journal) for ``run_id``.
+
+        Deleting an unknown ``run_id`` is a no-op. The per-run journal cached under
+        the same id is dropped too so a refused launch leaves no residual state.
+
+        Args:
+            run_id: The identifier of the run whose spec should be removed.
+        """
+        self._specs.pop(run_id, None)
+        self._journals.pop(run_id, None)
 
     async def load_spec(self, run_id: str) -> RunSpec | None:
         """Return the launch spec for ``run_id``, or ``None`` on miss.

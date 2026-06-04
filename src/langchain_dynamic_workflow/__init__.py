@@ -108,7 +108,6 @@ __all__ = [
     "Span",
     "SpanKind",
     "SpanSink",
-    "SqliteWorkflowStore",
     "WorkflowBudgetExceededError",
     "WorkflowDeterminismError",
     "WorkflowNestingError",

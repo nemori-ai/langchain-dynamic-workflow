@@ -21,7 +21,7 @@ def _spec() -> RunSpec:
         name_or_source="incident_triage",
         args={"severity": "high", "alerts": [1, 2, 3]},
         label="Incident triage",
-        thread_id="thread-abc",
+        journal_run_id="origin-run-id",
     )
 
 
@@ -39,7 +39,43 @@ async def test_save_then_load_round_trips_the_spec() -> None:
     assert loaded.name_or_source == "incident_triage"
     assert loaded.args == {"severity": "high", "alerts": [1, 2, 3]}
     assert loaded.label == "Incident triage"
-    assert loaded.thread_id == "thread-abc"
+    assert loaded.journal_run_id == "origin-run-id"
+
+
+async def test_journal_run_id_defaults_to_none() -> None:
+    """A fresh launch spec carries no journal lineage until one is stamped on."""
+    spec = RunSpec(
+        kind="name",
+        name_or_source="wf",
+        args={},
+        label="wf",
+    )
+
+    assert spec.journal_run_id is None
+
+
+async def test_delete_spec_drops_a_saved_spec() -> None:
+    """``delete_spec`` removes a saved spec so a later load misses.
+
+    This is the orphan-cleanup contract used when a launch is admitted-then-
+    rejected: the spec persisted before ``manager.start`` must be deletable so a
+    quota refusal leaves no unresumable orphan in the registry.
+    """
+    store = InMemoryRunStore()
+    await store.save_spec("run-1", _spec())
+
+    await store.delete_spec("run-1")
+
+    assert await store.load_spec("run-1") is None
+
+
+async def test_delete_spec_on_unknown_run_id_is_a_noop() -> None:
+    """Deleting a run that was never saved is silent, not an error."""
+    store = InMemoryRunStore()
+
+    await store.delete_spec("never-saved")  # must not raise
+
+    assert await store.load_spec("never-saved") is None
 
 
 async def test_load_unknown_run_id_returns_none() -> None:
@@ -82,7 +118,7 @@ def test_run_spec_is_frozen() -> None:
     spec = _spec()
 
     try:
-        spec.thread_id = "mutated"  # type: ignore[misc]
+        spec.journal_run_id = "mutated"  # type: ignore[misc]
     except AttributeError:
         return
     raise AssertionError("RunSpec must be frozen")

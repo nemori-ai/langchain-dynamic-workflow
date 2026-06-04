@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS run_specs (
     name_or_source TEXT NOT NULL,
     args TEXT NOT NULL,
     label TEXT NOT NULL,
-    thread_id TEXT NOT NULL
+    journal_run_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS journal_records (
@@ -272,26 +272,45 @@ class SqliteWorkflowStore:
         """Persist the launch spec for ``run_id`` (upsert in place).
 
         The spec's ``args`` are stored as a JSON string so a fresh process can
-        rebuild the original launch arguments.
+        rebuild the original launch arguments; ``args`` must therefore be
+        JSON-serializable. The nullable ``journal_run_id`` carries the canonical
+        origin (the journal + checkpoint-thread lineage) or ``None`` for a fresh
+        launch not yet stamped with its origin.
 
         Args:
             run_id: The unique identifier of the launched run.
             spec: The launch description to persist.
         """
         await self._store_conn.execute(
-            "INSERT INTO run_specs (run_id, kind, name_or_source, args, label, thread_id) "
+            "INSERT INTO run_specs (run_id, kind, name_or_source, args, label, journal_run_id) "
             "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(run_id) DO UPDATE SET "
             "kind = excluded.kind, name_or_source = excluded.name_or_source, "
-            "args = excluded.args, label = excluded.label, thread_id = excluded.thread_id",
+            "args = excluded.args, label = excluded.label, "
+            "journal_run_id = excluded.journal_run_id",
             (
                 run_id,
                 spec.kind,
                 spec.name_or_source,
                 json.dumps(spec.args),
                 spec.label,
-                spec.thread_id,
+                spec.journal_run_id,
             ),
+        )
+
+    async def delete_spec(self, run_id: str) -> None:
+        """Delete the ``run_specs`` row for ``run_id`` if present.
+
+        Used to roll back a spec persisted before a run was admitted, so a refused
+        admission leaves no unresumable orphan. Deleting an absent row affects no
+        rows and raises nothing.
+
+        Args:
+            run_id: The identifier of the run whose spec should be removed.
+        """
+        await self._store_conn.execute(
+            "DELETE FROM run_specs WHERE run_id = ?",
+            (run_id,),
         )
 
     async def load_spec(self, run_id: str) -> RunSpec | None:
@@ -305,7 +324,8 @@ class SqliteWorkflowStore:
             was saved under ``run_id``.
         """
         async with self._store_conn.execute(
-            "SELECT kind, name_or_source, args, label, thread_id FROM run_specs WHERE run_id = ?",
+            "SELECT kind, name_or_source, args, label, journal_run_id "
+            "FROM run_specs WHERE run_id = ?",
             (run_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -317,7 +337,7 @@ class SqliteWorkflowStore:
             name_or_source=row[1],
             args=args,
             label=row[3],
-            thread_id=row[4],
+            journal_run_id=row[4],
         )
 
     def journal_for(self, run_id: str) -> JournalStore:

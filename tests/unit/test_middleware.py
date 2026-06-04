@@ -221,7 +221,9 @@ async def test_middleware_forwards_injected_store_to_the_tool(
     spec = await store.load_spec(run_id)
     assert spec is not None
     assert spec.name_or_source == "wf"
-    assert spec.thread_id == "host-1"
+    # The host thread is not persisted; the canonical journal lineage is the run's
+    # own id so a resume keys the same journal regardless of the resuming thread.
+    assert spec.journal_run_id == run_id
 
 
 async def orchestrate_runner(roster: Roster) -> str:
