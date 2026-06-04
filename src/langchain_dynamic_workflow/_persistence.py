@@ -20,6 +20,13 @@ The store is built around three load-bearing sqlite invariants:
   correct without any extra ``asyncio.Lock``. Every query is keyed by the
   primary key and scoped to one ``run_id``.
 
+Schema versioning: ``PRAGMA user_version`` is used to track the schema version.
+On open, ``user_version=0`` (fresh or untracked db) triggers DDL bootstrapping
+followed by stamping ``user_version=_SCHEMA_VERSION``. A matching version
+proceeds without error. Any other non-zero value is an incompatible schema and
+raises a :class:`IncompatibleSchemaError` immediately, converting a silent
+shape-drift into a loud, actionable failure.
+
 ``SqliteWorkflowStore.open`` is an async factory because the checkpointer binds
 to the running event loop at construction; the host must build the store inside
 its single persistent loop and reuse the one instance across all runs.
@@ -44,6 +51,37 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 from ._engine import JournalRecord, JournalStore
 from ._run_store import RunSpec
+
+_SCHEMA_VERSION: int = 1
+"""Current db schema version stamped into ``PRAGMA user_version`` on every fresh open."""
+
+
+class IncompatibleSchemaError(Exception):
+    """Raised when a db file carries a schema version this engine cannot handle.
+
+    Args:
+        db_path: Filesystem path to the db file with the incompatible schema.
+        found_version: The ``PRAGMA user_version`` value read from the file.
+        supported_version: The ``_SCHEMA_VERSION`` this engine expects.
+    """
+
+    def __init__(self, db_path: str, found_version: int, supported_version: int) -> None:
+        """Build the error with a descriptive message.
+
+        Args:
+            db_path: Filesystem path to the db file with the incompatible schema.
+            found_version: The ``PRAGMA user_version`` value read from the file.
+            supported_version: The ``_SCHEMA_VERSION`` this engine expects.
+        """
+        super().__init__(
+            f"Incompatible db schema at '{db_path}': "
+            f"found version {found_version}, supported version {supported_version}. "
+            "The db was likely created by a newer version of langchain-dynamic-workflow."
+        )
+        self.db_path = db_path
+        self.found_version = found_version
+        self.supported_version = supported_version
+
 
 _SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS run_specs (
@@ -271,7 +309,20 @@ class SqliteWorkflowStore:
         try:
             await store_conn.execute("PRAGMA journal_mode=WAL")
             await store_conn.execute("PRAGMA busy_timeout=5000")
-            await store_conn.executescript(_SCHEMA_DDL)
+
+            # Schema-version guard: read user_version before touching any tables.
+            # user_version=0 means a fresh/untracked db — run DDL and stamp.
+            # user_version=_SCHEMA_VERSION — already set up, idempotent re-run is fine.
+            # Any other non-zero value — a future/incompatible schema: fail loud.
+            async with store_conn.execute("PRAGMA user_version") as _cur:
+                _version_row = await _cur.fetchone()
+            current_version: int = _version_row[0] if _version_row is not None else 0
+            if current_version == 0:
+                await store_conn.executescript(_SCHEMA_DDL)
+                await store_conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+            elif current_version != _SCHEMA_VERSION:
+                raise IncompatibleSchemaError(database, current_version, _SCHEMA_VERSION)
+            # current_version == _SCHEMA_VERSION: already bootstrapped, proceed.
 
             # A SECOND, separate connection backs the checkpointer: its explicit-
             # commit + WAL regime is incompatible with the autocommit store
@@ -283,10 +334,11 @@ class SqliteWorkflowStore:
             checkpointer = AsyncSqliteSaver(checkpointer_conn)
         except BaseException:
             # Any failure after the store connection is open leaves a live worker
-            # thread holding a file lock. Close everything already opened before
-            # re-raising so a partial open never leaks a thread or hangs exit.
+            # thread holding a file lock. Close BOTH connections defensively so
+            # a secondary close error cannot mask the original failure — the
+            # original exception always propagates.
             await _close_quietly(checkpointer_conn)
-            await store_conn.close()
+            await _close_quietly(store_conn)
             raise
 
         return cls(store_conn, checkpointer_conn, checkpointer)

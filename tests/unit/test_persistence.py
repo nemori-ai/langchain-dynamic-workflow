@@ -21,6 +21,7 @@ store is always closed in a ``finally`` so the WAL sidecar files are released.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 
 import aiosqlite
@@ -413,6 +414,116 @@ async def test_aclose_closes_checkpointer_even_if_store_close_raises(
         # actually stops (a stubbed-out close would otherwise leak the thread).
         store_conn.close = real_store_close  # type: ignore[method-assign]
         await store_conn.close()
+
+
+async def test_open_raises_loud_error_on_incompatible_schema_version(
+    tmp_path: Path,
+) -> None:
+    """Opening a db stamped with an unsupported future schema version raises a clear error.
+
+    If the db file carries a ``PRAGMA user_version`` that is neither 0 (fresh/untracked)
+    nor the current ``_SCHEMA_VERSION``, ``open`` must raise a descriptive error naming the
+    db path, the found version, and the supported version — instead of silently proceeding
+    to a cryptic ``OperationalError`` on the first query.
+    """
+    from langchain_dynamic_workflow._persistence import IncompatibleSchemaError
+
+    db_path = tmp_path / "workflows.db"
+
+    # Stamp the db with a future version that the current engine cannot handle.
+    raw = await aiosqlite.connect(str(db_path))
+    try:
+        await raw.execute("PRAGMA user_version=999")
+    finally:
+        await raw.close()
+
+    with pytest.raises(IncompatibleSchemaError, match="999"):
+        await SqliteWorkflowStore.open(db_path)
+
+
+async def test_open_stamps_version_on_fresh_db_and_reopens_idempotently(
+    tmp_path: Path,
+) -> None:
+    """A fresh db gets user_version=1 stamped; reopening the same file succeeds.
+
+    This verifies two things in one round-trip:
+    * ``open`` on a brand-new (user_version=0) db writes the schema and stamps
+      ``user_version = 1`` so a future open can recognise the schema.
+    * A subsequent ``open`` on the already-stamped file is idempotent: it neither
+      errors nor corrupts the stored data.
+    """
+    db_path = tmp_path / "workflows.db"
+    spec = _spec()
+
+    store = await SqliteWorkflowStore.open(db_path)
+    try:
+        await store.save_spec("run-1", spec)
+    finally:
+        await store.aclose()
+
+    # Verify the version was stamped.
+    raw = await aiosqlite.connect(str(db_path))
+    try:
+        async with raw.execute("PRAGMA user_version") as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 1
+    finally:
+        await raw.close()
+
+    # Idempotent reopen: no error, and data survives.
+    reopened = await SqliteWorkflowStore.open(db_path)
+    try:
+        loaded = await reopened.load_spec("run-1")
+        assert loaded == spec
+    finally:
+        await reopened.aclose()
+
+
+async def test_open_cleanup_propagates_original_error_even_if_store_close_also_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The original open failure propagates even when the cleanup store close also raises.
+
+    Both connections are closed via ``_close_quietly`` on the partial-failure path, so a
+    secondary error during cleanup is suppressed and the original exception always propagates.
+    This is the symmetric-cleanup invariant for Fix 2.
+    """
+    db_path = tmp_path / "workflows.db"
+    real_connect = aiosqlite.connect
+    store_conn_holder: list[aiosqlite.Connection] = []
+    real_store_close_holder: list[object] = []
+
+    def tracking_connect(*args: object, **kwargs: object) -> aiosqlite.Connection:
+        conn = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        # Capture the store (first) connection and stub its close to raise.
+        if not store_conn_holder:
+            real_store_close_holder.append(conn.close)
+
+            async def failing_close() -> None:
+                raise RuntimeError("secondary cleanup close failure")
+
+            conn.close = failing_close  # type: ignore[method-assign]
+            store_conn_holder.append(conn)
+        return conn
+
+    def boom(_conn: object) -> object:
+        raise RuntimeError("original open failure")
+
+    monkeypatch.setattr(
+        "langchain_dynamic_workflow._persistence.aiosqlite.connect", tracking_connect
+    )
+    monkeypatch.setattr("langchain_dynamic_workflow._persistence.AsyncSqliteSaver", boom)
+
+    # The ORIGINAL error must propagate even though store_conn.close() also raises.
+    with pytest.raises(RuntimeError, match="original open failure"):
+        await SqliteWorkflowStore.open(db_path)
+
+    # Restore real close and clean up worker thread so the test doesn't leak.
+    if store_conn_holder and real_store_close_holder:
+        store_conn_holder[0].close = real_store_close_holder[0]  # type: ignore[method-assign]
+        with contextlib.suppress(Exception):
+            await store_conn_holder[0].close()
 
 
 async def test_async_context_manager_opens_and_closes(tmp_path: Path) -> None:

@@ -47,7 +47,8 @@ from .tool import create_workflow_tool
 if TYPE_CHECKING:
     # Surfaced to type checkers without importing the optional-dependency module
     # at runtime: a bare ``import langchain_dynamic_workflow`` must stay
-    # dependency-free, so the concrete symbol is resolved lazily in __getattr__.
+    # dependency-free, so the concrete symbols are resolved lazily in __getattr__.
+    from ._persistence import IncompatibleSchemaError as IncompatibleSchemaError
     from ._persistence import SqliteWorkflowStore as SqliteWorkflowStore
 
 __version__ = version("langchain-dynamic-workflow")
