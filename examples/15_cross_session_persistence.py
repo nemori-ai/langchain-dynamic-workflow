@@ -47,7 +47,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -108,9 +108,9 @@ def _build_leaf(reply: str, counter: _LeafCounter) -> Runnable[Any, Any]:
         ``LDW_DEMO_REAL_MODEL`` set it is a real deepagent. Either way every live
         invocation bumps ``counter`` — and a journal replay never invokes it.
     """
-    model = real_model()
+    model = real_leaf_model()
     if model is not None:
-        real_leaf = create_deep_agent(model=model)
+        real_leaf = create_deep_agent(model=model, middleware=demo_cache_middleware())
 
         async def _real(
             inp: dict[str, Any], config: RunnableConfig | None = None
@@ -275,7 +275,7 @@ async def main() -> None:
             )
             host = create_deep_agent(
                 model=_ScriptedRunHost(),
-                middleware=[middleware],
+                middleware=[middleware, *demo_cache_middleware()],
                 system_prompt=HOST_SYSTEM_PROMPT,
                 skills=[str(skills_path())],
             )
@@ -325,7 +325,7 @@ async def main() -> None:
             )
             host = create_deep_agent(
                 model=_ScriptedResumeHost(run_id=run_id),
-                middleware=[middleware],
+                middleware=[middleware, *demo_cache_middleware()],
                 system_prompt=HOST_SYSTEM_PROMPT,
                 skills=[str(skills_path())],
             )

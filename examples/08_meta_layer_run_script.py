@@ -34,7 +34,7 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
 from deepagents import create_deep_agent
 from deepagents.backends.filesystem import FilesystemBackend
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -110,10 +110,10 @@ def _fake_echo_leaf(prefix: str) -> Any:
     return RunnableLambda(_leaf)
 
 
-def _build_leaf(role: str) -> Any:
-    model = real_model()
+def _build_leaf(role: str, *, web_search: bool = False) -> Any:
+    model = real_leaf_model(web_search=web_search)
     if model is not None:
-        return create_deep_agent(model=model)
+        return create_deep_agent(model=model, middleware=demo_cache_middleware())
     return _fake_echo_leaf(role)
 
 
@@ -193,14 +193,18 @@ async def main() -> None:
     host_model = real_model()
     roster = (
         Roster()
-        .register("researcher", _build_leaf("researcher"), description="Researches one topic")
+        .register(
+            "researcher",
+            _build_leaf("researcher", web_search=True),
+            description="Researches one topic",
+        )
         .register("writer", _build_leaf("writer"), description="Synthesizes the recommendation")
     )
     # No registered workflows: the host must author its own script via run_script.
     manager = BgRunManager()
     middleware = create_workflow_middleware(roster, workflows=WorkflowRegistry(), manager=manager)
 
-    host_kwargs: dict[str, Any] = {"middleware": [middleware]}
+    host_kwargs: dict[str, Any] = {"middleware": [middleware, *demo_cache_middleware()]}
     if host_model is not None:
         host_kwargs["model"] = host_model
         host_kwargs["system_prompt"] = HOST_SYSTEM_PROMPT

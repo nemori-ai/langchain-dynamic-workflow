@@ -35,7 +35,7 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -63,11 +63,11 @@ SKEPTICS_PER_FINDING = 3
 _RUN_ID_BOX: dict[str, str] = {}
 
 
-def _build_leaf(reply: str) -> Any:
+def _build_leaf(reply: str, *, web_search: bool = False) -> Any:
     """Build a research/refine leaf: a real deepagent if env-gated, else a fake."""
-    model = real_model()
+    model = real_leaf_model(web_search=web_search)
     if model is not None:
-        return create_deep_agent(model=model)
+        return create_deep_agent(model=model, middleware=demo_cache_middleware())
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
         return {"messages": [*inp["messages"], AIMessage(content=reply)]}
@@ -179,7 +179,7 @@ async def main() -> None:
         Roster()
         .register(
             "researcher",
-            _build_leaf("finding"),
+            _build_leaf("finding", web_search=True),
             description="Researches one source topic",
             needs_execution=True,
         )
@@ -220,7 +220,9 @@ async def main() -> None:
 
     print("\n=== host-driven run (background tool + notify) ===")
     middleware = create_workflow_middleware(roster, workflows=workflows, manager=manager)
-    host = create_deep_agent(model=ScriptedHost(), middleware=[middleware])
+    host = create_deep_agent(
+        model=ScriptedHost(), middleware=[middleware, *demo_cache_middleware()]
+    )
     config: RunnableConfig = {"configurable": {"thread_id": "demo-6-host"}}
 
     state1 = await host.ainvoke(

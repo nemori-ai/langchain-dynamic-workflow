@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -73,9 +73,12 @@ class _FakeWriteThenJudge(BaseChatModel):
 
 async def main() -> None:
     load_demo_env()
-    model = real_model()
+    model = real_leaf_model()
     mode = "REAL (OpenRouter)" if model is not None else "offline (fake)"
-    judge = read_only_leaf(model if model is not None else _FakeWriteThenJudge())
+    judge = read_only_leaf(
+        model if model is not None else _FakeWriteThenJudge(),
+        middleware=demo_cache_middleware(),
+    )
 
     print(f"mode: {mode}")
     out = await judge.ainvoke({"messages": [HumanMessage(content=JUDGE_PROMPT)]})

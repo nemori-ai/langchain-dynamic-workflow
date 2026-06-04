@@ -14,7 +14,7 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any
 
-from _demo_models import load_demo_env, real_model
+from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -47,12 +47,12 @@ class _ScriptedModel(BaseChatModel):
 
 
 def _build_model() -> Any:
-    return real_model() or _ScriptedModel(reply="Paris")
+    return real_leaf_model() or _ScriptedModel(reply="Paris")
 
 
 async def main() -> None:
     load_demo_env()
-    leaf = create_deep_agent(model=_build_model())
+    leaf = create_deep_agent(model=_build_model(), middleware=demo_cache_middleware())
     roster = Roster().register("geographer", leaf, description="Answers geography questions")
 
     async def orchestrate(ctx: Ctx) -> str:
