@@ -22,4 +22,4 @@
 
 ## 状态
 
-架构已锁（5 面承重墙 + 3 条接缝 + 对外形态全部收口）。v0.1.0、v0.2.0 均已实现并打 tag。v0.2.0 用例驱动 gap-closing 四个 gap 全部收口（批次见 [`v0_2_0_plans/00-roadmap.md`](v0_2_0_plans/00-roadmap.md)：**G1 `agent(schema=)`、G3 质量范式库、G2 `isolation="worktree"` 真隔离、G4 只读裁判 leaf 均已落地**）。历史批次归档在 `v0_1_0_plans/`。v0.3.0 用例收集进行中。
+架构已锁（5 面承重墙 + 3 条接缝 + 对外形态全部收口）。v0.1.0、v0.2.0 均已实现并打 tag。v0.2.0 用例驱动 gap-closing 四个 gap 全部收口（批次见 [`v0_2_0_plans/00-roadmap.md`](v0_2_0_plans/00-roadmap.md)：**G1 `agent(schema=)`、G3 质量范式库、G2 `isolation="worktree"` 真隔离、G4 只读裁判 leaf 均已落地**）。历史批次归档在 `v0_1_0_plans/`。v0.3.0 用例收集进行中。v0.4.0 批次开启（[`v0_4_0_plans/00-roadmap.md`](v0_4_0_plans/00-roadmap.md)）：首个确认目标 **M1 叶子级实时可观测**（live status + 运行事件流，框架原生 Layer-1 hook）设计已定稿、实现待启。
