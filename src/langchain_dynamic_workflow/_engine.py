@@ -103,9 +103,15 @@ async def run_workflow(
         on_span_begin: Optional sink receiving a ``SpanBegin`` the instant each
             ``agent``/``parallel``/``pipeline``/``race`` span opens, before its body
             runs — the running edge for a live status and an elapsed timer
-            (``now - started_at``). It carries the span's resume-stable ``span_id``
-            (shared with the matching end span), so a consumer correlates the running
-            and completed edges. Like the end span, begin is live-only, not
+            (``now - started_at``). It carries the span's ``span_id`` (shared with the
+            matching end span), so a consumer correlates the running and completed
+            edges. The ``span_id`` is resume-stable only for the sequential (depth-0)
+            path — where the script replays in the same source order, so a fresh run
+            and an honest resume mint the identical id; a fan-out leaf
+            (``parallel``/``pipeline``/``race``) opens its span in wall-clock order, so
+            its id correlates begin↔end within a run but is not guaranteed identical
+            across a resume (mirroring the determinism guard, which records only the
+            sequential path). Like the end span, begin is live-only, not
             replay-suppressed: a resumed run re-emits a begin for every replayed leaf
             and its matching end span is flagged ``cached=True`` with a near-zero
             duration, so a cached leaf renders as an instant replayed hit rather than

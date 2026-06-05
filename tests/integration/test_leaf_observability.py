@@ -34,6 +34,17 @@ async def test_begin_fires_before_end_for_every_span_kind(
     roster = Roster().register("researcher", leaf)
     begins: list[SpanBegin] = []
     ends: list[Span] = []
+    # A single tagged timeline in emission order, so we can assert begin-BEFORE-end
+    # ordering per span (not just that both edges happen to share an id).
+    timeline: list[tuple[str, str]] = []
+
+    def on_begin(begin: SpanBegin) -> None:
+        begins.append(begin)
+        timeline.append(("begin", begin.span_id))
+
+    def on_end(span: Span) -> None:
+        ends.append(span)
+        timeline.append(("end", span.span_id))
 
     async def orchestrate(ctx: Ctx) -> str:
         await ctx.agent("solo", agent_type="researcher")
@@ -53,8 +64,8 @@ async def test_begin_fires_before_end_for_every_span_kind(
     await run_workflow(
         orchestrate,
         roster=roster,
-        on_span_begin=begins.append,
-        on_span=ends.append,
+        on_span_begin=on_begin,
+        on_span=on_end,
     )
 
     begin_kinds = {b.kind for b in begins}
@@ -62,13 +73,14 @@ async def test_begin_fires_before_end_for_every_span_kind(
     assert SpanKind.PARALLEL in begin_kinds
     assert SpanKind.PIPELINE in begin_kinds
     assert SpanKind.RACE in begin_kinds
-    # Every end span has a matching begin with the same id (begin precedes end).
+    # Every end span has a matching begin with the same id.
     begin_ids = {b.span_id for b in begins}
     end_ids = {e.span_id for e in ends}
     assert end_ids <= begin_ids
-    # The AGENT begin precedes its own end in emission order (running-before-done).
-    agent_begin = next(b for b in begins if b.kind is SpanKind.AGENT)
-    assert agent_begin.span_id in end_ids
+    # Each span's begin edge is emitted BEFORE its end edge (running-before-done),
+    # proven against the single ordered timeline rather than two separate lists.
+    for span in ends:
+        assert timeline.index(("begin", span.span_id)) < timeline.index(("end", span.span_id))
 
 
 async def test_span_id_is_resume_stable_for_the_sequential_path(
@@ -234,6 +246,7 @@ async def test_payload_opt_in_surfaces_model_text_in_detail(
 
     shape_only: list[LeafEvent] = []
     await run_workflow(orchestrate=_solo, roster=roster, on_leaf_event=shape_only.append)
+    assert shape_only  # the leaf fired interior events (else the next assert is vacuous)
     assert all("VISIBLE-PAYLOAD" not in str(e.detail) for e in shape_only)
 
     leaf2, _ = make_deep_leaf("VISIBLE-PAYLOAD")
