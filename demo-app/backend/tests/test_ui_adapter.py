@@ -37,6 +37,7 @@ from langchain_dynamic_workflow import (
     ProgressEntry,
     ProgressKind,
     Span,
+    SpanBegin,
     SpanKind,
 )
 
@@ -238,6 +239,66 @@ def test_progress_event_id_is_still_adapter_computed() -> None:
     adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="research"))
     props = next(p for c, p in sent if c == _PHASE_TIMELINE)
     assert props.get("event_id")  # present and adapter-derived (not an engine span_id)
+
+
+# --- (2c) on_span_begin running edge + merge=True end edge -------------------
+
+
+def test_on_span_begin_emits_a_running_agent_span() -> None:
+    sent, adapter = _collector()
+    adapter.on_span_begin(
+        SpanBegin(
+            span_id="leaf-1",
+            kind=SpanKind.AGENT,
+            name="researcher",
+            attributes={"agent_type": "researcher"},
+            started_at=1000.0,
+            monotonic_start=5.0,
+        )
+    )
+    comp, props = sent[-1]
+    assert comp == _AGENT_SPAN
+    assert props["event_id"] == "leaf-1"  # same id the end edge will merge onto
+    assert props["running"] is True
+    assert props["started_at"] == 1000.0
+    assert props["agent_type"] == "researcher"
+    assert "duration_s" not in props  # unknown at open
+
+
+def test_end_agent_span_after_begin_carries_merge_true() -> None:
+    sent, adapter = _collector()
+    adapter.on_span_begin(
+        SpanBegin(
+            span_id="leaf-1",
+            kind=SpanKind.AGENT,
+            name="researcher",
+            attributes={"agent_type": "researcher"},
+            started_at=1000.0,
+            monotonic_start=5.0,
+        )
+    )
+    adapter.on_span(_agent_span(name="researcher", span_id="leaf-1", duration_s=0.42))
+    end_props = [p for c, p in sent if c == _AGENT_SPAN][-1]
+    assert end_props["event_id"] == "leaf-1"  # patches the begin card
+    assert end_props.get("merge") is True
+    assert end_props["running"] is False
+    assert end_props["duration_s"] == 0.42
+
+
+def test_begin_for_fanout_kind_is_ignored_for_now() -> None:
+    # Phase A renders only the leaf running chip; fan-out live progression is M7.
+    sent, adapter = _collector()
+    adapter.on_span_begin(
+        SpanBegin(
+            span_id="p-1",
+            kind=SpanKind.PARALLEL,
+            name="parallel",
+            attributes={},
+            started_at=1.0,
+            monotonic_start=1.0,
+        )
+    )
+    assert not [c for c, _ in sent if c == _FANOUT_GRAPH]
 
 
 # --- (3) Stable-id dedupe ----------------------------------------------------

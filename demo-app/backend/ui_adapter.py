@@ -53,7 +53,7 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from langchain_dynamic_workflow import ProgressEntry, Span, SpanKind
+from langchain_dynamic_workflow import ProgressEntry, Span, SpanBegin, SpanKind
 
 UiEmit = Callable[[str, dict[str, Any]], None]
 """Transport callback: deliver one ``(component_name, props)`` Gen-UI event."""
@@ -123,6 +123,37 @@ class UiAdapter:
             self._emit_agent(span)
         # Unknown future span kinds are intentionally ignored rather than guessed at.
 
+    def on_span_begin(self, begin: SpanBegin) -> None:
+        """Open a leaf's ``agent_span`` as a running chip at span-open (never raises).
+
+        The engine fires this when a leaf ``agent()`` starts, before any result is
+        known. The adapter emits an ``agent_span`` keyed by the engine-minted
+        ``span_id`` carrying ``running=True`` and ``started_at`` (the wall-clock open
+        time) so the chat can show a running chip with a live elapsed timer. The
+        matching end edge (``on_span``) re-emits the SAME ``span_id`` with ``merge=True``,
+        folding the completion fields onto this card in place — the running chip flips to
+        the completed state without a second card appearing.
+
+        Only the leaf (``AGENT``) kind opens a running card here. A ``parallel`` /
+        ``pipeline`` / ``race`` begin carries no live rendering yet, so it is ignored —
+        the fan-out span still surfaces its completed ``fanout_graph`` on the end edge.
+
+        Args:
+            begin: A :class:`~langchain_dynamic_workflow.SpanBegin` emitted by the
+                engine at span-open, carrying the resume-stable ``span_id`` and the
+                wall-clock ``started_at``.
+        """
+        if begin.kind is not SpanKind.AGENT:
+            return
+        running_props: dict[str, Any] = {
+            "kind": begin.kind.value,
+            "name": begin.name,
+            "agent_type": begin.attributes.get("agent_type", begin.name),
+            "running": True,
+            "started_at": begin.started_at,
+        }
+        self._emit_event(_AGENT_SPAN, running_props, event_id=begin.span_id)
+
     # --- span mappers --------------------------------------------------------
 
     def _emit_fanout(self, span: Span) -> None:
@@ -178,8 +209,14 @@ class UiAdapter:
             "usage_tokens": span.attributes.get("usage_tokens"),
             "duration_s": span.duration_s,
             "error": span.error,
+            "running": False,
         }
-        self._emit_event(_AGENT_SPAN, agent_props, event_id=span.span_id)
+        # The end edge patches the running chip opened by on_span_begin (same span_id):
+        # merge=True so the SDK reducer folds these completion fields onto the begin card
+        # in place rather than appending a second card. begin-only fields (started_at)
+        # are absent here and survive the shallow merge. When a leaf never opened a
+        # running card (no begin edge), the merge is a harmless no-op create.
+        self._emit_event(_AGENT_SPAN, agent_props, event_id=span.span_id, merge=True)
 
         if cached:
             badge_props: dict[str, Any] = {
@@ -214,6 +251,7 @@ class UiAdapter:
         *,
         event_id: str | None = None,
         dedupe_key: Mapping[str, Any] | None = None,
+        merge: bool = False,
     ) -> None:
         """Stamp a resume-stable id, drop duplicates, then emit — swallowing failures.
 
@@ -237,6 +275,14 @@ class UiAdapter:
         The id is recorded as seen only after a successful emit, so a swallowed
         transport failure leaves the door open for a later retry of the same id.
 
+        A ``merge`` event is the exception to seen-suppression: it is a deliberate
+        in-place patch of a card that was already created (the leaf's end edge folding
+        completion fields onto the running begin card). It therefore bypasses the
+        seen-set drop and carries a reserved ``merge`` props flag the transport pops and
+        forwards to ``push_ui_message(..., merge=True)`` so the SDK reducer shallow-merges
+        these props onto the existing same-``event_id`` card. A merge does not enter the
+        seen-set (it targets an id whose create already did).
+
         Args:
             component: The Gen-UI component name to render.
             props: The full component props, including run-variant display fields (an
@@ -246,6 +292,9 @@ class UiAdapter:
             dedupe_key: The stable subset of the event's identity, excluding any
                 run-variant field, used to compute the id and occurrence ordinal for
                 progress events. Required when ``event_id`` is ``None``.
+            merge: Whether this event patches an existing same-``event_id`` card in place
+                (the end edge of a leaf folding onto its running begin card). When ``True``
+                the event bypasses seen-suppression and carries the transport merge flag.
 
         Raises:
             ValueError: If neither ``event_id`` nor ``dedupe_key`` is supplied.
@@ -262,9 +311,13 @@ class UiAdapter:
             event_id = f"{stable}-{ordinal}"
             ordinal_to_undo = (stable, ordinal)
 
-        if event_id in self._seen:
+        # A merge is a deliberate in-place patch of an already-created card, so it must
+        # NOT be dropped by seen-suppression (the create already marked the id seen).
+        if not merge and event_id in self._seen:
             return
         props["event_id"] = event_id
+        if merge:
+            props["merge"] = True
         try:
             self._emit(component, props)
         except Exception:
