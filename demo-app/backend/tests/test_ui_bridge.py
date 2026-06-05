@@ -228,3 +228,59 @@ async def test_emit_swallows_push_failure_and_resets_contextvar(
     # Nothing was streamed or sent because the push failed before writer()/send().
     assert host_writer_events == []
     assert host_send_pairs == []
+
+
+async def test_merge_true_end_edge_folds_onto_same_id_begin_card() -> None:
+    """A ``merge=True`` end edge patches the same-id begin card in place.
+
+    The engine opens a span with a *begin* edge (running, with ``started_at``) and
+    closes it with an *end* edge carrying only the completion fields. For the two to
+    collapse onto one chip the transport must forward a reserved ``merge`` flag to
+    ``push_ui_message(..., merge=)`` so ``ui_message_reducer`` shallow-merges the end
+    props onto the begin card (same ui-message id), preserving begin-only fields like
+    ``started_at`` while applying the end's ``duration_s``. The reserved transport
+    flag must be stripped before it reaches component props.
+    """
+    host_writer_events: list[UIMessage] = []
+    host_send_pairs: list[tuple[str, UIMessage]] = []
+    host_config = _make_host_config(writer_sink=host_writer_events, send_sink=host_send_pairs)
+
+    token = var_child_runnable_config.set(host_config)
+    try:
+        emit = make_host_ui_emit(anchor=None)
+        # Begin: creates the card (running, with started_at).
+        emit(
+            "agent_span",
+            {
+                "event_id": "span-1",
+                "running": True,
+                "started_at": 123.0,
+                "agent_type": "researcher",
+            },
+        )
+        # End: same id, merge=True, carries the completion fields only.
+        emit(
+            "agent_span",
+            {
+                "event_id": "span-1",
+                "merge": True,
+                "running": False,
+                "duration_s": 0.42,
+                "cached": False,
+            },
+        )
+    finally:
+        var_child_runnable_config.reset(token)
+
+    # Fold the two host-channel sends exactly as the SDK does.
+    ui: list[AnyUIMessage] = []
+    for _key, evt in host_send_pairs:
+        ui = ui_message_reducer(ui, evt)
+
+    assert len(ui) == 1, "the same-id end edge must patch the begin card, not append a new one"
+    merged = cast(UIMessage, ui[0])["props"]
+    assert merged["started_at"] == 123.0  # begin-only field survives the merge
+    assert merged["duration_s"] == 0.42  # end field applied
+    assert merged["running"] is False
+    # The transport-only 'merge' flag must NOT leak into component props.
+    assert "merge" not in merged

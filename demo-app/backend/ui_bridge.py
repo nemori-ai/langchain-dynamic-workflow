@@ -59,11 +59,25 @@ def make_host_ui_emit(*, anchor: AIMessage | None) -> UiEmit:
     Returns:
         A ``(component_name, props) -> None`` emit that is host-bound and swallows
         every exception (never raising, never blocking the orchestration).
+
+    Note:
+        The reserved ``merge`` props key is a transport-only flag consumed here and
+        stripped before reaching the component: when truthy it forwards
+        ``push_ui_message(..., merge=True)`` so a same-``event_id`` event patches the
+        existing ui-message card in place (``ui_message_reducer`` shallow-merges its
+        props onto the prior card) instead of replacing it wholesale. The end edge of
+        a span thus folds its completion fields onto the running begin card without
+        clobbering begin-only fields. The flag never appears in component props.
     """
     host_config: RunnableConfig = get_config()
     anchor_kwargs: dict[str, Any] = {"message": anchor} if anchor is not None else {}
 
     def emit(component_name: str, props: dict[str, Any]) -> None:
+        # Pop the reserved transport-only merge flag before building id_kwargs so it
+        # never reaches component props. When truthy, the SDK reducer shallow-merges a
+        # same-id event onto the existing card (begin -> end folds in place) rather
+        # than replacing it; when falsy (the default), the event creates/replaces.
+        merge_flag = bool(props.pop("merge", False))
         # Thread the adapter's stable event_id into the SDK ui-message id. The SDK's
         # uiMessageReducer keys on the ui-message id (ui.id === event.id) and the
         # frontend's React render key is that same id — so passing event_id as id is
@@ -80,7 +94,7 @@ def make_host_ui_emit(*, anchor: AIMessage | None) -> UiEmit:
         # graph's config) so the engine's own streaming is untouched.
         token = var_child_runnable_config.set(host_config)
         try:
-            push_ui_message(component_name, props, **id_kwargs, **anchor_kwargs)
+            push_ui_message(component_name, props, **id_kwargs, **anchor_kwargs, merge=merge_flag)
         except Exception:
             # Red line: the engine calls progress sinks directly; a raising sink
             # would break orchestration. Swallow and continue.
