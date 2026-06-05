@@ -284,6 +284,9 @@ async def run_meta_script_live(*, submit_rejected: bool, adapter: UiAdapter, emi
         args={"topics": META_TOPICS},
         on_progress=adapter.on_progress,
         on_span=adapter.on_span,
+        on_span_begin=adapter.on_span_begin,
+        on_leaf_event=adapter.on_leaf_event,
+        leaf_event_include_payloads=False,
     )
     return str(result)
 
@@ -321,6 +324,9 @@ async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str
         roster=make_roster(),
         on_progress=adapter.on_progress,
         on_span=adapter.on_span,
+        on_span_begin=adapter.on_span_begin,
+        on_leaf_event=adapter.on_leaf_event,
+        leaf_event_include_payloads=False,
     )
     return f"Demo workflow finished: {result}"
 
@@ -335,8 +341,13 @@ async def run_workflow_live(
     ``name`` from :func:`~workflows.make_workflows`, wraps the two-argument
     ``WorkflowFn`` into the single-argument orchestrator ``run_workflow`` expects
     (binding ``args``), and runs it against the real roster with the adapter's sinks
-    wired to ``on_progress`` / ``on_span``. The same registry is also passed as
-    ``workflows=`` so a preset that nests ``ctx.workflow(...)`` resolves too.
+    wired to ``on_progress`` / ``on_span`` / ``on_span_begin`` / ``on_leaf_event`` —
+    the span-open edge surfaces each leaf's running chip, which the matching span-close
+    edge flips in place to its completed state, and ``on_leaf_event`` folds each
+    freshly-executing leaf's interior run tree onto its ``agent_span`` as a bounded,
+    shape-only drill-in subtree (``leaf_event_include_payloads=False`` so no raw tool
+    args or model text are surfaced). The same registry is also passed as ``workflows=``
+    so a preset that nests ``ctx.workflow(...)`` resolves too.
 
     When a ``lane`` is supplied its persisted journal / checkpointer / ``thread_id``
     are threaded into ``run_workflow`` so a second run on the same lane replays the
@@ -378,6 +389,9 @@ async def run_workflow_live(
         roster=make_roster(),
         on_progress=adapter.on_progress,
         on_span=adapter.on_span,
+        on_span_begin=adapter.on_span_begin,
+        on_leaf_event=adapter.on_leaf_event,
+        leaf_event_include_payloads=False,
         workflows=workflows,
         **durable,
     )
@@ -587,8 +601,8 @@ async def run_background(state: Annotated[dict[str, Any], InjectedState]) -> str
     return await run_background_live(_BG_MANAGER, thread_id=_host_thread_id())
 
 
-def make_host_graph() -> Any:
-    """Build the host deepagent graph served by ``langgraph dev``.
+def _build_host_graph(*, checkpointer: BaseCheckpointSaver[Any] | None = None) -> Any:
+    """Build the host deepagent graph, optionally with an explicit checkpointer.
 
     Resolves the host model once at build time. The provider is locked to OpenRouter and
     the model is fixed in code, so this is a per-call lazy model: it decides online vs.
@@ -601,13 +615,43 @@ def make_host_graph() -> Any:
     runs (``run_live``), the meta layer (``run_meta_script``), and a background run
     (``run_background``).
 
+    Kept OFF the ``langgraph dev`` factory path on purpose: the platform classifies a
+    graph factory by its parameter signature and injects its own value for a recognized
+    name like ``checkpointer`` (a config dict that fails ``create_deep_agent``'s compile).
+    The registered factory :func:`make_host_graph` therefore takes no parameters; this
+    builder carries the injectable one for in-process tests only.
+
+    Args:
+        checkpointer: Optional LangGraph checkpointer. ``None`` (the deployment path) lets
+            ``langgraph dev`` attach its own persistence; an ``InMemorySaver`` makes the
+            host thread durable in-process so a follow-up turn on the same ``thread_id``
+            resumes the accumulated state, as tests exercise.
+
     Returns:
         The compiled deepagent host graph (a runnable LangGraph graph).
     """
+    extra: dict[str, Any] = {"checkpointer": checkpointer} if checkpointer is not None else {}
     return create_deep_agent(
         model=resolve_host_model(),
         system_prompt=HOST_INSTRUCTIONS,
         tools=[run_hello_demo, run_live, run_meta_script, run_background],
         state_schema=HostState,
         middleware=cache_middleware(),
+        **extra,
     )
+
+
+def make_host_graph() -> Any:
+    """Build the host deepagent graph served by ``langgraph dev`` (no injectable params).
+
+    Registered under the ``host`` graph id in ``langgraph.json``. Takes NO parameters on
+    purpose: ``langgraph dev`` classifies a graph factory by its signature and injects
+    values for recognized parameter names, so any parameter here (notably ``checkpointer``)
+    would receive an injected config dict and break compilation. The deployment lets the
+    platform attach its own persistence; in-process tests call :func:`_build_host_graph`
+    directly to supply a checkpointer.
+
+    Returns:
+        The compiled deepagent host graph (a runnable LangGraph graph).
+    """
+    return _build_host_graph()

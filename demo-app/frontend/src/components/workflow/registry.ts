@@ -18,6 +18,12 @@ import { RunStatusBanner } from "./RunStatusBanner";
  * "journal_badge" — plus "hello_ui" (the round-trip smoke component), "meta_script"
  * (the meta-layer viewer, contract-only until backend emission lands), and
  * "run_status" (the per-turn offline/online banner the host emits).
+ *
+ * "agent_span" arrives as two same-id edges the SDK folds onto one card: a begin
+ * edge renders a running chip with a live elapsed timer, and a merge end edge flips
+ * the same card to its completed state. A freshly-run leaf also carries a shape-only
+ * `subtree` the card renders as a collapsible drill-in of its interior; a cached
+ * (resumed) leaf carries no subtree.
  */
 export const workflowComponents: Record<
   string,

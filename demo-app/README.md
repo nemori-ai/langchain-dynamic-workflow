@@ -12,11 +12,20 @@ It is the engine's headline ideas, rendered instead of described:
   and fan-out; the leaf `agent()` calls delegate to isolated sub-agents whose
   context is discarded, so only the final result comes back. You watch the
   `phase_timeline` advance and the `fanout_graph` widen as the *script* drives.
+- **Leaves go live** — each leaf opens as a **running chip with a ticking elapsed
+  timer**, then the same card flips in place to its completed state (final
+  duration, tokens) the moment the leaf returns — no second card appended. A
+  freshly-run leaf also offers a collapsible **drill-in**: expand it to see the
+  shape of its interior (the chain / model / tool steps it ran), kinds and names
+  only — never the raw tool args or model text, since the leaf's context is
+  quarantined.
 - **Parallel fan-out** — one researcher per angle, then adversarial skeptics per
   claim, all in flight at once, reduced by plain Python over typed results.
 - **Persistence / resume** — ask the host to "pick it back up" and the second run
   replays the first run's leaves from the content-hash journal as zero-cost cache
-  hits (each surfaces a `journal_badge`) instead of redoing the work.
+  hits (each surfaces a `journal_badge`) instead of redoing the work. A replayed
+  leaf runs no interior, so it comes back as a **cached chip** — no running timer
+  and no drill-in, since there is no fresh work to show.
 - **Meta layer** — when no preset fits, the host *writes* an orchestration script,
   submits the source across the AST security gate, and only runs it if admitted.
   Pass or fail, the chat shows the script and the gate verdict.
@@ -206,11 +215,13 @@ intentional and worth knowing:
   cannot push live `phase_timeline` / `fanout_graph` updates into the chat. The
   background scenario deliberately shows lifecycle status and the final result
   only. Live streaming is the inline path's job (scenarios 1–3).
-- **Out-of-process sandbox work is opaque.** The live panel renders the engine's
-  own progress/span events. Anything a leaf sub-agent does inside a sandbox backend
-  (file edits, shell, etc.) is not surfaced step-by-step — you see the leaf's span
-  and its returned result, not its internal trajectory. That is the context
-  quarantine working as designed.
+- **The drill-in is shape-only, and out-of-process sandbox work stays opaque.** A
+  fresh leaf's drill-in shows the *shape* of its interior — the chain / model / tool
+  callback steps it ran, kinds and names, never their raw args or text. Anything a
+  leaf sub-agent does inside a sandbox backend (file edits, shell, etc.) is not
+  surfaced step-by-step beyond those callback edges — you see the leaf's span, the
+  shape of its run, and its returned result, not its full internal trajectory. That
+  is the context quarantine working as designed.
 
 ---
 

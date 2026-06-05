@@ -9,29 +9,31 @@ and the actual ``push_ui_message`` call live in the transport layer.
 
 Three invariants the adapter guarantees:
 
-* **Stable, identity-based ids that survive resume.** Every emitted event carries an
-  ``event_id`` derived from the event's *logical identity* — never from run-variant
-  display fields. The engine re-emits the same logical event in two honest cases: a
-  failed-retry re-delivers a progress entry, and a resume re-executes the script and
-  re-emits a span for every replayed (now cached) leaf. On resume the same leaf's
-  ``Span`` comes back with ``cached`` flipped ``True``, a different ``usage_tokens``,
-  and a near-zero journal-lookup ``duration_s`` instead of real execution time — so
-  hashing those fields would mint a *new* id and double-fire the event. The dedupe
-  identity therefore hashes only the stable fields (component + name + ``agent_type``
-  for a leaf, component + counts for a fan-out, component + kind + message for a
-  progress line) and excludes ``duration_s`` / ``cached`` / ``usage_tokens``. The
-  re-emitted span collapses onto its first-run id and is dropped.
-* **Position-salted ids distinguish genuinely-distinct same-content events.** A pure
-  content hash cannot tell an honest re-emit apart from two different events that
-  render identical text (e.g. three skeptic leaves of the same ``agent_type``, or two
-  truncated log lines sharing a 50-char prefix). Because the orchestration script
-  re-executes in the same source order on resume (the engine's determinism guard
-  enforces this), the adapter salts each id with a *per-stable-key occurrence
-  ordinal*: the Nth event sharing a stable key gets ordinal N. Distinct same-content
-  events on one run get ordinals 0, 1, 2…; an honest resume re-emits them in the same
-  order and lands on the same ordinals, so honest re-emits still collide while
-  genuinely-distinct events stay separate.
-* **Idempotent, non-blocking delivery.** A seen-set keyed on the salted id suppresses
+* **Stable, identity-based ids that survive resume — by two routes, by event nature.**
+  Every emitted event carries an ``event_id`` that is stable across a fresh run and its
+  resume re-execution, never derived from run-variant display fields. A **span** event
+  (``agent_span`` / ``fanout_graph`` / ``journal_badge``) consumes the *engine-minted*
+  ``Span.span_id`` verbatim: the engine mints a resume-stable id for each span (and
+  reproduces it identically across the fresh and resume runs of a sequential leaf), so
+  the adapter passes it straight through rather than re-deriving its own hash. The
+  cached ``journal_badge`` shares the leaf's ``span_id`` but must stay a distinct card,
+  so its id is a deterministic local salt of the span id (``f"{span_id}-badge"``) — a
+  pure local suffix, not a re-hash of run-variant fields. A **progress** entry is NOT a
+  span and carries no engine id, so it keeps the adapter's self-computed path: the
+  ``event_id`` hashes the entry's stable identity (component + kind + message) and
+  excludes any run-variant field.
+* **Position-salted ids distinguish genuinely-distinct same-content progress lines.** A
+  pure content hash cannot tell an honest re-emit apart from two different progress
+  lines that render identical text (e.g. two truncated log lines sharing a 50-char
+  prefix). Because the orchestration script re-executes in the same source order on
+  resume (the engine's determinism guard enforces this), the adapter salts each
+  self-computed progress id with a *per-stable-key occurrence ordinal*: the Nth entry
+  sharing a stable key gets ordinal N. Distinct same-content entries on one run get
+  ordinals 0, 1, 2…; an honest resume re-emits them in the same order and lands on the
+  same ordinals, so honest re-emits still collide while genuinely-distinct entries stay
+  separate. (Distinct spans no longer need this salt — the engine already mints a
+  distinct ``span_id`` per span.)
+* **Idempotent, non-blocking delivery.** A seen-set keyed on the event id suppresses
   any event already delivered, so a re-emit never double-fires. The id is committed to
   the seen-set only *after* a successful emit, so a transient transport failure does
   not permanently suppress an event a later retry could deliver. Every emit is wrapped
@@ -40,7 +42,11 @@ Three invariants the adapter guarantees:
 
 Component vocabulary produced here: ``phase_timeline`` (progress), ``fanout_graph``
 (parallel / pipeline spans), ``agent_span`` (a leaf that ran fresh), and
-``journal_badge`` (a leaf served from the journal, i.e. ``cached=True``).
+``journal_badge`` (a leaf served from the journal, i.e. ``cached=True``). A fresh
+leaf's interior callback subtree is additionally folded onto its ``agent_span`` via
+``on_leaf_event``: a bounded, shape-only ``subtree`` prop merged in place so the chat
+can drill into the leaf's run tree. A cached (replayed) leaf fires no interior events,
+so it never carries a ``subtree`` — the cache-hit story stays the ``journal_badge``.
 """
 
 from __future__ import annotations
@@ -51,7 +57,7 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from langchain_dynamic_workflow import ProgressEntry, Span, SpanKind
+from langchain_dynamic_workflow import LeafEvent, ProgressEntry, Span, SpanBegin, SpanKind
 
 UiEmit = Callable[[str, dict[str, Any]], None]
 """Transport callback: deliver one ``(component_name, props)`` Gen-UI event."""
@@ -64,6 +70,12 @@ _AGENT_SPAN = "agent_span"
 _JOURNAL_BADGE = "journal_badge"
 
 _FANOUT_KINDS: frozenset[SpanKind] = frozenset({SpanKind.PARALLEL, SpanKind.PIPELINE})
+
+# Per-leaf interior node cap. A pathological leaf can fire thousands of callback
+# edges; bounding the buffered node count (and the re-emitted subtree) guards against
+# resource exhaustion. Once the cap is hit, further runs are dropped and the re-emit
+# carries a ``truncated`` flag so the frontend can say so honestly.
+_MAX_SUBTREE_NODES = 200
 
 
 class UiAdapter:
@@ -85,6 +97,14 @@ class UiAdapter:
         # honest resume — which re-emits the same keys in the same source order — lands
         # on the same ordinals and collapses onto the first run's ids.
         self._occurrences: defaultdict[str, int] = defaultdict(int)
+        # Per-leaf interior buffer: leaf_span_id -> {run_id -> node}. A node rolls a
+        # run's start and end edges into one record (run_id, parent_run_id, kind, name,
+        # phase). Keyed by run_id so a leaf's start/end pair collapses; keyed by
+        # leaf_span_id at the outer level so two leaves never cross-contaminate. Insertion
+        # order is preserved (dict), so the re-emitted subtree reads top-down.
+        self._leaf_nodes: defaultdict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        # Leaves whose interior overflowed the node cap, so the re-emit can flag it.
+        self._leaf_truncated: set[str] = set()
 
     # --- public engine sinks -------------------------------------------------
 
@@ -121,6 +141,96 @@ class UiAdapter:
             self._emit_agent(span)
         # Unknown future span kinds are intentionally ignored rather than guessed at.
 
+    def on_span_begin(self, begin: SpanBegin) -> None:
+        """Open a leaf's ``agent_span`` as a running chip at span-open (never raises).
+
+        The engine fires this when a leaf ``agent()`` starts, before any result is
+        known. The adapter emits an ``agent_span`` keyed by the engine-minted
+        ``span_id`` carrying ``running=True`` and ``started_at`` (the wall-clock open
+        time) so the chat can show a running chip with a live elapsed timer. The
+        matching end edge (``on_span``) re-emits the SAME ``span_id`` with ``merge=True``,
+        folding the completion fields onto this card in place — the running chip flips to
+        the completed state without a second card appearing.
+
+        Only the leaf (``AGENT``) kind opens a running card here. A ``parallel`` /
+        ``pipeline`` / ``race`` begin carries no live rendering yet, so it is ignored —
+        the fan-out span still surfaces its completed ``fanout_graph`` on the end edge.
+
+        Args:
+            begin: A :class:`~langchain_dynamic_workflow.SpanBegin` emitted by the
+                engine at span-open, carrying the resume-stable ``span_id`` and the
+                wall-clock ``started_at``.
+        """
+        if begin.kind is not SpanKind.AGENT:
+            return
+        running_props: dict[str, Any] = {
+            "kind": begin.kind.value,
+            "name": begin.name,
+            "agent_type": begin.attributes.get("agent_type", begin.name),
+            "running": True,
+            "started_at": begin.started_at,
+        }
+        self._emit_event(_AGENT_SPAN, running_props, event_id=begin.span_id)
+
+    def on_leaf_event(self, event: LeafEvent) -> None:
+        """Fold one interior callback edge into the leaf's drill-in subtree (never raises).
+
+        The engine taps a freshly-executing leaf's own callback subtree and forwards each
+        edge here as a :class:`~langchain_dynamic_workflow.LeafEvent`. The adapter buffers
+        the edges per ``leaf_span_id`` — rolling each run's ``start`` and ``end`` into one
+        node keyed by ``run_id`` — and re-emits the leaf's ``agent_span`` with ``merge=True``
+        carrying a ``subtree`` prop: a bounded, shape-only node list the frontend rebuilds
+        into a parent/child tree via ``parent_run_id``. The re-emit is idempotent and
+        latest-wins: each edge re-sends the whole current subtree onto the same
+        ``event_id`` (= ``leaf_span_id``), so the SDK reducer keeps patching one card.
+
+        Honesty caveats this method honors:
+
+        * **Real-execution only.** The engine attaches the leaf tap solely on the live
+          execution path, so a replayed/cached leaf fires zero events — its buffer stays
+          empty and no ``subtree`` is ever fabricated. The cached-leaf story stays the
+          ``journal_badge`` chip, with no drill-in.
+        * **Shape-only.** Only structural fields (``run_id`` / ``parent_run_id`` /
+          ``kind`` / ``name`` / ``phase``) reach a node. Raw ``detail`` payload keys
+          (``input`` / ``output`` / ``text``) are never copied in, so the drill-in shows
+          the interior's shape, never tool args or model text.
+        * **Bounded.** The interior node count is capped; a pathological leaf that fires
+          a flood of edges drops further nodes and the re-emit carries ``truncated=True``,
+          guarding against resource exhaustion.
+
+        Args:
+            event: One normalized interior callback edge from the leaf's run subtree.
+        """
+        leaf_id = event.leaf_span_id
+        nodes = self._leaf_nodes[leaf_id]
+        existing = nodes.get(event.run_id)
+        if existing is None:
+            if len(nodes) >= _MAX_SUBTREE_NODES:
+                # Cap reached: drop the new node, remember the leaf overflowed. Edges for
+                # already-buffered runs (e.g. a later end edge) still roll in below.
+                self._leaf_truncated.add(leaf_id)
+            else:
+                nodes[event.run_id] = {
+                    "run_id": event.run_id,
+                    "parent_run_id": event.parent_run_id,
+                    "kind": event.kind,
+                    "name": event.name,
+                    "phase": event.phase,
+                }
+        else:
+            # Roll a later edge of the same run into its node: advance the phase, and keep
+            # a non-empty start-edge name when the end edge carries an empty one.
+            existing["phase"] = event.phase
+            if event.name:
+                existing["name"] = event.name
+
+        subtree = list(nodes.values())
+        subtree_props: dict[str, Any] = {
+            "subtree": subtree,
+            "truncated": leaf_id in self._leaf_truncated,
+        }
+        self._emit_event(_AGENT_SPAN, subtree_props, event_id=leaf_id, merge=True)
+
     # --- span mappers --------------------------------------------------------
 
     def _emit_fanout(self, span: Span) -> None:
@@ -130,6 +240,10 @@ class UiAdapter:
         / ``surviving_count`` for a parallel barrier, ``item_count`` /
         ``surviving_count`` for a pipeline. Both are flattened into props so the
         frontend reads them directly.
+
+        The event id IS the engine-minted ``span.span_id`` (I1): the engine reproduces
+        the same id for the same fan-out span on a deterministic replay, so the adapter
+        consumes it verbatim instead of re-deriving its own hash.
         """
         counts = self._fanout_counts(span.attributes)
         props: dict[str, Any] = {
@@ -139,17 +253,7 @@ class UiAdapter:
             "error": span.error,
             **counts,
         }
-        # Dedupe identity excludes the run-variant wall-clock ``duration_s`` (which
-        # changes every execution); the kind / name / fan-out counts are reproduced
-        # exactly on a deterministic replay, so the re-emitted fan-out span collapses
-        # onto its first-run id.
-        dedupe_key: dict[str, Any] = {
-            "kind": span.kind.value,
-            "name": span.name,
-            "error": span.error,
-            **counts,
-        }
-        self._emit_event(_FANOUT_GRAPH, props, dedupe_key=dedupe_key)
+        self._emit_event(_FANOUT_GRAPH, props, event_id=span.span_id)
 
     def _emit_agent(self, span: Span) -> None:
         """Emit an ``agent_span`` for a leaf, plus a ``journal_badge`` if it was cached.
@@ -161,12 +265,16 @@ class UiAdapter:
         The crux of resume correctness: the SAME leaf re-emits on resume with three
         fields changed — ``cached`` flips ``False`` -> ``True``, ``usage_tokens`` may
         differ, and ``duration_s`` collapses from real execution time to a near-zero
-        journal lookup. The ``agent_span`` dedupe identity therefore hashes only the
-        leaf's stable shape (component + name + ``agent_type``), so the re-emit is
-        recognized as the same span and dropped. The ``journal_badge``, by contrast,
-        appears only on the cached re-emit (the fresh run has ``cached=False`` and
-        emits none), so it is genuinely new on resume — that is the visible cache-hit
-        story, not a duplicate.
+        journal lookup. The id that keys the ``agent_span`` IS the engine-minted
+        ``span.span_id`` (I1), which the engine reproduces identically across the fresh
+        and resume runs of a sequential leaf — so the re-emit lands on the same card and
+        the frontend recognizes it as the same logical span. The ``journal_badge``, by
+        contrast, appears only on the cached re-emit (the fresh run has ``cached=False``
+        and emits none), so it is genuinely new on resume — that is the visible cache-hit
+        story, not a duplicate. The badge shares the leaf's ``span_id`` but must stay a
+        SEPARATE card from the ``agent_span``, so its id is a deterministic local salt of
+        the span id (``f"{span_id}-badge"``): a pure local suffix, not a re-hash of
+        run-variant fields, so it preserves resume-stability and keeps the badge distinct.
         """
         cached = bool(span.attributes.get("cached", False))
         agent_type = span.attributes.get("agent_type", span.name)
@@ -178,16 +286,14 @@ class UiAdapter:
             "usage_tokens": span.attributes.get("usage_tokens"),
             "duration_s": span.duration_s,
             "error": span.error,
+            "running": False,
         }
-        # Stable identity only: exclude cached / usage_tokens / duration_s so a fresh
-        # span and its journaled re-emit share one id. The occurrence ordinal keeps
-        # distinct same-type leaves (e.g. three skeptics) separate.
-        agent_key: dict[str, Any] = {
-            "kind": span.kind.value,
-            "name": span.name,
-            "agent_type": agent_type,
-        }
-        self._emit_event(_AGENT_SPAN, agent_props, dedupe_key=agent_key)
+        # The end edge patches the running chip opened by on_span_begin (same span_id):
+        # merge=True so the SDK reducer folds these completion fields onto the begin card
+        # in place rather than appending a second card. begin-only fields (started_at)
+        # are absent here and survive the shallow merge. When a leaf never opened a
+        # running card (no begin edge), the merge is a harmless no-op create.
+        self._emit_event(_AGENT_SPAN, agent_props, event_id=span.span_id, merge=True)
 
         if cached:
             badge_props: dict[str, Any] = {
@@ -196,11 +302,7 @@ class UiAdapter:
                 "cached": True,
                 "usage_tokens": span.attributes.get("usage_tokens"),
             }
-            # Exclude the run-variant usage_tokens from the badge identity; the
-            # occurrence ordinal distinguishes distinct cached leaves of the same
-            # agent_type that happen to report identical usage.
-            badge_key: dict[str, Any] = {"name": span.name, "agent_type": agent_type}
-            self._emit_event(_JOURNAL_BADGE, badge_props, dedupe_key=badge_key)
+            self._emit_event(_JOURNAL_BADGE, badge_props, event_id=f"{span.span_id}-badge")
 
     @staticmethod
     def _fanout_counts(attributes: dict[str, Any]) -> dict[str, Any]:
@@ -220,45 +322,89 @@ class UiAdapter:
     # --- delivery: stable id, dedupe, swallow --------------------------------
 
     def _emit_event(
-        self, component: str, props: dict[str, Any], *, dedupe_key: Mapping[str, Any]
+        self,
+        component: str,
+        props: dict[str, Any],
+        *,
+        event_id: str | None = None,
+        dedupe_key: Mapping[str, Any] | None = None,
+        merge: bool = False,
     ) -> None:
         """Stamp a resume-stable id, drop duplicates, then emit — swallowing failures.
 
-        The ``event_id`` is a hash of ``(component, dedupe_key, occurrence_ordinal)``,
-        where ``dedupe_key`` is the event's *stable logical identity* (run-variant
-        display fields like ``duration_s`` / ``cached`` / ``usage_tokens`` are kept out
-        of it, in ``props`` only). So a resume re-emit of the same leaf — same stable
-        key, same ordinal, even though its display fields changed — collapses onto the
-        first run's id and is dropped. The occurrence ordinal is bumped *before* the
-        seen-check so genuinely-distinct same-key events (the Nth gets ordinal N) never
-        collide, yet honest re-emits in the same source order reuse the same ordinals.
+        Two id sources, by event nature:
+
+        * **Span events consume the engine-minted id (I1).** ``agent_span`` /
+          ``fanout_graph`` / ``journal_badge`` pass an explicit ``event_id`` (the
+          engine's resume-stable ``span_id``, or a deterministic local salt of it for
+          the badge). The engine reproduces this id identically across a fresh run and
+          its resume re-execution of a sequential leaf, so the adapter consumes it
+          verbatim and skips its own hashing entirely.
+        * **Progress events self-compute (scope boundary).** A ``phase_timeline`` entry
+          is NOT a span and carries no engine id, so it passes a ``dedupe_key`` and the
+          adapter derives ``event_id`` from a hash of
+          ``(component, dedupe_key, occurrence_ordinal)``. The ``dedupe_key`` is the
+          entry's stable logical identity; the per-key occurrence ordinal — bumped
+          *before* the seen-check — keeps genuinely-distinct same-text lines separate
+          (the Nth gets ordinal N) while an honest re-emit in the same source order
+          reuses the same ordinal and collapses onto the first run's id.
 
         The id is recorded as seen only after a successful emit, so a swallowed
-        transport failure leaves the door open for a later retry of the same ordinal.
+        transport failure leaves the door open for a later retry of the same id.
+
+        A ``merge`` event is the exception to seen-suppression: it is a deliberate
+        in-place patch of a card that was already created (the leaf's end edge folding
+        completion fields onto the running begin card). It therefore bypasses the
+        seen-set drop and carries a reserved ``merge`` props flag the transport pops and
+        forwards to ``push_ui_message(..., merge=True)`` so the SDK reducer shallow-merges
+        these props onto the existing same-``event_id`` card. A merge does not enter the
+        seen-set (it targets an id whose create already did).
 
         Args:
             component: The Gen-UI component name to render.
             props: The full component props, including run-variant display fields (an
                 ``event_id`` is added in place).
+            event_id: The engine-minted id to use verbatim, for span events. When
+                provided, the adapter skips its own hashing and occurrence-ordinal path.
             dedupe_key: The stable subset of the event's identity, excluding any
-                run-variant field, used to compute the dedupe id and the occurrence
-                ordinal.
+                run-variant field, used to compute the id and occurrence ordinal for
+                progress events. Required when ``event_id`` is ``None``.
+            merge: Whether this event patches an existing same-``event_id`` card in place
+                (the end edge of a leaf folding onto its running begin card). When ``True``
+                the event bypasses seen-suppression and carries the transport merge flag.
+
+        Raises:
+            ValueError: If neither ``event_id`` nor ``dedupe_key`` is supplied.
         """
-        stable = self._stable_id(component, dedupe_key)
-        ordinal = self._occurrences[stable]
-        self._occurrences[stable] = ordinal + 1
-        event_id = f"{stable}-{ordinal}"
-        if event_id in self._seen:
+        # For the self-computed (progress) path, remember the (stable_key, ordinal) so a
+        # swallowed failure can undo the ordinal bump; the engine-id path has no ordinal.
+        ordinal_to_undo: tuple[str, int] | None = None
+        if event_id is None:
+            if dedupe_key is None:
+                raise ValueError("_emit_event requires either event_id or dedupe_key")
+            stable = self._stable_id(component, dedupe_key)
+            ordinal = self._occurrences[stable]
+            self._occurrences[stable] = ordinal + 1
+            event_id = f"{stable}-{ordinal}"
+            ordinal_to_undo = (stable, ordinal)
+
+        # A merge is a deliberate in-place patch of an already-created card, so it must
+        # NOT be dropped by seen-suppression (the create already marked the id seen).
+        if not merge and event_id in self._seen:
             return
         props["event_id"] = event_id
+        if merge:
+            props["merge"] = True
         try:
             self._emit(component, props)
         except Exception:
             # Red line: the engine calls sinks directly; a raising sink would break
             # orchestration. Swallow and leave the id unseen so a retry can deliver.
-            # The ordinal was already consumed, so the retry must reuse THIS id rather
-            # than minting a fresh ordinal — undo the bump so a re-delivery matches.
-            self._occurrences[stable] = ordinal
+            # For the self-computed path, undo the ordinal bump so a re-delivery reuses
+            # THIS id rather than minting a fresh ordinal.
+            if ordinal_to_undo is not None:
+                stable, ordinal = ordinal_to_undo
+                self._occurrences[stable] = ordinal
             return
         self._seen.add(event_id)
 

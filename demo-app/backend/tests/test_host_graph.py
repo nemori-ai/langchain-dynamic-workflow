@@ -115,17 +115,98 @@ async def test_run_workflow_live_streams_named_preset_with_fanout() -> None:
     assert phase_titles == ["search", "extract", "verify", "synthesize"]
 
 
+async def test_run_workflow_live_emits_running_chip_before_completion() -> None:
+    """The live runner opens a running ``agent_span`` before its completed twin.
+
+    Proves the host wires the engine's ``on_span_begin`` sink into ``run_workflow``:
+    the engine fires a span-open edge at each leaf's start, which the adapter maps to a
+    ``running=True`` ``agent_span``; the matching span-close edge then re-emits the SAME
+    ``event_id`` with ``running=False`` (and ``merge=True``) so the chip flips in place.
+    A spy :class:`UiAdapter` captures the emit stream and asserts, for at least one
+    leaf, that the ``running=True`` open arrives BEFORE the matching ``running=False``
+    close on the same ``event_id``. If a future edit drops the ``on_span_begin`` wiring
+    no running chip is ever emitted and this fails — it is a behavioral guard, not a
+    source-inspection one.
+    """
+    from host_graph import run_workflow_live
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    adapter = UiAdapter(emit=lambda comp, props: events.append((comp, dict(props))))
+
+    await run_workflow_live("deep_research", {"question": "Q?"}, adapter=adapter)
+
+    agent_spans = [props for comp, props in events if comp == "agent_span"]
+    running_opens = [p for p in agent_spans if p.get("running") is True]
+    assert running_opens, "on_span_begin must surface a running agent_span for each leaf"
+
+    # For each running-open event_id, its open must precede the matching completed close.
+    open_indices: dict[str, int] = {}
+    close_indices: dict[str, int] = {}
+    for index, props in enumerate(agent_spans):
+        event_id = props["event_id"]
+        if props.get("running") is True:
+            open_indices.setdefault(event_id, index)
+        elif props.get("running") is False:
+            close_indices.setdefault(event_id, index)
+
+    flipped_in_place = [
+        event_id
+        for event_id, open_at in open_indices.items()
+        if event_id in close_indices and open_at < close_indices[event_id]
+    ]
+    assert flipped_in_place, (
+        "at least one leaf must emit running=True before its running=False twin on the "
+        "same event_id (the in-place flip) — proving on_span_begin is wired"
+    )
+
+
+async def test_run_workflow_live_folds_leaf_interior_into_a_subtree() -> None:
+    """The live runner folds each leaf's interior run tree onto its ``agent_span``.
+
+    Proves the host wires the engine's ``on_leaf_event`` sink into ``run_workflow``: the
+    engine taps each freshly-executing leaf's own callback subtree and forwards the
+    edges, which the adapter buffers per leaf and re-emits as a bounded, shape-only
+    ``subtree`` prop merged onto the leaf's ``agent_span``. A spy :class:`UiAdapter`
+    captures the emit stream and asserts at least one completed ``agent_span`` carries a
+    non-empty, closed ``subtree`` (one root, every non-root parent a known ``run_id``).
+    If a future edit drops the ``on_leaf_event`` wiring no ``subtree`` is ever emitted
+    and this fails — a behavioral guard, not a source-inspection one.
+    """
+    from host_graph import run_workflow_live
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    adapter = UiAdapter(emit=lambda comp, props: events.append((comp, dict(props))))
+
+    await run_workflow_live("deep_research", {"question": "Q?"}, adapter=adapter)
+
+    subtree_spans = [props for comp, props in events if comp == "agent_span" and "subtree" in props]
+    assert subtree_spans, "on_leaf_event must surface a drill-in subtree on a leaf's agent_span"
+    populated = [p for p in subtree_spans if p["subtree"]]
+    assert populated, "at least one leaf must carry a non-empty interior subtree"
+    sample = populated[-1]
+    run_ids = {n["run_id"] for n in sample["subtree"]}
+    assert sum(1 for n in sample["subtree"] if n["parent_run_id"] is None) >= 1
+    assert all(
+        n["parent_run_id"] in run_ids for n in sample["subtree"] if n["parent_run_id"] is not None
+    )
+
+
 async def test_run_workflow_live_resumes_cached_leaves_on_second_run() -> None:
     """A second run on the same resume lane replays leaves as journal hits.
 
     This is the "pick it back up" headline: the host persists a per-(thread, workflow)
     :class:`_ResumeLane` whose journal / checkpointer / thread_id are threaded into
     ``run_workflow``. The first run executes every leaf fresh (no ``journal_badge``,
-    every ``agent_span`` ``cached=False``); a second run on the SAME lane must replay
-    each recorded leaf from the journal — every ``agent_span`` comes back
-    ``cached=True`` and a ``journal_badge`` is newly emitted — proving the cached
+    every completed ``agent_span`` ``cached=False``); a second run on the SAME lane must
+    replay each recorded leaf from the journal — every completed ``agent_span`` comes
+    back ``cached=True`` and a ``journal_badge`` is newly emitted — proving the cached
     ``agent_span`` branch and the ``journal_badge`` component are reachable at runtime,
     not dead paths. The result is identical across runs (the journal replays it).
+
+    The cache flag lives on the COMPLETED (span-close) ``agent_span`` edge; the
+    span-open running chip (``running=True``) carries no cache flag (cache state is
+    unknown at open), so the assertions filter to the completed (``running is False``)
+    edges.
     """
     from host_graph import _ResumeLane, run_workflow_live
 
@@ -135,8 +216,8 @@ async def test_run_workflow_live_resumes_cached_leaves_on_second_run() -> None:
     adapter_first = UiAdapter(emit=lambda comp, props: first.append((comp, dict(props))))
     result_first = await run_workflow_live("deep_research", {}, adapter=adapter_first, lane=lane)
 
-    fresh_spans = [p for c, p in first if c == "agent_span"]
-    assert fresh_spans, "first run must emit agent spans"
+    fresh_spans = [p for c, p in first if c == "agent_span" and p.get("running") is False]
+    assert fresh_spans, "first run must emit completed agent spans"
     assert all(p["cached"] is False for p in fresh_spans)
     assert not [c for c, _ in first if c == "journal_badge"], "fresh run emits no journal badge"
 
@@ -144,7 +225,11 @@ async def test_run_workflow_live_resumes_cached_leaves_on_second_run() -> None:
     adapter_second = UiAdapter(emit=lambda comp, props: second.append((comp, dict(props))))
     result_second = await run_workflow_live("deep_research", {}, adapter=adapter_second, lane=lane)
 
-    cached_spans = [p for c, p in second if c == "agent_span" and p["cached"] is True]
+    cached_spans = [
+        p
+        for c, p in second
+        if c == "agent_span" and p.get("running") is False and p["cached"] is True
+    ]
     badges = [c for c, _ in second if c == "journal_badge"]
     assert len(cached_spans) == len(fresh_spans), "resume must replay every leaf as cached"
     assert len(badges) == len(fresh_spans), "each cached leaf surfaces a journal badge"
@@ -204,6 +289,66 @@ async def test_resume_replays_cached_leaves_across_two_host_graph_turns() -> Non
         if u.get("name") == "agent_span" and (u.get("props") or {}).get("cached") is True
     ]
     assert cached_agent_spans, "the second turn must replay leaves as cached agent spans"
+
+
+async def test_resume_clears_stale_drill_in_subtree_with_checkpointer() -> None:
+    """A resumed cached leaf must NOT keep a stale drill-in subtree (checkpointer path).
+
+    The multi-turn blindspot the no-checkpointer resume test above misses: only a
+    persistent checkpointer makes turn 2's state ACCUMULATE turn 1's subtree-bearing
+    ``agent_span`` cards (same resume-stable ``span_id``). The engine fires zero leaf
+    events on a cached leaf, and the adapter's span-open begin edge (``merge=False``)
+    REPLACES the card, dropping turn 1's subtree. This asserts turn 1's cards reappear in
+    turn 2's final ``ui`` channel (proving accumulation, so the check is non-vacuous) yet
+    come back ``cached=True`` with NO ``subtree`` — the "a cached leaf carries no drill-in"
+    honesty caveat, verified the way the frontend renders it (the final thread-state
+    ``ui`` channel), not via a stream scan that would replay turn 1's accumulated state.
+    """
+    from host_graph import _RESUME_LANES, _build_host_graph
+    from langchain_core.messages import HumanMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    _RESUME_LANES.clear()
+    graph = _build_host_graph(checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "test-resume-clears-stale-subtree"}}
+
+    first = await graph.ainvoke(
+        {"messages": [HumanMessage(content="Do a thorough deep research on RAG trade-offs.")]},
+        config=cfg,
+    )
+    first_subtree_ids = {
+        (u.get("props") or {}).get("event_id")
+        for u in first.get("ui", [])
+        if u.get("name") == "agent_span" and (u.get("props") or {}).get("subtree")
+    }
+    assert first_subtree_ids, "turn 1 (fresh) must surface drill-in subtrees on its agent spans"
+
+    second = await graph.ainvoke(
+        {"messages": [HumanMessage(content="Pick it back up where you left off.")]},
+        config=cfg,
+    )
+    ui = second.get("ui", [])
+    assert [u for u in ui if u.get("name") == "journal_badge"], (
+        "resume must surface journal badges (the cache-hit story)"
+    )
+
+    cards = {
+        (u.get("props") or {})["event_id"]: (u.get("props") or {})
+        for u in ui
+        if u.get("name") == "agent_span"
+    }
+    # Non-vacuity: turn-1's subtree cards must persist into turn-2 state (accumulation),
+    # so a stale subtree had every chance to survive — proving it is cleared, not absent.
+    reappeared = first_subtree_ids & set(cards)
+    assert reappeared, (
+        "turn-1 agent_span cards must accumulate into turn-2 state via the checkpointer"
+    )
+    for event_id in reappeared:
+        card = cards[event_id]
+        assert card.get("cached") is True, f"resumed card {event_id} must come back cached"
+        assert not card.get("subtree"), (
+            f"resumed cached card {event_id} kept a stale drill-in subtree"
+        )
 
 
 async def test_run_workflow_live_unknown_name_raises() -> None:
