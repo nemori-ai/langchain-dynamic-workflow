@@ -44,6 +44,7 @@ async def test_real_model_leaf_runs_a_real_shell_command_and_folds_the_real_outp
     from deepagents.backends.protocol import BackendProtocol
     from examples._shared.real_models import load_demo_env, real_leaf_model
     from langchain.tools import ToolRuntime  # pyright: ignore[reportUnknownVariableType]
+    from langgraph.config import get_config
 
     from langchain_dynamic_workflow import (
         Ctx,
@@ -56,23 +57,26 @@ async def test_real_model_leaf_runs_a_real_shell_command_and_folds_the_real_outp
     )
 
     load_demo_env()
-    # Disable LangSmith tracing for this deepagent-heavy run (memory: real-e2e).
-    os.environ.pop("LANGSMITH_TRACING", None)
+    # Keep LangSmith tracing on (as configured in .env) so this real run is captured
+    # in LangSmith for usage/billing visibility.
 
     model = real_leaf_model()
     assert model is not None, "real leaf model must be available under the gate"
 
     expected_digest = hashlib.sha256(_SHA_PAYLOAD.encode()).hexdigest()
 
-    def _leased_backend(runtime: ToolRuntime[Any, Any]) -> BackendProtocol:
+    def _leased_backend(_runtime: ToolRuntime[Any, Any]) -> BackendProtocol:
         """Resolve the per-leaf backend the engine threaded into the leaf config.
 
-        deepagents calls this factory with the live tool runtime; the engine leases
-        a real ``LocalSubprocessSandbox`` and threads it under ``sandbox_backend``,
+        The engine leases a real ``LocalSubprocessSandbox`` and threads it under
+        ``configurable["sandbox_backend"]``; this reads it back via ``get_config()``
+        (the same contextvar-based run-config access deepagents' own backends use),
         so returning it wires the builtin ``execute`` tool to the real subprocess
-        backend in the leaf's private temp root.
+        backend in the leaf's private temp root. The ``ToolRuntime`` deepagents passes
+        to a backend factory carries no ``config`` attribute, so the run config is read
+        from the contextvar rather than off the runtime.
         """
-        configurable = (runtime.config or {}).get("configurable", {})
+        configurable = (get_config() or {}).get("configurable") or {}
         backend: BackendProtocol = configurable["sandbox_backend"]
         return backend
 

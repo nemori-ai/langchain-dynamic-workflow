@@ -99,6 +99,24 @@ class LeafEventHandler(BaseCallbackHandler):
         self._leaf_span_id = leaf_span_id
         self._sink = sink
         self._include_payloads = include_payloads
+        # run_id -> name recorded at the start edge. LangChain's end/error callbacks
+        # carry no ``serialized`` payload, so the only way an end/error edge can name
+        # its runnable is to remember it from the matching start edge. A run_id is
+        # unique per runnable and its start always precedes its end/error, so a plain
+        # dict (set on start, popped on end/error) needs no lock.
+        self._names: dict[UUID, str] = {}
+
+    # --- name tracking -------------------------------------------------------
+
+    def _remember(self, serialized: dict[str, Any] | None, run_id: UUID) -> str:
+        """Record and return the runnable name for ``run_id`` at its start edge."""
+        name = self._name_of(serialized)
+        self._names[run_id] = name
+        return name
+
+    def _recall(self, run_id: UUID) -> str:
+        """Return (and forget) the name recorded for ``run_id`` at its start edge."""
+        return self._names.pop(run_id, "")
 
     # --- emit helper ---------------------------------------------------------
 
@@ -154,7 +172,7 @@ class LeafEventHandler(BaseCallbackHandler):
         self._emit(
             kind="chain",
             phase="start",
-            name=self._name_of(serialized),
+            name=self._remember(serialized, run_id),
             run_id=run_id,
             parent_run_id=parent_run_id,
             detail={},
@@ -171,7 +189,7 @@ class LeafEventHandler(BaseCallbackHandler):
         self._emit(
             kind="chain",
             phase="end",
-            name="",
+            name=self._recall(run_id),
             run_id=run_id,
             parent_run_id=parent_run_id,
             detail={},
@@ -188,7 +206,7 @@ class LeafEventHandler(BaseCallbackHandler):
         self._emit(
             kind="chain",
             phase="error",
-            name="",
+            name=self._recall(run_id),
             run_id=run_id,
             parent_run_id=parent_run_id,
             detail={"error": f"{type(error).__name__}: {error}"},
@@ -208,7 +226,7 @@ class LeafEventHandler(BaseCallbackHandler):
         self._emit(
             kind="chat_model",
             phase="start",
-            name=self._name_of(serialized),
+            name=self._remember(serialized, run_id),
             run_id=run_id,
             parent_run_id=parent_run_id,
             detail={},
@@ -229,7 +247,7 @@ class LeafEventHandler(BaseCallbackHandler):
         self._emit(
             kind="chat_model",
             phase="end",
-            name="",
+            name=self._recall(run_id),
             run_id=run_id,
             parent_run_id=parent_run_id,
             detail=detail,
@@ -246,7 +264,7 @@ class LeafEventHandler(BaseCallbackHandler):
         self._emit(
             kind="chat_model",
             phase="error",
-            name="",
+            name=self._recall(run_id),
             run_id=run_id,
             parent_run_id=parent_run_id,
             detail={"error": f"{type(error).__name__}: {error}"},
@@ -269,7 +287,7 @@ class LeafEventHandler(BaseCallbackHandler):
         self._emit(
             kind="tool",
             phase="start",
-            name=self._name_of(serialized),
+            name=self._remember(serialized, run_id),
             run_id=run_id,
             parent_run_id=parent_run_id,
             detail=detail,
@@ -289,7 +307,7 @@ class LeafEventHandler(BaseCallbackHandler):
         self._emit(
             kind="tool",
             phase="end",
-            name="",
+            name=self._recall(run_id),
             run_id=run_id,
             parent_run_id=parent_run_id,
             detail=detail,
@@ -306,7 +324,7 @@ class LeafEventHandler(BaseCallbackHandler):
         self._emit(
             kind="tool",
             phase="error",
-            name="",
+            name=self._recall(run_id),
             run_id=run_id,
             parent_run_id=parent_run_id,
             detail={"error": f"{type(error).__name__}: {error}"},
