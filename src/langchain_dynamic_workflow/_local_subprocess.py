@@ -24,14 +24,16 @@ is an explicit, host-constructed opt-in.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import IO, Literal
 
 from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
@@ -47,6 +49,42 @@ _DEFAULT_REJECT_REASON = "execution rejected by policy"
 
 _DRAIN_CHUNK_BYTES = 65536
 """Read granularity for the bounded output drain, in bytes."""
+
+_RLIMIT_WRAPPER_SOURCE = """\
+import json, os, resource, sys
+
+_RLIMITS = {
+    "cpu_seconds": resource.RLIMIT_CPU,
+    "address_space_bytes": resource.RLIMIT_AS,
+    "file_size_bytes": resource.RLIMIT_FSIZE,
+    "open_files": resource.RLIMIT_NOFILE,
+    "processes": resource.RLIMIT_NPROC,
+}
+profile = json.loads(sys.argv[1])
+command = sys.argv[2]
+for field_name, value in profile.items():
+    rlimit = _RLIMITS.get(field_name)
+    if rlimit is None or value is None:
+        continue
+    try:
+        _, hard = resource.getrlimit(rlimit)
+        unbounded = hard == resource.RLIM_INFINITY
+        new_hard = hard if unbounded or hard >= value else hard
+        new_soft = value if unbounded or value <= new_hard else new_hard
+        resource.setrlimit(rlimit, (new_soft, new_hard))
+    except (OSError, ValueError):
+        # Best-effort: a limit the kernel refuses (for example RLIMIT_AS on
+        # Darwin) is skipped rather than aborting the whole command.
+        pass
+os.execvp("/bin/sh", ["/bin/sh", "-c", command])
+"""
+"""Child-side source that applies POSIX rlimits then execs the shell command.
+
+Run as ``python -c <source> <json-profile> <command>`` so the limits are set in
+the child before the shell takes over, without the thread-unsafe ``preexec_fn``.
+After ``os.execvp`` the shell keeps this process's pid and session, so the
+process-group termination on timeout still reaches it and its descendants.
+"""
 
 ExecOutcome = Literal["allow", "reject"]
 """Whether an admission decision permits (``"allow"``) or refuses (``"reject"``)."""
@@ -74,31 +112,39 @@ class RLimitProfile:
 
     Each ``None`` field leaves that limit unset. The limits are applied via
     ``resource.setrlimit`` in a child wrapper (not ``preexec_fn``), which is the
-    thread-safe choice in a ``to_thread`` execution runtime. The default values
-    are generous enough not to break a typical build or test command yet low
-    enough to stop a runaway from exhausting the host:
+    thread-safe choice in a ``to_thread`` execution runtime. A limit the kernel
+    refuses (for example ``RLIMIT_AS`` on Darwin) is skipped best-effort rather
+    than aborting the command. The default values are generous enough not to
+    break a typical build or test command yet low enough to stop a runaway from
+    exhausting the host:
 
     - CPU ``60`` seconds: bounds a busy loop without truncating a normal build.
     - Address space ``2 GiB``: bounds a memory hog while leaving headroom for a
-      compiler or test runner.
+      compiler or test runner (kernel-enforced on Linux; ignored on Darwin).
     - File size ``256 MiB``: bounds runaway file growth.
     - Open files ``1024``: a common interactive-shell default; bounds descriptor
       leaks.
-    - Processes ``256``: bounds a fork bomb while permitting parallel builds.
+    - Processes: unset by default. ``RLIMIT_NPROC`` counts *every* process the
+      host user owns, not just this command's children, so a fixed cap reflects
+      ambient host load rather than the command and can break ``fork`` on a busy
+      host. A host that wants a fork-bomb guard sets it explicitly with headroom
+      above its own baseline process count.
 
     Attributes:
         cpu_seconds: ``RLIMIT_CPU`` soft/hard cap (CPU seconds).
         address_space_bytes: ``RLIMIT_AS`` (virtual memory) cap, in bytes.
         file_size_bytes: ``RLIMIT_FSIZE`` cap, in bytes.
         open_files: ``RLIMIT_NOFILE`` cap (max open descriptors).
-        processes: ``RLIMIT_NPROC`` cap (max processes for the user).
+        processes: ``RLIMIT_NPROC`` cap (max processes for the whole host user);
+            unset by default because the per-user count makes a fixed cap
+            unreliable as a per-command guard.
     """
 
     cpu_seconds: int | None = 60
     address_space_bytes: int | None = 2 * 1024 * 1024 * 1024
     file_size_bytes: int | None = 256 * 1024 * 1024
     open_files: int | None = 1024
-    processes: int | None = 256
+    processes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +287,65 @@ def _terminate_process_tree(proc: subprocess.Popen[bytes], grace_seconds: float)
         proc.kill()
 
 
+def _resolve_effective_timeout(
+    *, call_timeout: int | None, decision_timeout: int | None, default_timeout: int
+) -> int:
+    """Pick the tightest timeout among the call, the admission decision, and policy.
+
+    The admission decision may only clamp the timeout *down*: it is treated as a
+    ceiling, never a way to widen a tighter call- or policy-level bound. The
+    effective timeout is therefore the minimum of every value that was supplied
+    (the call timeout and the decision timeout are each optional, the policy
+    default always applies), guaranteeing a bounded deadline on every spawn.
+
+    Args:
+        call_timeout: The per-call timeout, or ``None`` when the caller deferred.
+        decision_timeout: The admission decision's override, or ``None``.
+        default_timeout: The policy default that always applies.
+
+    Returns:
+        The smallest of the supplied timeouts, in seconds.
+    """
+    candidates = [default_timeout]
+    if call_timeout is not None:
+        candidates.append(call_timeout)
+    if decision_timeout is not None:
+        candidates.append(decision_timeout)
+    return min(candidates)
+
+
+def _build_spawn_command(command: str, rlimits: RLimitProfile) -> str | list[str]:
+    """Build the ``Popen`` target that runs ``command`` under ``rlimits``.
+
+    On POSIX the command is launched through a small child wrapper
+    (``python -c <wrapper> <json-profile> <command>``) that applies the resource
+    limits in the child before ``os.execvp``-ing the shell — the thread-safe
+    alternative to ``preexec_fn`` in a ``to_thread`` runtime. The wrapper keeps
+    the process's pid and session, so the timeout's process-group termination
+    still reaches it. When the profile carries no limit at all the wrapper is
+    skipped and the shell runs directly. On non-POSIX platforms resource limits
+    are unavailable, so the command always runs directly through the shell.
+
+    Args:
+        command: The shell command string to run.
+        rlimits: The resource-limit profile to apply (POSIX only).
+
+    Returns:
+        Either the bare command string (run with ``shell=True``) or an argv list
+        for the rlimit wrapper (run with ``shell=False``).
+    """
+    profile = {name: value for name, value in asdict(rlimits).items() if value is not None}
+    if os.name != "posix" or not profile:
+        return command
+    return [
+        sys.executable,
+        "-c",
+        _RLIMIT_WRAPPER_SOURCE,
+        json.dumps(profile),
+        command,
+    ]
+
+
 class LocalSubprocessSandbox(SandboxBackendProtocol):
     """A full-protocol backend running each command in a per-leaf temp root.
 
@@ -299,18 +404,24 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         is a cross-thread :class:`threading.BoundedSemaphore` acquired here in the
         synchronous body, not the asyncio leaf gate. The slot is always returned
         in a ``finally`` so a timeout or exception cannot leak it. After the slot
-        is held, the admission hook decides whether to spawn at all; a rejection
-        returns the rejection sentinel without launching a process.
+        is held, the admission hook decides what to do: it may reject the command
+        (the rejection sentinel is returned without launching a process), clamp
+        the effective timeout down, lower the combined-output byte cap, or select
+        a different POSIX resource-limit profile for this one call. Any override
+        the decision omits falls back to the configured policy default.
 
         The command runs through the system shell with its working directory set
         to :attr:`root_path`. On POSIX the child starts a new session so the
-        whole process group can be terminated together. The combined stdout and
-        stderr are drained up to the effective output cap and returned as the
-        response output, with the child's exit code as
-        :attr:`ExecuteResponse.exit_code`.
+        whole process group can be terminated together, and the effective POSIX
+        resource limits are applied in a child wrapper before the shell takes
+        over. The combined stdout and stderr are drained up to the effective
+        output cap and returned as the response output, with the child's exit
+        code as :attr:`ExecuteResponse.exit_code`.
 
-        A bounded effective timeout always applies: the per-call ``timeout`` when
-        given, otherwise the policy default. The drain runs on a worker thread so
+        A bounded effective timeout always applies: the tightest of the per-call
+        ``timeout``, the admission decision's clamp, and the policy default (the
+        decision can only narrow it, never widen it). The drain runs on a worker
+        thread so
         the calling thread can wait on the child with a deadline; when the
         deadline passes the process tree is escalated down (``SIGTERM``, a grace
         window, then ``SIGKILL`` to the whole group on POSIX) and the response
@@ -346,8 +457,10 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
 
         The admission hook is consulted first (the slot is already held, so the
         hook can observe true in-flight concurrency). A rejection short-circuits
-        without spawning. Otherwise the command is spawned, drained, and timed
-        out exactly as :meth:`execute` documents.
+        without spawning. Otherwise the decision's timeout clamp, output-cap, and
+        resource-limit overrides are resolved against the policy defaults, and the
+        command is spawned, drained, and timed out exactly as :meth:`execute`
+        documents.
 
         Args:
             command: The full shell command string to run.
@@ -370,11 +483,20 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
                 exit_code=EXIT_REJECTED,
                 truncated=False,
             )
-        output_cap_bytes = self._policy.output_cap_bytes
-        effective_timeout = timeout if timeout is not None else self._policy.default_timeout
+        # Apply the admission overrides: the decision may lower the output cap,
+        # clamp the timeout down (never widen it), and select a different rlimit
+        # profile. A missing override falls back to the policy default.
+        output_cap_bytes = decision.output_cap_bytes or self._policy.output_cap_bytes
+        effective_timeout = _resolve_effective_timeout(
+            call_timeout=timeout,
+            decision_timeout=decision.timeout,
+            default_timeout=self._policy.default_timeout,
+        )
+        rlimits = decision.rlimits or self._policy.rlimits
+        spawn_command = _build_spawn_command(command, rlimits)
         proc = subprocess.Popen(
-            command,
-            shell=True,
+            spawn_command,
+            shell=isinstance(spawn_command, str),
             cwd=self._root,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

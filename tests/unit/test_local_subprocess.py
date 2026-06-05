@@ -198,3 +198,143 @@ def test_exec_gate_slot_is_released_after_a_timeout() -> None:
         assert time.monotonic() - started < 10  # not blocked on a leaked slot
     finally:
         backend.close()
+
+
+def test_before_execute_reject_does_not_spawn_and_returns_126() -> None:
+    def deny(_req: ExecRequest) -> ExecDecision:
+        return ExecDecision(outcome="reject", reason="policy: no shell in this run")
+
+    backend = _backend(ExecPolicy(before_execute=deny))
+    try:
+        result = backend.execute(f'{sys.executable} -c "print(1)"')
+        assert result.exit_code == 126  # discipline reject sentinel
+        assert "policy" in result.output
+        assert result.truncated is False
+    finally:
+        backend.close()
+
+
+def test_before_execute_reject_receives_the_real_request() -> None:
+    # The hook observes the actual command / timeout / leaf identity, so a real
+    # admission policy can branch on them rather than rejecting blindly.
+    seen: list[ExecRequest] = []
+
+    def record_then_reject(req: ExecRequest) -> ExecDecision:
+        seen.append(req)
+        return ExecDecision(outcome="reject", reason="seen")
+
+    backend = LocalSubprocessSandbox(
+        identity="leaf-admission",
+        policy=ExecPolicy(before_execute=record_then_reject),
+        exec_gate=threading.BoundedSemaphore(8),
+    )
+    try:
+        backend.execute("echo unreachable", timeout=7)
+        assert len(seen) == 1
+        assert seen[0].command == "echo unreachable"
+        assert seen[0].timeout == 7
+        assert seen[0].leaf_id == "leaf-admission"
+    finally:
+        backend.close()
+
+
+def test_before_execute_reduce_timeout_clamps_the_effective_timeout() -> None:
+    def clamp(_req: ExecRequest) -> ExecDecision:
+        return ExecDecision(timeout=1)
+
+    backend = _backend(ExecPolicy(default_timeout=60, grace_seconds=0.5, before_execute=clamp))
+    try:
+        started = time.monotonic()
+        result = backend.execute(f'{sys.executable} -c "import time; time.sleep(30)"')
+        assert result.exit_code == 124
+        assert time.monotonic() - started < 10  # clamped to ~1s, not 60s
+    finally:
+        backend.close()
+
+
+def test_before_execute_reduce_timeout_only_clamps_down_never_up() -> None:
+    # The clamp is a minimum: a decision that names a larger timeout cannot widen
+    # a tighter call/policy timeout. A 1s policy default with a decision asking for
+    # 60s must still time the 30s sleeper out promptly.
+    def widen(_req: ExecRequest) -> ExecDecision:
+        return ExecDecision(timeout=60)
+
+    backend = _backend(ExecPolicy(default_timeout=1, grace_seconds=0.5, before_execute=widen))
+    try:
+        started = time.monotonic()
+        result = backend.execute(f'{sys.executable} -c "import time; time.sleep(30)"')
+        assert result.exit_code == 124
+        assert time.monotonic() - started < 10  # the 1s default still bounds it
+    finally:
+        backend.close()
+
+
+def test_before_execute_cap_output_lowers_the_byte_cap() -> None:
+    def cap(_req: ExecRequest) -> ExecDecision:
+        return ExecDecision(output_cap_bytes=50)
+
+    backend = _backend(ExecPolicy(output_cap_bytes=10_000, before_execute=cap))
+    try:
+        result = backend.execute(f'{sys.executable} -c "print(\\"y\\" * 5000)"')
+        assert result.truncated is True
+        assert len(result.output.encode()) <= 50 + 64
+    finally:
+        backend.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="rlimits are POSIX-only")
+def test_rlimit_cpu_actually_kills_a_busy_loop() -> None:
+    # A tight CPU-seconds cap makes a busy loop exceed its quota and get killed by
+    # the kernel (SIGXCPU), so the command exits non-zero rather than spinning the
+    # host CPU unbounded. RLIMIT_CPU is the portable POSIX cap exercised here:
+    # RLIMIT_AS is not kernel-enforced for this allocation pattern on Darwin, so a
+    # busy-loop CPU cap is the honest, kernel-enforced assertion on every POSIX.
+    from langchain_dynamic_workflow._local_subprocess import RLimitProfile
+
+    backend = _backend(
+        ExecPolicy(
+            default_timeout=30,
+            rlimits=RLimitProfile(cpu_seconds=1),
+        )
+    )
+    try:
+        started = time.monotonic()
+        result = backend.execute(f'{sys.executable} -c "x = 0\nwhile True:\n    x += 1"')
+        elapsed = time.monotonic() - started
+        assert result.exit_code != 0  # the kernel killed the over-quota child
+        assert elapsed < 20  # the CPU cap, not the 30s timeout, ended it
+    finally:
+        backend.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="rlimits are POSIX-only")
+def test_default_rlimits_do_not_break_a_normal_command() -> None:
+    # The default profile carries finite caps; a benign command must still run
+    # cleanly under it. A limit the kernel refuses (for example RLIMIT_AS on
+    # Darwin) is applied best-effort and skipped, never crashing the spawn.
+    backend = _backend()  # default ExecPolicy => default RLimitProfile
+    try:
+        result = backend.execute(f'{sys.executable} -c "print(2 + 2)"')
+        assert "4" in result.output
+        assert result.exit_code == 0
+    finally:
+        backend.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="rlimits are POSIX-only")
+def test_decision_rlimits_override_the_policy_profile() -> None:
+    # An ExecDecision.rlimits selects a different profile for one call: here a
+    # tight CPU cap that the busy loop trips, overriding the generous default.
+    from langchain_dynamic_workflow._local_subprocess import RLimitProfile
+
+    def tighten(_req: ExecRequest) -> ExecDecision:
+        return ExecDecision(rlimits=RLimitProfile(cpu_seconds=1))
+
+    backend = _backend(ExecPolicy(default_timeout=30, before_execute=tighten))
+    try:
+        started = time.monotonic()
+        result = backend.execute(f'{sys.executable} -c "x = 0\nwhile True:\n    x += 1"')
+        assert result.exit_code != 0
+        assert time.monotonic() - started < 20
+    finally:
+        backend.close()
