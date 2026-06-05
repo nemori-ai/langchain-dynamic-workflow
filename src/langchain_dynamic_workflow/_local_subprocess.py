@@ -408,8 +408,10 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
     Each instance owns a private temporary directory created at construction; the
     command's working directory is that directory, and the file operations read
     and write real files beneath it, so ``execute`` and the file tools share one
-    filesystem. :meth:`close` removes the directory and terminates any straggler
-    process; it is idempotent.
+    filesystem. Every :meth:`execute` call reaps its own child (and, on POSIX,
+    its process group on timeout) before it returns, so a completed call leaves
+    no live process behind; :meth:`close` therefore only removes the temporary
+    directory, and is idempotent.
 
     Args:
         identity: The owning leaf identity, surfaced via :attr:`id`.
@@ -867,8 +869,10 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
     def close(self) -> None:
         """Remove the per-leaf temp directory (idempotent).
 
-        Best-effort: a directory that is already gone is tolerated. Straggler
-        process termination is wired in by the resilience layers.
+        Best-effort: a directory that is already gone is tolerated. No process
+        cleanup is needed here because every :meth:`execute` call reaps its own
+        child (and its process group on timeout) before returning, so a closed
+        backend never had a live process to terminate.
         """
         if self._closed:
             return
