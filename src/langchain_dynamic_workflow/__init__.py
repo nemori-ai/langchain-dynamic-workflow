@@ -21,6 +21,7 @@ from ._errors import (
     WorkflowScriptError,
 )
 from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal_key, race_key
+from ._leaf_events import LeafEvent, LeafEventSink
 from ._leaves import read_only_builder, read_only_leaf
 from ._observability import Span, SpanBegin, SpanBeginSink, SpanKind, SpanSink
 from ._progress import ProgressEntry, ProgressKind, ProgressSink
@@ -93,6 +94,8 @@ __all__ = [
     "InMemoryWorktreeProvider",
     "JournalRecord",
     "JournalStore",
+    "LeafEvent",
+    "LeafEventSink",
     "Orchestrator",
     "ProgressEntry",
     "ProgressKind",
