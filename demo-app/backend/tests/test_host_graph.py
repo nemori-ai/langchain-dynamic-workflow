@@ -115,17 +115,67 @@ async def test_run_workflow_live_streams_named_preset_with_fanout() -> None:
     assert phase_titles == ["search", "extract", "verify", "synthesize"]
 
 
+async def test_run_workflow_live_emits_running_chip_before_completion() -> None:
+    """The live runner opens a running ``agent_span`` before its completed twin.
+
+    Proves the host wires the engine's ``on_span_begin`` sink into ``run_workflow``:
+    the engine fires a span-open edge at each leaf's start, which the adapter maps to a
+    ``running=True`` ``agent_span``; the matching span-close edge then re-emits the SAME
+    ``event_id`` with ``running=False`` (and ``merge=True``) so the chip flips in place.
+    A spy :class:`UiAdapter` captures the emit stream and asserts, for at least one
+    leaf, that the ``running=True`` open arrives BEFORE the matching ``running=False``
+    close on the same ``event_id``. If a future edit drops the ``on_span_begin`` wiring
+    no running chip is ever emitted and this fails — it is a behavioral guard, not a
+    source-inspection one.
+    """
+    from host_graph import run_workflow_live
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    adapter = UiAdapter(emit=lambda comp, props: events.append((comp, dict(props))))
+
+    await run_workflow_live("deep_research", {"question": "Q?"}, adapter=adapter)
+
+    agent_spans = [props for comp, props in events if comp == "agent_span"]
+    running_opens = [p for p in agent_spans if p.get("running") is True]
+    assert running_opens, "on_span_begin must surface a running agent_span for each leaf"
+
+    # For each running-open event_id, its open must precede the matching completed close.
+    open_indices: dict[str, int] = {}
+    close_indices: dict[str, int] = {}
+    for index, props in enumerate(agent_spans):
+        event_id = props["event_id"]
+        if props.get("running") is True:
+            open_indices.setdefault(event_id, index)
+        elif props.get("running") is False:
+            close_indices.setdefault(event_id, index)
+
+    flipped_in_place = [
+        event_id
+        for event_id, open_at in open_indices.items()
+        if event_id in close_indices and open_at < close_indices[event_id]
+    ]
+    assert flipped_in_place, (
+        "at least one leaf must emit running=True before its running=False twin on the "
+        "same event_id (the in-place flip) — proving on_span_begin is wired"
+    )
+
+
 async def test_run_workflow_live_resumes_cached_leaves_on_second_run() -> None:
     """A second run on the same resume lane replays leaves as journal hits.
 
     This is the "pick it back up" headline: the host persists a per-(thread, workflow)
     :class:`_ResumeLane` whose journal / checkpointer / thread_id are threaded into
     ``run_workflow``. The first run executes every leaf fresh (no ``journal_badge``,
-    every ``agent_span`` ``cached=False``); a second run on the SAME lane must replay
-    each recorded leaf from the journal — every ``agent_span`` comes back
-    ``cached=True`` and a ``journal_badge`` is newly emitted — proving the cached
+    every completed ``agent_span`` ``cached=False``); a second run on the SAME lane must
+    replay each recorded leaf from the journal — every completed ``agent_span`` comes
+    back ``cached=True`` and a ``journal_badge`` is newly emitted — proving the cached
     ``agent_span`` branch and the ``journal_badge`` component are reachable at runtime,
     not dead paths. The result is identical across runs (the journal replays it).
+
+    The cache flag lives on the COMPLETED (span-close) ``agent_span`` edge; the
+    span-open running chip (``running=True``) carries no cache flag (cache state is
+    unknown at open), so the assertions filter to the completed (``running is False``)
+    edges.
     """
     from host_graph import _ResumeLane, run_workflow_live
 
@@ -135,8 +185,8 @@ async def test_run_workflow_live_resumes_cached_leaves_on_second_run() -> None:
     adapter_first = UiAdapter(emit=lambda comp, props: first.append((comp, dict(props))))
     result_first = await run_workflow_live("deep_research", {}, adapter=adapter_first, lane=lane)
 
-    fresh_spans = [p for c, p in first if c == "agent_span"]
-    assert fresh_spans, "first run must emit agent spans"
+    fresh_spans = [p for c, p in first if c == "agent_span" and p.get("running") is False]
+    assert fresh_spans, "first run must emit completed agent spans"
     assert all(p["cached"] is False for p in fresh_spans)
     assert not [c for c, _ in first if c == "journal_badge"], "fresh run emits no journal badge"
 
@@ -144,7 +194,11 @@ async def test_run_workflow_live_resumes_cached_leaves_on_second_run() -> None:
     adapter_second = UiAdapter(emit=lambda comp, props: second.append((comp, dict(props))))
     result_second = await run_workflow_live("deep_research", {}, adapter=adapter_second, lane=lane)
 
-    cached_spans = [p for c, p in second if c == "agent_span" and p["cached"] is True]
+    cached_spans = [
+        p
+        for c, p in second
+        if c == "agent_span" and p.get("running") is False and p["cached"] is True
+    ]
     badges = [c for c, _ in second if c == "journal_badge"]
     assert len(cached_spans) == len(fresh_spans), "resume must replay every leaf as cached"
     assert len(badges) == len(fresh_spans), "each cached leaf surfaces a journal badge"
