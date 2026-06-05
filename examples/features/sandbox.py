@@ -1,18 +1,14 @@
-"""Phase 4 demo: per-leaf sandbox isolation + ``/shared/`` artifact hand-off.
+"""Per-leaf sandbox isolation + ``/shared/`` artifact hand-off.
 
-Two ``needs_execution`` producer leaves each run in their own isolated sandbox,
-writing the SAME isolated path (``/work/out.txt``) with DIFFERENT content — and
-each reads back only its own write, proving the sandboxes are mutually invisible.
-Each producer also drops an artifact under ``/shared/``; a third consumer leaf
-then picks both up through the run-shared store, demonstrating the explicit
-hand-off across otherwise-isolated leaves.
+Two producer leaves each run in their own isolated sandbox, writing the SAME
+isolated path (``/work/out.txt``) with DIFFERENT content — and each reads back
+only its own write, proving the sandboxes are mutually invisible. Each producer
+also drops an artifact under ``/shared/``; a consumer leaf then picks both up
+through the run-shared store, showing the explicit hand-off across otherwise
+isolated leaves. The leaves read the per-leaf backend the engine threads into
+``config['configurable']['sandbox_backend']``, so the demo runs fully offline.
 
-The leaves read the per-leaf backend the engine threads into
-``config['configurable']['sandbox_backend']`` and call its file operations
-directly, so the demo runs fully offline with no API key and no real sandbox
-infrastructure — the in-memory sandbox backend stands in for a container.
-
-    uv run python examples/04_sandbox_artifacts.py
+    uv run python -m examples.features.sandbox
 """
 
 from __future__ import annotations
@@ -20,7 +16,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from _demo_models import load_demo_env
 from deepagents.backends.protocol import BackendProtocol
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
@@ -31,7 +26,7 @@ ISOLATED_PATH = "/work/out.txt"
 
 
 def _producer_leaf(*, label: str, shared_path: str) -> Runnable[Any, Any]:
-    """A producer: writes an isolated file and a shared artifact, reads its own back."""
+    """Build a producer: writes an isolated file and a shared artifact, reads its own back."""
 
     async def _call(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
         configurable = (config or {}).get("configurable", {})
@@ -50,7 +45,7 @@ def _producer_leaf(*, label: str, shared_path: str) -> Runnable[Any, Any]:
 
 
 def _consumer_leaf(shared_paths: list[str]) -> Runnable[Any, Any]:
-    """A consumer: reads every producer's artifact back through ``/shared/``."""
+    """Build a consumer: reads every producer's artifact back through ``/shared/``."""
 
     async def _call(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
         configurable = (config or {}).get("configurable", {})
@@ -65,7 +60,6 @@ def _consumer_leaf(shared_paths: list[str]) -> Runnable[Any, Any]:
 
 
 async def main() -> None:
-    load_demo_env()
     roster = (
         Roster()
         .register(
@@ -102,7 +96,7 @@ async def main() -> None:
         return {"produced": produced, "collected": collected}
 
     result = await run_workflow(
-        orchestrate, roster=roster, sandbox_manager=manager, thread_id="demo-4"
+        orchestrate, roster=roster, sandbox_manager=manager, thread_id="sandbox"
     )
 
     print("isolated production (each producer reads back only its own write):")
@@ -112,6 +106,20 @@ async def main() -> None:
     # The engine's lifecycle finale stops every execution sandbox it leased once
     # the script settles, so the manager holds zero live sandboxes after the run.
     print(f"active sandboxes still live after the run: {manager.active_count}")
+
+    # Each producer read back only its own write (isolation), and the consumer
+    # collected both artifacts (explicit hand-off) — and no sandbox leaked.
+    assert result["produced"][0].startswith("A: isolated read-back='private:A'"), (
+        "producer A must read back only its own isolated write"
+    )
+    assert result["produced"][1].startswith("B: isolated read-back='private:B'"), (
+        "producer B must read back only its own isolated write"
+    )
+    assert result["collected"] == "artifact-from-A, artifact-from-B", (
+        "the consumer must collect both producers' shared artifacts"
+    )
+    assert manager.active_count == 0, "every leased sandbox must be stopped at settle"
+    print("OK: sandboxes stayed mutually invisible; the /shared/ hand-off delivered both.")
 
 
 if __name__ == "__main__":

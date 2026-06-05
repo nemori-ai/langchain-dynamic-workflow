@@ -1,6 +1,6 @@
 """Phase G3 integration: the runnable quality-patterns workflow behaves as documented.
 
-Loads ``examples/09_quality_patterns.py`` and drives its ``code_review`` workflow
+Loads ``examples.features.reduce`` and drives its ``code_review`` workflow
 through ``run_workflow`` with deterministic, call-counting fake leaves (no host
 agent, no API key). The assertions pin the *behavior* the quality patterns promise:
 a finding the skeptics refute by majority is dropped (adversarial-verify works), the
@@ -10,9 +10,7 @@ instead of spinning forever.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
+import importlib
 from types import ModuleType
 from typing import Any
 
@@ -29,20 +27,8 @@ _BAIT = f"{_FALSE_MARKER}: an unused import is a security vulnerability"
 
 
 def _load_example() -> ModuleType:
-    """Import ``examples/09_quality_patterns.py`` as a module (sibling import safe)."""
-    examples_dir = Path(__file__).resolve().parents[2] / "examples"
-    if str(examples_dir) not in sys.path:
-        sys.path.insert(0, str(examples_dir))
-    path = examples_dir / "09_quality_patterns.py"
-    spec = importlib.util.spec_from_file_location("_ldw_quality_patterns_example", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    # Register before exec so the module's nested pydantic models (ReviewBatch ->
-    # Finding) can resolve their forward refs under `from __future__ import
-    # annotations` (pydantic looks the namespace up via sys.modules[__module__]).
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    """Import the reduce feature demo (code_review sub-workflow) as a module."""
+    return importlib.import_module("examples.features.reduce")
 
 
 def _reviewer_builder(module: ModuleType, counter: dict[str, int]) -> Any:

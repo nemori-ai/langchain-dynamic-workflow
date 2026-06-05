@@ -1,4 +1,4 @@
-"""Demo (M3): a durable background workflow survives a process restart.
+"""A durable background workflow survives a process restart at zero replay cost.
 
 The headline of cross-session persistence: a run launched in one process can be
 *resumed* in a fresh one — pointed at the same sqlite db file — and every leaf the
@@ -28,26 +28,20 @@ The smoking gun is a per-leaf live-invocation counter that persists across the
 spares the second process from re-paying). After the resume the counters are
 unchanged — the resumed run added nothing.
 
-Set ``LDW_DEMO_REAL_MODEL`` to drive real deepagent leaves inside the workflow
-through OpenRouter (model ``anthropic/claude-opus-4.8``; credentials from a local
-``.env``); the host model stays scripted so the demo is deterministic. The live
-path needs ``uv sync --group example`` and the optional ``sqlite`` extra
-(``uv sync --extra sqlite``). LangSmith tracing is disabled for the
-deepagent-heavy run so the trace volume stays sane.
+Runs fully offline with a deterministic fake; the optional ``sqlite`` extra (in
+the dev group, installed by ``uv sync``) backs the durable store.
 
-    uv run python examples/15_cross_session_persistence.py
+    uv run python -m examples.features.persistence
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -62,22 +56,8 @@ from langchain_dynamic_workflow import (
     SqliteWorkflowStore,
     WorkflowRegistry,
     create_workflow_middleware,
-    skills_path,
 )
 from langchain_dynamic_workflow.middleware import WORKFLOW_NOTIFICATION_TAG
-
-# 道 (mental model), never 术 (mechanics): the host prompt carries only *why* a
-# durable background workflow matters — it must outlive a restart and must never
-# re-pay for work already finished. It deliberately names no tool commands, no
-# registered workflow, and no argument shapes; how to drive the workflow tool is
-# the job of the bundled skill and the tool's own description.
-HOST_SYSTEM_PROMPT = (
-    "You are an assistant that delegates heavy, multi-step work to background "
-    "workflows. Treat such work as durable: a long-running job must survive a "
-    "restart, and once a step has been done its result is settled — never redo "
-    "finished work or pay for it twice. When you pick a job back up after an "
-    "interruption, continue from where it left off rather than starting over."
-)
 
 
 class _LeafCounter:
@@ -94,31 +74,17 @@ class _LeafCounter:
 
 
 def _build_leaf(reply: str, counter: _LeafCounter) -> Runnable[Any, Any]:
-    """Build a leaf that counts each live invocation (real deepagent when gated).
+    """Build a leaf that counts each live invocation.
 
     Args:
-        reply: The text the offline fake's terminal ``AIMessage`` carries; on the
-            real path it is folded into the prompt so the live model produces a
-            comparable single-line finding.
+        reply: The text the offline fake's terminal ``AIMessage`` carries.
         counter: The counter incremented once per live invocation, shared across
             the restart so the zero-cost claim is checkable.
 
     Returns:
-        A runnable leaf. Offline it is a deterministic fake; with
-        ``LDW_DEMO_REAL_MODEL`` set it is a real deepagent. Either way every live
-        invocation bumps ``counter`` — and a journal replay never invokes it.
+        A runnable leaf. Every live invocation bumps ``counter`` — and a journal
+        replay never invokes it.
     """
-    model = real_leaf_model()
-    if model is not None:
-        real_leaf = create_deep_agent(model=model, middleware=demo_cache_middleware())
-
-        async def _real(
-            inp: dict[str, Any], config: RunnableConfig | None = None
-        ) -> dict[str, Any]:
-            counter.live_calls += 1
-            return await real_leaf.ainvoke(inp, config)
-
-        return RunnableLambda(_real)
 
     async def _fake(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
         counter.live_calls += 1
@@ -241,14 +207,6 @@ def _make_roster(planner_counter: _LeafCounter, writer_counter: _LeafCounter) ->
 
 
 async def main() -> None:
-    load_demo_env()
-    # The real path is deepagent-heavy; keep its trace volume sane by disabling
-    # LangSmith tracing for these runs. No-op on the offline fake path.
-    if real_model() is not None:
-        os.environ["LANGSMITH_TRACING"] = "false"
-
-    print(f"mode: {'REAL (OpenRouter)' if real_model() is not None else 'offline (fake)'}")
-
     # One temp db file the two processes share; cleaned up on exit.
     with tempfile.TemporaryDirectory() as tmp_dir:
         db_path = Path(tmp_dir) / "workflows.db"
@@ -273,12 +231,7 @@ async def main() -> None:
                 store=store,
                 checkpointer=store.checkpointer,
             )
-            host = create_deep_agent(
-                model=_ScriptedRunHost(),
-                middleware=[middleware, *demo_cache_middleware()],
-                system_prompt=HOST_SYSTEM_PROMPT,
-                skills=[str(skills_path())],
-            )
+            host = create_deep_agent(model=_ScriptedRunHost(), middleware=[middleware])
             config: RunnableConfig = {"configurable": {"thread_id": "session-1"}}
 
             state1 = await host.ainvoke(
@@ -324,10 +277,7 @@ async def main() -> None:
                 checkpointer=store.checkpointer,
             )
             host = create_deep_agent(
-                model=_ScriptedResumeHost(run_id=run_id),
-                middleware=[middleware, *demo_cache_middleware()],
-                system_prompt=HOST_SYSTEM_PROMPT,
-                skills=[str(skills_path())],
+                model=_ScriptedResumeHost(run_id=run_id), middleware=[middleware]
             )
             config = {"configurable": {"thread_id": "session-2"}}
 

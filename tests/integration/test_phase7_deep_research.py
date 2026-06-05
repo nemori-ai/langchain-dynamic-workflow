@@ -9,10 +9,8 @@ synthesis — so a regression that collapses a phase or drops the fan-out is cau
 
 from __future__ import annotations
 
-import importlib.util
-import sys
+import importlib
 from collections.abc import Callable
-from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -24,16 +22,8 @@ from langchain_dynamic_workflow import Roster, run_workflow
 
 
 def _load_example() -> ModuleType:
-    """Import ``examples/07_deep_research_real_e2e.py`` as a module (sibling import safe)."""
-    examples_dir = Path(__file__).resolve().parents[2] / "examples"
-    if str(examples_dir) not in sys.path:
-        sys.path.insert(0, str(examples_dir))
-    path = examples_dir / "07_deep_research_real_e2e.py"
-    spec = importlib.util.spec_from_file_location("_ldw_deep_research_example", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """Import the registered-deep-research flagship as a module."""
+    return importlib.import_module("examples.flagship.deep_research_preset")
 
 
 def _counting_leaf(counter: dict[str, int], role: str, reply: str) -> Any:

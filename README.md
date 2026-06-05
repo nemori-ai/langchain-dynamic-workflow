@@ -141,24 +141,24 @@ A run executes in the background and a completion notice is injected before the 
 
 ## Examples
 
-Every example under [`examples/`](examples/) runs **offline with no API key** (deterministic fake models). To drive real leaves through OpenRouter and capture LangSmith traces, install the demo extras with `uv sync --group example`, put `OPENROUTER_API_KEY` and the `LANGSMITH_*` settings in a local `.env`, then set `LDW_DEMO_REAL_MODEL` (defaults to `anthropic/claude-opus-4.8`; set it to any OpenRouter slug to override).
+The **15 feature demos** under [`examples/features/`](examples/features/) each isolate one mechanism and run **offline with no API key** (deterministic fake models). The two **flagships** under [`examples/flagship/`](examples/flagship/) carry the real end-to-end path: offline by default, they light up live OpenRouter leaves with native web search + prompt caching when you opt in. To drive the real path, install the demo extras with `uv sync --group example`, put `OPENROUTER_API_KEY` and the `LANGSMITH_*` settings in a local `.env`, then set `LDW_DEMO_REAL_MODEL` (defaults to `anthropic/claude-opus-4.8`; set it to any OpenRouter slug to override). The full taxonomy and the authoritative index of every demo live in **[`examples/AGENTS.md`](examples/AGENTS.md)**.
 
-| Example | Shows |
+| Demo | Shows |
 |---|---|
-| [`01_single_agent`](examples/01_single_agent.py) | One leaf `agent()` call, end to end. |
-| [`02_fanout`](examples/02_fanout.py) | `parallel()` barrier fan-out and filtering failed leaves. |
-| [`03_loop_until_budget`](examples/03_loop_until_budget.py) | A refine loop driven by `ctx.budget.remaining()`. |
-| [`04_sandbox_artifacts`](examples/04_sandbox_artifacts.py) | Per-leaf sandbox isolation with a `/shared/` artifact hand-off. |
-| [`05_host_agent_workflow`](examples/05_host_agent_workflow.py) | A host agent driving a workflow through the `workflow` tool. |
-| [`06_capstone`](examples/06_capstone.py) | Flagship: `parallel`-research → `pipeline`-refine → adversarial-verify → synthesize. |
-| [`07_deep_research_real_e2e`](examples/07_deep_research_real_e2e.py) | A live OpenRouter host launching a registered `deep_research` workflow. |
-| [`08_meta_layer_run_script`](examples/08_meta_layer_run_script.py) | The meta layer: the host *authors* a script and submits it via `run_script`. |
+| **[`flagship/deep_research_preset`](examples/flagship/deep_research_preset.py)** | Flagship (real model): a host drives the registered `deep_research` workflow — parallel search → extract → adversarial verify → synthesize, with native web search + prompt caching. |
+| **[`flagship/deep_research_authored`](examples/flagship/deep_research_authored.py)** | Flagship (real model): a host *authors* the deep-research script live and runs it via `run_script` (AST gate happy path), same web-search + caching leaf stack. |
+
+The 15 offline feature demos (one mechanism each, no API key) and the full taxonomy live in **[`examples/AGENTS.md`](examples/AGENTS.md)**.
 
 ```bash
-uv run python examples/06_capstone.py
+# any offline feature demo:
+uv run python -m examples.features.parallel
+
+# a flagship, offline by default:
+uv run python -m examples.flagship.deep_research_preset
 
 # fully real end-to-end (live OpenRouter host + leaves):
-LDW_DEMO_REAL_MODEL=anthropic/claude-opus-4.8 uv run python examples/07_deep_research_real_e2e.py
+LDW_DEMO_REAL_MODEL=anthropic/claude-opus-4.8 uv run python -m examples.flagship.deep_research_preset
 ```
 
 ## Public API

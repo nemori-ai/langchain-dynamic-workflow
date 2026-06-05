@@ -181,7 +181,7 @@ def demo_cache_middleware() -> list[Any]:
     """Return the Anthropic prompt-caching middleware to register on EVERY example agent.
 
     Mirrors the interactive demo app: a ``PromptCachingMiddleware`` (see
-    ``examples/_prompt_caching.py``) that injects ``cache_control`` breakpoints for
+    ``examples/_shared/prompt_caching.py``) that injects ``cache_control`` breakpoints for
     Anthropic models accessed via ``ChatOpenRouter``. It is a no-op on the offline fake
     path (the scripted model is not an OpenRouter Anthropic model), so it is safe to
     attach unconditionally. ``pin_openrouter_provider`` is off because the models already
@@ -190,7 +190,7 @@ def demo_cache_middleware() -> list[Any]:
     Returns:
         A one-element middleware list to pass as ``create_deep_agent(middleware=...)``.
     """
-    from _prompt_caching import PromptCachingMiddleware
+    from examples._shared.prompt_caching import PromptCachingMiddleware
 
     return [
         PromptCachingMiddleware(

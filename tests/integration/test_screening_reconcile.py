@@ -1,4 +1,4 @@
-"""Integration: the screening workflow (examples/12) runs corroborate + reconcile end to end.
+"""Integration: the screening workflow runs corroborate + reconcile end to end.
 
 Loads the runnable example and drives its ``screening`` workflow through ``run_workflow``
 with deterministic structured fakes (no host, no API key). Pins the reduce shape: every
@@ -8,9 +8,7 @@ source emits the same claim (so it corroborates), both screeners include (so it 
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
+import importlib
 from types import ModuleType
 from typing import Any
 
@@ -21,15 +19,8 @@ from langchain_dynamic_workflow import Roster, run_workflow
 
 
 def _load_example() -> ModuleType:
-    examples_dir = Path(__file__).resolve().parents[2] / "examples"
-    if str(examples_dir) not in sys.path:
-        sys.path.insert(0, str(examples_dir))
-    path = examples_dir / "12_screening_reconcile_real_e2e.py"
-    spec = importlib.util.spec_from_file_location("_ldw_screening_example", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """Import the reduce feature demo (screening sub-workflow) as a module."""
+    return importlib.import_module("examples.features.reduce")
 
 
 def _structured_builder(make: Any) -> Any:
