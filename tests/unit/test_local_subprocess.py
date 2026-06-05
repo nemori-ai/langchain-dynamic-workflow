@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import os
 import sys
+import textwrap
 import threading
+import time
+
+import pytest
 
 from langchain_dynamic_workflow._local_subprocess import (
     ExecPolicy,
@@ -78,5 +82,49 @@ def test_output_under_the_cap_is_not_flagged_truncated() -> None:
         result = backend.execute(f'{sys.executable} -c "print(\\"hello\\")"')
         assert result.truncated is False
         assert "hello" in result.output
+    finally:
+        backend.close()
+
+
+def test_timeout_actually_kills_a_sleeping_process_and_reports_124() -> None:
+    backend = _backend(ExecPolicy(default_timeout=1, grace_seconds=0.5))
+    try:
+        started = time.monotonic()
+        result = backend.execute(f'{sys.executable} -c "import time; time.sleep(30)"')
+        elapsed = time.monotonic() - started
+        assert result.exit_code == 124  # timeout sentinel
+        assert elapsed < 10  # killed promptly, did not run the full 30s
+    finally:
+        backend.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group kill is POSIX-only")
+def test_timeout_kills_the_whole_process_group_no_orphan() -> None:
+    # The child spawns a grandchild that writes a pidfile then sleeps; on timeout
+    # the WHOLE group must die — assert the grandchild pid is gone after.
+    backend = _backend(ExecPolicy(default_timeout=1, grace_seconds=0.5))
+    try:
+        pidfile = os.path.join(backend.root_path, "grandchild.pid")
+        scriptfile = os.path.join(backend.root_path, "forker.py")
+        script = textwrap.dedent(f"""
+            import os, time
+            pid = os.fork()
+            if pid == 0:
+                with open({pidfile!r}, "w") as handle:
+                    handle.write(str(os.getpid()))
+                time.sleep(30)
+            else:
+                time.sleep(30)
+        """)
+        with open(scriptfile, "w") as handle:
+            handle.write(script)
+        result = backend.execute(f"{sys.executable} {scriptfile}")
+        assert result.exit_code == 124
+        # The grandchild must be dead (group kill reached it).
+        time.sleep(0.5)
+        with open(pidfile) as handle:
+            grandchild_pid = int(handle.read())
+        with pytest.raises(ProcessLookupError):
+            os.kill(grandchild_pid, 0)  # 0 = liveness probe; raises if gone
     finally:
         backend.close()

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -187,6 +188,56 @@ def _drain_bounded(stream: IO[bytes] | None, output_cap_bytes: int) -> tuple[str
     return kept.decode("utf-8", errors="replace"), truncated
 
 
+def _terminate_process_tree(proc: subprocess.Popen[bytes], grace_seconds: float) -> None:
+    """Escalate termination of ``proc`` and (POSIX) its whole process group.
+
+    On POSIX the child was started in its own session (``start_new_session``), so
+    a single ``os.killpg`` to the child's process-group id reaches the child and
+    every descendant it spawned. The escalation is a graceful ``SIGTERM`` first, then a
+    ``grace_seconds`` window for the tree to exit, then an unconditional
+    ``SIGKILL`` if anything is still alive. On non-POSIX platforms there is no
+    process-group semantics, so only the direct child is signalled with the
+    best-effort ``terminate`` then ``kill``.
+
+    Every signal is wrapped because a target that already exited raises
+    ``ProcessLookupError`` (POSIX) or ``OSError`` (Windows); a race where the
+    process dies between the liveness check and the signal must not surface as an
+    error from a timeout that was, in fact, handled.
+
+    Args:
+        proc: The spawned child whose tree must be torn down.
+        grace_seconds: Seconds to wait after ``SIGTERM`` before sending
+            ``SIGKILL``.
+    """
+    if os.name == "posix":
+        try:
+            process_group_id = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            # The child is already gone; nothing left to signal.
+            return
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=grace_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    else:
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        proc.kill()
+
+
 class LocalSubprocessSandbox(SandboxBackendProtocol):
     """A full-protocol backend running each command in a per-leaf temp root.
 
@@ -239,10 +290,19 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
 
         The command runs through the system shell with its working directory set
         to :attr:`root_path`. On POSIX the child starts a new session so the
-        whole process group can be terminated together by later resilience
-        layers. The combined stdout and stderr are drained up to the effective
-        output cap and returned as the response output, with the child's exit
-        code as :attr:`ExecuteResponse.exit_code`.
+        whole process group can be terminated together. The combined stdout and
+        stderr are drained up to the effective output cap and returned as the
+        response output, with the child's exit code as
+        :attr:`ExecuteResponse.exit_code`.
+
+        A bounded effective timeout always applies: the per-call ``timeout`` when
+        given, otherwise the policy default. The drain runs on a worker thread so
+        the calling thread can wait on the child with a deadline; when the
+        deadline passes the process tree is escalated down (``SIGTERM``, a grace
+        window, then ``SIGKILL`` to the whole group on POSIX) and the response
+        carries the timeout exit-code sentinel. The child is always reaped and
+        the drain thread always joined, so no zombie, orphan, or leaked thread
+        survives the timeout path.
 
         The drain is byte-bounded: once the effective cap is reached the response
         stops accumulating and is flagged truncated, but the pipe keeps being
@@ -259,6 +319,7 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
             code, and a truncation flag.
         """
         output_cap_bytes = self._policy.output_cap_bytes
+        effective_timeout = timeout if timeout is not None else self._policy.default_timeout
         proc = subprocess.Popen(
             command,
             shell=True,
@@ -267,17 +328,37 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
             stderr=subprocess.STDOUT,
             start_new_session=(os.name == "posix"),
         )
+        # The drain runs on a worker so the calling thread can enforce the
+        # deadline; the worker stores its result for the calling thread to read
+        # once the pipe has closed (which the kill, if any, guarantees).
+        drained: dict[str, tuple[str, bool]] = {}
+
+        def _drain() -> None:
+            drained["result"] = _drain_bounded(proc.stdout, output_cap_bytes)
+
+        drain_thread = threading.Thread(target=_drain, name=f"ldw-drain-{self._identity}")
+        drain_thread.start()
+        timed_out = False
         try:
-            output, truncated = _drain_bounded(proc.stdout, output_cap_bytes)
+            try:
+                proc.wait(timeout=effective_timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _terminate_process_tree(proc, self._policy.grace_seconds)
         finally:
-            # Reap the child and release its pipes on every path so neither a
-            # zombie process nor a leaked descriptor survives this call.
+            # Reap the child and join the drain on every path so neither a zombie
+            # process, an orphaned group, a leaked descriptor, nor a dangling
+            # thread survives this call. The kill closes the write end, so the
+            # drain reaches end-of-file and the join cannot hang.
             proc.wait()
+            drain_thread.join()
             if proc.stdout is not None:
                 proc.stdout.close()
+        output, truncated = drained.get("result", ("", False))
+        exit_code = EXIT_TIMEOUT if timed_out else proc.returncode
         return ExecuteResponse(
             output=output,
-            exit_code=proc.returncode,
+            exit_code=exit_code,
             truncated=truncated,
         )
 
