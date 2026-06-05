@@ -115,6 +115,7 @@ class LeafRunner(Protocol):
         needs_execution: bool = False,
         response_format: Any = None,
         isolation: str = "shared",
+        leaf_span_id: str = "",
     ) -> Awaitable[LeafOutcome]:
         """Run the leaf and return its ``LeafOutcome`` (raw state + token usage)."""
         ...
@@ -479,6 +480,7 @@ class Ctx:
                     needs_execution=entry.needs_execution,
                     response_format=response_format,
                     isolation=isolation,
+                    leaf_span_id=span.span_id,
                 )
             )
             # With a schema, fold the validated structured object and journal its

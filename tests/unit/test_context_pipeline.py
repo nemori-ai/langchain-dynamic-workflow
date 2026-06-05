@@ -29,6 +29,7 @@ class _CountingLeaf:
         needs_execution: bool = False,
         response_format: Any = None,
         isolation: str = "shared",
+        leaf_span_id: str = "",
     ) -> LeafOutcome:
         self.calls += 1
         return LeafOutcome(

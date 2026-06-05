@@ -157,6 +157,7 @@ async def run_workflow(
         needs_execution: bool,
         response_format: Any = None,
         isolation: str = "shared",
+        leaf_span_id: str = "",
     ) -> dict[str, Any]:
         # A durable @task return crosses the checkpointer, whose serializer
         # round-trips built-in containers (and the registered LangChain message
@@ -242,12 +243,15 @@ async def run_workflow(
         needs_execution: bool = False,
         response_format: Any = None,
         isolation: str = "shared",
+        leaf_span_id: str = "",
     ) -> LeafOutcome:
         # The single durable leaf path, shared by agent / parallel / pipeline.
         # The shared gate (applied inside Ctx) bounds how many of these run at
         # once across every fan-out path in this run. The task returns the
         # checkpointer-safe payload mapping; rebuild the typed LeafOutcome here so
-        # the context layer keeps working with .state / .usage unchanged.
+        # the context layer keeps working with .state / .usage unchanged. The
+        # owning AGENT span's id is threaded through so the leaf seam can correlate
+        # the leaf's callback subtree to its span.
         payload = await leaf_task(
             agent_type,
             prompt,
@@ -256,6 +260,7 @@ async def run_workflow(
             needs_execution=needs_execution,
             response_format=response_format,
             isolation=isolation,
+            leaf_span_id=leaf_span_id,
         )
         return LeafOutcome.from_payload(payload)
 

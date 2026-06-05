@@ -64,11 +64,15 @@ class ActiveSpan:
         kind: The primitive the span describes.
         name: A short, human-readable span name (e.g. the agent type, or the
             fan-out label).
+        span_id: The minted resume-stable id, set at open and shared with both the
+            opening :class:`SpanBegin` and the matching end :class:`Span`, so the
+            primitive's body can correlate the leaf's callback subtree to this span.
         attributes: A free-form attribute bag populated via :meth:`set`.
     """
 
     kind: SpanKind
     name: str
+    span_id: str = ""
     attributes: dict[str, Any] = field(default_factory=_empty_attributes)
 
     def set(self, key: str, value: Any) -> None:
@@ -205,7 +209,7 @@ class SpanRecorder:
             The open :class:`ActiveSpan` to populate with attributes.
         """
         span_id = self._mint_span_id(kind, name)
-        active = ActiveSpan(kind=kind, name=name)
+        active = ActiveSpan(kind=kind, name=name, span_id=span_id)
         started_at = time.time()
         monotonic_start = time.monotonic()
         # Emit the open edge before the body runs so a consumer paints "running"
