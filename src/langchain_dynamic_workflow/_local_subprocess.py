@@ -31,7 +31,7 @@ import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import IO, Literal
 
 from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
 
@@ -40,6 +40,9 @@ EXIT_TIMEOUT = 124
 
 EXIT_REJECTED = 126
 """Exit-code sentinel reported when admission control rejects a command unspawned."""
+
+_DRAIN_CHUNK_BYTES = 65536
+"""Read granularity for the bounded output drain, in bytes."""
 
 ExecOutcome = Literal["allow", "reject"]
 """Whether an admission decision permits (``"allow"``) or refuses (``"reject"``)."""
@@ -143,6 +146,47 @@ class ExecPolicy:
     before_execute: BeforeExecuteHook | None = None
 
 
+def _drain_bounded(stream: IO[bytes] | None, output_cap_bytes: int) -> tuple[str, bool]:
+    """Drain ``stream`` to end-of-file, keeping at most ``output_cap_bytes``.
+
+    The stream is read in fixed-size chunks. Bytes are accumulated only until the
+    cap is reached; past that point the reader keeps consuming and discarding so
+    the producing child never blocks on a full pipe, but the kept buffer stays
+    byte-bounded by construction. The kept bytes are decoded as UTF-8 with
+    ``errors="replace"`` so a chunk boundary that splits a multibyte sequence
+    cannot raise.
+
+    Args:
+        stream: The child's combined stdout/stderr pipe in binary mode, or
+            ``None`` when no pipe was attached.
+        output_cap_bytes: The maximum number of bytes to keep. A non-positive
+            cap keeps nothing while still draining the pipe to end-of-file.
+
+    Returns:
+        A ``(decoded_output, truncated)`` pair where ``truncated`` is ``True``
+        when at least one byte was dropped because the cap was reached.
+    """
+    if stream is None:
+        return "", False
+    kept = bytearray()
+    truncated = False
+    while True:
+        chunk = stream.read(_DRAIN_CHUNK_BYTES)
+        if not chunk:
+            break
+        remaining = output_cap_bytes - len(kept)
+        if remaining > 0:
+            take = chunk[:remaining]
+            kept.extend(take)
+            if len(take) < len(chunk):
+                truncated = True
+        else:
+            # Already at the cap; keep reading to EOF so the child is not
+            # wedged on a full pipe, but drop everything past the cap.
+            truncated = True
+    return kept.decode("utf-8", errors="replace"), truncated
+
+
 class LocalSubprocessSandbox(SandboxBackendProtocol):
     """A full-protocol backend running each command in a per-leaf temp root.
 
@@ -196,8 +240,14 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         The command runs through the system shell with its working directory set
         to :attr:`root_path`. On POSIX the child starts a new session so the
         whole process group can be terminated together by later resilience
-        layers. The combined stdout and stderr are returned as the response
-        output and the child's exit code as :attr:`ExecuteResponse.exit_code`.
+        layers. The combined stdout and stderr are drained up to the effective
+        output cap and returned as the response output, with the child's exit
+        code as :attr:`ExecuteResponse.exit_code`.
+
+        The drain is byte-bounded: once the effective cap is reached the response
+        stops accumulating and is flagged truncated, but the pipe keeps being
+        read and discarded to end-of-file so a chatty child never blocks on a
+        full pipe. The response buffer therefore never grows past the cap.
 
         Args:
             command: The full shell command string to run.
@@ -205,19 +255,20 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
                 default.
 
         Returns:
-            An :class:`ExecuteResponse` with the combined output and exit code.
+            An :class:`ExecuteResponse` with the bounded combined output, exit
+            code, and a truncation flag.
         """
+        output_cap_bytes = self._policy.output_cap_bytes
         proc = subprocess.Popen(
             command,
             shell=True,
             cwd=self._root,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
             start_new_session=(os.name == "posix"),
         )
         try:
-            output, _ = proc.communicate()
+            output, truncated = _drain_bounded(proc.stdout, output_cap_bytes)
         finally:
             # Reap the child and release its pipes on every path so neither a
             # zombie process nor a leaked descriptor survives this call.
@@ -225,9 +276,9 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
             if proc.stdout is not None:
                 proc.stdout.close()
         return ExecuteResponse(
-            output=output or "",
+            output=output,
             exit_code=proc.returncode,
-            truncated=False,
+            truncated=truncated,
         )
 
     def close(self) -> None:

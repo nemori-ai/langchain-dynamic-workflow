@@ -57,3 +57,26 @@ def test_execute_runs_in_the_per_leaf_temp_root_not_the_repo_cwd() -> None:
         assert os.getcwd() not in result.output
     finally:
         backend.close()
+
+
+def test_output_truncation_actually_trips_at_the_cap() -> None:
+    # A command that prints far more than the cap is drained up to the cap and
+    # flagged truncated, never buffered unbounded.
+    backend = _backend(ExecPolicy(output_cap_bytes=100))
+    try:
+        result = backend.execute(f'{sys.executable} -c "print(\\"x\\" * 10000)"')
+        assert result.truncated is True
+        assert len(result.output.encode()) <= 100 + 64  # cap + small slack
+        assert result.exit_code == 0
+    finally:
+        backend.close()
+
+
+def test_output_under_the_cap_is_not_flagged_truncated() -> None:
+    backend = _backend(ExecPolicy(output_cap_bytes=10_000))
+    try:
+        result = backend.execute(f'{sys.executable} -c "print(\\"hello\\")"')
+        assert result.truncated is False
+        assert "hello" in result.output
+    finally:
+        backend.close()
