@@ -1,13 +1,16 @@
-"""Phase 7 demo: a REAL host agent runs a registered ``deep_research`` workflow end to end.
+"""Flagship: a real host drives the registered ``deep_research`` workflow end to end.
 
-Unlike the other demos (which script the host for determinism), this one is built
-to run against a **real model through OpenRouter**: a real host agent reads the
-``dynamic-workflow`` skill, decides on its own to launch the registered
-``deep_research`` workflow via the ``workflow`` tool, waits for the background run,
-then fetches and presents the report.
+This is one of the two real-model flagships. It combines several mechanisms in a
+single end-to-end run: a real host agent (opus, when env-gated) reads the
+workflow skill and launches the **registered** ``deep_research`` workflow through
+the ``workflow`` tool; that workflow fans research leaves out per angle (real
+sonnet + native web search + prompt caching), extracts schema-validated claims,
+runs adversarial read-only skeptics, reduces with ``dedup`` + ``survives``, and a
+writer folds the survivors into a report. The host waits for the background run,
+then fetches and presents it.
 
-The ``deep_research`` workflow ports the shape of Claude Code's built-in
-deep-research dynamic workflow onto this engine's primitives:
+The deep-research shape ports Claude Code's built-in deep-research workflow onto
+this engine's primitives:
 
     search (parallel fan-out, one researcher per angle)
       -> extract (no-barrier pipeline: one falsifiable claim per finding)
@@ -15,20 +18,14 @@ deep-research dynamic workflow onto this engine's primitives:
                  skeptic is a read-only judge — it can only verify, never edit)
       -> synthesize (one writer folds the surviving claims into a report)
 
-The leaves reason from the model's own knowledge (no live WebSearch/WebFetch tools
-are wired in — that is the natural extension point); the value shown here is the
-deterministic control-flow inversion driving real model calls.
-
-Run it:
-
-    uv sync --group example
-    # credentials + model come from a local .env (OPENROUTER_API_KEY); see _demo_models
-    export LDW_DEMO_REAL_MODEL=anthropic/claude-opus-4.8
-    uv run python examples/07_deep_research_real_e2e.py
-
 With ``LDW_DEMO_REAL_MODEL`` unset the demo runs fully offline: a scripted host
 drives deterministic fake leaves, so the orchestration is exercised end to end
-with no API key (this is the path the integration test pins).
+with no API key.
+
+    uv run python -m examples.flagship.deep_research_preset
+    # real end-to-end:
+    export LDW_DEMO_REAL_MODEL=anthropic/claude-opus-4.8
+    uv run python -m examples.flagship.deep_research_preset
 """
 
 from __future__ import annotations
@@ -37,7 +34,6 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any
 
-from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
 from deepagents import create_deep_agent
 from deepagents.backends.filesystem import FilesystemBackend
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -47,6 +43,13 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from pydantic import BaseModel
 
+from examples._shared.offline_models import echo_leaf, structured_leaf
+from examples._shared.real_models import (
+    demo_cache_middleware,
+    load_demo_env,
+    real_leaf_model,
+    real_model,
+)
 from langchain_dynamic_workflow import (
     BgRunManager,
     BgStatus,
@@ -207,39 +210,12 @@ async def deep_research(ctx: Ctx, args: dict[str, Any]) -> str:
 # ── leaves (real deepagents when env-gated, deterministic fakes offline) ──────
 
 
-def _fake_echo_leaf(prefix: str) -> Any:
-    """An offline fake leaf that echoes a trimmed prompt behind a role prefix."""
-
-    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
-        last = inp["messages"][-1].text if inp["messages"] else ""
-        return {"messages": [*inp["messages"], AIMessage(content=f"{prefix}: {last.strip()[:80]}")]}
-
-    return RunnableLambda(_leaf)
-
-
-def _fake_structured_leaf(structured: BaseModel, *, reply: str) -> Any:
-    """An offline fake leaf that attaches a fixed ``structured_response``.
-
-    Stands in for a ``create_deep_agent`` built with ``response_format=ToolStrategy(...)``:
-    the leaf appends an ``AIMessage`` and hands back the given validated model
-    instance under ``structured_response`` so ``agent(schema=...)`` can fold it out.
-    """
-
-    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
-        return {
-            "messages": [*inp["messages"], AIMessage(content=reply)],
-            "structured_response": structured,
-        }
-
-    return RunnableLambda(_leaf)
-
-
 def _build_leaf(role: str, *, web_search: bool = False) -> Any:
     """Build a schema-less text leaf (researcher / writer)."""
     model = real_leaf_model(web_search=web_search)
     if model is not None:
         return create_deep_agent(model=model, middleware=demo_cache_middleware())
-    return _fake_echo_leaf(role)
+    return echo_leaf(role)
 
 
 def _build_extractor(*, response_format: Any = None) -> Any:
@@ -283,7 +259,7 @@ def _build_skeptic(*, response_format: Any = None) -> Any:
         )
     # Offline skeptics never refute, so every claim survives — a deterministic,
     # readable demo. The real path exercises genuine adversarial refutation.
-    return _fake_structured_leaf(
+    return structured_leaf(
         Verdict(refuted=False, reason="consistent with the cited evidence"),
         reply="reviewed the claim",
     )
@@ -297,7 +273,7 @@ class ScriptedHost(BaseChatModel):
 
     @property
     def _llm_type(self) -> str:
-        return "demo-scripted-host-7"
+        return "demo-scripted-host-deep-research"
 
     def _generate(
         self,
@@ -387,7 +363,7 @@ async def main() -> None:
     else:
         host_kwargs["model"] = ScriptedHost()
     host = create_deep_agent(**host_kwargs)
-    config: RunnableConfig = {"configurable": {"thread_id": "demo-7"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "demo-deep-research-preset"}}
 
     print(f"question: {QUESTION}")
     print(f"mode: {'REAL (OpenRouter)' if host_model is not None else 'offline (fake)'}")
@@ -411,8 +387,8 @@ async def main() -> None:
     print(f"[turn 1] host reply: {state1['messages'][-1].text}")
 
     # Let the background run settle.
-    await manager.wait(run_id, thread_id="demo-7")
-    assert manager.poll(run_id, thread_id="demo-7") == BgStatus.DONE
+    await manager.wait(run_id, thread_id="demo-deep-research-preset")
+    assert manager.poll(run_id, thread_id="demo-deep-research-preset") == BgStatus.DONE
     print("[background] deep research finished")
 
     # Turn 2: notification is injected; the host fetches the report and presents it.
@@ -421,6 +397,10 @@ async def main() -> None:
         config=config,
     )
     print(f"[turn 2] final answer:\n{state2['messages'][-1].text}")
+
+    final = state2["messages"][-1].text
+    assert "research report" in final.lower(), "flagship must present a synthesized report"
+    print("OK: registered deep_research drove the host turn loop end to end.")
 
 
 if __name__ == "__main__":

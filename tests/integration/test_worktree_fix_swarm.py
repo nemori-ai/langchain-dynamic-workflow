@@ -1,6 +1,6 @@
 """Phase G2 integration: the worktree fix-swarm example runs end to end.
 
-Loads ``examples/10_worktree_fix_swarm.py`` and drives its ``fix_swarm`` workflow
+Loads ``examples.features.worktree`` and drives its ``fix_swarm`` workflow
 through ``run_workflow`` with a real SandboxManager wired with an
 InMemoryWorktreeProvider, using the example's OWN offline fixer/reviewer leaves (so
 the real example code is exercised, not a duplicate fake). Pins the swarm shape —
@@ -10,9 +10,7 @@ patch actually fixes its file's bug (read from its seeded worktree).
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
+import importlib
 from types import ModuleType
 from typing import Any
 
@@ -25,16 +23,8 @@ from langchain_dynamic_workflow import (
 
 
 def _load_example() -> ModuleType:
-    examples_dir = Path(__file__).resolve().parents[2] / "examples"
-    if str(examples_dir) not in sys.path:
-        sys.path.insert(0, str(examples_dir))
-    path = examples_dir / "10_worktree_fix_swarm.py"
-    spec = importlib.util.spec_from_file_location("_ldw_fix_swarm_example", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module  # register for nested-model forward refs
-    spec.loader.exec_module(module)
-    return module
+    """Import the worktree fix-swarm feature demo as a module."""
+    return importlib.import_module("examples.features.worktree")
 
 
 async def test_fix_swarm_produces_one_correct_isolated_patch_per_target() -> None:

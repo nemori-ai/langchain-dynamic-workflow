@@ -1,4 +1,4 @@
-"""Demo: AI-SRE multi-hypothesis diagnosis with ctx.race (early-exit + cancel).
+"""``ctx.race`` — best-of-N early-exit with in-flight cancel.
 
 An incident comes in; the workflow investigates several root-cause hypotheses in
 parallel and takes the FIRST one that clears a confidence bar, cancelling the rest:
@@ -8,17 +8,13 @@ parallel and takes the FIRST one that clears a confidence bar, cancelling the re
       -> win = confidence >= 0.8  (first high-confidence hypothesis wins)
       -> the remaining investigators are cancelled
 
-Shows race as a first-class early-exit primitive: latency is bounded by the first
-good-enough answer, not the slowest hypothesis, and the decision is journaled so a
-resume reproduces the same winner and re-runs nothing.
+Latency is bounded by the first good-enough answer, not the slowest hypothesis,
+and the decision is journaled so a resume reproduces the same winner and re-runs
+nothing.
 
 Run it:
 
-    uv sync --group example
-    export LDW_DEMO_REAL_MODEL=anthropic/claude-opus-4.8
-    uv run --group example python examples/13_ai_sre_race_real_e2e.py
-
-With LDW_DEMO_REAL_MODEL unset it runs fully offline on deterministic fakes.
+    uv run python -m examples.features.race
 """
 
 from __future__ import annotations
@@ -26,8 +22,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
-from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from pydantic import BaseModel
@@ -106,25 +100,18 @@ async def diagnose(ctx: Ctx, args: dict[str, Any]) -> dict[str, Any]:
     return {"root_cause": None, "confidence": None, "evidence": None, "winner_index": None}
 
 
-# ── leaves (real deepagents when env-gated, deterministic fakes offline) ──────
+# ── leaf (deterministic, hypothesis-aware fake) ──────────────────────────────
 
 # The one hypothesis the incident's trace evidence actually confirms — the deploy
-# regression. Offline, only the investigator testing THIS hypothesis clears the win
-# bar; the others stay low and lose. So the race picks it and cancels the rest — the
-# same verdict the real model reaches when LDW_DEMO_REAL_MODEL is set.
+# regression. Only the investigator testing THIS hypothesis clears the win bar; the
+# others stay low and lose. So the race picks it and cancels the rest.
 _CONFIRMED_HYPOTHESIS = HYPOTHESES[2]
 
 
 def _build_investigator(*, response_format: Any = None) -> Any:
-    model = real_leaf_model()
-    if model is not None:
-        return create_deep_agent(
-            model=model, response_format=response_format, middleware=demo_cache_middleware()
-        )
-
-    # Offline: a deterministic, hypothesis-aware fake. It reads the hypothesis out of
-    # the investigate prompt and returns a high-confidence Diagnosis only for the one
-    # the trace evidence confirms, a low-confidence one for the rest — so the race
+    # A deterministic, hypothesis-aware fake. It reads the hypothesis out of the
+    # investigate prompt and returns a high-confidence Diagnosis only for the one the
+    # trace evidence confirms, a low-confidence one for the rest — so the race
     # demonstrates win-predicate gating (the deploy regression wins, the others lose),
     # not merely an ascending-index tie-break.
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
@@ -152,7 +139,6 @@ def _build_investigator(*, response_format: Any = None) -> Any:
 
 
 async def main() -> None:
-    load_demo_env()
     roster = Roster().register(
         "investigator",
         builder=_build_investigator,
@@ -163,11 +149,14 @@ async def main() -> None:
         return await diagnose(ctx, {"incident": INCIDENT})
 
     print(f"incident: {INCIDENT}")
-    print(f"mode: {'REAL (OpenRouter)' if real_model() is not None else 'offline (fake)'}")
     result = await run_workflow(orchestrate, roster=roster)
     print(f"root_cause: {result['root_cause']}")
     print(f"confidence: {result['confidence']}")
     print(f"winning hypothesis index: {result['winner_index']}")
+
+    assert result["winner_index"] == HYPOTHESES.index(_CONFIRMED_HYPOTHESIS)
+    assert result["confidence"] is not None and result["confidence"] >= 0.8
+    print("OK: race picked the confirmed hypothesis and cancelled the rest.")
 
 
 if __name__ == "__main__":

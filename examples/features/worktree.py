@@ -1,27 +1,19 @@
-"""Phase G2 demo: a parallel fix swarm over isolated worktrees.
+"""A parallel fix swarm over isolated git worktrees.
 
-Mirrors the shape of Claude Code's flagship migration workflow (one fixer per file,
-each in its own git worktree, returning a patch the orchestration reviews):
+Mirrors the shape of a flagship migration workflow — one fixer per file, each in
+its own worktree:
 
     fan out one fixer per target file
       -> each runs in its OWN worktree, seeded from the base repo (isolation="worktree")
       -> each returns a Patch (schema-as-handoff), separating "generate" from "apply"
       -> 2-vote review per patch -> keep the approved patches
 
-Each fixer is leased a sandbox seeded with an isolated copy of the base repo, so the
-fixers cannot see one another's edits; the patch each returns is the unit the
-orchestration layer reviews and would merge.
+Each fixer is leased a sandbox seeded with an isolated copy of the base repo, so
+the fixers cannot see one another's edits; the patch each returns is the unit the
+orchestration layer reviews and would merge. Deterministic offline fixers read
+their seeded worktree and return a patch, so the demo runs with no API key.
 
-Run it:
-
-    uv sync --group example
-    # credentials + model come from a local .env (OPENROUTER_API_KEY); see _demo_models
-    export LDW_DEMO_REAL_MODEL=anthropic/claude-haiku-4.5
-    uv run python examples/10_worktree_fix_swarm.py
-
-With ``LDW_DEMO_REAL_MODEL`` unset the demo runs fully offline: deterministic fake
-fixers read their seeded worktree and return a patch, with no API key (the path the
-integration test pins).
+    uv run python -m examples.features.worktree
 """
 
 from __future__ import annotations
@@ -29,8 +21,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model, real_model
-from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from pydantic import BaseModel
@@ -104,6 +94,13 @@ async def fix_swarm(ctx: Any, args: dict[str, Any]) -> list[dict[str, Any]]:
 
     Each fixer returns a ``Patch`` (the generated change); the orchestration layer
     reviews and keeps the approved ones — generation and application stay separate.
+
+    Args:
+        ctx: The workflow context driving ``parallel``/``agent``/``log``/``phase``.
+        args: Carries ``targets`` — the file paths to fix.
+
+    Returns:
+        One approved-patch dict per target that cleared the 2-vote review.
     """
     targets: list[str] = sorted(args["targets"])
 
@@ -144,16 +141,11 @@ async def fix_swarm(ctx: Any, args: dict[str, Any]) -> list[dict[str, Any]]:
     return approved
 
 
-# ── leaves (real deepagents when env-gated, deterministic fakes offline) ──────
+# ── offline leaves (deterministic fakes) ──────────────────────────────────────
 
 
 def _fixer_builder(*, response_format: Any = None) -> Any:
-    """Fixer leaf: reads its seeded worktree, returns a Patch for its target file."""
-    model = real_leaf_model()
-    if model is not None:
-        return create_deep_agent(
-            model=model, response_format=response_format, middleware=demo_cache_middleware()
-        )
+    """Build a fixer leaf: reads its seeded worktree, returns a Patch for its target file."""
     schema: Any = response_format.schema if response_format is not None else Patch
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
@@ -161,9 +153,9 @@ def _fixer_builder(*, response_format: Any = None) -> Any:
         backend = (config or {}).get("configurable", {})["sandbox_backend"]
         target = next(path for path in BASE_REPO if path in prompt)
         original = backend.read(target).file_data  # proves the worktree was seeded
-        base = original["content"] if original is not None else ""
+        base = str(original["content"]) if original is not None else ""
         # Apply the actual fix (and drop the now-resolved bug comment), line by line.
-        fixed_lines = []
+        fixed_lines: list[str] = []
         for line in base.splitlines():
             line = line.replace("a - b", "a + b").replace("s.lower()", "s.upper()")
             fixed_lines.append(line.split("  # bug")[0].rstrip())
@@ -180,12 +172,7 @@ def _fixer_builder(*, response_format: Any = None) -> Any:
 
 
 def _reviewer_builder(*, response_format: Any = None) -> Any:
-    """Reviewer leaf: approves a patch (offline always approves)."""
-    model = real_leaf_model()
-    if model is not None:
-        return create_deep_agent(
-            model=model, response_format=response_format, middleware=demo_cache_middleware()
-        )
+    """Build a reviewer leaf: approves a patch (offline always approves)."""
     schema: Any = response_format.schema if response_format is not None else Vote
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
@@ -202,8 +189,6 @@ def _reviewer_builder(*, response_format: Any = None) -> Any:
 
 
 async def main() -> None:
-    load_demo_env()
-    mode = "REAL (OpenRouter)" if real_model() is not None else "offline (fake)"
     manager = SandboxManager(worktree_provider=InMemoryWorktreeProvider(BASE_REPO))
     roster = (
         Roster()
@@ -219,12 +204,22 @@ async def main() -> None:
     async def orchestrate(ctx: Any) -> list[dict[str, Any]]:
         return await fix_swarm(ctx, {"targets": sorted(BASE_REPO)})
 
-    print(f"mode: {mode}")
     approved = await run_workflow(orchestrate, roster=roster, sandbox_manager=manager)
     print(f"approved patches ({len(approved)}):")
     for patch in approved:
         paths = [f["path"] for f in patch["files"]]
         print(f"  - {patch['summary']} -> {paths}")
+
+    # One approved patch per target, each actually fixing its file's bug.
+    by_path = {f["path"]: f["new_content"] for patch in approved for f in patch["files"]}
+    assert set(by_path) == set(BASE_REPO), "every target must yield exactly one approved patch"
+    assert "a + b" in by_path["/calc.py"] and "a - b" not in by_path["/calc.py"], (
+        "the /calc.py patch must fix the subtraction bug"
+    )
+    assert "s.upper()" in by_path["/strutil.py"] and "s.lower()" not in by_path["/strutil.py"], (
+        "the /strutil.py patch must fix the lower-case bug"
+    )
+    print("OK: one isolated-worktree fixer per file, each patch fixing its own bug.")
 
 
 if __name__ == "__main__":

@@ -1,24 +1,27 @@
-"""Demo (M3.5): a host fans out several workflows in parallel and monitors them.
+"""Host integration — wire the workflow tool into a host and run N background runs.
 
-The host launches one background research run per topic — several at once — then,
-instead of polling each ``run_id`` one by one, uses the aggregate runs view to see
-all of them in a single call and reacts once they have all landed:
+This is the host-side story end to end, fully offline and deterministic:
+``create_workflow_middleware`` is wired into a scripted deepagent host, the host
+fans out one non-blocking background ``run`` per topic, a completion
+``<workflow_notification>`` is injected once the runs settle, and the host reads
+the aggregate ``runs`` view (every run on the thread with its label and live
+status) instead of polling each ``run_id`` one by one.
 
-1. Turn 1: the host issues several ``run`` calls in one go (one per topic). Each
-   returns a ``run_id`` placeholder immediately; the host turn is never blocked.
-   Every launch is recorded in the ``workflow_runs`` state channel as ``running``.
-2. The runs execute concurrently in the background.
-3. Turn 2: a ``<workflow_notification>`` is injected once runs settle; the host
-   asks for the aggregate runs view (every run on the thread with its label and
-   live status) and synthesizes from it. By now the ``workflow_runs`` channel has
-   been rewritten from ``running`` to each run's terminal status.
+The flow, in two segments:
 
-Set ``LDW_DEMO_REAL_MODEL`` to drive real deepagent leaves inside each run through
-OpenRouter (model ``anthropic/claude-opus-4.8``; credentials from a local
-``.env``); the host model stays scripted so the demo is deterministic. The live
-path needs ``uv sync --group example``.
+1. launch N background runs — the host issues several ``run`` calls in one go
+   (one per topic). Each returns a ``run_id`` placeholder immediately; the host
+   turn is never blocked, and every launch is recorded in the ``workflow_runs``
+   state channel as ``running``.
+2. aggregate runs view — once the background runs settle, a notification is
+   injected before the host's next model call; the host asks for the aggregate
+   ``runs`` view and synthesizes from it. By now the settle-aware ``workflow_runs``
+   channel has been rewritten from ``running`` to each run's terminal status.
 
-    uv run python examples/14_parallel_runs_observability.py
+The host model is scripted so the demo is deterministic, and the leaves are
+offline echoes — no API key, no network.
+
+    uv run python -m examples.features.host_integration
 """
 
 from __future__ import annotations
@@ -27,14 +30,14 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any
 
-from _demo_models import demo_cache_middleware, load_demo_env, real_leaf_model
 from deepagents import create_deep_agent
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from langchain_core.runnables import RunnableConfig, RunnableLambda
+from langchain_core.runnables import RunnableConfig
 
+from examples._shared.offline_models import echo_leaf
 from langchain_dynamic_workflow import (
     BgRunManager,
     Ctx,
@@ -42,6 +45,7 @@ from langchain_dynamic_workflow import (
     WorkflowRegistry,
     create_workflow_middleware,
 )
+from langchain_dynamic_workflow._background import _TERMINAL_STATUSES
 from langchain_dynamic_workflow.middleware import WORKFLOW_NOTIFICATION_TAG
 
 TOPICS = ["grid-scale batteries", "green hydrogen", "small modular reactors"]
@@ -106,18 +110,6 @@ def _call_many(calls: list[dict[str, Any]]) -> ChatResult:
     return ChatResult(generations=[ChatGeneration(message=message)])
 
 
-def _build_leaf() -> Any:
-    model = real_leaf_model(web_search=True)
-    if model is not None:
-        return create_deep_agent(model=model, middleware=demo_cache_middleware())
-
-    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
-        last = inp["messages"][-1].text if inp["messages"] else ""
-        return {"messages": [*inp["messages"], AIMessage(content=f"finding({last})")]}
-
-    return RunnableLambda(_leaf)
-
-
 async def topic_research(ctx: Ctx, args: dict[str, Any]) -> str:
     """One background run: research a single topic and return a short finding."""
     topic: str = args["topic"]
@@ -128,17 +120,17 @@ async def topic_research(ctx: Ctx, args: dict[str, Any]) -> str:
 
 
 async def main() -> None:
-    load_demo_env()
-    roster = Roster().register("researcher", _build_leaf(), description="Researches one topic")
+    roster = Roster().register(
+        "researcher", echo_leaf("finding"), description="Researches one topic"
+    )
     workflows = WorkflowRegistry().register("topic_research", topic_research)
     manager = BgRunManager()
     middleware = create_workflow_middleware(roster, workflows=workflows, manager=manager)
 
-    host = create_deep_agent(
-        model=ScriptedHost(), middleware=[middleware, *demo_cache_middleware()]
-    )
-    config: RunnableConfig = {"configurable": {"thread_id": "demo-14"}}
+    host = create_deep_agent(model=ScriptedHost(), middleware=[middleware])
+    config: RunnableConfig = {"configurable": {"thread_id": "host-integration"}}
 
+    print("=== launch N background runs ===")
     # Turn 1: the host fans out one background run per topic (non-blocking).
     state1 = await host.ainvoke(
         {"messages": [{"role": "user", "content": f"Research these in parallel: {TOPICS}"}]},
@@ -149,21 +141,32 @@ async def main() -> None:
     print(f"[turn 1] host launched {len(run_ids)} parallel runs: {run_ids}")
     print(f"[turn 1] workflow_runs statuses: {[r['status'] for r in launched]}")
     print(f"[turn 1] host reply: {state1['messages'][-1].text}")
+    assert len(run_ids) == len(TOPICS), "the host must launch one background run per topic"
+    assert all(r["status"] == "running" for r in launched), "every run starts as 'running'"
 
     # Let all background runs settle (the host could be doing other work meanwhile).
     for run_id in run_ids:
-        await manager.wait(run_id, thread_id="demo-14")
+        await manager.wait(run_id, thread_id="host-integration")
     print("[background] all parallel runs finished")
 
+    print("=== aggregate runs view ===")
     # Turn 2: notification injected; host asks for the aggregate runs view and folds it.
     state2 = await host.ainvoke(
         {"messages": [{"role": "user", "content": "How are the research runs doing?"}]},
         config=config,
     )
     # The workflow_runs channel is now settle-aware: statuses are terminal, not 'running'.
-    final_statuses = {r["run_id"]: r["status"] for r in state2["workflow_runs"]}
+    settled = state2["workflow_runs"]
+    final_statuses = {r["run_id"]: r["status"] for r in settled}
     print(f"[turn 2] workflow_runs statuses now: {sorted(set(final_statuses.values()))}")
     print(f"[turn 2] host final answer:\n{state2['messages'][-1].text}")
+    assert all(r["status"] in _TERMINAL_STATUSES for r in settled), (
+        "settle-aware workflow_runs must show terminal statuses on turn 2"
+    )
+    assert state2["messages"][-1].text.startswith("All parallel runs accounted for."), (
+        "the host must reach the aggregate runs view in its final answer"
+    )
+    print("OK: wired the workflow tool into a host, ran N background runs, read the runs board.")
 
 
 if __name__ == "__main__":

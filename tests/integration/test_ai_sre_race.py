@@ -1,4 +1,4 @@
-"""Integration: the AI-SRE workflow (examples/13) runs ctx.race end to end.
+"""Integration: the AI-SRE workflow runs ctx.race end to end.
 
 Loads the runnable example and drives its ``diagnose`` workflow through
 ``run_workflow`` with a deterministic structured fake (no host, no API key). Pins
@@ -8,9 +8,7 @@ hypothesis (ascending tie-break), and a resume reproduces the same winner.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
+import importlib
 from types import ModuleType
 from typing import Any
 
@@ -21,15 +19,8 @@ from langchain_dynamic_workflow import InMemoryJournalStore, Roster, run_workflo
 
 
 def _load_example() -> ModuleType:
-    examples_dir = Path(__file__).resolve().parents[2] / "examples"
-    if str(examples_dir) not in sys.path:
-        sys.path.insert(0, str(examples_dir))
-    path = examples_dir / "13_ai_sre_race_real_e2e.py"
-    spec = importlib.util.spec_from_file_location("_ldw_ai_sre_example", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """Import the race feature demo (diagnose workflow) as a module."""
+    return importlib.import_module("examples.features.race")
 
 
 def _structured_builder(make: Any) -> Any:

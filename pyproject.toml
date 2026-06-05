@@ -116,6 +116,12 @@ reportMissingTypeStubs = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Put the repo root on sys.path so tests can import the runnable `examples`
+# package directly (e.g. `from examples._shared.offline_models import ...`).
+# --import-mode=importlib does not prepend rootdir to sys.path, and the bare
+# `pytest` entrypoint (unlike `python -m pytest`) does not add cwd, so this is
+# required for the example-loading integration tests to resolve the package.
+pythonpath = ["."]
 # Coverage runs on every `uv run pytest`: the engine measures the source package
 # and the run fails if total line coverage drops below the gate (see
 # [tool.coverage.report] fail_under). The core orchestration paths (agent /

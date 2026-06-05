@@ -10,10 +10,8 @@ covers the compiled path just as it covers a hand-written one.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
+import importlib
 from collections.abc import Callable
-from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -34,16 +32,8 @@ DeepLeafFactory = Callable[[str], tuple[Runnable[Any, Any], Any]]
 
 
 def _load_example() -> ModuleType:
-    """Import ``examples/08_meta_layer_run_script.py`` as a module (sibling import safe)."""
-    examples_dir = Path(__file__).resolve().parents[2] / "examples"
-    if str(examples_dir) not in sys.path:
-        sys.path.insert(0, str(examples_dir))
-    path = examples_dir / "08_meta_layer_run_script.py"
-    spec = importlib.util.spec_from_file_location("_ldw_meta_layer_example", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """Import the AST-gate meta-layer feature demo as a module."""
+    return importlib.import_module("examples.features.ast_gate")
 
 
 _PARALLEL_SCRIPT = """\
