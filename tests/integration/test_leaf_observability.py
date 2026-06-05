@@ -240,5 +240,104 @@ async def test_payload_opt_in_surfaces_model_text_in_detail(
     assert any("VISIBLE-PAYLOAD" in str(e.detail) for e in with_payload)
 
 
+async def test_synthetic_nested_subtree_reconstructs_a_closed_run_tree() -> None:
+    # CI floor for tree-structure correctness (offline, no real model, no deepagents
+    # sub-agent): a leaf RunnableLambda awaits a NESTED child RunnableLambda with the
+    # forwarded config, producing genuine parent/child callback edges. The handler is
+    # attached on the SAME callbacks-config seam the engine uses, so this exercises the
+    # real tree-reconstruction path. (Driven at the handler seam rather than through
+    # run_workflow because the engine's @task wrapper makes a bare RunnableLambda
+    # leaf's outermost chain inherit a non-None parent outside the captured subtree;
+    # the deepagent-graph leaf path roots cleanly and is asserted through run_workflow
+    # in test_leaf_event_correlates_to_owning_leaf_span_id.)
+    from langchain_core.messages import AIMessage
+    from langchain_core.runnables import RunnableConfig, RunnableLambda
+
+    from langchain_dynamic_workflow import LeafEvent
+    from langchain_dynamic_workflow._leaf_events import LeafEventHandler
+
+    child: Runnable[Any, Any] = RunnableLambda(lambda inp, config=None: {"echo": inp.get("q", "")})
+
+    async def parent(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        # Await the nested child WITH the forwarded config so its callback edges
+        # thread under the parent in the run tree (deeper subtree correlation).
+        await child.ainvoke({"q": "hello"}, config=config)
+        return {"messages": [*inp["messages"], AIMessage(content="done")]}
+
+    leaf: Runnable[Any, Any] = RunnableLambda(parent)
+
+    events: list[LeafEvent] = []
+    handler = LeafEventHandler(leaf_span_id="leaf-OWNER", sink=events.append)
+    await leaf.ainvoke({"messages": []}, config={"callbacks": [handler]})
+
+    assert events, "the nested leaf subtree must fire callback edges"
+    run_ids = {e.run_id for e in events}
+    # The nested child is a distinct node from the parent leaf.
+    assert len(run_ids) >= 2
+    # (a) At least one root: the outermost leaf edge has no parent in the subtree.
+    assert any(e.parent_run_id is None for e in events)
+    # (b) The tree closes: every non-root edge's parent is itself an emitted run_id.
+    assert all(e.parent_run_id in run_ids for e in events if e.parent_run_id is not None)
+    # (c) Every edge carries the one owning leaf span id (handler-closure correlation).
+    assert {e.leaf_span_id for e in events} == {"leaf-OWNER"}
+
+
+async def test_nested_leaf_subtree_stamps_one_owning_span_id() -> None:
+    # The leaf's callbacks list is forwarded to any sub-agent it spawns, so the
+    # WHOLE subtree (including deeper nodes) correlates to the ONE owning leaf span.
+    # Build a deepagent leaf and assert every emitted event carries the single owning
+    # leaf_span_id (deepagents forwards callbacks/tags/configurable to subagents;
+    # verified statically in _build_subagent_config).
+    from deepagents import create_deep_agent  # pyright: ignore[reportUnknownVariableType]
+    from examples._shared.offline_models import ScriptedModel
+
+    from langchain_dynamic_workflow import LeafEvent
+
+    leaf = create_deep_agent(model=ScriptedModel(reply="done"))  # pyright: ignore[reportUnknownVariableType]
+    roster = Roster().register("worker", leaf)
+    begins: list[SpanBegin] = []
+    events: list[LeafEvent] = []
+
+    async def orchestrate(ctx: Ctx) -> str:
+        return await ctx.agent("go", agent_type="worker")
+
+    await run_workflow(
+        orchestrate, roster=roster, on_span_begin=begins.append, on_leaf_event=events.append
+    )
+    agent_begin = next(b for b in begins if b.kind is SpanKind.AGENT)
+    # EXACT correlation: no event leaks a different span id (the handler closes over
+    # this leaf's id; it never sees a sibling leaf's subtree).
+    assert events
+    assert {e.leaf_span_id for e in events} == {agent_begin.span_id}
+
+
+async def test_two_sequential_leaves_keep_their_subtrees_separate(
+    make_deep_leaf: Callable[[str], tuple[Runnable[Any, Any], Any]],
+) -> None:
+    # Two leaves => two distinct span ids => each subtree files under its own id, never
+    # cross-contaminated (one handler per leaf invocation).
+    from langchain_dynamic_workflow import LeafEvent
+
+    leaf, _ = make_deep_leaf("done")
+    roster = Roster().register("worker", leaf)
+    begins: list[SpanBegin] = []
+    events: list[LeafEvent] = []
+
+    async def orchestrate(ctx: Ctx) -> str:
+        a = await ctx.agent("one", agent_type="worker")
+        b = await ctx.agent("two", agent_type="worker")
+        return f"{a}|{b}"
+
+    await run_workflow(
+        orchestrate, roster=roster, on_span_begin=begins.append, on_leaf_event=events.append
+    )
+    agent_ids = {b.span_id for b in begins if b.kind is SpanKind.AGENT}
+    assert len(agent_ids) == 2
+    # Every event's leaf_span_id is one of the two leaf ids; both ids appear.
+    event_ids = {e.leaf_span_id for e in events}
+    assert event_ids <= agent_ids
+    assert event_ids == agent_ids  # both leaves emitted interior events
+
+
 async def _solo(ctx: Ctx) -> str:
     return await ctx.agent("go", agent_type="worker")
