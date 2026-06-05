@@ -143,3 +143,42 @@ sequenceDiagram
 ```
 
 **要点**:**头条 = journal 交付零成本重放,checkpointer 是 durable add-on**(resume 侧即便 `checkpointer=None` 仍零成本)。autocommit store 连接让每条 `put()` 返回即 durable(零显式 commit);第二条连接背 `AsyncSqliteSaver`(隔离 regime 不兼容,故分连接、同 db 文件,皆 WAL)。`AsyncSqliteSaver` 构造期绑 event loop——进程 B 是全新 loop + 全新 saver 实例(绝不跨 loop 复用)。**per-run 规范 id**(`journal_run_id`,fresh launch 采自身 `run_id`、resume 从 spec 继承)同 key journal 谱系与引擎 `thread_id`(checkpoint thread),故不同 run 不撞、resume 重接原 thread;**host thread 是另一回事**——只 key manager slot。**save-before-start**:`save_spec` 先于 `manager.start`,被准入的 run 总有可 resume 的 spec(quota 拒入则 `delete_spec` 回滚)。`journal_key` 跨 `PYTHONHASHSEED` 逐字节稳定 → A 进程写的键 B 进程命中。已知边界:`race()` 无胜者不 journal → 跨进程 resume 会重派候选。
+
+## E — agent() span 生命周期 + 逐叶 live 可观测性（begin 边 / 叶回调 tap / cached 路）
+
+```mermaid
+sequenceDiagram
+  participant C as Ctx.agent
+  participant SR as SpanRecorder
+  participant BS as on_span_begin (begin sink)
+  participant J as Journal
+  participant LR as leaf_runner / leaf_task
+  participant H as LeafEventHandler (一叶一实例)
+  participant LE as on_leaf_event (leaf-event sink)
+  participant L as leaf deepagents runnable
+  participant SS as on_span (end sink)
+
+  C->>SR: with span(AGENT, agent_type) 打开
+  SR->>SR: mint span_id = sha256(kind+name+出现序号)[:16]
+  SR->>BS: emit SpanBegin(span_id, started_at 墙钟, monotonic_start)
+  Note over SR,BS: begin 发于 span 打开, 早于 journal 查询 (先发后定)
+  C->>J: get(journal_key)
+  alt miss — 真执行
+    C->>LR: leaf_runner(..., leaf_span_id=span.span_id)
+    LR->>H: 构造 LeafEventHandler(leaf_span_id, sink=on_leaf_event, include_payloads)
+    LR->>L: ainvoke(config callbacks=[usage_handler, H])
+    Note over L,H: deepagents 转发 callbacks/tags/configurable (不转发 metadata) → H 见整棵子树
+    L-->>H: on_*_start/end/error (run_id/parent_run_id)
+    H->>LE: normalize → LeafEvent(leaf_span_id, run_id, parent_run_id, detail 默认 shape-only)
+    L-->>LR: 仅最终结论 (context quarantine)
+    LR->>J: put(journal_key, result, usage) (success-only)
+    C->>SS: span 关闭 emit Span(span_id, duration_s, cached=False)
+  else hit — 重放 (cached)
+    J-->>C: 命中(success) → 缓存结果 (0 模型调用, 不进 leaf_runner)
+    Note over C,LE: 叶 runner 根本不跑 → 不挂 handler → 零 LeafEvent
+    C->>SS: span 关闭 emit Span(span_id, duration_s≈0, cached=True)
+    Note over BS,SS: begin 已重发 + cached 完成 → 消费者画即时命中, 非卡住 running chip
+  end
+```
+
+**要点**:`on_span_begin` 全 span 类型、打开即发,**不**被 replay 抑制——故 cached 叶子也重发 begin、再配一条 `cached=True`、`duration_s≈0` 的完成 `Span`,渲染成即时命中而非卡住 running chip。`on_leaf_event` 只在 journal **miss** 走真叶子时挂 `LeafEventHandler`(命中走缓存路径根本不进 leaf runner),故**重放叶子零 interior 事件**——replay 策略随控制流自落、无需额外开关。关联靠 handler 实例**构造时闭包持有的 `leaf_span_id`**,不靠 metadata 继承(deepagents subagent 边界丢弃 metadata,只转发 `callbacks`/`tags`/`configurable`)。两条边皆走带外、不进宿主 LLM 上下文(quarantine 保持);`detail` 默认 shape-only,原始 payload 仅 `leaf_event_include_payloads=True` 时带、截断有界。`span_id` 顺序深度-0 path resume 稳定(同源序重放 + 序号每 run 重置),扇出 span 因打开顺序随墙钟不担保。
