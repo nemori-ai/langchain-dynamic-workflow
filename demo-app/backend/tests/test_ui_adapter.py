@@ -25,7 +25,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from ui_adapter import _AGENT_SPAN, _JOURNAL_BADGE, UiAdapter
+from ui_adapter import (
+    _AGENT_SPAN,
+    _FANOUT_GRAPH,
+    _JOURNAL_BADGE,
+    _PHASE_TIMELINE,
+    UiAdapter,
+)
 
 from langchain_dynamic_workflow import (
     ProgressEntry,
@@ -50,6 +56,7 @@ def _collector() -> tuple[list[Event], UiAdapter]:
 def _agent_span(
     *,
     name: str = "researcher",
+    span_id: str = "span0span0span0span0",
     cached: bool = False,
     usage_tokens: int | None = None,
     duration_s: float = 0.5,
@@ -59,11 +66,22 @@ def _agent_span(
     Defaults mirror what the engine records: a fresh leaf reports real token usage and
     a real wall-clock duration; a cached (resumed) leaf reports its replayed usage and
     a near-zero journal-lookup duration. These run-variant fields are exactly what must
-    NOT enter the dedupe identity, so the helper lets a test set them independently.
+    NOT enter the emitted ``event_id``, so the helper lets a test set them independently.
+
+    Args:
+        name: The leaf's display name (also its ``agent_type`` attribute).
+        span_id: The engine-minted span id. The engine reproduces this identical id
+            across a fresh run and its resume re-execution for a sequential leaf, so a
+            resume test supplies the SAME ``span_id`` for the fresh and cached span to
+            mirror what the engine does — and the adapter consumes it verbatim (I1).
+        cached: Whether the leaf was served from the journal.
+        usage_tokens: Replayed/real token usage; defaults to a cached/fresh stand-in.
+        duration_s: Wall-clock (fresh) or near-zero journal-lookup (cached) duration.
     """
     if usage_tokens is None:
         usage_tokens = 0 if cached else 1234
     return Span(
+        span_id=span_id,
         kind=SpanKind.AGENT,
         name=name,
         attributes={"agent_type": name, "cached": cached, "usage_tokens": usage_tokens},
@@ -107,6 +125,7 @@ def test_parallel_span_maps_to_fanout_graph() -> None:
 
     adapter.on_span(
         Span(
+            span_id="par0par0par0par0",
             kind=SpanKind.PARALLEL,
             name="parallel",
             attributes={"thunk_count": 3, "surviving_count": 2},
@@ -130,6 +149,7 @@ def test_pipeline_span_maps_to_fanout_graph() -> None:
 
     adapter.on_span(
         Span(
+            span_id="pipe0pipe0pipe0pipe0",
             kind=SpanKind.PIPELINE,
             name="pipeline",
             attributes={"item_count": 4, "surviving_count": 4},
@@ -174,6 +194,52 @@ def test_fresh_agent_span_does_not_emit_journal_badge() -> None:
     assert span_props["cached"] is False
 
 
+# --- (2b) I1: spans consume the engine-minted span_id ------------------------
+
+
+def test_agent_span_event_id_is_the_engine_minted_span_id() -> None:
+    sent, adapter = _collector()
+    adapter.on_span(_agent_span(name="researcher", span_id="deadbeefcafef00d"))
+    span_props = next(p for c, p in sent if c == _AGENT_SPAN)
+    # I1: the adapter consumes the engine id verbatim; it no longer computes its own.
+    assert span_props["event_id"] == "deadbeefcafef00d"
+
+
+def test_fanout_span_event_id_is_the_engine_minted_span_id() -> None:
+    sent, adapter = _collector()
+    adapter.on_span(
+        Span(
+            span_id="fan0fan0fan0fan0",
+            kind=SpanKind.PARALLEL,
+            name="parallel",
+            attributes={"thunk_count": 2, "surviving_count": 2},
+            duration_s=0.1,
+            error=None,
+        )
+    )
+    props = next(p for c, p in sent if c == _FANOUT_GRAPH)
+    assert props["event_id"] == "fan0fan0fan0fan0"
+
+
+def test_cached_badge_event_id_is_derived_from_the_span_id() -> None:
+    # The badge shares the leaf's span_id but must stay a SEPARATE card, so its id is a
+    # deterministic local salt of the span id (preserves resume-stability, distinct card).
+    sent, adapter = _collector()
+    adapter.on_span(_agent_span(name="researcher", span_id="cafef00dcafef00d", cached=True))
+    span_props = next(p for c, p in sent if c == _AGENT_SPAN)
+    badge_props = next(p for c, p in sent if c == _JOURNAL_BADGE)
+    assert span_props["event_id"] == "cafef00dcafef00d"
+    assert badge_props["event_id"] == "cafef00dcafef00d-badge"
+
+
+def test_progress_event_id_is_still_adapter_computed() -> None:
+    # Scope boundary: progress entries are NOT spans, so they keep the adapter id path.
+    sent, adapter = _collector()
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="research"))
+    props = next(p for c, p in sent if c == _PHASE_TIMELINE)
+    assert props.get("event_id")  # present and adapter-derived (not an engine span_id)
+
+
 # --- (3) Stable-id dedupe ----------------------------------------------------
 
 
@@ -189,18 +255,36 @@ def test_resumed_cached_leaf_gets_the_same_agent_span_id_as_the_fresh_run() -> N
     re-executes the script, re-emitting the SAME leaf with the run-variant fields changed
     exactly as the engine changes them: the fresh run reports ``cached=False`` with real
     usage + a real wall-clock duration; the resume re-emits it as ``cached=True`` with
-    replayed usage and a near-zero journal-lookup duration. Because the dedupe identity
-    excludes those volatile fields, both adapters mint the SAME ``event_id`` for the leaf
-    — so the frontend (which keys on ``event_id``) recognizes the resume re-emit as the
-    same logical span and drops it instead of double-firing.
+    replayed usage and a near-zero journal-lookup duration. The engine — not the adapter —
+    mints the resume-stable ``span_id`` (reproduced identically fresh -> cached for a
+    sequential leaf), so both adapters consume the SAME ``span_id`` and emit the SAME
+    ``event_id`` for the leaf — so the frontend (which keys on ``event_id``) recognizes
+    the resume re-emit as the same logical span and drops it instead of double-firing.
+    This proves the adapter faithfully passes the engine-reproduced id through (I1).
     """
     fresh_events: list[Event] = []
     fresh = UiAdapter(emit=lambda comp, props: fresh_events.append((comp, dict(props))))
-    fresh.on_span(_agent_span(name="leaf-A", cached=False, usage_tokens=1234, duration_s=2.31))
+    fresh.on_span(
+        _agent_span(
+            name="leaf-A",
+            span_id="leafa0leafa0leaf",
+            cached=False,
+            usage_tokens=1234,
+            duration_s=2.31,
+        )
+    )
 
     resume_events: list[Event] = []
     resume = UiAdapter(emit=lambda comp, props: resume_events.append((comp, dict(props))))
-    resume.on_span(_agent_span(name="leaf-A", cached=True, usage_tokens=1180, duration_s=0.0007))
+    resume.on_span(
+        _agent_span(
+            name="leaf-A",
+            span_id="leafa0leafa0leaf",
+            cached=True,
+            usage_tokens=1180,
+            duration_s=0.0007,
+        )
+    )
 
     fresh_ids = _agent_ids(fresh_events)
     resume_ids = _agent_ids(resume_events)
@@ -216,22 +300,25 @@ def test_resumed_cached_leaf_gets_the_same_agent_span_id_as_the_fresh_run() -> N
 def test_resume_reproduces_the_full_agent_span_id_sequence() -> None:
     """A full ordered span stream re-emitted on resume reuses the same id sequence.
 
-    Three same-type leaves (e.g. three skeptics) fan out on the fresh run. A resume
-    re-executes the script (a fresh adapter) and re-emits all three IN THE SAME ORDER,
-    now cached. The per-stable-key occurrence ordinal — which resets per adapter and is
-    walked in source order — makes the resume reproduce the EXACT id sequence the fresh
-    run produced, so the frontend dedupes all three; yet within either run the three
-    stay distinct (not collapsed into one).
+    Three same-type leaves (e.g. three skeptics) fan out on the fresh run, each with its
+    own engine-minted ``span_id``. A resume re-executes the script (a fresh adapter) and
+    re-emits all three IN THE SAME ORDER, now cached, with the engine reproducing the
+    same three ``span_id``\\ s. The adapter consumes those ids verbatim (I1), so the
+    resume reproduces the EXACT id sequence the fresh run produced — the frontend dedupes
+    all three; yet within either run the three stay distinct (not collapsed into one)
+    because the engine mints three distinct ids.
     """
+    span_ids = ["skeptic0one0one0", "skeptic0two0two0", "skeptic0three0three"]
+
     fresh_events: list[Event] = []
     fresh = UiAdapter(emit=lambda comp, props: fresh_events.append((comp, dict(props))))
-    for i in range(3):
-        fresh.on_span(_agent_span(name="skeptic", cached=False, duration_s=0.5 + i))
+    for i, sid in enumerate(span_ids):
+        fresh.on_span(_agent_span(name="skeptic", span_id=sid, cached=False, duration_s=0.5 + i))
 
     resume_events: list[Event] = []
     resume = UiAdapter(emit=lambda comp, props: resume_events.append((comp, dict(props))))
-    for _ in range(3):
-        resume.on_span(_agent_span(name="skeptic", cached=True, duration_s=0.0001))
+    for sid in span_ids:
+        resume.on_span(_agent_span(name="skeptic", span_id=sid, cached=True, duration_s=0.0001))
 
     fresh_ids = _agent_ids(fresh_events)
     # Three distinct leaves within the fresh run: distinct ids, none collapsed.
@@ -298,16 +385,21 @@ def test_distinct_log_lines_with_identical_text_are_not_collapsed() -> None:
 def test_distinct_cached_leaves_with_identical_usage_each_get_a_badge() -> None:
     """Two cached leaves of the same type with identical usage must each badge.
 
-    Excluding ``usage_tokens`` from the badge identity (a run-variant field) could
-    collapse two genuinely-distinct cached leaves that report the same usage into one
-    badge. The occurrence ordinal keeps them separate, so the resume's per-leaf
-    cache-hit story stays faithful.
+    Two genuinely-distinct cached leaves that report the same ``usage_tokens`` (a
+    run-variant field) must not collapse into one badge. The engine mints a distinct
+    ``span_id`` for each leaf, and the badge id is derived deterministically from the
+    span id (``f"{span_id}-badge"``), so two leaves with distinct span ids keep distinct
+    badges — the resume's per-leaf cache-hit story stays faithful.
     """
     sent: list[Event] = []
     adapter = UiAdapter(emit=lambda comp, props: sent.append((comp, dict(props))))
 
-    adapter.on_span(_agent_span(name="skeptic", cached=True, usage_tokens=0))
-    adapter.on_span(_agent_span(name="skeptic", cached=True, usage_tokens=0))
+    adapter.on_span(
+        _agent_span(name="skeptic", span_id="skepticbadge0one", cached=True, usage_tokens=0)
+    )
+    adapter.on_span(
+        _agent_span(name="skeptic", span_id="skepticbadge0two", cached=True, usage_tokens=0)
+    )
 
     badges = [props for comp, props in sent if comp == _JOURNAL_BADGE]
     assert len(badges) == 2, "two distinct cached leaves must each surface a badge"
@@ -336,6 +428,7 @@ def test_emit_exception_is_swallowed_on_span() -> None:
     # Both a fanout span and a cached leaf (which fans out into two emits) must be safe.
     adapter.on_span(
         Span(
+            span_id="boom0boom0boom0boom0",
             kind=SpanKind.PARALLEL,
             name="parallel",
             attributes={"thunk_count": 2, "surviving_count": 2},

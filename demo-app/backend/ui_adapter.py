@@ -9,29 +9,31 @@ and the actual ``push_ui_message`` call live in the transport layer.
 
 Three invariants the adapter guarantees:
 
-* **Stable, identity-based ids that survive resume.** Every emitted event carries an
-  ``event_id`` derived from the event's *logical identity* — never from run-variant
-  display fields. The engine re-emits the same logical event in two honest cases: a
-  failed-retry re-delivers a progress entry, and a resume re-executes the script and
-  re-emits a span for every replayed (now cached) leaf. On resume the same leaf's
-  ``Span`` comes back with ``cached`` flipped ``True``, a different ``usage_tokens``,
-  and a near-zero journal-lookup ``duration_s`` instead of real execution time — so
-  hashing those fields would mint a *new* id and double-fire the event. The dedupe
-  identity therefore hashes only the stable fields (component + name + ``agent_type``
-  for a leaf, component + counts for a fan-out, component + kind + message for a
-  progress line) and excludes ``duration_s`` / ``cached`` / ``usage_tokens``. The
-  re-emitted span collapses onto its first-run id and is dropped.
-* **Position-salted ids distinguish genuinely-distinct same-content events.** A pure
-  content hash cannot tell an honest re-emit apart from two different events that
-  render identical text (e.g. three skeptic leaves of the same ``agent_type``, or two
-  truncated log lines sharing a 50-char prefix). Because the orchestration script
-  re-executes in the same source order on resume (the engine's determinism guard
-  enforces this), the adapter salts each id with a *per-stable-key occurrence
-  ordinal*: the Nth event sharing a stable key gets ordinal N. Distinct same-content
-  events on one run get ordinals 0, 1, 2…; an honest resume re-emits them in the same
-  order and lands on the same ordinals, so honest re-emits still collide while
-  genuinely-distinct events stay separate.
-* **Idempotent, non-blocking delivery.** A seen-set keyed on the salted id suppresses
+* **Stable, identity-based ids that survive resume — by two routes, by event nature.**
+  Every emitted event carries an ``event_id`` that is stable across a fresh run and its
+  resume re-execution, never derived from run-variant display fields. A **span** event
+  (``agent_span`` / ``fanout_graph`` / ``journal_badge``) consumes the *engine-minted*
+  ``Span.span_id`` verbatim: the engine mints a resume-stable id for each span (and
+  reproduces it identically across the fresh and resume runs of a sequential leaf), so
+  the adapter passes it straight through rather than re-deriving its own hash. The
+  cached ``journal_badge`` shares the leaf's ``span_id`` but must stay a distinct card,
+  so its id is a deterministic local salt of the span id (``f"{span_id}-badge"``) — a
+  pure local suffix, not a re-hash of run-variant fields. A **progress** entry is NOT a
+  span and carries no engine id, so it keeps the adapter's self-computed path: the
+  ``event_id`` hashes the entry's stable identity (component + kind + message) and
+  excludes any run-variant field.
+* **Position-salted ids distinguish genuinely-distinct same-content progress lines.** A
+  pure content hash cannot tell an honest re-emit apart from two different progress
+  lines that render identical text (e.g. two truncated log lines sharing a 50-char
+  prefix). Because the orchestration script re-executes in the same source order on
+  resume (the engine's determinism guard enforces this), the adapter salts each
+  self-computed progress id with a *per-stable-key occurrence ordinal*: the Nth entry
+  sharing a stable key gets ordinal N. Distinct same-content entries on one run get
+  ordinals 0, 1, 2…; an honest resume re-emits them in the same order and lands on the
+  same ordinals, so honest re-emits still collide while genuinely-distinct entries stay
+  separate. (Distinct spans no longer need this salt — the engine already mints a
+  distinct ``span_id`` per span.)
+* **Idempotent, non-blocking delivery.** A seen-set keyed on the event id suppresses
   any event already delivered, so a re-emit never double-fires. The id is committed to
   the seen-set only *after* a successful emit, so a transient transport failure does
   not permanently suppress an event a later retry could deliver. Every emit is wrapped
@@ -130,6 +132,10 @@ class UiAdapter:
         / ``surviving_count`` for a parallel barrier, ``item_count`` /
         ``surviving_count`` for a pipeline. Both are flattened into props so the
         frontend reads them directly.
+
+        The event id IS the engine-minted ``span.span_id`` (I1): the engine reproduces
+        the same id for the same fan-out span on a deterministic replay, so the adapter
+        consumes it verbatim instead of re-deriving its own hash.
         """
         counts = self._fanout_counts(span.attributes)
         props: dict[str, Any] = {
@@ -139,17 +145,7 @@ class UiAdapter:
             "error": span.error,
             **counts,
         }
-        # Dedupe identity excludes the run-variant wall-clock ``duration_s`` (which
-        # changes every execution); the kind / name / fan-out counts are reproduced
-        # exactly on a deterministic replay, so the re-emitted fan-out span collapses
-        # onto its first-run id.
-        dedupe_key: dict[str, Any] = {
-            "kind": span.kind.value,
-            "name": span.name,
-            "error": span.error,
-            **counts,
-        }
-        self._emit_event(_FANOUT_GRAPH, props, dedupe_key=dedupe_key)
+        self._emit_event(_FANOUT_GRAPH, props, event_id=span.span_id)
 
     def _emit_agent(self, span: Span) -> None:
         """Emit an ``agent_span`` for a leaf, plus a ``journal_badge`` if it was cached.
@@ -161,12 +157,16 @@ class UiAdapter:
         The crux of resume correctness: the SAME leaf re-emits on resume with three
         fields changed — ``cached`` flips ``False`` -> ``True``, ``usage_tokens`` may
         differ, and ``duration_s`` collapses from real execution time to a near-zero
-        journal lookup. The ``agent_span`` dedupe identity therefore hashes only the
-        leaf's stable shape (component + name + ``agent_type``), so the re-emit is
-        recognized as the same span and dropped. The ``journal_badge``, by contrast,
-        appears only on the cached re-emit (the fresh run has ``cached=False`` and
-        emits none), so it is genuinely new on resume — that is the visible cache-hit
-        story, not a duplicate.
+        journal lookup. The id that keys the ``agent_span`` IS the engine-minted
+        ``span.span_id`` (I1), which the engine reproduces identically across the fresh
+        and resume runs of a sequential leaf — so the re-emit lands on the same card and
+        the frontend recognizes it as the same logical span. The ``journal_badge``, by
+        contrast, appears only on the cached re-emit (the fresh run has ``cached=False``
+        and emits none), so it is genuinely new on resume — that is the visible cache-hit
+        story, not a duplicate. The badge shares the leaf's ``span_id`` but must stay a
+        SEPARATE card from the ``agent_span``, so its id is a deterministic local salt of
+        the span id (``f"{span_id}-badge"``): a pure local suffix, not a re-hash of
+        run-variant fields, so it preserves resume-stability and keeps the badge distinct.
         """
         cached = bool(span.attributes.get("cached", False))
         agent_type = span.attributes.get("agent_type", span.name)
@@ -179,15 +179,7 @@ class UiAdapter:
             "duration_s": span.duration_s,
             "error": span.error,
         }
-        # Stable identity only: exclude cached / usage_tokens / duration_s so a fresh
-        # span and its journaled re-emit share one id. The occurrence ordinal keeps
-        # distinct same-type leaves (e.g. three skeptics) separate.
-        agent_key: dict[str, Any] = {
-            "kind": span.kind.value,
-            "name": span.name,
-            "agent_type": agent_type,
-        }
-        self._emit_event(_AGENT_SPAN, agent_props, dedupe_key=agent_key)
+        self._emit_event(_AGENT_SPAN, agent_props, event_id=span.span_id)
 
         if cached:
             badge_props: dict[str, Any] = {
@@ -196,11 +188,7 @@ class UiAdapter:
                 "cached": True,
                 "usage_tokens": span.attributes.get("usage_tokens"),
             }
-            # Exclude the run-variant usage_tokens from the badge identity; the
-            # occurrence ordinal distinguishes distinct cached leaves of the same
-            # agent_type that happen to report identical usage.
-            badge_key: dict[str, Any] = {"name": span.name, "agent_type": agent_type}
-            self._emit_event(_JOURNAL_BADGE, badge_props, dedupe_key=badge_key)
+            self._emit_event(_JOURNAL_BADGE, badge_props, event_id=f"{span.span_id}-badge")
 
     @staticmethod
     def _fanout_counts(attributes: dict[str, Any]) -> dict[str, Any]:
@@ -220,34 +208,60 @@ class UiAdapter:
     # --- delivery: stable id, dedupe, swallow --------------------------------
 
     def _emit_event(
-        self, component: str, props: dict[str, Any], *, dedupe_key: Mapping[str, Any]
+        self,
+        component: str,
+        props: dict[str, Any],
+        *,
+        event_id: str | None = None,
+        dedupe_key: Mapping[str, Any] | None = None,
     ) -> None:
         """Stamp a resume-stable id, drop duplicates, then emit — swallowing failures.
 
-        The ``event_id`` is a hash of ``(component, dedupe_key, occurrence_ordinal)``,
-        where ``dedupe_key`` is the event's *stable logical identity* (run-variant
-        display fields like ``duration_s`` / ``cached`` / ``usage_tokens`` are kept out
-        of it, in ``props`` only). So a resume re-emit of the same leaf — same stable
-        key, same ordinal, even though its display fields changed — collapses onto the
-        first run's id and is dropped. The occurrence ordinal is bumped *before* the
-        seen-check so genuinely-distinct same-key events (the Nth gets ordinal N) never
-        collide, yet honest re-emits in the same source order reuse the same ordinals.
+        Two id sources, by event nature:
+
+        * **Span events consume the engine-minted id (I1).** ``agent_span`` /
+          ``fanout_graph`` / ``journal_badge`` pass an explicit ``event_id`` (the
+          engine's resume-stable ``span_id``, or a deterministic local salt of it for
+          the badge). The engine reproduces this id identically across a fresh run and
+          its resume re-execution of a sequential leaf, so the adapter consumes it
+          verbatim and skips its own hashing entirely.
+        * **Progress events self-compute (scope boundary).** A ``phase_timeline`` entry
+          is NOT a span and carries no engine id, so it passes a ``dedupe_key`` and the
+          adapter derives ``event_id`` from a hash of
+          ``(component, dedupe_key, occurrence_ordinal)``. The ``dedupe_key`` is the
+          entry's stable logical identity; the per-key occurrence ordinal — bumped
+          *before* the seen-check — keeps genuinely-distinct same-text lines separate
+          (the Nth gets ordinal N) while an honest re-emit in the same source order
+          reuses the same ordinal and collapses onto the first run's id.
 
         The id is recorded as seen only after a successful emit, so a swallowed
-        transport failure leaves the door open for a later retry of the same ordinal.
+        transport failure leaves the door open for a later retry of the same id.
 
         Args:
             component: The Gen-UI component name to render.
             props: The full component props, including run-variant display fields (an
                 ``event_id`` is added in place).
+            event_id: The engine-minted id to use verbatim, for span events. When
+                provided, the adapter skips its own hashing and occurrence-ordinal path.
             dedupe_key: The stable subset of the event's identity, excluding any
-                run-variant field, used to compute the dedupe id and the occurrence
-                ordinal.
+                run-variant field, used to compute the id and occurrence ordinal for
+                progress events. Required when ``event_id`` is ``None``.
+
+        Raises:
+            ValueError: If neither ``event_id`` nor ``dedupe_key`` is supplied.
         """
-        stable = self._stable_id(component, dedupe_key)
-        ordinal = self._occurrences[stable]
-        self._occurrences[stable] = ordinal + 1
-        event_id = f"{stable}-{ordinal}"
+        # For the self-computed (progress) path, remember the (stable_key, ordinal) so a
+        # swallowed failure can undo the ordinal bump; the engine-id path has no ordinal.
+        ordinal_to_undo: tuple[str, int] | None = None
+        if event_id is None:
+            if dedupe_key is None:
+                raise ValueError("_emit_event requires either event_id or dedupe_key")
+            stable = self._stable_id(component, dedupe_key)
+            ordinal = self._occurrences[stable]
+            self._occurrences[stable] = ordinal + 1
+            event_id = f"{stable}-{ordinal}"
+            ordinal_to_undo = (stable, ordinal)
+
         if event_id in self._seen:
             return
         props["event_id"] = event_id
@@ -256,9 +270,11 @@ class UiAdapter:
         except Exception:
             # Red line: the engine calls sinks directly; a raising sink would break
             # orchestration. Swallow and leave the id unseen so a retry can deliver.
-            # The ordinal was already consumed, so the retry must reuse THIS id rather
-            # than minting a fresh ordinal — undo the bump so a re-delivery matches.
-            self._occurrences[stable] = ordinal
+            # For the self-computed path, undo the ordinal bump so a re-delivery reuses
+            # THIS id rather than minting a fresh ordinal.
+            if ordinal_to_undo is not None:
+                stable, ordinal = ordinal_to_undo
+                self._occurrences[stable] = ordinal
             return
         self._seen.add(event_id)
 
