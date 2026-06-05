@@ -41,7 +41,7 @@ from ._journal import (
 from ._journal import (
     JournalRecord as JournalRecord,  # re-exported for Layer-2 persistence on the public wall
 )
-from ._observability import SpanRecorder, SpanSink
+from ._observability import SpanBeginSink, SpanRecorder, SpanSink
 from ._progress import ProgressEntry, ProgressLog, ProgressSink
 from ._roster import Roster
 from ._sandbox import SandboxManager, SharedArtifactStore, build_leaf_backend
@@ -67,6 +67,7 @@ async def run_workflow(
     budget: int | None = None,
     on_progress: ProgressSink | None = None,
     on_span: SpanSink | None = None,
+    on_span_begin: SpanBeginSink | None = None,
     sandbox_manager: SandboxManager | None = None,
     workflows: WorkflowResolver | None = None,
 ) -> Any:
@@ -96,6 +97,16 @@ async def run_workflow(
             spans are *not* replay-suppressed: a resumed run re-emits a span for each
             replayed leaf, flagged ``cached=True``, so a trace reflects the resume.
             When omitted, span recording is a silent no-op (zero cost).
+        on_span_begin: Optional sink receiving a ``SpanBegin`` the instant each
+            ``agent``/``parallel``/``pipeline``/``race`` span opens, before its body
+            runs — the running edge for a live status and an elapsed timer
+            (``now - started_at``). It carries the span's resume-stable ``span_id``
+            (shared with the matching end span), so a consumer correlates the running
+            and completed edges. Like the end span, begin is live-only, not
+            replay-suppressed: a resumed run re-emits a begin for every replayed leaf
+            and its matching end span is flagged ``cached=True`` with a near-zero
+            duration, so a cached leaf renders as an instant replayed hit rather than
+            a stuck "running" chip. When omitted, begin recording is a silent no-op.
         sandbox_manager: Optional per-leaf sandbox lifecycle manager. When
             supplied, a leaf whose roster entry is ``needs_execution`` is leased an
             isolated execution backend (keyed by its derived, resume-stable
@@ -253,7 +264,7 @@ async def run_workflow(
     progress_sink: ProgressSink = on_progress if on_progress is not None else _default_progress_sink
     # One span recorder per run. Spans are emitted live (not replay-suppressed), so
     # a resumed run re-emits a span for every replayed leaf flagged cached=True.
-    span_recorder = SpanRecorder(sink=on_span)
+    span_recorder = SpanRecorder(sink=on_span, begin_sink=on_span_begin)
 
     @entrypoint(checkpointer=saver)
     async def _run(_input: Any) -> Any:
