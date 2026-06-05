@@ -42,7 +42,11 @@ Three invariants the adapter guarantees:
 
 Component vocabulary produced here: ``phase_timeline`` (progress), ``fanout_graph``
 (parallel / pipeline spans), ``agent_span`` (a leaf that ran fresh), and
-``journal_badge`` (a leaf served from the journal, i.e. ``cached=True``).
+``journal_badge`` (a leaf served from the journal, i.e. ``cached=True``). A fresh
+leaf's interior callback subtree is additionally folded onto its ``agent_span`` via
+``on_leaf_event``: a bounded, shape-only ``subtree`` prop merged in place so the chat
+can drill into the leaf's run tree. A cached (replayed) leaf fires no interior events,
+so it never carries a ``subtree`` — the cache-hit story stays the ``journal_badge``.
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from langchain_dynamic_workflow import ProgressEntry, Span, SpanBegin, SpanKind
+from langchain_dynamic_workflow import LeafEvent, ProgressEntry, Span, SpanBegin, SpanKind
 
 UiEmit = Callable[[str, dict[str, Any]], None]
 """Transport callback: deliver one ``(component_name, props)`` Gen-UI event."""
@@ -66,6 +70,12 @@ _AGENT_SPAN = "agent_span"
 _JOURNAL_BADGE = "journal_badge"
 
 _FANOUT_KINDS: frozenset[SpanKind] = frozenset({SpanKind.PARALLEL, SpanKind.PIPELINE})
+
+# Per-leaf interior node cap. A pathological leaf can fire thousands of callback
+# edges; bounding the buffered node count (and the re-emitted subtree) guards against
+# resource exhaustion. Once the cap is hit, further runs are dropped and the re-emit
+# carries a ``truncated`` flag so the frontend can say so honestly.
+_MAX_SUBTREE_NODES = 200
 
 
 class UiAdapter:
@@ -87,6 +97,14 @@ class UiAdapter:
         # honest resume — which re-emits the same keys in the same source order — lands
         # on the same ordinals and collapses onto the first run's ids.
         self._occurrences: defaultdict[str, int] = defaultdict(int)
+        # Per-leaf interior buffer: leaf_span_id -> {run_id -> node}. A node rolls a
+        # run's start and end edges into one record (run_id, parent_run_id, kind, name,
+        # phase). Keyed by run_id so a leaf's start/end pair collapses; keyed by
+        # leaf_span_id at the outer level so two leaves never cross-contaminate. Insertion
+        # order is preserved (dict), so the re-emitted subtree reads top-down.
+        self._leaf_nodes: defaultdict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        # Leaves whose interior overflowed the node cap, so the re-emit can flag it.
+        self._leaf_truncated: set[str] = set()
 
     # --- public engine sinks -------------------------------------------------
 
@@ -153,6 +171,65 @@ class UiAdapter:
             "started_at": begin.started_at,
         }
         self._emit_event(_AGENT_SPAN, running_props, event_id=begin.span_id)
+
+    def on_leaf_event(self, event: LeafEvent) -> None:
+        """Fold one interior callback edge into the leaf's drill-in subtree (never raises).
+
+        The engine taps a freshly-executing leaf's own callback subtree and forwards each
+        edge here as a :class:`~langchain_dynamic_workflow.LeafEvent`. The adapter buffers
+        the edges per ``leaf_span_id`` — rolling each run's ``start`` and ``end`` into one
+        node keyed by ``run_id`` — and re-emits the leaf's ``agent_span`` with ``merge=True``
+        carrying a ``subtree`` prop: a bounded, shape-only node list the frontend rebuilds
+        into a parent/child tree via ``parent_run_id``. The re-emit is idempotent and
+        latest-wins: each edge re-sends the whole current subtree onto the same
+        ``event_id`` (= ``leaf_span_id``), so the SDK reducer keeps patching one card.
+
+        Honesty caveats this method honors:
+
+        * **Real-execution only.** The engine attaches the leaf tap solely on the live
+          execution path, so a replayed/cached leaf fires zero events — its buffer stays
+          empty and no ``subtree`` is ever fabricated. The cached-leaf story stays the
+          ``journal_badge`` chip, with no drill-in.
+        * **Shape-only.** Only structural fields (``run_id`` / ``parent_run_id`` /
+          ``kind`` / ``name`` / ``phase``) reach a node. Raw ``detail`` payload keys
+          (``input`` / ``output`` / ``text``) are never copied in, so the drill-in shows
+          the interior's shape, never tool args or model text.
+        * **Bounded.** The interior node count is capped; a pathological leaf that fires
+          a flood of edges drops further nodes and the re-emit carries ``truncated=True``,
+          guarding against resource exhaustion.
+
+        Args:
+            event: One normalized interior callback edge from the leaf's run subtree.
+        """
+        leaf_id = event.leaf_span_id
+        nodes = self._leaf_nodes[leaf_id]
+        existing = nodes.get(event.run_id)
+        if existing is None:
+            if len(nodes) >= _MAX_SUBTREE_NODES:
+                # Cap reached: drop the new node, remember the leaf overflowed. Edges for
+                # already-buffered runs (e.g. a later end edge) still roll in below.
+                self._leaf_truncated.add(leaf_id)
+            else:
+                nodes[event.run_id] = {
+                    "run_id": event.run_id,
+                    "parent_run_id": event.parent_run_id,
+                    "kind": event.kind,
+                    "name": event.name,
+                    "phase": event.phase,
+                }
+        else:
+            # Roll a later edge of the same run into its node: advance the phase, and keep
+            # a non-empty start-edge name when the end edge carries an empty one.
+            existing["phase"] = event.phase
+            if event.name:
+                existing["name"] = event.name
+
+        subtree = list(nodes.values())
+        subtree_props: dict[str, Any] = {
+            "subtree": subtree,
+            "truncated": leaf_id in self._leaf_truncated,
+        }
+        self._emit_event(_AGENT_SPAN, subtree_props, event_id=leaf_id, merge=True)
 
     # --- span mappers --------------------------------------------------------
 

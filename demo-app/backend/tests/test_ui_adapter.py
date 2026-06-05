@@ -34,6 +34,7 @@ from ui_adapter import (
 )
 
 from langchain_dynamic_workflow import (
+    LeafEvent,
     ProgressEntry,
     ProgressKind,
     Span,
@@ -299,6 +300,245 @@ def test_begin_for_fanout_kind_is_ignored_for_now() -> None:
         )
     )
     assert not [c for c, _ in sent if c == _FANOUT_GRAPH]
+
+
+# --- (2d) on_leaf_event: buffered, bounded, shape-only subtree ---------------
+
+
+def test_on_leaf_event_buffers_and_reemits_a_shape_only_subtree() -> None:
+    sent, adapter = _collector()
+    leaf = "leaf-1"
+    root, model, tool = "r0", "m1", "t1"
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id=leaf,
+            run_id=root,
+            parent_run_id=None,
+            kind="chain",
+            phase="start",
+            name="agent",
+            ts=1.0,
+            detail={},
+        )
+    )
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id=leaf,
+            run_id=model,
+            parent_run_id=root,
+            kind="chat_model",
+            phase="start",
+            name="fake-model",
+            ts=2.0,
+            detail={},
+        )
+    )
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id=leaf,
+            run_id=model,
+            parent_run_id=root,
+            kind="chat_model",
+            phase="end",
+            name="",
+            ts=3.0,
+            detail={},
+        )
+    )
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id=leaf,
+            run_id=tool,
+            parent_run_id=root,
+            kind="tool",
+            phase="start",
+            name="search",
+            ts=4.0,
+            detail={},
+        )
+    )
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id=leaf,
+            run_id=tool,
+            parent_run_id=root,
+            kind="tool",
+            phase="end",
+            name="",
+            ts=5.0,
+            detail={},
+        )
+    )
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id=leaf,
+            run_id=root,
+            parent_run_id=None,
+            kind="chain",
+            phase="end",
+            name="",
+            ts=6.0,
+            detail={},
+        )
+    )
+
+    # The re-emit patches the leaf's agent_span (same event_id, merge=True).
+    span_emits = [p for c, p in sent if c == _AGENT_SPAN]
+    assert span_emits, "leaf events must surface onto the leaf's agent_span"
+    latest = span_emits[-1]
+    assert latest["event_id"] == leaf
+    assert latest.get("merge") is True
+    subtree = latest["subtree"]
+    # Tree closes: exactly one root (parent None), every other parent in run_ids.
+    run_ids = {n["run_id"] for n in subtree}
+    roots = [n for n in subtree if n["parent_run_id"] is None]
+    assert len(roots) == 1
+    assert all(n["parent_run_id"] in run_ids for n in subtree if n["parent_run_id"] is not None)
+    # Shape-only: names/kinds present, no raw payloads (include_payloads is False).
+    assert {n["kind"] for n in subtree} == {"chain", "chat_model", "tool"}
+    assert all("input" not in n and "output" not in n and "text" not in n for n in subtree)
+
+
+def test_leaf_events_for_different_leaves_do_not_cross_contaminate() -> None:
+    sent, adapter = _collector()
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id="A",
+            run_id="a0",
+            parent_run_id=None,
+            kind="chain",
+            phase="start",
+            name="a",
+            ts=1.0,
+            detail={},
+        )
+    )
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id="B",
+            run_id="b0",
+            parent_run_id=None,
+            kind="chain",
+            phase="start",
+            name="b",
+            ts=1.0,
+            detail={},
+        )
+    )
+    a = [p for c, p in sent if c == _AGENT_SPAN and p["event_id"] == "A"][-1]
+    b = [p for c, p in sent if c == _AGENT_SPAN and p["event_id"] == "B"][-1]
+    assert {n["run_id"] for n in a["subtree"]} == {"a0"}
+    assert {n["run_id"] for n in b["subtree"]} == {"b0"}
+
+
+def test_leaf_event_rolls_start_into_end_keeping_the_start_name() -> None:
+    """A run's start and end edges roll into ONE node, keeping the start's name.
+
+    The engine emits a readable ``name`` only on the ``start`` edge; the ``end`` edge
+    carries an empty name. The buffer must roll the pair into one node per ``run_id``,
+    advancing the ``phase`` to ``end`` while preserving the start-edge name (so the UI
+    shows ``search`` / ``fake-model`` for a completed node, not a blank).
+    """
+    sent, adapter = _collector()
+    leaf = "leaf-roll"
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id=leaf,
+            run_id="t1",
+            parent_run_id=None,
+            kind="tool",
+            phase="start",
+            name="search",
+            ts=1.0,
+            detail={},
+        )
+    )
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id=leaf,
+            run_id="t1",
+            parent_run_id=None,
+            kind="tool",
+            phase="end",
+            name="",
+            ts=2.0,
+            detail={},
+        )
+    )
+    latest = [p for c, p in sent if c == _AGENT_SPAN][-1]
+    subtree = latest["subtree"]
+    assert len(subtree) == 1, "start+end of one run_id must roll into a single node"
+    node = subtree[0]
+    assert node["run_id"] == "t1"
+    assert node["phase"] == "end"  # latest phase wins
+    assert node["name"] == "search"  # start-edge name preserved through the empty end name
+
+
+def test_on_leaf_event_caps_the_subtree_and_flags_truncation() -> None:
+    """A pathological interior is bounded: the node count caps with a truncated flag.
+
+    A leaf that fires thousands of edges must not let the buffer (or the re-emitted
+    subtree) grow without bound — that is the resource-exhaustion guard. The buffer
+    caps the node count and surfaces a ``truncated`` flag once the cap is hit.
+    """
+    sent, adapter = _collector()
+    leaf = "leaf-big"
+    root = "root"
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id=leaf,
+            run_id=root,
+            parent_run_id=None,
+            kind="chain",
+            phase="start",
+            name="agent",
+            ts=0.0,
+            detail={},
+        )
+    )
+    for i in range(500):
+        adapter.on_leaf_event(
+            LeafEvent(
+                leaf_span_id=leaf,
+                run_id=f"child-{i}",
+                parent_run_id=root,
+                kind="tool",
+                phase="start",
+                name=f"tool-{i}",
+                ts=float(i),
+                detail={},
+            )
+        )
+    latest = [p for c, p in sent if c == _AGENT_SPAN][-1]
+    subtree = latest["subtree"]
+    assert len(subtree) <= 200, "the subtree must be node-capped to bound cost"
+    assert latest["truncated"] is True
+
+
+def test_on_leaf_event_never_raises_on_a_failing_transport() -> None:
+    """A raising transport must not propagate out of ``on_leaf_event``.
+
+    The engine calls leaf-event sinks directly inside orchestration; a raising sink
+    would break the run, so the adapter swallows the transport failure (mirrors the
+    other sinks' red line).
+    """
+
+    def boom(_component: str, _props: dict[str, Any]) -> None:
+        raise RuntimeError("ui down")
+
+    adapter = UiAdapter(emit=boom)
+    adapter.on_leaf_event(
+        LeafEvent(
+            leaf_span_id="leaf-x",
+            run_id="r0",
+            parent_run_id=None,
+            kind="chain",
+            phase="start",
+            name="agent",
+            ts=1.0,
+            detail={},
+        )
+    )
 
 
 # --- (3) Stable-id dedupe ----------------------------------------------------
