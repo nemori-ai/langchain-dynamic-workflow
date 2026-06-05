@@ -160,6 +160,37 @@ async def test_run_workflow_live_emits_running_chip_before_completion() -> None:
     )
 
 
+async def test_run_workflow_live_folds_leaf_interior_into_a_subtree() -> None:
+    """The live runner folds each leaf's interior run tree onto its ``agent_span``.
+
+    Proves the host wires the engine's ``on_leaf_event`` sink into ``run_workflow``: the
+    engine taps each freshly-executing leaf's own callback subtree and forwards the
+    edges, which the adapter buffers per leaf and re-emits as a bounded, shape-only
+    ``subtree`` prop merged onto the leaf's ``agent_span``. A spy :class:`UiAdapter`
+    captures the emit stream and asserts at least one completed ``agent_span`` carries a
+    non-empty, closed ``subtree`` (one root, every non-root parent a known ``run_id``).
+    If a future edit drops the ``on_leaf_event`` wiring no ``subtree`` is ever emitted
+    and this fails — a behavioral guard, not a source-inspection one.
+    """
+    from host_graph import run_workflow_live
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    adapter = UiAdapter(emit=lambda comp, props: events.append((comp, dict(props))))
+
+    await run_workflow_live("deep_research", {"question": "Q?"}, adapter=adapter)
+
+    subtree_spans = [props for comp, props in events if comp == "agent_span" and "subtree" in props]
+    assert subtree_spans, "on_leaf_event must surface a drill-in subtree on a leaf's agent_span"
+    populated = [p for p in subtree_spans if p["subtree"]]
+    assert populated, "at least one leaf must carry a non-empty interior subtree"
+    sample = populated[-1]
+    run_ids = {n["run_id"] for n in sample["subtree"]}
+    assert sum(1 for n in sample["subtree"] if n["parent_run_id"] is None) >= 1
+    assert all(
+        n["parent_run_id"] in run_ids for n in sample["subtree"] if n["parent_run_id"] is not None
+    )
+
+
 async def test_run_workflow_live_resumes_cached_leaves_on_second_run() -> None:
     """A second run on the same resume lane replays leaves as journal hits.
 

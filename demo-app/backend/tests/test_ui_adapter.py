@@ -25,6 +25,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig, RunnableLambda
 from ui_adapter import (
     _AGENT_SPAN,
     _FANOUT_GRAPH,
@@ -34,12 +36,16 @@ from ui_adapter import (
 )
 
 from langchain_dynamic_workflow import (
+    Ctx,
+    InMemoryJournalStore,
     LeafEvent,
     ProgressEntry,
     ProgressKind,
+    Roster,
     Span,
     SpanBegin,
     SpanKind,
+    run_workflow,
 )
 
 Event = tuple[str, dict[str, Any]]
@@ -538,6 +544,148 @@ def test_on_leaf_event_never_raises_on_a_failing_transport() -> None:
             ts=1.0,
             detail={},
         )
+    )
+
+
+# --- (2e) on_leaf_event integration: real nested runnable through run_workflow ---
+
+
+def _nested_leaf_roster() -> Roster:
+    """A roster whose ``nested`` leaf invokes a child runnable with the forwarded config.
+
+    The leaf is a :class:`~langchain_core.runnables.RunnableLambda` that awaits a NESTED
+    ``RunnableLambda`` while forwarding the engine-supplied ``config`` — so the child
+    inherits the engine's per-leaf callback handler and fires genuine parent/child
+    ``on_chain_start``/``on_chain_end`` edges. This produces a real interior run tree
+    (root chain + child chain) for the adapter to fold into a drill-in ``subtree``,
+    with no model in the loop (LB7's synthetic-nesting recipe).
+
+    Returns:
+        A :class:`~langchain_dynamic_workflow.Roster` with one leaf under ``"nested"``.
+    """
+
+    async def _child(value: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        return value
+
+    child = RunnableLambda(_child)
+
+    async def _leaf(value: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        # Forward the engine-supplied config so the child inherits the leaf callbacks
+        # (the per-leaf event tap) and fires real nested edges.
+        await child.ainvoke(value, config=config)
+        return {"messages": [AIMessage(content="done")]}
+
+    leaf = RunnableLambda(_leaf)
+    return Roster().register("nested", leaf)
+
+
+async def test_leaf_subtree_reconstructs_through_run_workflow_offline() -> None:
+    """A real nested-runnable leaf, driven through ``run_workflow``, yields a closed subtree.
+
+    Wires the adapter's ``on_span`` / ``on_span_begin`` / ``on_leaf_event`` sinks into a
+    live ``run_workflow`` run of a leaf whose runnable invokes a nested child with the
+    forwarded config (real callback edges, no model — LB7). The leaf's completed
+    ``agent_span`` must then carry a ``subtree`` that:
+
+    * is non-empty (the interior was actually observed);
+    * is keyed onto the leaf's engine-minted span id (the subtree lands on the right card
+      — its ``event_id`` equals the leaf's ``leaf_span_id`` from the event stream);
+    * has at least one root (``parent_run_id is None``); and
+    * closes — every non-root node's ``parent_run_id`` is itself an emitted ``run_id``.
+    """
+    roster = _nested_leaf_roster()
+    sent, adapter = _collector()
+    seen_leaf_ids: list[str] = []
+    base_on_leaf_event = adapter.on_leaf_event
+
+    def _capture_leaf_event(event: LeafEvent) -> None:
+        seen_leaf_ids.append(event.leaf_span_id)
+        base_on_leaf_event(event)
+
+    async def orchestrate(ctx: Ctx) -> Any:
+        return await ctx.agent("solo", agent_type="nested")
+
+    await run_workflow(
+        orchestrate,
+        roster=roster,
+        on_span=adapter.on_span,
+        on_span_begin=adapter.on_span_begin,
+        on_leaf_event=_capture_leaf_event,
+        leaf_event_include_payloads=False,
+    )
+
+    # The engine fired interior edges, all correlated to one leaf span id.
+    assert seen_leaf_ids, "the nested leaf must fire at least one interior leaf event"
+    leaf_span_id = seen_leaf_ids[0]
+    assert all(lid == leaf_span_id for lid in seen_leaf_ids), "all edges share one leaf span id"
+
+    subtree_spans = [p for c, p in sent if c == _AGENT_SPAN and "subtree" in p]
+    assert subtree_spans, "the leaf's interior must surface as a subtree on its agent_span"
+    latest = subtree_spans[-1]
+    # The subtree lands on the leaf's engine-minted span id (the right card).
+    assert latest["event_id"] == leaf_span_id
+    assert latest.get("merge") is True
+    subtree = latest["subtree"]
+    assert subtree, "the subtree must be non-empty"
+    run_ids = {n["run_id"] for n in subtree}
+    # At least one root, and the tree closes (every non-root parent is a known run_id).
+    assert sum(1 for n in subtree if n["parent_run_id"] is None) >= 1
+    assert all(n["parent_run_id"] in run_ids for n in subtree if n["parent_run_id"] is not None)
+    # Shape-only: no raw payload keys leaked into any node (include_payloads is False).
+    assert all("input" not in n and "output" not in n and "text" not in n for n in subtree)
+
+
+async def test_cached_leaf_emits_no_subtree_on_resume() -> None:
+    """A resumed (cached) leaf fires no interior events, so it carries no drill-in subtree.
+
+    Honesty caveat: the engine attaches the leaf-event tap only on the live execution
+    path, so a journal-replayed leaf emits zero ``LeafEvent``s. Running the same nested
+    leaf twice on one shared journal, each with a FRESH adapter (a real resume builds a
+    new host-tool invocation): the first run's ``agent_span`` carries a ``subtree``; the
+    second (cached) run's adapter sees ZERO ``on_leaf_event`` calls and its completed
+    ``agent_span`` carries no ``subtree`` — the cache-hit story stays the ``journal_badge``,
+    never a fabricated drill-in.
+    """
+    roster = _nested_leaf_roster()
+    journal = InMemoryJournalStore()
+
+    async def orchestrate(ctx: Ctx) -> Any:
+        return await ctx.agent("solo", agent_type="nested")
+
+    first_sent, first_adapter = _collector()
+    await run_workflow(
+        orchestrate,
+        roster=roster,
+        journal=journal,
+        on_span=first_adapter.on_span,
+        on_span_begin=first_adapter.on_span_begin,
+        on_leaf_event=first_adapter.on_leaf_event,
+        leaf_event_include_payloads=False,
+    )
+    assert [p for c, p in first_sent if c == _AGENT_SPAN and "subtree" in p], (
+        "the fresh run must surface a subtree"
+    )
+
+    # Resume: a fresh adapter (a new host-tool invocation) over the SAME journal.
+    second_sent, second_adapter = _collector()
+    leaf_event_calls: list[LeafEvent] = []
+
+    def _spy_leaf_event(event: LeafEvent) -> None:
+        leaf_event_calls.append(event)
+        second_adapter.on_leaf_event(event)
+
+    await run_workflow(
+        orchestrate,
+        roster=roster,
+        journal=journal,
+        on_span=second_adapter.on_span,
+        on_span_begin=second_adapter.on_span_begin,
+        on_leaf_event=_spy_leaf_event,
+        leaf_event_include_payloads=False,
+    )
+    assert leaf_event_calls == [], "a cached leaf must fire no interior leaf events on resume"
+    assert not [p for c, p in second_sent if c == _AGENT_SPAN and "subtree" in p], (
+        "a cached leaf must not carry a fabricated subtree"
     )
 
 

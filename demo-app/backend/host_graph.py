@@ -285,6 +285,8 @@ async def run_meta_script_live(*, submit_rejected: bool, adapter: UiAdapter, emi
         on_progress=adapter.on_progress,
         on_span=adapter.on_span,
         on_span_begin=adapter.on_span_begin,
+        on_leaf_event=adapter.on_leaf_event,
+        leaf_event_include_payloads=False,
     )
     return str(result)
 
@@ -323,6 +325,8 @@ async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str
         on_progress=adapter.on_progress,
         on_span=adapter.on_span,
         on_span_begin=adapter.on_span_begin,
+        on_leaf_event=adapter.on_leaf_event,
+        leaf_event_include_payloads=False,
     )
     return f"Demo workflow finished: {result}"
 
@@ -337,10 +341,13 @@ async def run_workflow_live(
     ``name`` from :func:`~workflows.make_workflows`, wraps the two-argument
     ``WorkflowFn`` into the single-argument orchestrator ``run_workflow`` expects
     (binding ``args``), and runs it against the real roster with the adapter's sinks
-    wired to ``on_progress`` / ``on_span`` / ``on_span_begin`` — the span-open edge
-    surfaces each leaf's running chip, which the matching span-close edge flips in place
-    to its completed state. The same registry is also passed as ``workflows=`` so a
-    preset that nests ``ctx.workflow(...)`` resolves too.
+    wired to ``on_progress`` / ``on_span`` / ``on_span_begin`` / ``on_leaf_event`` —
+    the span-open edge surfaces each leaf's running chip, which the matching span-close
+    edge flips in place to its completed state, and ``on_leaf_event`` folds each
+    freshly-executing leaf's interior run tree onto its ``agent_span`` as a bounded,
+    shape-only drill-in subtree (``leaf_event_include_payloads=False`` so no raw tool
+    args or model text are surfaced). The same registry is also passed as ``workflows=``
+    so a preset that nests ``ctx.workflow(...)`` resolves too.
 
     When a ``lane`` is supplied its persisted journal / checkpointer / ``thread_id``
     are threaded into ``run_workflow`` so a second run on the same lane replays the
@@ -383,6 +390,8 @@ async def run_workflow_live(
         on_progress=adapter.on_progress,
         on_span=adapter.on_span,
         on_span_begin=adapter.on_span_begin,
+        on_leaf_event=adapter.on_leaf_event,
+        leaf_event_include_payloads=False,
         workflows=workflows,
         **durable,
     )
