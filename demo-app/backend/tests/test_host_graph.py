@@ -291,6 +291,66 @@ async def test_resume_replays_cached_leaves_across_two_host_graph_turns() -> Non
     assert cached_agent_spans, "the second turn must replay leaves as cached agent spans"
 
 
+async def test_resume_clears_stale_drill_in_subtree_with_checkpointer() -> None:
+    """A resumed cached leaf must NOT keep a stale drill-in subtree (checkpointer path).
+
+    The multi-turn blindspot the no-checkpointer resume test above misses: only a
+    persistent checkpointer makes turn 2's state ACCUMULATE turn 1's subtree-bearing
+    ``agent_span`` cards (same resume-stable ``span_id``). The engine fires zero leaf
+    events on a cached leaf, and the adapter's span-open begin edge (``merge=False``)
+    REPLACES the card, dropping turn 1's subtree. This asserts turn 1's cards reappear in
+    turn 2's final ``ui`` channel (proving accumulation, so the check is non-vacuous) yet
+    come back ``cached=True`` with NO ``subtree`` — the "a cached leaf carries no drill-in"
+    honesty caveat, verified the way the frontend renders it (the final thread-state
+    ``ui`` channel), not via a stream scan that would replay turn 1's accumulated state.
+    """
+    from host_graph import _RESUME_LANES, make_host_graph
+    from langchain_core.messages import HumanMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    _RESUME_LANES.clear()
+    graph = make_host_graph(checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "test-resume-clears-stale-subtree"}}
+
+    first = await graph.ainvoke(
+        {"messages": [HumanMessage(content="Do a thorough deep research on RAG trade-offs.")]},
+        config=cfg,
+    )
+    first_subtree_ids = {
+        (u.get("props") or {}).get("event_id")
+        for u in first.get("ui", [])
+        if u.get("name") == "agent_span" and (u.get("props") or {}).get("subtree")
+    }
+    assert first_subtree_ids, "turn 1 (fresh) must surface drill-in subtrees on its agent spans"
+
+    second = await graph.ainvoke(
+        {"messages": [HumanMessage(content="Pick it back up where you left off.")]},
+        config=cfg,
+    )
+    ui = second.get("ui", [])
+    assert [u for u in ui if u.get("name") == "journal_badge"], (
+        "resume must surface journal badges (the cache-hit story)"
+    )
+
+    cards = {
+        (u.get("props") or {})["event_id"]: (u.get("props") or {})
+        for u in ui
+        if u.get("name") == "agent_span"
+    }
+    # Non-vacuity: turn-1's subtree cards must persist into turn-2 state (accumulation),
+    # so a stale subtree had every chance to survive — proving it is cleared, not absent.
+    reappeared = first_subtree_ids & set(cards)
+    assert reappeared, (
+        "turn-1 agent_span cards must accumulate into turn-2 state via the checkpointer"
+    )
+    for event_id in reappeared:
+        card = cards[event_id]
+        assert card.get("cached") is True, f"resumed card {event_id} must come back cached"
+        assert not card.get("subtree"), (
+            f"resumed cached card {event_id} kept a stale drill-in subtree"
+        )
+
+
 async def test_run_workflow_live_unknown_name_raises() -> None:
     """An unknown workflow name fails loud with the registry's KeyError."""
     from host_graph import run_workflow_live

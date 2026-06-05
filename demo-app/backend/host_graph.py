@@ -601,7 +601,7 @@ async def run_background(state: Annotated[dict[str, Any], InjectedState]) -> str
     return await run_background_live(_BG_MANAGER, thread_id=_host_thread_id())
 
 
-def make_host_graph() -> Any:
+def make_host_graph(*, checkpointer: BaseCheckpointSaver[Any] | None = None) -> Any:
     """Build the host deepagent graph served by ``langgraph dev``.
 
     Resolves the host model once at build time. The provider is locked to OpenRouter and
@@ -615,13 +615,22 @@ def make_host_graph() -> Any:
     runs (``run_live``), the meta layer (``run_meta_script``), and a background run
     (``run_background``).
 
+    Args:
+        checkpointer: Optional LangGraph checkpointer. Left ``None`` for the
+            ``langgraph dev`` deployment, which injects its own persistence; supply an
+            ``InMemorySaver`` to make the host thread durable in-process, so a follow-up
+            turn on the same ``thread_id`` resumes the accumulated state (what the
+            deployment does, exercised in tests).
+
     Returns:
         The compiled deepagent host graph (a runnable LangGraph graph).
     """
+    extra: dict[str, Any] = {"checkpointer": checkpointer} if checkpointer is not None else {}
     return create_deep_agent(
         model=resolve_host_model(),
         system_prompt=HOST_INSTRUCTIONS,
         tools=[run_hello_demo, run_live, run_meta_script, run_background],
         state_schema=HostState,
         middleware=cache_middleware(),
+        **extra,
     )
