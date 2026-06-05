@@ -338,3 +338,115 @@ def test_decision_rlimits_override_the_policy_profile() -> None:
         assert time.monotonic() - started < 20
     finally:
         backend.close()
+
+
+def test_write_then_execute_sees_the_same_file() -> None:
+    # A file written via the backend's write() is visible to a command run via
+    # execute() — one shared per-leaf filesystem (the 岔口-1 guarantee).
+    backend = _backend()
+    try:
+        write = backend.write("/data.txt", "shared-content")
+        assert write.error is None
+        result = backend.execute(f'{sys.executable} -c "print(open(\\"data.txt\\").read())"')
+        assert "shared-content" in result.output
+    finally:
+        backend.close()
+
+
+def test_write_errors_when_the_file_already_exists() -> None:
+    # write() must refuse to clobber an existing path, like InMemorySandbox.write,
+    # so a leaf cannot silently overwrite a file it already created.
+    backend = _backend()
+    try:
+        first = backend.write("/once.txt", "first")
+        assert first.error is None and first.path == "/once.txt"
+        second = backend.write("/once.txt", "second")
+        assert second.error is not None
+        # The original content survives the refused overwrite.
+        read = backend.read("/once.txt")
+        assert read.file_data is not None
+        assert read.file_data["content"] == "first"
+    finally:
+        backend.close()
+
+
+def test_read_grep_glob_ls_round_trip_on_the_real_dir() -> None:
+    backend = _backend()
+    try:
+        backend.write("/a/note.txt", "alpha\nTODO fix\nbeta")
+        read = backend.read("/a/note.txt")
+        assert read.error is None and read.file_data is not None
+        assert read.file_data["content"] == "alpha\nTODO fix\nbeta"
+        grep = backend.grep("TODO")
+        assert grep.matches and any("TODO" in m["text"] for m in grep.matches)
+        glob = backend.glob("*.txt", "/a")
+        assert glob.matches
+        ls = backend.ls("/a")
+        assert ls.entries and any(entry["path"] == "/a/note.txt" for entry in ls.entries)
+    finally:
+        backend.close()
+
+
+def test_edit_replaces_content_on_the_real_dir() -> None:
+    # edit() must operate on the same real file that read()/execute() see, so an
+    # edit made via the tool surface is observable to a later command.
+    backend = _backend()
+    try:
+        backend.write("/code.py", "value = 1\nvalue = 1\n")
+        edit = backend.edit("/code.py", "value = 1", "value = 9", replace_all=True)
+        assert edit.error is None
+        assert edit.occurrences == 2
+        result = backend.execute(f'{sys.executable} -c "print(open(\\"code.py\\").read())"')
+        assert "value = 9" in result.output
+        assert "value = 1" not in result.output
+    finally:
+        backend.close()
+
+
+def test_read_missing_file_reports_an_error() -> None:
+    backend = _backend()
+    try:
+        miss = backend.read("/nope.txt")
+        assert miss.error is not None
+        assert miss.file_data is None
+    finally:
+        backend.close()
+
+
+def test_upload_then_download_round_trips_bytes() -> None:
+    # upload_files overwrites (idempotent batch) and download_files returns the
+    # exact bytes — the binary round trip through the real temp dir.
+    backend = _backend()
+    try:
+        uploads = backend.upload_files([("/in/a.txt", b"alpha"), ("/in/b.txt", b"beta")])
+        assert all(response.error is None for response in uploads)
+        downloads = backend.download_files(["/in/a.txt", "/in/b.txt", "/in/missing.txt"])
+        assert downloads[0].content == b"alpha"
+        assert downloads[1].content == b"beta"
+        assert downloads[2].error is not None  # missing path lands as an error
+        assert downloads[2].content is None
+    finally:
+        backend.close()
+
+
+def test_file_ops_reject_traversal_above_the_root() -> None:
+    # A `..` escape that would write outside the per-leaf root must be refused,
+    # not silently land on the host filesystem above the temp dir.
+    backend = _backend()
+    try:
+        escape = backend.write("/../escape.txt", "leak")
+        assert escape.error is not None
+        # Nothing was created above the root.
+        assert not os.path.exists(os.path.join(os.path.dirname(backend.root_path), "escape.txt"))
+    finally:
+        backend.close()
+
+
+def test_close_removes_the_temp_dir_and_leaves_no_process() -> None:
+    backend = _backend()
+    root = backend.root_path
+    backend.execute(f'{sys.executable} -c "print(1)"')
+    assert os.path.isdir(root)
+    backend.close()
+    assert not os.path.exists(root)  # cleaned up, no leaked dir
+    backend.close()  # idempotent

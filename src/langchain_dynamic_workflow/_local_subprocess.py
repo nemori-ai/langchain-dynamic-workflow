@@ -24,6 +24,7 @@ is an explicit, host-constructed opt-in.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import shutil
@@ -36,7 +37,23 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import IO, Literal
 
-from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
+from deepagents.backends.protocol import (
+    FILE_NOT_FOUND,
+    INVALID_PATH,
+    EditResult,
+    ExecuteResponse,
+    FileData,
+    FileDownloadResponse,
+    FileInfo,
+    FileUploadResponse,
+    GlobResult,
+    GrepMatch,
+    GrepResult,
+    LsResult,
+    ReadResult,
+    SandboxBackendProtocol,
+    WriteResult,
+)
 
 EXIT_TIMEOUT = 124
 """Exit-code sentinel reported when a command is killed for exceeding its timeout."""
@@ -346,6 +363,39 @@ def _build_spawn_command(command: str, rlimits: RLimitProfile) -> str | list[str
     ]
 
 
+def _canonical_segments(path: str) -> list[str]:
+    """Resolve a protocol absolute path to its segment list, rejecting escapes.
+
+    The protocol file APIs use absolute paths rooted at ``/``. This collapses
+    ``.`` and empty segments and resolves ``..`` segments, treating a ``..`` that
+    would climb above the root as a hard error rather than a silent clamp. That
+    guard is what stops a path like ``/../escape`` from landing on the host
+    filesystem above the per-leaf temporary directory.
+
+    Args:
+        path: An absolute protocol path (treated as rooted at ``/`` regardless of
+            a leading slash).
+
+    Returns:
+        The canonical path segments below the root, e.g. ``["a", "b"]`` for
+        ``/a/b`` and ``[]`` for the bare root.
+
+    Raises:
+        ValueError: If a ``..`` segment would escape above the root.
+    """
+    segments: list[str] = []
+    for segment in path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if not segments:
+                raise ValueError(f"path {path!r} escapes root via '..' traversal")
+            segments.pop()
+            continue
+        segments.append(segment)
+    return segments
+
+
 class LocalSubprocessSandbox(SandboxBackendProtocol):
     """A full-protocol backend running each command in a per-leaf temp root.
 
@@ -535,6 +585,284 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
             exit_code=exit_code,
             truncated=truncated,
         )
+
+    def _resolve(self, path: str) -> str:
+        """Map a protocol absolute path to a real path under the temp root.
+
+        The protocol file APIs address files with absolute paths rooted at ``/``;
+        those map one-to-one onto real files beneath the per-leaf temporary
+        directory, which is exactly why ``execute`` (running with that directory
+        as its working directory) sees the same files the tool surface writes. A
+        ``..`` segment that would escape above the root is rejected so a write can
+        never land on the host filesystem outside the leaf's private directory.
+
+        Args:
+            path: An absolute protocol path.
+
+        Returns:
+            The absolute host path of the file beneath the temp root.
+
+        Raises:
+            ValueError: If the path escapes above the root via ``..``.
+        """
+        return os.path.join(self._root, *_canonical_segments(path))
+
+    def _stored_paths(self) -> list[str]:
+        """List every regular file under the temp root as a protocol path.
+
+        Real files beneath the temp root are surfaced back to callers using the
+        protocol's ``/``-rooted absolute path scheme (the inverse of
+        :meth:`_resolve`), so listing, globbing, and grepping report the same
+        addresses a caller would pass to :meth:`read`. The result is sorted for
+        deterministic ordering.
+
+        Returns:
+            Every regular file's protocol path, in ascending lexical order.
+        """
+        stored: list[str] = []
+        for current_dir, _subdirs, filenames in os.walk(self._root):
+            for filename in filenames:
+                absolute = os.path.join(current_dir, filename)
+                relative = os.path.relpath(absolute, self._root)
+                stored.append("/" + relative.replace(os.sep, "/"))
+        stored.sort()
+        return stored
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        """Create ``file_path`` as a real file under the temp root.
+
+        Mirrors :class:`InMemorySandbox.write`: the write refuses to clobber an
+        existing path (returning an error rather than overwriting) so a leaf
+        cannot silently destroy a file it already produced. Parent directories
+        are created as needed.
+
+        Args:
+            file_path: Absolute protocol path to create.
+            content: UTF-8 text content to write.
+
+        Returns:
+            A :class:`WriteResult` carrying the written path, or an error when the
+            file already exists or the path escapes the root.
+        """
+        try:
+            real_path = self._resolve(file_path)
+        except ValueError as error:
+            return WriteResult(error=str(error))
+        if os.path.exists(real_path):
+            return WriteResult(error=f"Cannot write to {file_path} because it already exists.")
+        os.makedirs(os.path.dirname(real_path), exist_ok=True)
+        with open(real_path, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        return WriteResult(path=file_path)
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        """Read ``file_path`` from the temp root.
+
+        Args:
+            file_path: Absolute protocol path to read.
+            offset: Accepted for protocol compatibility; the full content is
+                returned regardless of ``offset``/``limit`` for this backend.
+            limit: Accepted for protocol compatibility; see ``offset``.
+
+        Returns:
+            A :class:`ReadResult` with the file data, or an error on miss or an
+            out-of-root path.
+        """
+        try:
+            real_path = self._resolve(file_path)
+        except ValueError as error:
+            return ReadResult(error=str(error))
+        if not os.path.isfile(real_path):
+            return ReadResult(error=f"File '{file_path}' not found")
+        with open(real_path, encoding="utf-8", errors="replace") as handle:
+            content = handle.read()
+        return ReadResult(file_data=FileData(content=content, encoding="utf-8"))
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        """Replace ``old_string`` with ``new_string`` in a file under the temp root.
+
+        Args:
+            file_path: Absolute protocol path to edit.
+            old_string: Exact substring to replace.
+            new_string: Replacement text.
+            replace_all: Replace every occurrence when ``True``; otherwise the
+                first occurrence only.
+
+        Returns:
+            An :class:`EditResult` with the edited path and replacement count, or
+            an error on miss or an out-of-root path.
+        """
+        try:
+            real_path = self._resolve(file_path)
+        except ValueError as error:
+            return EditResult(error=str(error))
+        if not os.path.isfile(real_path):
+            return EditResult(error=f"File '{file_path}' not found")
+        with open(real_path, encoding="utf-8", errors="replace") as handle:
+            content = handle.read()
+        count = content.count(old_string) if replace_all else (1 if old_string in content else 0)
+        updated = (
+            content.replace(old_string, new_string)
+            if replace_all
+            else content.replace(old_string, new_string, 1)
+        )
+        with open(real_path, "w", encoding="utf-8") as handle:
+            handle.write(updated)
+        return EditResult(path=file_path, occurrences=count)
+
+    def ls(self, path: str) -> LsResult:
+        """List the files at or under ``path`` within the temp root.
+
+        Args:
+            path: Directory protocol path; only entries under it are returned.
+
+        Returns:
+            An :class:`LsResult` with one entry per stored file under ``path``, or
+            an error on an out-of-root path.
+        """
+        try:
+            self._resolve(path)
+        except ValueError as error:
+            return LsResult(error=str(error))
+        prefix = path if path.endswith("/") else f"{path}/"
+        entries = [
+            self._file_info(stored)
+            for stored in self._stored_paths()
+            if stored == path or stored.startswith(prefix)
+        ]
+        return LsResult(entries=entries)
+
+    def grep(self, pattern: str, path: str | None = None, glob: str | None = None) -> GrepResult:
+        """Search files under the temp root for a literal substring.
+
+        Matching is literal (not regex), mirroring the protocol contract. ``path``
+        restricts the search to files at or under that directory; ``glob`` filters
+        which files are searched by filename pattern. Matches are returned in
+        deterministic (path, line) order.
+
+        Args:
+            pattern: Literal substring to search for in each line.
+            path: Optional directory to restrict the search to; ``None`` searches
+                every stored file.
+            glob: Optional filename glob filtering which files are searched.
+
+        Returns:
+            A :class:`GrepResult` listing one match per matching line, or an error
+            on an out-of-root ``path``.
+        """
+        if path is not None:
+            try:
+                self._resolve(path)
+            except ValueError as error:
+                return GrepResult(error=str(error))
+        prefix = None if path is None else (path if path.endswith("/") else f"{path}/")
+        matches: list[GrepMatch] = []
+        for stored in self._stored_paths():
+            if prefix is not None and stored != path and not stored.startswith(prefix):
+                continue
+            if glob is not None and not fnmatch.fnmatch(stored, glob):
+                continue
+            with open(self._resolve(stored), encoding="utf-8", errors="replace") as handle:
+                content = handle.read()
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if pattern in line:
+                    matches.append(GrepMatch(path=stored, line=line_number, text=line))
+        return GrepResult(matches=matches)
+
+    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+        """Find files matching ``pattern`` under ``path`` within the temp root.
+
+        Args:
+            pattern: Glob pattern matched against each stored file's full path.
+            path: Base directory the search is rooted at; only files at or under
+                it are considered.
+
+        Returns:
+            A :class:`GlobResult` of matching files in deterministic path order,
+            or an error on an out-of-root ``path``.
+        """
+        try:
+            self._resolve(path)
+        except ValueError as error:
+            return GlobResult(error=str(error))
+        prefix = path if path.endswith("/") else f"{path}/"
+        matches = [
+            self._file_info(stored)
+            for stored in self._stored_paths()
+            if (stored == path or stored.startswith(prefix)) and fnmatch.fnmatch(stored, pattern)
+        ]
+        return GlobResult(matches=matches)
+
+    def _file_info(self, stored_path: str) -> FileInfo:
+        """Build a :class:`FileInfo` entry for a stored protocol path."""
+        try:
+            size = os.path.getsize(self._resolve(stored_path))
+        except OSError:
+            size = 0
+        return FileInfo(path=stored_path, is_dir=False, size=size, modified_at="")
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        """Store each ``(path, content)`` pair as a UTF-8 file (overwriting).
+
+        Upload deliberately overwrites (unlike :meth:`write`, which errors on an
+        existing path) so a batch upload is idempotent. Binary content that is not
+        valid UTF-8, or a path that escapes the root, is reported as that file's
+        ``invalid_path`` error rather than aborting the batch.
+
+        Args:
+            files: ``(destination_path, content_bytes)`` pairs to store.
+
+        Returns:
+            One :class:`FileUploadResponse` per input, in input order.
+        """
+        responses: list[FileUploadResponse] = []
+        for file_path, content in files:
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                responses.append(FileUploadResponse(path=file_path, error=INVALID_PATH))
+                continue
+            try:
+                real_path = self._resolve(file_path)
+            except ValueError:
+                responses.append(FileUploadResponse(path=file_path, error=INVALID_PATH))
+                continue
+            os.makedirs(os.path.dirname(real_path), exist_ok=True)
+            with open(real_path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            responses.append(FileUploadResponse(path=file_path))
+        return responses
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        """Return the bytes of each requested path (partial success per entry).
+
+        Args:
+            paths: File protocol paths to download.
+
+        Returns:
+            One :class:`FileDownloadResponse` per input path, in input order; a
+            missing path lands as that entry's ``file_not_found`` error and an
+            out-of-root path as ``invalid_path``.
+        """
+        responses: list[FileDownloadResponse] = []
+        for path in paths:
+            try:
+                real_path = self._resolve(path)
+            except ValueError:
+                responses.append(FileDownloadResponse(path=path, error=INVALID_PATH))
+                continue
+            if not os.path.isfile(real_path):
+                responses.append(FileDownloadResponse(path=path, error=FILE_NOT_FOUND))
+                continue
+            with open(real_path, "rb") as handle:
+                responses.append(FileDownloadResponse(path=path, content=handle.read()))
+        return responses
 
     def close(self) -> None:
         """Remove the per-leaf temp directory (idempotent).
