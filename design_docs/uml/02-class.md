@@ -5,6 +5,8 @@ classDiagram
   class run_workflow {
     <<facade>>
     +run_workflow(script, *, roster, config) Any
+    +on_progress / on_span / on_span_begin / on_leaf_event sinks
+    +leaf_event_include_payloads: bool
   }
   class WorkflowEngine {
     +run(script, thread_id, config) Any
@@ -154,6 +156,48 @@ classDiagram
     <<_codegen: L2 AST gate + exec>>
     +compile_workflow_source(source) Callable
   }
+  class SpanRecorder {
+    <<_observability: 开 span, 发 begin+end 两条带外边>>
+    +span(kind, name) ActiveSpan
+    -_mint_span_id(kind, name) str
+    -_sink: SpanSink
+    -_begin_sink: SpanBeginSink
+  }
+  class SpanBegin {
+    <<_observability: span 打开即发的 running 边>>
+    +span_id: str
+    +kind: SpanKind
+    +name: str
+    +attributes: dict
+    +started_at: float
+    +monotonic_start: float
+  }
+  class Span {
+    <<_observability: span 关闭时发的完成边>>
+    +span_id: str
+    +kind: SpanKind
+    +name: str
+    +attributes: dict
+    +duration_s: float
+    +error: str or None
+  }
+  class LeafEvent {
+    <<_leaf_events: 叶子回调子树的一条 normalize 边>>
+    +leaf_span_id: str
+    +run_id: str
+    +parent_run_id: str or None
+    +kind: str (chain|chat_model|llm|tool)
+    +phase: str (start|end|error)
+    +name: str
+    +ts: float
+    +detail: dict (默认 shape-only)
+  }
+  class LeafEventHandler {
+    <<_leaf_events: BaseCallbackHandler, 引擎内部, 一叶一实例>>
+    +on_chain_start / on_chat_model_start / on_tool_start ...
+    -_leaf_span_id: str (构造时闭包持有 → 关联)
+    -_include_payloads: bool
+  }
 
   run_workflow --> WorkflowEngine
   WorkflowEngine --> Ctx
@@ -192,11 +236,17 @@ classDiagram
   Ctx ..> RaceCandidate : race() candidate spec
   Ctx ..> RaceResult : race() return
   Ctx ..> Journal : race_key() journals the decision
+  WorkflowEngine --> SpanRecorder : SpanRecorder(sink=on_span, begin_sink=on_span_begin)
+  Ctx --> SpanRecorder : span() per primitive (mints span_id, threads into leaf_runner)
+  SpanRecorder ..> SpanBegin : 打开即 emit (begin sink)
+  SpanRecorder ..> Span : 关闭时 emit (end sink)
+  WorkflowEngine ..> LeafEventHandler : 叶调用接缝 append 到 leaf_config.callbacks (miss-only, 闭包持 leaf_span_id)
+  LeafEventHandler ..> LeafEvent : normalize 回调边 → on_leaf_event sink
 ```
 
 ## 分层归属
 
-- **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`、`create_workflow_tool`(产 `WorkflowTool`)、`create_workflow_middleware`(产 `WorkflowMiddleware`)、`InMemoryWorktreeProvider`/`WorktreeProvider`(worktree 隔离 seam)、`read_only_leaf`/`read_only_builder`(只读裁判叶,deny-write permission,D-G4)、跨叶归约 helper `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`,`_reduce` 纯函数,F)、race 值类型 `RaceCandidate`/`RaceResult`(+ `race_key`,`_race_types` 纯类型,B,配 `ctx.race` 原语)。
+- **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`、`create_workflow_tool`(产 `WorkflowTool`)、`create_workflow_middleware`(产 `WorkflowMiddleware`)、`InMemoryWorktreeProvider`/`WorktreeProvider`(worktree 隔离 seam)、`read_only_leaf`/`read_only_builder`(只读裁判叶,deny-write permission,D-G4)、跨叶归约 helper `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`,`_reduce` 纯函数,F)、race 值类型 `RaceCandidate`/`RaceResult`(+ `race_key`,`_race_types` 纯类型,B,配 `ctx.race` 原语)、可观测性值类型与 sink 别名 `Span`/`SpanBegin`/`SpanKind`/`LeafEvent`(+ `SpanSink`/`SpanBeginSink`/`LeafEventSink`,M1,供宿主消费 `run_workflow` 的 `on_span`/`on_span_begin`/`on_leaf_event` 带外边)。`LeafEventHandler` 是引擎内部(不导出)的回调 normalizer,一叶一实例、闭包持 `leaf_span_id` 关联(见 [01 §2b](../01-engine-mechanism.md))。
 - **agent 面(运行时)**：`WorkflowTool`(多命令)。
 - **host 后台机制**：`WorkflowMiddleware` + `BgRunManager` + `BgRunSlot` + `ResultStore`。
 - **跨会话持久化(M3,Layer 2 host-wiring)**：`WorkflowRunStore`(协议)+ `RunSpec`(可 resume 的 launch 描述,携规范 `journal_run_id` 谱系)+ `InMemoryRunStore`(默认、零依赖)+ `SqliteWorkflowStore`(`[sqlite]` extra:统一 sqlite db 文件 + 两条连接——autocommit store 背 registry + `RunScopedJournal` per-run journal、第二连接背持久 `AsyncSqliteSaver` checkpointer)。`_persistence` / `_run_store` 只从 `._engine`(公共墙)import `JournalStore`/`JournalRecord`,故 import-linter Contract 1 把这两模块列入 `source_modules`。零成本重放由持久 journal 交付,checkpointer 是 durable add-on。

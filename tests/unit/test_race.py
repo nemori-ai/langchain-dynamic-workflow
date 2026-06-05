@@ -47,6 +47,7 @@ def _text_runner(
         needs_execution: bool = False,
         response_format: Any = None,
         isolation: str = "shared",
+        leaf_span_id: str = "",
     ) -> LeafOutcome:
         if prompt in raise_on:
             raise RuntimeError("fake leaf boom")
@@ -224,6 +225,7 @@ async def test_race_cancels_losers_and_releases_gate_slots() -> None:
         needs_execution: bool = False,
         response_format: Any = None,
         isolation: str = "shared",
+        leaf_span_id: str = "",
     ) -> LeafOutcome:
         if agent_type == "winner":
             return LeafOutcome(state={"messages": [AIMessage(content="WIN")]}, usage=0)

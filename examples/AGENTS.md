@@ -46,7 +46,7 @@ The 15 feature demos, one mechanism each:
 | `features/race` | `ctx.race` best-of-N early exit + in-flight cancel + journaled determinism (replay reproduces the winner and dispatches nothing new). |
 | `features/nesting` | `workflow()` named nesting (one level of nesting). |
 | `features/budget` | loop-until-budget / loop-until-dry via `ctx.budget.remaining()`. |
-| `features/observability` | `phase()` / `log()` narration + `on_progress` / `on_span` taps rendering a trace (the same surface the demo app consumes). |
+| `features/observability` | `phase()` / `log()` narration + the full tap set — `on_progress` / `on_span` for the trace, `on_span_begin` for the running edge, `on_leaf_event` for a leaf's run-tree subtree (the same surfaces the demo app consumes). |
 | `features/reduce` | cross-leaf reduce family: gather → `dedup` → `corroborate` → `survives` (voting) → `reconcile` (double-blind reconciliation). |
 | `features/journal_resume` | in-process resume: content-hash journal replay + fail-loud determinism guard. |
 | `features/persistence` | cross-session sqlite store: proc1 launches → "restart" → proc2 resumes, zero-cost replay (an offline counter proves the replay is free). |

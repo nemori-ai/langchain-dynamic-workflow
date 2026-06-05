@@ -37,6 +37,17 @@
 
 这些是"能写什么"；用好它们的**作者模式库**（adversarial-verify、pipeline-by-default、loop-until-dry + 硬 MAX_ROUNDS、judge-panel、model-routing…）及其确定性适配见 [03-authoring-patterns.md](03-authoring-patterns.md)，可运行投影在 `skills/dynamic-workflow/SKILL.md`。
 
+## 2b. Span 生命周期与逐叶 live 可观测性（带外、隔离不变量保持）
+
+每个原语调用(`agent` / `parallel` / `pipeline` / `race`)经 `SpanRecorder.span()` 开一个 span,期间产**两条**带外边——**打开**即发的 `SpanBegin`(running 边)与**关闭**时发的既有完成 `Span`。两条边共享一个 `span_id`,故消费者据此把 running 与 done 对上。
+
+- **两条边的载荷分工**:`SpanBegin` 携 `started_at`(墙钟,供 `now - started_at` 算 live elapsed timer)+ `monotonic_start`(无漂移内部时长基准)+ 打开时已知的 `attributes`;完成 `Span` 携 `duration_s`(monotonic 差)/ `error` / cache 结果(`cached`)/ usage 等关闭时才知道的字段。
+- **`span_id` 由谁铸**:引擎铸,消费者只读。`span_id` = `(kind + name + 出现序号)` 经 `json.dumps(sort_keys=True)` 后 SHA-256 截 16 hex;出现序号按 `SpanRecorder` 实例(即每 run)对每个 `(kind, name)` 计数(第 N 个同名同 kind 的 span 取序号 N,故同名叶子彼此区分)。**顺序路径(深度 0)resume 稳定**——脚本同源序重放(确定性 guard 背书)、序号每 run 重置,故 fresh 与诚实 resume 铸出逐字节相同的 id 序列。**扇出 span 的打开顺序随墙钟变化**,其 `span_id` 不保证 fresh/resume 一致(同"扇出叶不入确定性序列"同因);故 resume 稳定性仅对顺序深度-0 span 担保。
+- **两个新 sink(皆 keyword-only、默认 `None` no-op、不入 journal、live-only)**:
+  - `on_span_begin`——**全 span 类型**,打开即发。它**不**被 replay 抑制:resume 时为每个被重放(cached)的叶子重发一条 begin,且其完成 `Span` 标 `cached=True`、`duration_s` 近零——故缓存叶子渲染成"即时命中"而非卡住的 running chip(begin 发于 span 打开、早于 journal 查询,故天然"先发后定")。
+  - `on_leaf_event`——把**叶子自己的回调子树**(其 model/tool/chain 的 `on_*_start`/`on_*_end`/`on_*_error` 边)normalize 成 `LeafEvent`,经 `run_id`/`parent_run_id` 可重建叶内 run tree。handler 挂在既有 `leaf_config["callbacks"]` 列表上(见 §7 budget 管线复刻的同一条 callbacks 转发路径);**deepagents 把 `callbacks`/`tags`/`configurable` 转发给 subagent,但不转发 `metadata`**,故关联**不**靠 metadata 继承,而靠 handler 实例在构造时闭包持有的 `leaf_span_id`(一叶一 handler,它收到的每条边按构造即属本叶子)。它**仅真执行触发**:handler 只在 journal **未命中**走真叶子时挂上,journal 命中走缓存路径根本不进叶子 runner,故重放叶子**零** interior 事件。
+- **隔离不变量**:两个 sink 皆走带外,事件只进 sink、**绝不**注入宿主 LLM 的 message context;`agent()` 仍只 fold 最终结论。故接不接 sink,宿主上下文逐字节相同(quarantine 保持)。`LeafEvent.detail` 默认 **shape-only**(节点 kind/name/timing);原始 tool 入参/输出、模型文本仅在显式 opt-in(`leaf_event_include_payloads=True`)时带上,且截断有界。
+
 ## 3. 底座同构：LangGraph Functional API + 两偏差（实证）
 
 LangGraph functional API 与 Claude Code Workflow 是同一范式,durable execution 白送大半:
@@ -181,6 +192,7 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | D19 | 接缝③ L2 交付节奏 | v1 = L0/L1 先行,L2 架构预留紧跟(L2-as-skill,见 02) |
 | D20 | async 后台 tool 执行 | 自建轻量后台机制(无 server / 无重依赖);v1 即含;蓝本 = omne-next 实现 + deepagents async-task API 形态。详见 [02 §3](02-architecture.md) |
 | D21 | 跨会话持久化形态(M3) | **一个统一 sqlite db 文件**,run_id 命名空间化四表(registry + journal),**两条连接**(autocommit store + explicit-commit `AsyncSqliteSaver`,皆 WAL)。否决"分文件 / 复用单连接":隔离 regime 不兼容须分连接、同文件保单一持久单元。**journal(非 checkpointer)交付零成本重放**,checkpointer 是 durable add-on。`[sqlite]` 可选 extra 把守,base 安装零依赖。per-run 规范 id(`journal_run_id`)同 key journal 谱系与 checkpoint thread;host thread 仅 key manager slot。schema-version guard(`PRAGMA user_version`)fail-loud。详见 §13b |
+| D22 | 逐叶 live 可观测性 tap 形态(M1) | **选 callback-handler tap**(把 `BaseCallbackHandler` 挂上叶子既有 `leaf_config["callbacks"]`),否决 `astream_events`:叶 `ainvoke` 调用路径不变(folding / 结构化输出 / usage 计量逐字节不动),复用 budget 已走的同一条 callbacks 转发路径。**`metadata` 关联法被否**——deepagents subagent 边界丢弃 `metadata`(只转发 `callbacks`/`tags`/`configurable`),故 `leaf_span_id` 关联改由 per-leaf handler 实例在构造时**闭包**承担(一叶一 handler,它见的每条边按构造即属本叶子)。`SpanBegin` 立为**独立值类型**(非把 begin 字段塞进统一 event),与完成 `Span` 共享 `span_id`。`detail` opt-in 取**单一 bool**(`leaf_event_include_payloads`),不引入更重的 sink-config 对象。replay 策略**随控制流自落**:begin 发于 span 打开、早于 journal 查询故 cached 叶照常重发(配 cached 完成);`on_leaf_event` 只在 miss 路挂 handler,故 journal 命中**零** interior 事件——无需额外开关 |
 
 ## 13. 实现待核实清单（开工前/中逐条钉测试）
 

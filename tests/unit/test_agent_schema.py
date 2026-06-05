@@ -34,6 +34,7 @@ def _ctx_with_structured(structured: Claim, counter: list[int]) -> Ctx:
         needs_execution: bool = False,
         response_format: Any = None,
         isolation: str = "shared",
+        leaf_span_id: str = "",
     ) -> LeafOutcome:
         counter[0] += 1
         # Honor the bound schema like a real create_deep_agent(response_format=...):

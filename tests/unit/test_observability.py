@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from langchain_dynamic_workflow._observability import (
     Span,
+    SpanBegin,
     SpanKind,
     SpanRecorder,
 )
@@ -81,3 +82,30 @@ def test_recorder_emits_a_race_span() -> None:
     assert completed.attributes["candidate_count"] == 4
     assert completed.attributes["won"] is True
     assert completed.attributes["winner_index"] == 1
+
+
+def test_span_carries_a_span_id_shared_with_its_begin() -> None:
+    begins: list[SpanBegin] = []
+    ends: list[Span] = []
+    recorder = SpanRecorder(sink=ends.append, begin_sink=begins.append)
+
+    with recorder.span(SpanKind.AGENT, "researcher") as span:
+        span.set("agent_type", "researcher")
+
+    assert len(begins) == 1
+    assert len(ends) == 1
+    # The begin edge fires with an id; the end span carries the SAME id.
+    assert begins[0].span_id == ends[0].span_id
+    assert begins[0].span_id  # non-empty
+    # Begin carries open-time fields only; end-only fields are absent from begin.
+    assert begins[0].kind is SpanKind.AGENT
+    assert begins[0].name == "researcher"
+    assert begins[0].started_at > 0.0
+    assert "cached" not in begins[0].attributes
+
+
+def test_begin_sink_default_is_a_silent_noop() -> None:
+    # No begin_sink wired ⇒ begin recording costs nothing and never raises.
+    recorder = SpanRecorder()
+    with recorder.span(SpanKind.PIPELINE, "refine") as span:
+        span.set("item_count", 3)

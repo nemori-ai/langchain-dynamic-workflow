@@ -41,7 +41,8 @@ from ._journal import (
 from ._journal import (
     JournalRecord as JournalRecord,  # re-exported for Layer-2 persistence on the public wall
 )
-from ._observability import SpanRecorder, SpanSink
+from ._leaf_events import LeafEventHandler, LeafEventSink
+from ._observability import SpanBeginSink, SpanRecorder, SpanSink
 from ._progress import ProgressEntry, ProgressLog, ProgressSink
 from ._roster import Roster
 from ._sandbox import SandboxManager, SharedArtifactStore, build_leaf_backend
@@ -67,6 +68,9 @@ async def run_workflow(
     budget: int | None = None,
     on_progress: ProgressSink | None = None,
     on_span: SpanSink | None = None,
+    on_span_begin: SpanBeginSink | None = None,
+    on_leaf_event: LeafEventSink | None = None,
+    leaf_event_include_payloads: bool = False,
     sandbox_manager: SandboxManager | None = None,
     workflows: WorkflowResolver | None = None,
 ) -> Any:
@@ -96,6 +100,35 @@ async def run_workflow(
             spans are *not* replay-suppressed: a resumed run re-emits a span for each
             replayed leaf, flagged ``cached=True``, so a trace reflects the resume.
             When omitted, span recording is a silent no-op (zero cost).
+        on_span_begin: Optional sink receiving a ``SpanBegin`` the instant each
+            ``agent``/``parallel``/``pipeline``/``race`` span opens, before its body
+            runs — the running edge for a live status and an elapsed timer
+            (``now - started_at``). It carries the span's ``span_id`` (shared with the
+            matching end span), so a consumer correlates the running and completed
+            edges. The ``span_id`` is resume-stable only for the sequential (depth-0)
+            path — where the script replays in the same source order, so a fresh run
+            and an honest resume mint the identical id; a fan-out leaf
+            (``parallel``/``pipeline``/``race``) opens its span in wall-clock order, so
+            its id correlates begin↔end within a run but is not guaranteed identical
+            across a resume (mirroring the determinism guard, which records only the
+            sequential path). Like the end span, begin is live-only, not
+            replay-suppressed: a resumed run re-emits a begin for every replayed leaf
+            and its matching end span is flagged ``cached=True`` with a near-zero
+            duration, so a cached leaf renders as an instant replayed hit rather than
+            a stuck "running" chip. When omitted, begin recording is a silent no-op.
+        on_leaf_event: Optional sink receiving a ``LeafEvent`` for each runtime edge
+            in a leaf's own callback subtree (its model calls, tool calls, nested
+            sub-agent steps), correlated to the owning leaf via ``leaf_span_id`` and
+            reconstructable into the in-leaf run tree via ``run_id`` /
+            ``parent_run_id``. Events are delivered out-of-band and never injected
+            into the host LLM's context, so quarantine is preserved. The tap fires
+            only on real execution: a leaf served from the journal runs no interior,
+            so a replayed leaf emits no leaf events. When omitted, no per-leaf tap is
+            attached (zero cost).
+        leaf_event_include_payloads: When ``True``, each ``LeafEvent``'s ``detail``
+            carries bounded raw payloads (truncated tool input/output, model text);
+            the default ``False`` keeps ``detail`` shape-only (node kind/name/timing),
+            so leaf internals are not streamed unless the caller opts in.
         sandbox_manager: Optional per-leaf sandbox lifecycle manager. When
             supplied, a leaf whose roster entry is ``needs_execution`` is leased an
             isolated execution backend (keyed by its derived, resume-stable
@@ -146,6 +179,7 @@ async def run_workflow(
         needs_execution: bool,
         response_format: Any = None,
         isolation: str = "shared",
+        leaf_span_id: str = "",
     ) -> dict[str, Any]:
         # A durable @task return crosses the checkpointer, whose serializer
         # round-trips built-in containers (and the registered LangChain message
@@ -182,8 +216,23 @@ async def run_workflow(
             configurable["model"] = model
 
         async def _invoke() -> dict[str, Any]:
+            callbacks: list[Any] = [usage_handler]
+            # Attach the per-leaf event tap on the SAME callbacks list deepagents
+            # forwards to subagents, so the whole leaf subtree is observed. The
+            # handler closes over THIS leaf's span id for correlation; metadata is
+            # not used (the subagent boundary drops it). It is attached only on real
+            # execution -- _invoke runs only on a journal miss, so a journal hit
+            # never emits interior events.
+            if on_leaf_event is not None and leaf_span_id:
+                callbacks.append(
+                    LeafEventHandler(
+                        leaf_span_id=leaf_span_id,
+                        sink=on_leaf_event,
+                        include_payloads=leaf_event_include_payloads,
+                    )
+                )
             leaf_config: RunnableConfig = {
-                "callbacks": [usage_handler],
+                "callbacks": callbacks,
                 "configurable": configurable,
             }
             state: dict[str, Any] = await runnable.ainvoke(
@@ -231,12 +280,15 @@ async def run_workflow(
         needs_execution: bool = False,
         response_format: Any = None,
         isolation: str = "shared",
+        leaf_span_id: str = "",
     ) -> LeafOutcome:
         # The single durable leaf path, shared by agent / parallel / pipeline.
         # The shared gate (applied inside Ctx) bounds how many of these run at
         # once across every fan-out path in this run. The task returns the
         # checkpointer-safe payload mapping; rebuild the typed LeafOutcome here so
-        # the context layer keeps working with .state / .usage unchanged.
+        # the context layer keeps working with .state / .usage unchanged. The
+        # owning AGENT span's id is threaded through so the leaf seam can correlate
+        # the leaf's callback subtree to its span.
         payload = await leaf_task(
             agent_type,
             prompt,
@@ -245,6 +297,7 @@ async def run_workflow(
             needs_execution=needs_execution,
             response_format=response_format,
             isolation=isolation,
+            leaf_span_id=leaf_span_id,
         )
         return LeafOutcome.from_payload(payload)
 
@@ -253,7 +306,7 @@ async def run_workflow(
     progress_sink: ProgressSink = on_progress if on_progress is not None else _default_progress_sink
     # One span recorder per run. Spans are emitted live (not replay-suppressed), so
     # a resumed run re-emits a span for every replayed leaf flagged cached=True.
-    span_recorder = SpanRecorder(sink=on_span)
+    span_recorder = SpanRecorder(sink=on_span, begin_sink=on_span_begin)
 
     @entrypoint(checkpointer=saver)
     async def _run(_input: Any) -> Any:
