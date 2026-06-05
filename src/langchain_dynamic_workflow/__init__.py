@@ -23,6 +23,13 @@ from ._errors import (
 from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal_key, race_key
 from ._leaf_events import LeafEvent, LeafEventSink
 from ._leaves import read_only_builder, read_only_leaf
+from ._local_subprocess import (
+    ExecDecision,
+    ExecPolicy,
+    ExecRequest,
+    LocalSubprocessSandbox,
+    RLimitProfile,
+)
 from ._observability import Span, SpanBegin, SpanBeginSink, SpanKind, SpanSink
 from ._progress import ProgressEntry, ProgressKind, ProgressSink
 from ._race_types import RaceCandidate, RaceResult
@@ -38,7 +45,7 @@ from ._reduce import (
 from ._result import fold_result
 from ._roster import Roster, RosterEntry
 from ._run_store import InMemoryRunStore, RunSpec, WorkflowRunStore
-from ._sandbox import SandboxManager
+from ._sandbox import SandboxFactory, SandboxManager, local_subprocess_factory
 from ._workflows import WorkflowRegistry
 from ._worktree import InMemoryWorktreeProvider, WorktreeProvider
 from .middleware import create_workflow_middleware
@@ -89,6 +96,9 @@ __all__ = [
     "Budget",
     "Consensus",
     "Ctx",
+    "ExecDecision",
+    "ExecPolicy",
+    "ExecRequest",
     "InMemoryJournalStore",
     "InMemoryRunStore",
     "InMemoryWorktreeProvider",
@@ -96,10 +106,12 @@ __all__ = [
     "JournalStore",
     "LeafEvent",
     "LeafEventSink",
+    "LocalSubprocessSandbox",
     "Orchestrator",
     "ProgressEntry",
     "ProgressKind",
     "ProgressSink",
+    "RLimitProfile",
     "RaceCandidate",
     "RaceResult",
     "Reconciled",
@@ -108,6 +120,7 @@ __all__ = [
     "Roster",
     "RosterEntry",
     "RunSpec",
+    "SandboxFactory",
     "SandboxManager",
     "Span",
     "SpanBegin",
@@ -130,6 +143,7 @@ __all__ = [
     "extract_meta",
     "fold_result",
     "journal_key",
+    "local_subprocess_factory",
     "race_key",
     "read_only_builder",
     "read_only_leaf",

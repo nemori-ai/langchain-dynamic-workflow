@@ -450,3 +450,21 @@ def test_inmemory_sandbox_close_is_a_no_op() -> None:
     sandbox.close()
     sandbox.close()
     assert sandbox.read("/keep.txt").error is None
+
+
+def test_real_execution_public_surface_is_exported() -> None:
+    # A host opts into real execution from the package root, so every type it
+    # needs to wire and tune a LocalSubprocessSandbox must be a top-level export.
+    import langchain_dynamic_workflow as ldw
+
+    for name in (
+        "LocalSubprocessSandbox",
+        "SandboxFactory",
+        "local_subprocess_factory",
+        "ExecPolicy",
+        "ExecRequest",
+        "ExecDecision",
+        "RLimitProfile",
+    ):
+        assert hasattr(ldw, name), name
+        assert name in ldw.__all__
