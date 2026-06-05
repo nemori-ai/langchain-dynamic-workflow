@@ -566,7 +566,14 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         # Apply the admission overrides: the decision may lower the output cap,
         # clamp the timeout down (never widen it), and select a different rlimit
         # profile. A missing override falls back to the policy default.
-        output_cap_bytes = decision.output_cap_bytes or self._policy.output_cap_bytes
+        # Distinguish an explicit 0 (suppress output) from None (no override): a
+        # falsey ``or`` would treat a 0-byte admission cap as "unset" and fall back to
+        # the policy cap, so admission could never reduce the cap to zero.
+        output_cap_bytes = (
+            self._policy.output_cap_bytes
+            if decision.output_cap_bytes is None
+            else decision.output_cap_bytes
+        )
         effective_timeout = _resolve_effective_timeout(
             call_timeout=timeout,
             decision_timeout=decision.timeout,
@@ -595,9 +602,18 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         drained: dict[str, tuple[str, bool]] = {}
 
         def _drain() -> None:
-            drained["result"] = _drain_bounded(proc.stdout, output_cap_bytes)
+            try:
+                drained["result"] = _drain_bounded(proc.stdout, output_cap_bytes)
+            except Exception:
+                # The read end was closed under us (an escaped child kept the pipe
+                # open past the deadline and the caller closed it to unblock us).
+                # Record an incomplete result instead of surfacing in this daemon
+                # thread.
+                drained.setdefault("result", ("", True))
 
-        drain_thread = threading.Thread(target=_drain, name=f"ldw-drain-{self._identity}")
+        drain_thread = threading.Thread(
+            target=_drain, name=f"ldw-drain-{self._identity}", daemon=True
+        )
         drain_thread.start()
         timed_out = False
         try:
@@ -607,13 +623,24 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
                 timed_out = True
                 _terminate_process_tree(proc, self._policy.grace_seconds)
         finally:
-            # Reap the child and join the drain on every path so neither a zombie
-            # process, an orphaned group, a leaked descriptor, nor a dangling
-            # thread survives this call. The kill closes the write end, so the
-            # drain reaches end-of-file and the join cannot hang.
+            # Reap the direct child and join the drain. After a process-group kill the
+            # child's write end closes, so the drain hits EOF and joins promptly. But a
+            # descendant that escaped the group (setsid / daemonize) can keep the pipe
+            # open: bound the join so one escaped child cannot wedge execute() past its
+            # deadline (and hold the exec-gate slot), then close the read end to unblock
+            # an abandoned drain. The drain thread is a daemon, so an abandoned one never
+            # blocks interpreter shutdown.
             proc.wait()
-            drain_thread.join()
-            if proc.stdout is not None:
+            drain_thread.join(timeout=self._policy.grace_seconds)
+            if drain_thread.is_alive():
+                # An escaped child (setsid / daemonize) still holds the write end open,
+                # so the drain is blocked in read() holding the BufferedReader lock;
+                # calling close() here would block on that same lock and re-introduce
+                # the hang. Abandon the daemon drain instead (it ends on its own when
+                # the escaped child finally closes the pipe) and return bounded with an
+                # incomplete result rather than wedging execute past its deadline.
+                drained.setdefault("result", ("", True))
+            elif proc.stdout is not None:
                 proc.stdout.close()
         output, truncated = drained.get("result", ("", False))
         exit_code = EXIT_TIMEOUT if timed_out else proc.returncode
@@ -633,6 +660,15 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         ``..`` segment that would escape above the root is rejected so a write can
         never land on the host filesystem outside the leaf's private directory.
 
+        Two layers guard the root: ``_canonical_segments`` rejects a lexical ``..``
+        escape, and a ``realpath`` check rejects a symlink created inside the root by
+        a command that points outside it (a lexical join alone would return the
+        in-root symlink path and the later ``open`` would follow it to the host). A
+        symlink that stays within the root resolves fine. This keeps the file APIs
+        rooted even though shell execution itself is not sandboxed. It is best-effort
+        against a TOCTOU swap (the symlink could change between this check and the
+        ``open``), consistent with the backend's documented non-sandbox posture.
+
         Args:
             path: An absolute protocol path.
 
@@ -640,9 +676,14 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
             The absolute host path of the file beneath the temp root.
 
         Raises:
-            ValueError: If the path escapes above the root via ``..``.
+            ValueError: If the path escapes the root via ``..`` or a symlink.
         """
-        return os.path.join(self._root, *_canonical_segments(path))
+        candidate = os.path.join(self._root, *_canonical_segments(path))
+        root_real = os.path.realpath(self._root)
+        candidate_real = os.path.realpath(candidate)
+        if candidate_real != root_real and not candidate_real.startswith(root_real + os.sep):
+            raise ValueError(f"path {path!r} escapes the leaf root via a symlink")
+        return candidate
 
     def _stored_paths(self) -> list[str]:
         """List every regular file under the temp root as a protocol path.

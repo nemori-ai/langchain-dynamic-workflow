@@ -450,3 +450,75 @@ def test_close_removes_the_temp_dir_and_leaves_no_process() -> None:
     backend.close()
     assert not os.path.exists(root)  # cleaned up, no leaked dir
     backend.close()  # idempotent
+
+
+def test_admission_zero_output_cap_suppresses_output() -> None:
+    # A before_execute decision of output_cap_bytes=0 must actually suppress output,
+    # not fall back to the policy cap. Guards the falsey-`or` bug where 0 was treated
+    # as "unset" so admission could never reduce the cap to zero.
+    def cap_to_zero(_request: ExecRequest) -> ExecDecision:
+        return ExecDecision(output_cap_bytes=0)
+
+    backend = _backend(ExecPolicy(output_cap_bytes=10_000, before_execute=cap_to_zero))
+    try:
+        result = backend.execute(f'{sys.executable} -c "print(\\"x\\" * 1000)"')
+        assert result.output == ""  # capped to zero, NOT the 10_000 policy cap
+        assert result.truncated is True
+        assert result.exit_code == 0
+    finally:
+        backend.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid group-escape is POSIX-only")
+def test_execute_is_bounded_when_a_child_escapes_the_group_holding_stdout() -> None:
+    # A grandchild that setsid()-escapes the process group and keeps the inherited
+    # stdout open must NOT wedge execute() on the drain join. The parent returns fast;
+    # without the bounded join + read-end close, the open pipe would hang execute for
+    # the grandchild's full sleep. Assert execute returns well before that sleep and
+    # flags the abandoned drain as incomplete.
+    backend = _backend(ExecPolicy(default_timeout=10, grace_seconds=0.5))
+    try:
+        scriptfile = os.path.join(backend.root_path, "escaper.py")
+        script = textwrap.dedent("""
+            import os, time
+            pid = os.fork()
+            if pid == 0:
+                os.setsid()      # grandchild escapes into its own session/group
+                time.sleep(5)    # keep the inherited stdout pipe open
+            else:
+                time.sleep(0.1)  # parent returns fast; the escaped grandchild lingers
+        """)
+        with open(scriptfile, "w") as handle:
+            handle.write(script)
+        started = time.monotonic()
+        result = backend.execute(f"{sys.executable} {scriptfile}")
+        elapsed = time.monotonic() - started
+        # Bounded: parent (~0.1s) + drain-join grace (0.5s), nowhere near the 5s the
+        # escaped grandchild holds the pipe. Without the fix this would hang ~5s.
+        assert elapsed < 4
+        assert result.truncated is True  # drain abandoned -> flagged incomplete
+    finally:
+        backend.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink escape test uses POSIX symlinks")
+def test_file_api_rejects_a_symlink_escaping_the_root(tmp_path: object) -> None:
+    # A command (running in the leaf root) creates a symlink pointing OUTSIDE the
+    # root; the file API must reject a read through it (realpath guard) rather than
+    # follow it to the host, keeping the file APIs rooted even though shell execution
+    # itself is not sandboxed.
+    import pathlib
+
+    outside = pathlib.Path(str(tmp_path)) / "host-secret.txt"
+    outside.write_text("top secret")
+    backend = _backend()
+    try:
+        link = backend.execute(f"ln -s {str(outside)!r} escape.txt")
+        assert link.exit_code == 0
+        result = backend.read("/escape.txt")
+        assert result.error is not None
+        assert "symlink" in result.error or "escape" in result.error
+        # A read of the real file via its host path is also rejected (lexical + realpath).
+        assert backend.read(f"/{outside}").error is not None
+    finally:
+        backend.close()
