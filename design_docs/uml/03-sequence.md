@@ -182,3 +182,62 @@ sequenceDiagram
 ```
 
 **要点**:`on_span_begin` 全 span 类型、打开即发,**不**被 replay 抑制——故 cached 叶子也重发 begin、再配一条 `cached=True`、`duration_s≈0` 的完成 `Span`,渲染成即时命中而非卡住 running chip。`on_leaf_event` 只在 journal **miss** 走真叶子时挂 `LeafEventHandler`(命中走缓存路径根本不进 leaf runner),故**重放叶子零 interior 事件**——replay 策略随控制流自落、无需额外开关。关联靠 handler 实例**构造时闭包持有的 `leaf_span_id`**,不靠 metadata 继承(deepagents subagent 边界丢弃 metadata,只转发 `callbacks`/`tags`/`configurable`)。两条边皆走带外、不进宿主 LLM 上下文(quarantine 保持);`detail` 默认 shape-only,原始 payload 仅 `leaf_event_include_payloads=True` 时带、截断有界。`span_id` 顺序深度-0 path resume 稳定(同源序重放 + 序号每 run 重置),扇出 span 因打开顺序随墙钟不担保。
+
+## F — 真本地执行后端（M5:工厂 → lease → 守卫复合 → execute 准入/spawn/抽干/超时组杀 → teardown）
+
+```mermaid
+sequenceDiagram
+  participant H as host (build-time)
+  participant SM as SandboxManager
+  participant F as SandboxFactory (local_subprocess_factory)
+  participant B as LocalSubprocessSandbox (per-leaf 临时根)
+  participant GB as _GuardedBackend / CompositeBackend
+  participant DA as leaf deepagents (aexecute → to_thread)
+  participant EG as ExecGate (threading.BoundedSemaphore, 一工厂一闸)
+  participant BE as before_execute (准入钩子)
+  participant P as Popen 子进程 (+ POSIX 进程组)
+  participant DR as drain worker 线程
+
+  Note over H,SM: build-time opt-in (危险, 非安全 sandbox)
+  H->>SM: SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))
+  SM->>F: 构造期建一只共享 exec_gate(max_concurrent_execs)
+
+  Note over SM,B: 执行叶 lease (needs_execution=True)
+  SM->>F: _new_sandbox(leaf_id) → factory(leaf_id)
+  F->>B: LocalSubprocessSandbox(identity, policy, exec_gate) — mkdtemp 临时根
+  SM->>GB: build_leaf_backend(isolated=B, /shared/ → SharedArtifactStore)
+  Note over GB: 引擎 lease/teardown 路径不变; isinstance(B, SandboxBackendProtocol) 闸已纳
+
+  Note over DA,P: 叶子调 execute (跑在 to_thread worker 上, 同步体)
+  DA->>GB: execute(command) → 委派 _isolated.execute
+  GB->>B: execute(command, *, timeout)
+  B->>EG: acquire() (finally 必 release; 与叶级 ConcurrencyGate 正交)
+  B->>BE: before_execute(ExecRequest(command, timeout, leaf_id))
+  alt reject — 不 spawn
+    BE-->>B: ExecDecision(outcome=reject, reason)
+    B-->>GB: ExecuteResponse(reason, exit_code=126, truncated=False)
+  else allow — 真 spawn
+    BE-->>B: ExecDecision(allow [可缩超时/降 cap/选 RLimitProfile])
+    B->>B: 解析有效超时(取最紧) / output cap / rlimits
+    B->>P: Popen(cwd=临时根, stdout=PIPE, stderr=STDOUT, start_new_session=POSIX) [POSIX 经子 wrapper setrlimit→execvp /bin/sh]
+    B->>DR: 起 drain worker — 分块读, 过 cap 标 truncated + 续读到 EOF (防满管道)
+    B->>P: proc.wait(有效超时) (调用线程)
+    alt 超时
+      B->>P: killpg SIGTERM → grace 窗 → killpg SIGKILL (整组连子孙; 码 124)
+    else 干净退出
+      P-->>B: returncode
+    end
+    B->>P: finally reap proc.wait() + join drain + close pipe (无僵尸/孤儿/漏线程/漏 fd)
+    DR-->>B: (output, truncated)
+    B-->>GB: ExecuteResponse(output, exit_code [124 超时 否则 returncode], truncated)
+  end
+  B->>EG: release() (finally)
+  GB-->>DA: ExecuteResponse
+  Note over DA: 命令文本/输出可观测性复用 M1 on_leaf_event 工具边 (无新命令汇, 岔口 0)
+
+  Note over SM,B: teardown / eviction
+  SM->>B: stop(leaf_id) / reclaim_idle / _evict_one_idle → _close_backend → close()
+  B->>B: shutil.rmtree(临时根) (幂等; 子进程已在每次 execute reap)
+```
+
+**要点**:**执行变真无需改引擎**——只需 build-time 注入工厂;lease/`_GuardedBackend`/teardown 路径原样复用(`_GuardedBackend.execute` 已委派被租隔离后端、`isinstance(SandboxBackendProtocol)` 闸已纳)。`execute` 跑在 deepagents 的 `aexecute → to_thread(self.execute)` worker 上,故 `ExecGate` 是**跨线程** `threading.BoundedSemaphore`(`finally` 必还闸位)、与叶级 asyncio `ConcurrencyGate` **正交**;一工厂一闸 ⇒ 一 run 并发 exec 上限全局。`before_execute` 是**准入控制**(allow / reject 返 126 不 spawn / 缩超时只可收紧 / 降 cap / 选 `RLimitProfile`),非可观测性 sink。有界抽干跑在 worker、调用线程 `wait(超时)`:超时则 POSIX `killpg` SIGTERM→grace→SIGKILL 整组杀(`start_new_session` 连子孙)、码 124;每路 `finally` reap + join + close,**无僵尸/孤儿/漏线程/漏 fd**。rlimit 经**子 wrapper**(`setrlimit` 后 `os.execvp`)非 `preexec_fn`,默认 generous-but-bounded profile ON(POSIX;Windows best-effort 无 rlimit/无进程组)。teardown `close()` 删临时根、幂等。诚实非目标:per-leaf 临时根只界定默认工作目录、**非安全 sandbox**(命令仍能经绝对路径读写宿主 FS / 用网络 / 超 best-effort rlimit 耗资源);container/cgroup/网络隔离与真 git-worktree 后端在 backlog。
