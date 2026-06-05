@@ -41,6 +41,7 @@ from ._journal import (
 from ._journal import (
     JournalRecord as JournalRecord,  # re-exported for Layer-2 persistence on the public wall
 )
+from ._leaf_events import LeafEventHandler, LeafEventSink
 from ._observability import SpanBeginSink, SpanRecorder, SpanSink
 from ._progress import ProgressEntry, ProgressLog, ProgressSink
 from ._roster import Roster
@@ -68,6 +69,8 @@ async def run_workflow(
     on_progress: ProgressSink | None = None,
     on_span: SpanSink | None = None,
     on_span_begin: SpanBeginSink | None = None,
+    on_leaf_event: LeafEventSink | None = None,
+    leaf_event_include_payloads: bool = False,
     sandbox_manager: SandboxManager | None = None,
     workflows: WorkflowResolver | None = None,
 ) -> Any:
@@ -107,6 +110,19 @@ async def run_workflow(
             and its matching end span is flagged ``cached=True`` with a near-zero
             duration, so a cached leaf renders as an instant replayed hit rather than
             a stuck "running" chip. When omitted, begin recording is a silent no-op.
+        on_leaf_event: Optional sink receiving a ``LeafEvent`` for each runtime edge
+            in a leaf's own callback subtree (its model calls, tool calls, nested
+            sub-agent steps), correlated to the owning leaf via ``leaf_span_id`` and
+            reconstructable into the in-leaf run tree via ``run_id`` /
+            ``parent_run_id``. Events are delivered out-of-band and never injected
+            into the host LLM's context, so quarantine is preserved. The tap fires
+            only on real execution: a leaf served from the journal runs no interior,
+            so a replayed leaf emits no leaf events. When omitted, no per-leaf tap is
+            attached (zero cost).
+        leaf_event_include_payloads: When ``True``, each ``LeafEvent``'s ``detail``
+            carries bounded raw payloads (truncated tool input/output, model text);
+            the default ``False`` keeps ``detail`` shape-only (node kind/name/timing),
+            so leaf internals are not streamed unless the caller opts in.
         sandbox_manager: Optional per-leaf sandbox lifecycle manager. When
             supplied, a leaf whose roster entry is ``needs_execution`` is leased an
             isolated execution backend (keyed by its derived, resume-stable
@@ -194,8 +210,23 @@ async def run_workflow(
             configurable["model"] = model
 
         async def _invoke() -> dict[str, Any]:
+            callbacks: list[Any] = [usage_handler]
+            # Attach the per-leaf event tap on the SAME callbacks list deepagents
+            # forwards to subagents, so the whole leaf subtree is observed. The
+            # handler closes over THIS leaf's span id for correlation; metadata is
+            # not used (the subagent boundary drops it). It is attached only on real
+            # execution -- _invoke runs only on a journal miss, so a journal hit
+            # never emits interior events.
+            if on_leaf_event is not None and leaf_span_id:
+                callbacks.append(
+                    LeafEventHandler(
+                        leaf_span_id=leaf_span_id,
+                        sink=on_leaf_event,
+                        include_payloads=leaf_event_include_payloads,
+                    )
+                )
             leaf_config: RunnableConfig = {
-                "callbacks": [usage_handler],
+                "callbacks": callbacks,
                 "configurable": configurable,
             }
             state: dict[str, Any] = await runnable.ainvoke(

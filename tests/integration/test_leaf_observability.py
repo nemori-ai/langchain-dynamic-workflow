@@ -125,3 +125,120 @@ async def test_cached_leaf_emits_begin_marked_cached_on_resume(
     # Same id correlates the running edge with the (now cached) completion.
     assert agent_begin.span_id == agent_end.span_id
     assert agent_end.attributes["cached"] is True
+
+
+async def test_leaf_event_correlates_to_owning_leaf_span_id(
+    make_deep_leaf: Callable[[str], tuple[Runnable[Any, Any], Any]],
+) -> None:
+    # A real deepagent leaf fires its own callback subtree (chain + chat_model
+    # edges). Each LeafEvent must carry the owning leaf's span_id (the AGENT span's
+    # id from the begin edge) and a run-tree node id, so a consumer can file the
+    # subtree under the right leaf and rebuild the tree from parent_run_id.
+    from langchain_dynamic_workflow import LeafEvent
+
+    leaf, _model = make_deep_leaf("done")
+    roster = Roster().register("worker", leaf)
+    begins: list[SpanBegin] = []
+    leaf_events: list[LeafEvent] = []
+
+    async def orchestrate(ctx: Ctx) -> str:
+        return await ctx.agent("go", agent_type="worker")
+
+    await run_workflow(
+        orchestrate,
+        roster=roster,
+        on_span_begin=begins.append,
+        on_leaf_event=leaf_events.append,
+    )
+
+    agent_begin = next(b for b in begins if b.kind is SpanKind.AGENT)
+    assert leaf_events, "a real deepagent leaf must fire interior callback events"
+    # Every leaf event is correlated to the single AGENT leaf's span id.
+    assert {e.leaf_span_id for e in leaf_events} == {agent_begin.span_id}
+    # The subtree carries at least one chat_model edge (the leaf called its model).
+    assert any(e.kind == "chat_model" for e in leaf_events)
+    # Run-tree shape (REAL assertion, no "or True"): at least one event roots the
+    # subtree (parent_run_id is None) and every non-root parent_run_id closes the
+    # tree by referencing a run_id we actually emitted.
+    run_ids = {e.run_id for e in leaf_events}
+    assert any(e.parent_run_id is None for e in leaf_events)
+    assert all(e.parent_run_id in run_ids for e in leaf_events if e.parent_run_id is not None)
+
+
+async def test_on_leaf_event_does_not_fire_on_a_journal_hit(
+    make_deep_leaf: Callable[[str], tuple[Runnable[Any, Any], Any]],
+) -> None:
+    # LOCKED replay policy: no leaf interior runs on a journal hit, so on_leaf_event
+    # MUST stay silent on resume for a replayed leaf -- else resume double-renders
+    # activity that never ran.
+    from langchain_dynamic_workflow import LeafEvent
+
+    leaf, model = make_deep_leaf("done")
+    roster = Roster().register("worker", leaf)
+    journal = InMemoryJournalStore()
+
+    async def orchestrate(ctx: Ctx) -> str:
+        return await ctx.agent("go", agent_type="worker")
+
+    first: list[LeafEvent] = []
+    await run_workflow(orchestrate, roster=roster, journal=journal, on_leaf_event=first.append)
+    assert first, "the fresh run's leaf fires interior events"
+    fresh_calls = model.calls
+
+    second: list[LeafEvent] = []
+    await run_workflow(orchestrate, roster=roster, journal=journal, on_leaf_event=second.append)
+    assert model.calls == fresh_calls  # replayed: no fresh model call
+    assert second == []  # NO interior events on the journal hit
+
+
+async def test_sinks_default_none_is_zero_cost_and_quarantine_byte_identical(
+    make_deep_leaf: Callable[[str], tuple[Runnable[Any, Any], Any]],
+) -> None:
+    # Default-None sinks => no handler attached => the leaf's host-facing result is
+    # byte-identical with and without the observability sinks (quarantine preserved:
+    # the sinks never touch the folded result or the host context).
+    from langchain_dynamic_workflow import LeafEvent
+
+    leaf_a, _ = make_deep_leaf("identical-result")
+    leaf_b, _ = make_deep_leaf("identical-result")
+
+    async def orchestrate(ctx: Ctx) -> str:
+        return await ctx.agent("go", agent_type="worker")
+
+    without = await run_workflow(orchestrate, roster=Roster().register("worker", leaf_a))
+    events: list[LeafEvent] = []
+    begins: list[SpanBegin] = []
+    with_sinks = await run_workflow(
+        orchestrate,
+        roster=Roster().register("worker", leaf_b),
+        on_span_begin=begins.append,
+        on_leaf_event=events.append,
+    )
+    assert without == with_sinks  # folded result is identical; sinks are out-of-band
+
+
+async def test_payload_opt_in_surfaces_model_text_in_detail(
+    make_deep_leaf: Callable[[str], tuple[Runnable[Any, Any], Any]],
+) -> None:
+    from langchain_dynamic_workflow import LeafEvent
+
+    leaf, _ = make_deep_leaf("VISIBLE-PAYLOAD")
+    roster = Roster().register("worker", leaf)
+
+    shape_only: list[LeafEvent] = []
+    await run_workflow(orchestrate=_solo, roster=roster, on_leaf_event=shape_only.append)
+    assert all("VISIBLE-PAYLOAD" not in str(e.detail) for e in shape_only)
+
+    leaf2, _ = make_deep_leaf("VISIBLE-PAYLOAD")
+    with_payload: list[LeafEvent] = []
+    await run_workflow(
+        orchestrate=_solo,
+        roster=Roster().register("worker", leaf2),
+        on_leaf_event=with_payload.append,
+        leaf_event_include_payloads=True,
+    )
+    assert any("VISIBLE-PAYLOAD" in str(e.detail) for e in with_payload)
+
+
+async def _solo(ctx: Ctx) -> str:
+    return await ctx.agent("go", agent_type="worker")
