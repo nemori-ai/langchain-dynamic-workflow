@@ -42,6 +42,9 @@ EXIT_TIMEOUT = 124
 EXIT_REJECTED = 126
 """Exit-code sentinel reported when admission control rejects a command unspawned."""
 
+_DEFAULT_REJECT_REASON = "execution rejected by policy"
+"""Output text used when admission rejects a command without giving a reason."""
+
 _DRAIN_CHUNK_BYTES = 65536
 """Read granularity for the bounded output drain, in bytes."""
 
@@ -288,6 +291,17 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """Run ``command`` as a real subprocess in this backend's temp root.
 
+        Admission is gated twice. First the shared exec gate bounds the number of
+        concurrent ``execute`` calls across every backend produced by one factory
+        (the per-run cap). This is a *distinct* bound from the leaf concurrency
+        gate, which bounds in-flight leaves on the event loop: one leaf can fire
+        many ``execute`` calls, and several runs share the host, so the exec gate
+        is a cross-thread :class:`threading.BoundedSemaphore` acquired here in the
+        synchronous body, not the asyncio leaf gate. The slot is always returned
+        in a ``finally`` so a timeout or exception cannot leak it. After the slot
+        is held, the admission hook decides whether to spawn at all; a rejection
+        returns the rejection sentinel without launching a process.
+
         The command runs through the system shell with its working directory set
         to :attr:`root_path`. On POSIX the child starts a new session so the
         whole process group can be terminated together. The combined stdout and
@@ -318,6 +332,44 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
             An :class:`ExecuteResponse` with the bounded combined output, exit
             code, and a truncation flag.
         """
+        # The shared exec gate bounds concurrent executions per run; hold it for
+        # the whole spawn-and-wait and release it in a finally so a timeout or an
+        # unexpected error can never strand a slot.
+        self._exec_gate.acquire()
+        try:
+            return self._execute_admitted(command, timeout=timeout)
+        finally:
+            self._exec_gate.release()
+
+    def _execute_admitted(self, command: str, *, timeout: int | None) -> ExecuteResponse:
+        """Run ``command`` while holding the exec-gate slot.
+
+        The admission hook is consulted first (the slot is already held, so the
+        hook can observe true in-flight concurrency). A rejection short-circuits
+        without spawning. Otherwise the command is spawned, drained, and timed
+        out exactly as :meth:`execute` documents.
+
+        Args:
+            command: The full shell command string to run.
+            timeout: The per-call timeout, or ``None`` to defer to the policy
+                default.
+
+        Returns:
+            The execution response, or the rejection sentinel when admission
+            refused the command.
+        """
+        request = ExecRequest(command=command, timeout=timeout, leaf_id=self._identity)
+        decision = (
+            self._policy.before_execute(request)
+            if self._policy.before_execute is not None
+            else ExecDecision()
+        )
+        if decision.outcome == "reject":
+            return ExecuteResponse(
+                output=decision.reason or _DEFAULT_REJECT_REASON,
+                exit_code=EXIT_REJECTED,
+                truncated=False,
+            )
         output_cap_bytes = self._policy.output_cap_bytes
         effective_timeout = timeout if timeout is not None else self._policy.default_timeout
         proc = subprocess.Popen(

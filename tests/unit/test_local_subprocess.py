@@ -19,7 +19,9 @@ import time
 import pytest
 
 from langchain_dynamic_workflow._local_subprocess import (
+    ExecDecision,
     ExecPolicy,
+    ExecRequest,
     LocalSubprocessSandbox,
 )
 
@@ -126,5 +128,73 @@ def test_timeout_kills_the_whole_process_group_no_orphan() -> None:
             grandchild_pid = int(handle.read())
         with pytest.raises(ProcessLookupError):
             os.kill(grandchild_pid, 0)  # 0 = liveness probe; raises if gone
+    finally:
+        backend.close()
+
+
+def test_exec_gate_bounds_concurrent_executions() -> None:
+    # A shared gate of 2 across 6 contending threads must never let more than 2
+    # children run at once. Concurrency is measured at admission time (after the
+    # gate is acquired, via before_execute) and released after execute returns.
+    # The decrement happens after the gate slot is already returned, so it can
+    # only OVER-count overlap, never under-count it — which makes `peak <= 2` a
+    # strict, real guarantee rather than a filler assertion.
+    gate = threading.BoundedSemaphore(2)
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+
+    def probe(_req: ExecRequest) -> ExecDecision:
+        nonlocal in_flight, peak
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        return ExecDecision()
+
+    backend = LocalSubprocessSandbox(
+        identity="leaf-c",
+        policy=ExecPolicy(default_timeout=10, before_execute=probe),
+        exec_gate=gate,
+    )
+
+    def run() -> None:
+        nonlocal in_flight
+        try:
+            # A short sleep so true overlap is observable if the gate failed.
+            backend.execute(f'{sys.executable} -c "import time; time.sleep(0.3)"')
+        finally:
+            with lock:
+                in_flight -= 1
+
+    threads = [threading.Thread(target=run, name=f"ldw-exec-{i}") for i in range(6)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert peak <= 2  # the gate held the bound under contention
+        assert peak >= 1  # at least one exec actually admitted (sanity)
+    finally:
+        backend.close()
+
+
+def test_exec_gate_slot_is_released_after_a_timeout() -> None:
+    # A timed-out exec must still return its gate slot, or a single-slot gate
+    # would deadlock the next exec forever. With a gate of 1, a 1s-timeout sleeper
+    # followed by a fast command must both complete bounded in time.
+    gate = threading.BoundedSemaphore(1)
+    backend = LocalSubprocessSandbox(
+        identity="leaf-timeout-release",
+        policy=ExecPolicy(default_timeout=1, grace_seconds=0.5),
+        exec_gate=gate,
+    )
+    try:
+        slow = backend.execute(f'{sys.executable} -c "import time; time.sleep(30)"')
+        assert slow.exit_code == 124  # timed out and (the point) released its slot
+        started = time.monotonic()
+        fast = backend.execute(f'{sys.executable} -c "print(7)"')
+        assert "7" in fast.output
+        assert fast.exit_code == 0
+        assert time.monotonic() - started < 10  # not blocked on a leaked slot
     finally:
         backend.close()
