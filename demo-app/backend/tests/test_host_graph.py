@@ -304,12 +304,12 @@ async def test_resume_clears_stale_drill_in_subtree_with_checkpointer() -> None:
     honesty caveat, verified the way the frontend renders it (the final thread-state
     ``ui`` channel), not via a stream scan that would replay turn 1's accumulated state.
     """
-    from host_graph import _RESUME_LANES, make_host_graph
+    from host_graph import _RESUME_LANES, _build_host_graph
     from langchain_core.messages import HumanMessage
     from langgraph.checkpoint.memory import InMemorySaver
 
     _RESUME_LANES.clear()
-    graph = make_host_graph(checkpointer=InMemorySaver())
+    graph = _build_host_graph(checkpointer=InMemorySaver())
     cfg = {"configurable": {"thread_id": "test-resume-clears-stale-subtree"}}
 
     first = await graph.ainvoke(
