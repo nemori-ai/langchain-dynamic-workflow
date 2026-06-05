@@ -14,6 +14,7 @@ start/end edge genuinely fires — not a fallback that bypasses the tool.
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -71,13 +72,17 @@ async def test_real_leaf_emits_begin_before_completion_and_correlated_leaf_event
         on_span=ends.append,
         on_leaf_event=events.append,
     )
+    completion_ts = time.time()
     assert "3,200,000" in result or "3200000" in result.replace(",", "")
 
     # Headline 1: the running edge fired, before the completion, with a shared id.
     agent_begin = next(b for b in begins if b.kind is SpanKind.AGENT)
     agent_end = next(e for e in ends if e.kind is SpanKind.AGENT)
     assert agent_begin.span_id == agent_end.span_id
-    assert agent_begin.started_at <= agent_end.duration_s + agent_begin.started_at
+    # The begin edge's wall-clock (stamped at span-open, mid-run) precedes the moment
+    # the run was observed to complete -- the running edge genuinely fired first.
+    assert agent_begin.started_at > 0.0
+    assert agent_begin.started_at <= completion_ts
 
     # Headline 2: real interior events arrived, correlated, with a real tool call.
     assert events, "a real leaf must fire interior callback events"

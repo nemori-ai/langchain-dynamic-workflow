@@ -16,6 +16,7 @@ from langchain_core.runnables import Runnable
 from langchain_dynamic_workflow import (
     Ctx,
     InMemoryJournalStore,
+    RaceCandidate,
     Roster,
     Span,
     SpanBegin,
@@ -42,6 +43,11 @@ async def test_begin_fires_before_end_for_every_span_kind(
             return await ctx.agent(f"s{item}", agent_type="researcher")
 
         await ctx.pipeline(["x"], stage)
+        await ctx.race(
+            [RaceCandidate(prompt="r", agent_type="researcher")],
+            win=lambda _text: True,
+            win_tag="every-kind",
+        )
         return "ok"
 
     await run_workflow(
@@ -55,6 +61,7 @@ async def test_begin_fires_before_end_for_every_span_kind(
     assert SpanKind.AGENT in begin_kinds
     assert SpanKind.PARALLEL in begin_kinds
     assert SpanKind.PIPELINE in begin_kinds
+    assert SpanKind.RACE in begin_kinds
     # Every end span has a matching begin with the same id (begin precedes end).
     begin_ids = {b.span_id for b in begins}
     end_ids = {e.span_id for e in ends}
