@@ -25,17 +25,20 @@ is an explicit, host-constructed opt-in.
 from __future__ import annotations
 
 import fnmatch
-import json
 import os
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import IO, Literal
+
+try:
+    import resource
+except ModuleNotFoundError:  # pragma: no cover - non-POSIX has no resource module
+    resource = None  # type: ignore[assignment]
 
 from deepagents.backends.protocol import (
     FILE_NOT_FOUND,
@@ -67,41 +70,6 @@ _DEFAULT_REJECT_REASON = "execution rejected by policy"
 _DRAIN_CHUNK_BYTES = 65536
 """Read granularity for the bounded output drain, in bytes."""
 
-_RLIMIT_WRAPPER_SOURCE = """\
-import json, os, resource, sys
-
-_RLIMITS = {
-    "cpu_seconds": resource.RLIMIT_CPU,
-    "address_space_bytes": resource.RLIMIT_AS,
-    "file_size_bytes": resource.RLIMIT_FSIZE,
-    "open_files": resource.RLIMIT_NOFILE,
-    "processes": resource.RLIMIT_NPROC,
-}
-profile = json.loads(sys.argv[1])
-command = sys.argv[2]
-for field_name, value in profile.items():
-    rlimit = _RLIMITS.get(field_name)
-    if rlimit is None or value is None:
-        continue
-    try:
-        _, hard = resource.getrlimit(rlimit)
-        unbounded = hard == resource.RLIM_INFINITY
-        new_hard = hard if unbounded or hard >= value else hard
-        new_soft = value if unbounded or value <= new_hard else new_hard
-        resource.setrlimit(rlimit, (new_soft, new_hard))
-    except (OSError, ValueError):
-        # Best-effort: a limit the kernel refuses (for example RLIMIT_AS on
-        # Darwin) is skipped rather than aborting the whole command.
-        pass
-os.execvp("/bin/sh", ["/bin/sh", "-c", command])
-"""
-"""Child-side source that applies POSIX rlimits then execs the shell command.
-
-Run as ``python -c <source> <json-profile> <command>`` so the limits are set in
-the child before the shell takes over, without the thread-unsafe ``preexec_fn``.
-After ``os.execvp`` the shell keeps this process's pid and session, so the
-process-group termination on timeout still reaches it and its descendants.
-"""
 
 ExecOutcome = Literal["allow", "reject"]
 """Whether an admission decision permits (``"allow"``) or refuses (``"reject"``)."""
@@ -128,10 +96,12 @@ class RLimitProfile:
     """POSIX resource limits applied in the child before exec (best-effort).
 
     Each ``None`` field leaves that limit unset. The limits are applied via
-    ``resource.setrlimit`` in a child wrapper (not ``preexec_fn``), which is the
-    thread-safe choice in a ``to_thread`` execution runtime. A limit the kernel
-    refuses (for example ``RLIMIT_AS`` on Darwin) is skipped best-effort rather
-    than aborting the command. The default values are generous enough not to
+    ``resource.setrlimit`` in a minimal ``preexec_fn`` (run in the child between
+    fork and exec); the soft/hard values are pre-computed in the parent so the
+    child body allocates nothing, which keeps the hook safe in a ``to_thread``
+    execution runtime. A limit the kernel refuses (for example ``RLIMIT_AS`` on
+    Darwin) is skipped best-effort rather than aborting the command. The default
+    values are generous enough not to
     break a typical build or test command yet low enough to stop a runaway from
     exhausting the host:
 
@@ -295,13 +265,22 @@ def _terminate_process_tree(proc: subprocess.Popen[bytes], grace_seconds: float)
         except ProcessLookupError:
             return
     else:
-        proc.terminate()
+        # Non-POSIX: best-effort, and (like the POSIX branch) tolerate a process that
+        # already exited between the check and the signal — an OSError there must not
+        # turn a handled timeout into a raised error.
+        try:
+            proc.terminate()
+        except OSError:
+            return
         try:
             proc.wait(timeout=grace_seconds)
             return
         except subprocess.TimeoutExpired:
             pass
-        proc.kill()
+        try:
+            proc.kill()
+        except OSError:
+            return
 
 
 def _resolve_effective_timeout(
@@ -331,36 +310,84 @@ def _resolve_effective_timeout(
     return min(candidates)
 
 
-def _build_spawn_command(command: str, rlimits: RLimitProfile) -> str | list[str]:
-    """Build the ``Popen`` target that runs ``command`` under ``rlimits``.
+def _build_rlimit_setters(rlimits: RLimitProfile) -> list[tuple[int, tuple[int, int]]]:
+    """Pre-compute ``(rlimit_id, (soft, hard))`` pairs in the PARENT process.
 
-    On POSIX the command is launched through a small child wrapper
-    (``python -c <wrapper> <json-profile> <command>``) that applies the resource
-    limits in the child before ``os.execvp``-ing the shell — the thread-safe
-    alternative to ``preexec_fn`` in a ``to_thread`` runtime. The wrapper keeps
-    the process's pid and session, so the timeout's process-group termination
-    still reaches it. When the profile carries no limit at all the wrapper is
-    skipped and the shell runs directly. On non-POSIX platforms resource limits
-    are unavailable, so the command always runs directly through the shell.
+    Doing the ``getrlimit`` reads and the soft/hard arithmetic here, before the
+    fork, keeps the child-side ``preexec_fn`` minimal: it only calls
+    ``resource.setrlimit`` on a ready-made list, with no allocation, import, or
+    lock acquisition. That is what makes a ``preexec_fn`` safe to run between fork
+    and exec even though the parent is multi-threaded — each ``execute`` already
+    runs on its own ``to_thread`` worker that forks then immediately execs, and the
+    child touches nothing another thread could hold a lock on. Applying the limits
+    in-process this way (no extra ``python -c`` helper) keeps a full interpreter
+    start-up off every command's critical path.
+
+    The hard cap is lowered to the requested value only when the inherited hard cap
+    is finite and not already below it; otherwise the inherited hard cap is kept (a
+    process cannot raise its own hard cap). The soft cap never exceeds the resulting
+    hard cap. Limits the kernel refuses (for example ``RLIMIT_AS`` on Darwin) are
+    skipped, best-effort, rather than aborting the command.
 
     Args:
-        command: The shell command string to run.
-        rlimits: The resource-limit profile to apply (POSIX only).
+        rlimits: The resource-limit profile to apply.
 
     Returns:
-        Either the bare command string (run with ``shell=True``) or an argv list
-        for the rlimit wrapper (run with ``shell=False``).
+        A list of ``(rlimit_id, (soft, hard))`` pairs; empty on non-POSIX.
     """
-    profile = {name: value for name, value in asdict(rlimits).items() if value is not None}
-    if os.name != "posix" or not profile:
-        return command
-    return [
-        sys.executable,
-        "-c",
-        _RLIMIT_WRAPPER_SOURCE,
-        json.dumps(profile),
-        command,
-    ]
+    if resource is None:  # non-POSIX: no resource limits
+        return []
+    # resource is narrowed non-None below; RLIMIT_* ids exist only on POSIX.
+    constants = {
+        "cpu_seconds": resource.RLIMIT_CPU,
+        "address_space_bytes": resource.RLIMIT_AS,
+        "file_size_bytes": resource.RLIMIT_FSIZE,
+        "open_files": resource.RLIMIT_NOFILE,
+        "processes": resource.RLIMIT_NPROC,
+    }
+    setters: list[tuple[int, tuple[int, int]]] = []
+    for field_name, value in asdict(rlimits).items():
+        rlimit = constants.get(field_name)
+        if rlimit is None or value is None:
+            continue
+        try:
+            _, hard = resource.getrlimit(rlimit)
+        except (OSError, ValueError):  # pragma: no cover - kernel refusal
+            continue
+        unbounded = hard == resource.RLIM_INFINITY
+        new_hard = value if (not unbounded and hard >= value) else hard
+        new_soft = value if unbounded else min(value, new_hard)
+        setters.append((rlimit, (new_soft, new_hard)))
+    return setters
+
+
+def _rlimit_preexec(setters: list[tuple[int, tuple[int, int]]]) -> Callable[[], None]:
+    """Return a minimal ``preexec_fn`` applying pre-computed rlimits in the child.
+
+    Runs between fork and exec. It only iterates the pre-built ``setters`` and calls
+    ``resource.setrlimit`` (a syscall) — deliberately no allocation, import, or lock,
+    so it is safe between fork and exec in the threaded ``to_thread`` runtime. A
+    limit the kernel refuses at set time is skipped rather than aborting the spawn.
+
+    Args:
+        setters: Pre-computed ``(rlimit_id, (soft, hard))`` pairs from
+            :func:`_build_rlimit_setters`.
+
+    Returns:
+        A zero-argument callable suitable for ``subprocess.Popen(preexec_fn=...)``.
+    """
+
+    def _apply() -> None:
+        for rlimit, pair in setters:
+            # Bare try/except (not contextlib.suppress) keeps this preexec_fn body
+            # allocation-light across the fork-then-exec window; a limit the kernel
+            # refuses at set time is skipped best-effort.
+            try:  # noqa: SIM105
+                resource.setrlimit(rlimit, pair)  # type: ignore[union-attr]
+            except (OSError, ValueError):
+                pass
+
+    return _apply
 
 
 def _canonical_segments(path: str) -> list[str]:
@@ -465,8 +492,9 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         The command runs through the system shell with its working directory set
         to :attr:`root_path`. On POSIX the child starts a new session so the
         whole process group can be terminated together, and the effective POSIX
-        resource limits are applied in a child wrapper before the shell takes
-        over. The combined stdout and stderr are drained up to the effective
+        resource limits are applied via a minimal ``preexec`` hook in the child
+        before the shell takes over. The combined stdout and stderr are drained up
+        to the effective
         output cap and returned as the response output, with the child's exit
         code as :attr:`ExecuteResponse.exit_code`.
 
@@ -545,14 +573,21 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
             default_timeout=self._policy.default_timeout,
         )
         rlimits = decision.rlimits or self._policy.rlimits
-        spawn_command = _build_spawn_command(command, rlimits)
+        # Apply POSIX rlimits via a minimal preexec_fn (set in the child between fork
+        # and exec) rather than a python -c wrapper, so no extra interpreter start-up
+        # precedes the command. The shell command runs directly under shell=True; the
+        # child still gets its own session (start_new_session) so the timeout's
+        # process-group kill reaches it and every descendant.
+        rlimit_setters = _build_rlimit_setters(rlimits)
+        preexec = _rlimit_preexec(rlimit_setters) if rlimit_setters else None
         proc = subprocess.Popen(
-            spawn_command,
-            shell=isinstance(spawn_command, str),
+            command,
+            shell=True,
             cwd=self._root,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=(os.name == "posix"),
+            preexec_fn=preexec,
         )
         # The drain runs on a worker so the calling thread can enforce the
         # deadline; the worker stores its result for the calling thread to read
