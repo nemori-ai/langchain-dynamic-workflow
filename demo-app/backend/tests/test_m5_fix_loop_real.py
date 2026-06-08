@@ -8,7 +8,7 @@ the tool and the preset. A clean pass that bypassed host tool-selection (calling
 ``fix_loop`` directly) would skip the very surface the demo ships, the anti-pattern the
 project's real-E2E discipline warns against; this routes through it.
 
-Driving ``make_host_graph().ainvoke(...)`` with the scenario message exercises the same
+Driving ``make_host_graph().astream(...)`` with the scenario message exercises the same
 chain ``langgraph dev`` runs for the button press: the host model reads the request,
 routes to the ``run_live`` tool with ``workflow="fix_loop"``, which runs the preset inline
 against the real roster + a real :class:`SandboxManager`, so a real ``code_fixer`` leaf
@@ -152,6 +152,42 @@ def _execution_command_props(ui_messages: list[dict[str, Any]]) -> list[dict[str
     ]
 
 
+def _iter_execution_command_props(chunk: Any) -> list[dict[str, Any]]:
+    """Recursively pull every ``execution_command`` event's props out of a stream chunk.
+
+    ``push_ui_message`` writes each Gen-UI message to the custom stream AS IT IS EMITTED, so
+    the transient begin (``running``) edge is observable here even though the end edge merges
+    over it in the final ui channel (begin + end share one ``event_id``; ``merge=True`` folds
+    the terminal fields onto the running card in place, so the final accumulated state retains
+    only the terminal status). Asserting ``running`` against the final state would be testing a
+    transient where it cannot survive — we read the live deliveries instead. The custom chunk
+    is the ``UIMessage`` dict (``{"type": "ui", "name", "props", ...}``); this walks the chunk
+    tolerantly so a minor shape variation does not silently drop the event.
+
+    Args:
+        chunk: One ``stream_mode="custom"`` chunk from the host graph's ``astream``.
+
+    Returns:
+        The props of every ``execution_command`` UIMessage nested anywhere in the chunk.
+    """
+    found: list[dict[str, Any]] = []
+
+    def _walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            props = obj.get("props")
+            if obj.get("name") == "execution_command" and isinstance(props, dict):
+                found.append(props)
+                return
+            for value in obj.values():
+                _walk(value)
+        elif isinstance(obj, (list, tuple)):
+            for value in obj:
+                _walk(value)
+
+    _walk(chunk)
+    return found
+
+
 async def test_real_model_fix_loop_through_host_graph_runs_bun_until_green(
     _real_fix_loop_setup: None,
 ) -> None:
@@ -175,12 +211,24 @@ async def test_real_model_fix_loop_through_host_graph_runs_bun_until_green(
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
     graph = make_host_graph()
-    out = await graph.ainvoke(
-        {"messages": [HumanMessage(content=_MAKE_IT_PASS_MESSAGE)]},
-        config={"configurable": {"thread_id": "t-m5-fix-loop-real-host"}},
-    )
+    config = {"configurable": {"thread_id": "t-m5-fix-loop-real-host"}}
+    inp = {"messages": [HumanMessage(content=_MAKE_IT_PASS_MESSAGE)]}
 
-    messages = out["messages"]
+    # STREAM the run (don't ainvoke) so the transient begin (running) edge is observable: a
+    # command's begin + end edges share an event_id and the end edge merges in place, so the
+    # final ui channel keeps only each card's terminal state. We collect every
+    # execution_command DELIVERED onto the host ui stream across the run, plus the final
+    # values snapshot for the message/tool assertions. (Single fresh turn, fresh thread — no
+    # resume replay, so the stream carries no stale-state confounder.)
+    streamed_command_props: list[dict[str, Any]] = []
+    final_state: dict[str, Any] = {}
+    async for mode, chunk in graph.astream(inp, config=config, stream_mode=["custom", "values"]):
+        if mode == "custom":
+            streamed_command_props.extend(_iter_execution_command_props(chunk))
+        elif mode == "values":
+            final_state = chunk
+
+    messages = final_state["messages"]
 
     # Headline 0a: the REAL host model selected the executable-verification preset. The
     # message names no preset, so a run_live tool call carrying workflow="fix_loop" proves
@@ -223,11 +271,13 @@ async def test_real_model_fix_loop_through_host_graph_runs_bun_until_green(
     )
 
     # The engine's on_command sink fired through the host UI surface: TerminalCard payloads
-    # land on the ui channel as execution_command events. An offline fake fixer runs no
-    # subprocess and would emit ZERO of these.
-    command_events = _execution_command_props(out.get("ui", []))
+    # delivered onto the host ui stream as execution_command events. An offline fake fixer
+    # runs no subprocess and would emit ZERO of these. Reading the STREAMED deliveries (not
+    # the merged final ui channel) keeps the transient begin (running) edge observable; we
+    # fall back to the final ui channel only if the custom stream surfaced nothing.
+    command_events = streamed_command_props or _execution_command_props(final_state.get("ui", []))
     assert command_events, (
-        "no execution_command events on the host ui channel: a real execution leaf must "
+        "no execution_command events on the host ui stream: a real execution leaf must "
         "shell out via its execute tool (an offline fake fixer runs none, and a direct "
         "fix_loop call that bypassed the host surface would never reach this channel)"
     )

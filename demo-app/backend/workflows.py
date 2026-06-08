@@ -27,6 +27,7 @@ from _models import cache_middleware, resolve_leaf_model, resolve_openrouter_key
 from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
+from langgraph.config import get_config
 from pydantic import BaseModel
 
 from langchain_dynamic_workflow import (
@@ -644,8 +645,12 @@ def _build_code_fixer(*, response_format: Any = None, api_key: str | None = None
         # into the leaf config under 'sandbox_backend'. A backend factory reads it at call
         # time (the backend is per-leaf, resolved at runtime, not at construction), so the
         # leaf's execute tool runs against the real LocalSubprocessSandbox.
-        def _backend_factory(runtime: Any) -> Any:
-            return runtime.config["configurable"]["sandbox_backend"]
+        def _backend_factory(_runtime: Any) -> Any:
+            # deepagents hands the factory a Runtime with no ``.config``; read the
+            # engine-leased per-leaf sandbox off the run-config contextvar via langgraph's
+            # get_config instead (the canonical pattern in the engine's real-exec test).
+            configurable = (get_config() or {}).get("configurable") or {}
+            return configurable["sandbox_backend"]
 
         return create_deep_agent(
             model=model,
