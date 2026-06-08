@@ -618,28 +618,53 @@ class Ctx:
                     leaf_span_id=span.span_id,
                 )
             )
+            # Authoritative changeset (R5): a real-git worktree execution leaf has its
+            # real `git diff` folded into the leaf state by the engine. When present
+            # it MUST be surfaced as the authoritative file source — the model's
+            # self-reported file bytes can never win over what the leaf actually wrote
+            # (mirroring M5's "gate on the real exit code, not the model's boolean").
+            # A schema-less worktree leaf would collect a diff it can never surface,
+            # so the boundary would be only half-closed; a worktree schema lacking the
+            # `files` field, or typing it as anything but dict[str, str], would either
+            # drop the diff or (under model_copy) journal a type-mismatched payload
+            # that crashes on a later resume. All three fail loud here, at fold time.
+            changeset = outcome.state.get(WORKTREE_CHANGESET_KEY)
             # With a schema, fold the validated structured object and journal its
             # canonical JSON; without one, fold the final text directly.
             folded_obj: str | BaseModel
             if structured_model is not None:
                 folded_obj = fold_structured(outcome.state, structured_model)
-                # Authoritative changeset (R5): a real-git worktree leaf has its real
-                # `git diff` folded into the leaf state by the engine. When present,
-                # override exactly the schema's `files` field with that on-disk truth
-                # so the model's self-reported file bytes can never win over what the
-                # leaf actually wrote — mirroring M5's "gate on the real exit code,
-                # not the model's boolean". Other metadata (summary, etc.) is kept.
-                # The override happens BEFORE model_dump_json, so the authoritative
-                # changeset is what gets journaled and replayed on resume.
-                changeset = outcome.state.get(WORKTREE_CHANGESET_KEY)
-                if changeset is not None and _WORKTREE_FILES_FIELD in type(folded_obj).model_fields:
-                    folded_obj = folded_obj.model_copy(update={_WORKTREE_FILES_FIELD: changeset})
+                if changeset is not None:
+                    if _WORKTREE_FILES_FIELD not in type(folded_obj).model_fields:
+                        raise ValueError(
+                            f"a git-worktree execution leaf (agent_type {agent_type!r}) must "
+                            f"declare a schema with a {_WORKTREE_FILES_FIELD!r}: dict[str, str] "
+                            "field to carry its authoritative changeset; the bound schema "
+                            f"{structured_model.__name__!r} has no such field"
+                        )
+                    # Override `files` THROUGH validation (not model_copy, which
+                    # bypasses it): a wrong-typed `files` field then fails loud here on
+                    # the first run, never journaling a payload that would crash on a
+                    # resume's model_validate_json.
+                    folded_obj = type(folded_obj).model_validate(
+                        {
+                            **folded_obj.model_dump(by_alias=False),
+                            _WORKTREE_FILES_FIELD: changeset,
+                        }
+                    )
                 # Dump by alias with round-trip semantics so a schema with field
                 # aliases survives resume: model_validate_json (the replay path)
                 # validates by alias by default, so the stored JSON must use aliases
                 # too. For alias-free models this is identical to a plain dump.
                 result_str = folded_obj.model_dump_json(by_alias=True, round_trip=True)
             else:
+                if changeset is not None:
+                    raise ValueError(
+                        f"a git-worktree execution leaf (agent_type {agent_type!r}) must declare a "
+                        f"schema with a {_WORKTREE_FILES_FIELD!r}: dict[str, str] field to carry "
+                        "its authoritative changeset (schema-less worktree leaves are not "
+                        "supported)"
+                    )
                 folded_obj = fold_result(outcome.state)
                 result_str = folded_obj
             # success-only: unreachable if the leaf raised. Usage is journaled so

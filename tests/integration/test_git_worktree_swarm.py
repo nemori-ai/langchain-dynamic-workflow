@@ -18,6 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pytest
 from deepagents.backends.protocol import SandboxBackendProtocol
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
@@ -187,6 +188,124 @@ async def test_engine_makes_real_git_diff_authoritative_over_model_self_report(
         assert patch.summary == "fixed the operator"
         # But the changeset is the DISK TRUTH (a + b), not the model's lie (a * b).
         assert patch.files == {"/calc.py": "def add(a, b):\n    return a + b\n"}
+    finally:
+        provider.cleanup_all()
+
+
+def _schemaless_fixer_builder(*, response_format: object = None) -> Runnable[Any, Any]:
+    """A git-worktree fixer that returns no schema (no `files` to carry the diff)."""
+
+    async def _call(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        backend = (config or {}).get("configurable", {})["sandbox_backend"]
+        await backend.aedit("/calc.py", "return a - b", "return a + b")
+        return {"messages": [*inp["messages"], AIMessage(content="done")]}
+
+    return RunnableLambda(_call)
+
+
+class _BadPatch(BaseModel):
+    """A worktree schema whose `files` field is the WRONG shape (list, not dict)."""
+
+    summary: str
+    files: list[str]
+
+
+def _bad_shape_fixer_builder(*, response_format: object = None) -> Runnable[Any, Any]:
+    async def _call(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        backend = (config or {}).get("configurable", {})["sandbox_backend"]
+        await backend.aedit("/calc.py", "return a - b", "return a + b")
+        return {
+            "messages": [*inp["messages"], AIMessage(content="done")],
+            "structured_response": _BadPatch(summary="x", files=["/calc.py"]),
+        }
+
+    return RunnableLambda(_call)
+
+
+async def test_schemaless_git_worktree_leaf_fails_loud(tmp_path: Path) -> None:
+    # H2: a schema-less worktree leaf collects a real diff that can never be
+    # surfaced (no `files` field to carry it). The R5 trust boundary would be only
+    # half-closed, so the engine must fail loud, not silently drop the changeset.
+    base = _make_base_repo(tmp_path, {"calc.py": "def add(a, b):\n    return a - b\n"})
+    provider = GitWorktreeProvider(base_repo=base)
+    manager = SandboxManager(git_worktree_provider=provider)
+    roster = Roster().register("fixer", builder=_schemaless_fixer_builder, needs_execution=True)
+
+    async def orchestrate(ctx: Ctx) -> str:
+        return await ctx.agent("fix", agent_type="fixer", isolation="worktree")
+
+    try:
+        with pytest.raises(ValueError, match="files"):
+            await run_workflow(
+                orchestrate, roster=roster, sandbox_manager=manager, thread_id="t-schemaless"
+            )
+    finally:
+        provider.cleanup_all()
+
+
+async def test_wrong_files_shape_fails_loud_at_fold_not_on_resume(tmp_path: Path) -> None:
+    # H1: a worktree schema whose `files` is list[str] must fail loud at FOLD on the
+    # first run (when the override is validated), not silently journal a type-
+    # mismatched payload that crashes only on a later resume's model_validate_json.
+    base = _make_base_repo(tmp_path, {"calc.py": "def add(a, b):\n    return a - b\n"})
+    provider = GitWorktreeProvider(base_repo=base)
+    manager = SandboxManager(git_worktree_provider=provider)
+    roster = Roster().register("fixer", builder=_bad_shape_fixer_builder, needs_execution=True)
+    journal = InMemoryJournalStore()
+
+    async def orchestrate(ctx: Ctx) -> _BadPatch:
+        return await ctx.agent("fix", agent_type="fixer", schema=_BadPatch, isolation="worktree")
+
+    try:
+        # FOLD-time failure on the FIRST run: pydantic's ValidationError (a ValueError
+        # subclass) surfaced loud at fold, not a silently journaled mismatch.
+        with pytest.raises(ValueError):
+            await run_workflow(
+                orchestrate,
+                roster=roster,
+                sandbox_manager=manager,
+                journal=journal,
+                thread_id="t-badshape",
+            )
+        # Success-only journaling: the bad payload never made it into the journal, so a
+        # later run re-raises at fold rather than serving a poisoned cache entry that
+        # would crash on model_validate_json. (A persisted bad payload would instead
+        # short-circuit and crash on the cached-restore path.)
+        with pytest.raises(ValueError):
+            await run_workflow(
+                orchestrate,
+                roster=roster,
+                sandbox_manager=manager,
+                journal=journal,
+                thread_id="t-badshape-2",
+            )
+    finally:
+        provider.cleanup_all()
+
+
+async def test_authoritative_changeset_survives_resume(tmp_path: Path) -> None:
+    # H1 happy path: the validated authoritative changeset is journaled and replayed
+    # byte-for-byte on resume (the override goes through validation, not model_copy).
+    base = _make_base_repo(tmp_path, {"calc.py": "def add(a, b):\n    return a - b\n"})
+    provider = GitWorktreeProvider(base_repo=base)
+    manager = SandboxManager(git_worktree_provider=provider)
+    roster = Roster().register("fixer", builder=_lying_fixer_builder, needs_execution=True)
+    journal = InMemoryJournalStore()
+
+    async def orchestrate(ctx: Ctx) -> _Patch:
+        return await ctx.agent("fix calc", agent_type="fixer", schema=_Patch, isolation="worktree")
+
+    try:
+        first = await run_workflow(
+            orchestrate, roster=roster, sandbox_manager=manager, journal=journal, thread_id="t-r1"
+        )
+        second = await run_workflow(
+            orchestrate, roster=roster, sandbox_manager=manager, journal=journal, thread_id="t-r2"
+        )
+        # Resume restores the authoritative (disk-truth) changeset, not the lie.
+        assert first.files == {"/calc.py": "def add(a, b):\n    return a + b\n"}
+        assert second.files == first.files
+        assert second.summary == first.summary
     finally:
         provider.cleanup_all()
 
