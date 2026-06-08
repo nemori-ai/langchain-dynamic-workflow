@@ -130,6 +130,32 @@ A run executes in the background and a completion notice is injected before the 
 
 > **Security boundary.** The gate plus the restricted namespace stop an honest model's slip — they are **not a security sandbox**, and a determined adversarial script can still escape. Submit only scripts the host authors itself; for adversarial input, run the engine behind an out-of-process isolation backend.
 
+> ## ⚠️ Real shell execution is a DANGEROUS opt-in — NOT a security sandbox
+>
+> By default, execution leaves use the offline in-memory backend and **run no real shell**. You can opt a `SandboxManager` into a real local-subprocess backend (`SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))`), which runs each leaf's shell command in a **private per-leaf temporary directory**. **This is not a security sandbox — read this before enabling it.**
+>
+> **What a command CAN still do — it runs as you, on your host:**
+> - **Read and write any host path via absolute paths.** The per-leaf temp directory bounds only the *default working directory*, not the reachable filesystem. `cat ~/.ssh/id_rsa` or `rm -rf /some/path` is fully within reach.
+> - **Use the network with your user's permissions** — exfiltrate, download, connect anywhere your account can.
+> - **Consume host resources beyond the best-effort POSIX `rlimit`s** — the limits are a runaway guard, not a hard cgroup-grade containment.
+>
+> **What it DOES guarantee** (resilience, not confinement):
+> - A private temp working directory per leaf — no accidental execution in the engine's own directory.
+> - The engine file APIs stay rooted, with `..` traversal rejected.
+> - A bounded effective timeout with best-effort process-group kill (SIGTERM → grace → SIGKILL on POSIX).
+> - Bounded combined stdout+stderr output (flagged when truncated).
+> - A bounded count of concurrent executions.
+>
+> **What it deliberately does NOT provide** (deferred sharp edges):
+> - Hard filesystem confinement (container / chroot / nsjail / firejail).
+> - Network-egress blocking.
+> - cgroup-grade CPU / memory / process containment.
+> - Strong orphan cleanup for processes that deliberately daemonize or escape the process group.
+>
+> **The single biggest risk is false security.** A per-leaf temp working directory *looks* isolated but is not. **Never run untrusted or adversarial commands through it.** For those, run the engine behind an out-of-process isolation backend (a container).
+>
+> **Windows is weaker still:** no `rlimit`s and no honest resource/security posture — only a timeout, an output cap, a temp working directory, best-effort termination, and the concurrency bound.
+
 ## Resume, budget, and observability
 
 `run_workflow` takes a few keyword-only knobs that compose:

@@ -24,6 +24,7 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Protocol, runtime_checkable
 
 from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.protocol import (
@@ -46,6 +47,7 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.state import StateBackend
 
+from ._local_subprocess import ExecPolicy, LocalSubprocessSandbox
 from ._worktree import WorktreeProvider
 
 SANDBOX_ID_PREFIX = "leaf"
@@ -53,6 +55,48 @@ SANDBOX_ID_PREFIX = "leaf"
 
 SHARED_ROUTE_PREFIX = "/shared/"
 """Route prefix that hands a leaf's files off to the shared artifact store."""
+
+SandboxFactory = Callable[[str], SandboxBackendProtocol]
+"""Builds a fresh per-leaf isolated backend from a leaf identity.
+
+The single seam through which the manager constructs a leaf's sandbox. The
+default produces an offline :class:`InMemorySandbox`; a host opts into real
+execution by passing a factory (for example :func:`local_subprocess_factory`)
+to :class:`SandboxManager`.
+"""
+
+
+def local_subprocess_factory(policy: ExecPolicy | None = None) -> SandboxFactory:
+    """Build a factory producing real local-subprocess backends sharing one gate.
+
+    Every backend the returned factory creates shares a single
+    :class:`threading.BoundedSemaphore`, so the policy's concurrent-execution cap
+    is global across all of one run's execution leaves rather than per leaf. The
+    semaphore is created once, when this function is called, and captured by the
+    returned closure; constructing one factory per :class:`SandboxManager`
+    therefore scopes the cap to that manager's run.
+
+    DANGEROUS OPT-IN — the produced backend runs real shell commands on the host
+    with the calling user's permissions and is not a security sandbox. See
+    :class:`LocalSubprocessSandbox` and the project README before enabling it.
+
+    Args:
+        policy: The resilience and admission policy applied to every produced
+            backend; ``None`` uses the default :class:`ExecPolicy`.
+
+    Returns:
+        A :data:`SandboxFactory` that maps a leaf identity to a fresh
+        :class:`LocalSubprocessSandbox` bound to the shared exec gate.
+    """
+    effective_policy = policy or ExecPolicy()
+    exec_gate = threading.BoundedSemaphore(effective_policy.max_concurrent_execs)
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        return LocalSubprocessSandbox(
+            identity=leaf_id, policy=effective_policy, exec_gate=exec_gate
+        )
+
+    return factory
 
 
 def normalize_path(path: str) -> str:
@@ -171,6 +215,15 @@ class InMemorySandbox(SandboxBackendProtocol):
     def id(self) -> str:
         """The owning leaf identity (unique per sandbox instance)."""
         return self._identity
+
+    def close(self) -> None:
+        """Release this sandbox's resources (a no-op for the in-memory backend).
+
+        The in-memory backend holds only an in-process dict, so there is nothing
+        to release. The method exists so the manager can call ``close`` uniformly
+        on teardown and eviction regardless of the concrete backend type, without
+        a per-call ``getattr`` probe. It is idempotent.
+        """
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """Run a shell command in the sandbox (offline no-op echo).
@@ -367,12 +420,46 @@ class InMemorySandbox(SandboxBackendProtocol):
         return responses
 
 
+@runtime_checkable
+class _Closeable(Protocol):
+    """A backend that releases host-side resources on teardown.
+
+    ``SandboxBackendProtocol`` itself declares no ``close``: an offline,
+    in-memory backend has nothing to release. A real backend (for example a
+    local-subprocess backend with a private temp directory and a possible
+    straggler process) does. This narrow protocol lets the manager release such a
+    backend on teardown and eviction without assuming the concrete type.
+    """
+
+    def close(self) -> None:
+        """Release the backend's resources (must be idempotent)."""
+        ...
+
+
+def _close_backend(backend: SandboxBackendProtocol) -> None:
+    """Release a backend's host-side resources if it supports closing.
+
+    A backend that exposes ``close`` (such as the real local-subprocess backend,
+    or the in-memory backend's no-op) has it called so a teardown or eviction
+    removes its temp directory and terminates any straggler process. A backend
+    without ``close`` is left untouched.
+
+    Args:
+        backend: The backend a freed slot held.
+    """
+    if isinstance(backend, _Closeable):
+        backend.close()
+
+
 @dataclass(slots=True)
 class _SandboxSlot:
     """Bookkeeping for one live sandbox: the backend plus its lifecycle clocks.
 
     Attributes:
-        sandbox: The isolated execution backend instance.
+        sandbox: The isolated execution backend instance. Typed at the protocol
+            level so a pluggable factory may produce any full-protocol backend
+            (for example a real local-subprocess backend) without the slot
+            assuming the in-memory concrete type.
         created_at: Monotonic timestamp when the sandbox was first created;
             drives the hard TTL (total-lifetime cap).
         last_used_at: Monotonic timestamp of the most recent lease release;
@@ -381,7 +468,7 @@ class _SandboxSlot:
             reclaimable only when idle (``in_use == 0``).
     """
 
-    sandbox: InMemorySandbox
+    sandbox: SandboxBackendProtocol
     created_at: float
     last_used_at: float
     in_use: int = field(default=0)
@@ -427,6 +514,11 @@ class SandboxManager:
             use, or ``None`` to disable the hard cap.
         clock: Monotonic time source (seconds); injectable for deterministic
             TTL testing. Defaults to :func:`time.monotonic`.
+        sandbox_factory: Builds each leaf's isolated backend from its identity.
+            ``None`` (the default) keeps the offline, zero-dependency behavior of
+            seeding a fresh :class:`InMemorySandbox`; a host opts into real
+            execution by passing a factory (for example the product of
+            :func:`local_subprocess_factory`).
     """
 
     def __init__(
@@ -437,6 +529,7 @@ class SandboxManager:
         hard_ttl: float | None = None,
         clock: Callable[[], float] = time.monotonic,
         worktree_provider: WorktreeProvider | None = None,
+        sandbox_factory: SandboxFactory | None = None,
     ) -> None:
         # Live execution sandboxes keyed by leaf identity. Reasoning leaves never
         # enter this map — that is what keeps active_count tied to execution work.
@@ -448,25 +541,35 @@ class SandboxManager:
         # Seeds + collects changesets for isolation="worktree" leaves; None keeps
         # worktree leaves as plain empty sandboxes (no seeding source).
         self._worktree_provider = worktree_provider
+        # The seam that constructs a leaf's backend. The default reproduces the
+        # prior behavior byte-for-byte (a fresh offline InMemorySandbox), so the
+        # zero-dependency offline path is unchanged unless a host injects one.
+        self._factory: SandboxFactory = sandbox_factory or (
+            lambda leaf_id: InMemorySandbox(identity=leaf_id)
+        )
         # Signalled whenever a slot frees, so a lease parked under backpressure
         # can wake and re-check for room rather than busy-spinning.
         self._slot_freed = asyncio.Condition()
 
-    def _new_sandbox(self, leaf_id: str, isolation: str) -> InMemorySandbox:
-        """Create a leaf's sandbox, seeding it from the worktree base when asked.
+    def _new_sandbox(self, leaf_id: str, isolation: str) -> SandboxBackendProtocol:
+        """Create a leaf's sandbox via the factory, seeding it when asked.
 
-        For ``isolation="worktree"`` with a configured provider the sandbox is
-        populated with an isolated copy of the base snapshot before the leaf runs;
-        otherwise it starts empty (the prior per-leaf behavior).
+        The configured factory builds the backend (the default produces a fresh
+        offline :class:`InMemorySandbox`). For ``isolation="worktree"`` with a
+        configured provider the new backend is then populated with an isolated
+        copy of the base snapshot before the leaf runs; otherwise it starts empty
+        (the prior per-leaf behavior). The worktree seeding uses ``upload_files``,
+        a :class:`SandboxBackendProtocol` method, so it applies to any backend the
+        factory returns.
 
         Args:
             leaf_id: The leaf's derived identity.
             isolation: ``"worktree"`` to seed from the base snapshot, else ``"shared"``.
 
         Returns:
-            The new, possibly-seeded :class:`InMemorySandbox`.
+            The new, possibly-seeded backend.
         """
-        sandbox = InMemorySandbox(identity=leaf_id)
+        sandbox = self._factory(leaf_id)
         if isolation == "worktree" and self._worktree_provider is not None:
             seed = self._worktree_provider.seed(leaf_id)
             if seed:
@@ -497,6 +600,10 @@ class SandboxManager:
             if slot.in_use == 0 and self._is_expired(slot, now)
         ]
         for leaf_id in expired:
+            # Release the backend's host-side resources (temp dir, straggler
+            # process) before dropping the slot, so a reclaimed real backend
+            # leaves nothing behind.
+            _close_backend(self._slots[leaf_id].sandbox)
             del self._slots[leaf_id]
         return len(expired)
 
@@ -671,6 +778,9 @@ class SandboxManager:
             return False
         idle.sort()
         _, lru_leaf_id = idle[0]
+        # Eviction is a teardown path too: release the evicted backend's
+        # host-side resources before dropping its slot.
+        _close_backend(self._slots[lru_leaf_id].sandbox)
         del self._slots[lru_leaf_id]
         return True
 
@@ -685,7 +795,11 @@ class SandboxManager:
                 run unconditionally.
         """
         async with self._slot_freed:
-            if self._slots.pop(leaf_id, None) is not None:
+            removed = self._slots.pop(leaf_id, None)
+            if removed is not None:
+                # Release the backend's host-side resources (temp dir, straggler
+                # process) on teardown so a stopped real backend leaves nothing.
+                _close_backend(removed.sandbox)
                 self._slot_freed.notify()
 
 

@@ -53,8 +53,9 @@ classDiagram
   class SandboxManager {
     +acquire(leaf_id, isolation) Backend
     +lease(leaf_id, needs_execution, isolation) Backend
-    +stop(id)
+    +stop(id) (调 close)
     -worktree_provider: WorktreeProvider?
+    -factory: SandboxFactory (默认 InMemorySandbox)
   }
   class WorktreeProvider {
     <<protocol>>
@@ -64,6 +65,64 @@ classDiagram
   class InMemoryWorktreeProvider {
     +seed(leaf_id) Mapping
     +collect(leaf_id, files) dict
+  }
+  class SandboxBackendProtocol {
+    <<deepagents protocol: 全文件操作 + id + execute>>
+    +id property
+    +execute(command, *, timeout) ExecuteResponse
+    +ls / read / write / edit / grep / glob / upload_files / download_files
+    +close() (_Closeable, 幂等)
+  }
+  class InMemorySandbox {
+    <<离线默认, 零依赖, per-instance dict>>
+    +execute(...) no-op ExecuteResponse
+    +close() no-op
+  }
+  class LocalSubprocessSandbox {
+    <<M5 真后端: 全协议 + per-leaf 临时根 + stdlib-only — DANGEROUS OPT-IN 非安全 sandbox>>
+    +execute(command, *, timeout) ExecuteResponse (Popen, 有界抽干, 超时组杀)
+    +ls / read / write / edit / grep / glob / upload_files / download_files (真文件 @ 临时根)
+    +id property
+    +root_path property
+    +close() (删临时根, 幂等)
+    -policy: ExecPolicy
+    -exec_gate: threading.BoundedSemaphore (一工厂一闸)
+    -root: str (tempfile.mkdtemp)
+  }
+  class ExecPolicy {
+    <<_local_subprocess: frozen+slots, 韧性+准入策略>>
+    +default_timeout: int (30s)
+    +output_cap_bytes: int (1MB)
+    +grace_seconds: float (2.0)
+    +max_concurrent_execs: int (8)
+    +rlimits: RLimitProfile
+    +before_execute: BeforeExecuteHook or None
+  }
+  class RLimitProfile {
+    <<_local_subprocess: frozen+slots, POSIX best-effort 资源上限>>
+    +cpu_seconds: int or None (60)
+    +address_space_bytes: int or None (2 GiB)
+    +file_size_bytes: int or None (256 MiB)
+    +open_files: int or None (1024)
+    +processes: int or None (None — per-user 计数不可靠)
+  }
+  class ExecRequest {
+    <<_local_subprocess: frozen+slots, spawn 前准入请求>>
+    +command: str
+    +timeout: int or None
+    +leaf_id: str
+  }
+  class ExecDecision {
+    <<_local_subprocess: frozen+slots, before_execute 返回>>
+    +outcome: allow or reject
+    +timeout: int or None (仅可收紧)
+    +output_cap_bytes: int or None
+    +rlimits: RLimitProfile or None
+    +reason: str
+  }
+  class SandboxFactory {
+    <<_sandbox: 类型别名 leaf_id to SandboxBackendProtocol>>
+    +local_subprocess_factory(policy) SandboxFactory
   }
   class WorkflowTool {
     <<BaseTool, multi-command>>
@@ -211,8 +270,17 @@ classDiagram
   Journal ..> JournalStore
   Roster *-- RosterEntry
   SandboxManager ..> Backend : deepagents backend 实例
+  SandboxManager ..> SandboxFactory : _new_sandbox 经工厂构造 (默认 InMemorySandbox)
   SandboxManager ..> WorktreeProvider : isolation=worktree 播种
   WorktreeProvider <|.. InMemoryWorktreeProvider
+  SandboxBackendProtocol <|.. InMemorySandbox
+  SandboxBackendProtocol <|.. LocalSubprocessSandbox
+  SandboxFactory ..> LocalSubprocessSandbox : local_subprocess_factory 产 (共享 exec_gate)
+  LocalSubprocessSandbox *-- ExecPolicy
+  ExecPolicy *-- RLimitProfile
+  LocalSubprocessSandbox ..> ExecRequest : before_execute 入参
+  LocalSubprocessSandbox ..> ExecDecision : before_execute 返回 (准入)
+  ExecDecision ..> RLimitProfile : rlimits 覆写 (内联 = 选 profile)
   WorkflowMiddleware *-- WorkflowTool
   WorkflowMiddleware *-- BgRunManager
   WorkflowTool --> BgRunManager
@@ -246,7 +314,7 @@ classDiagram
 
 ## 分层归属
 
-- **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`、`create_workflow_tool`(产 `WorkflowTool`)、`create_workflow_middleware`(产 `WorkflowMiddleware`)、`InMemoryWorktreeProvider`/`WorktreeProvider`(worktree 隔离 seam)、`read_only_leaf`/`read_only_builder`(只读裁判叶,deny-write permission,D-G4)、跨叶归约 helper `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`,`_reduce` 纯函数,F)、race 值类型 `RaceCandidate`/`RaceResult`(+ `race_key`,`_race_types` 纯类型,B,配 `ctx.race` 原语)、可观测性值类型与 sink 别名 `Span`/`SpanBegin`/`SpanKind`/`LeafEvent`(+ `SpanSink`/`SpanBeginSink`/`LeafEventSink`,M1,供宿主消费 `run_workflow` 的 `on_span`/`on_span_begin`/`on_leaf_event` 带外边)。`LeafEventHandler` 是引擎内部(不导出)的回调 normalizer,一叶一实例、闭包持 `leaf_span_id` 关联(见 [01 §2b](../01-engine-mechanism.md))。
+- **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`、`create_workflow_tool`(产 `WorkflowTool`)、`create_workflow_middleware`(产 `WorkflowMiddleware`)、`InMemoryWorktreeProvider`/`WorktreeProvider`(worktree 隔离 seam)、`read_only_leaf`/`read_only_builder`(只读裁判叶,deny-write permission,D-G4)、跨叶归约 helper `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`,`_reduce` 纯函数,F)、race 值类型 `RaceCandidate`/`RaceResult`(+ `race_key`,`_race_types` 纯类型,B,配 `ctx.race` 原语)、可观测性值类型与 sink 别名 `Span`/`SpanBegin`/`SpanKind`/`LeafEvent`(+ `SpanSink`/`SpanBeginSink`/`LeafEventSink`,M1,供宿主消费 `run_workflow` 的 `on_span`/`on_span_begin`/`on_leaf_event` 带外边)、**真执行 opt-in 面 `LocalSubprocessSandbox`/`SandboxFactory`/`local_subprocess_factory` + 策略值类型 `ExecPolicy`/`ExecRequest`/`ExecDecision`/`RLimitProfile`(M5,`_local_subprocess`/`_sandbox`,供宿主 `SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))` 注入真本地执行——危险 opt-in,非安全 sandbox)**。`LeafEventHandler` 是引擎内部(不导出)的回调 normalizer,一叶一实例、闭包持 `leaf_span_id` 关联(见 [01 §2b](../01-engine-mechanism.md))。
 - **agent 面(运行时)**：`WorkflowTool`(多命令)。
 - **host 后台机制**：`WorkflowMiddleware` + `BgRunManager` + `BgRunSlot` + `ResultStore`。
 - **跨会话持久化(M3,Layer 2 host-wiring)**：`WorkflowRunStore`(协议)+ `RunSpec`(可 resume 的 launch 描述,携规范 `journal_run_id` 谱系)+ `InMemoryRunStore`(默认、零依赖)+ `SqliteWorkflowStore`(`[sqlite]` extra:统一 sqlite db 文件 + 两条连接——autocommit store 背 registry + `RunScopedJournal` per-run journal、第二连接背持久 `AsyncSqliteSaver` checkpointer)。`_persistence` / `_run_store` 只从 `._engine`(公共墙)import `JournalStore`/`JournalRecord`,故 import-linter Contract 1 把这两模块列入 `source_modules`。零成本重放由持久 journal 交付,checkpointer 是 durable add-on。

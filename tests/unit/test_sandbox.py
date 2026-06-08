@@ -375,3 +375,96 @@ def test_inmemory_sandbox_upload_overwrites_and_download_round_trips() -> None:
     downloaded = sandbox.download_files(["/data.txt", "/missing.txt"])
     assert downloaded[0].error is None and downloaded[0].content == b"v2"
     assert downloaded[1].error == "file_not_found" and downloaded[1].content is None
+
+
+def test_default_factory_still_yields_an_in_memory_sandbox() -> None:
+    # The zero-dep default is unchanged: no factory ⇒ InMemorySandbox.
+    manager = SandboxManager()
+    backend = manager.acquire(leaf_id="leaf-a", needs_execution=True)
+    assert isinstance(backend, InMemorySandbox)
+
+
+async def test_injected_factory_product_is_leased() -> None:
+    # A custom factory's backend is what a leaf is handed (the pluggable seam).
+    from langchain_dynamic_workflow._local_subprocess import (
+        ExecPolicy,
+        LocalSubprocessSandbox,
+    )
+    from langchain_dynamic_workflow._sandbox import local_subprocess_factory
+
+    manager = SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy()))
+    backend = manager.acquire(leaf_id="leaf-real", needs_execution=True)
+    try:
+        assert isinstance(backend, LocalSubprocessSandbox)
+        assert isinstance(backend, SandboxBackendProtocol)
+    finally:
+        await manager.stop("leaf-real")
+
+
+async def test_stop_closes_a_real_backend_temp_dir() -> None:
+    # Teardown releases the real backend's resources (temp dir removed).
+    import os
+
+    from langchain_dynamic_workflow._local_subprocess import (
+        ExecPolicy,
+        LocalSubprocessSandbox,
+    )
+    from langchain_dynamic_workflow._sandbox import local_subprocess_factory
+
+    manager = SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy()))
+    backend = manager.acquire(leaf_id="leaf-real", needs_execution=True)
+    assert isinstance(backend, LocalSubprocessSandbox)
+    root = backend.root_path
+    await manager.stop("leaf-real")
+    assert not os.path.exists(root)  # stop() called close()
+
+
+async def test_evicting_an_idle_real_backend_closes_its_temp_dir() -> None:
+    # Quota-pressure eviction of an idle real backend must also release its temp
+    # dir — eviction is a teardown path, not only stop().
+    import os
+
+    from langchain_dynamic_workflow._local_subprocess import (
+        ExecPolicy,
+        LocalSubprocessSandbox,
+    )
+    from langchain_dynamic_workflow._sandbox import local_subprocess_factory
+
+    manager = SandboxManager(max_active=1, sandbox_factory=local_subprocess_factory(ExecPolicy()))
+    first = manager.acquire(leaf_id="leaf-one", needs_execution=True)
+    assert isinstance(first, LocalSubprocessSandbox)
+    first_root = first.root_path
+    # leaf-one is idle (acquire does not hold a lease), so admitting leaf-two at
+    # max_active=1 evicts the LRU idle backend — which must close it.
+    second = manager.acquire(leaf_id="leaf-two", needs_execution=True)
+    assert isinstance(second, LocalSubprocessSandbox)
+    assert not os.path.exists(first_root)  # evicted ⇒ closed
+    await manager.stop("leaf-two")
+
+
+def test_inmemory_sandbox_close_is_a_no_op() -> None:
+    # InMemorySandbox gains a uniform close() so teardown need not special-case
+    # the backend type; it must be a harmless no-op (idempotent).
+    sandbox = InMemorySandbox(identity="s")
+    sandbox.write("/keep.txt", "v")
+    sandbox.close()
+    sandbox.close()
+    assert sandbox.read("/keep.txt").error is None
+
+
+def test_real_execution_public_surface_is_exported() -> None:
+    # A host opts into real execution from the package root, so every type it
+    # needs to wire and tune a LocalSubprocessSandbox must be a top-level export.
+    import langchain_dynamic_workflow as ldw
+
+    for name in (
+        "LocalSubprocessSandbox",
+        "SandboxFactory",
+        "local_subprocess_factory",
+        "ExecPolicy",
+        "ExecRequest",
+        "ExecDecision",
+        "RLimitProfile",
+    ):
+        assert hasattr(ldw, name), name
+        assert name in ldw.__all__
