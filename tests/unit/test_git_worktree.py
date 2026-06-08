@@ -15,12 +15,28 @@ from pathlib import Path
 
 import pytest
 
-from langchain_dynamic_workflow._git_worktree import GitWorktreeError, GitWorktreeProvider
+from langchain_dynamic_workflow._git_worktree import (
+    GitWorktreeError,
+    GitWorktreeProvider,
+    _safe_dirname,
+)
 from langchain_dynamic_workflow._local_subprocess import LocalSubprocessSandbox
 
 
 def _git(cwd: str, *args: str) -> None:
     subprocess.run(["git", "-C", cwd, *args], check=True, capture_output=True)
+
+
+def test_safe_dirname_does_not_collide_for_distinct_ids_that_sanitize_alike() -> None:
+    # M5: "a/b" and "a_b" both collapse to the same sanitized stem, but they are
+    # distinct leaf_ids — their worktree paths must NOT collide (the provider keys
+    # _worktrees/branch by the raw id, so a path collision would corrupt isolation).
+    assert _safe_dirname("a/b") != _safe_dirname("a_b")
+    # The sanitized stem is still filesystem-safe (no separators) for both.
+    assert "/" not in _safe_dirname("a/b")
+    assert "/" not in _safe_dirname("a_b")
+    # Stable: the same id always maps to the same dirname (deterministic across runs).
+    assert _safe_dirname("a/b") == _safe_dirname("a/b")
 
 
 @pytest.fixture

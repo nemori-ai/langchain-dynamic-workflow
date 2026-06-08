@@ -23,6 +23,7 @@ worktree with no extra hook), with :meth:`cleanup_all` as a run-end backstop.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import subprocess
@@ -61,16 +62,21 @@ def _safe_dirname(leaf_id: str) -> str:
     A leaf id is normally ``leaf-<hash>`` (already safe), but a host-supplied or
     test leaf id may contain path separators or other unsafe characters; this
     collapses any run of unsafe characters to a single ``_`` so the worktree path
-    can never escape ``workspace_root``.
+    can never escape ``workspace_root``. A short stable hash of the RAW id is
+    appended so two distinct ids that sanitize to the same stem (for example
+    ``"a/b"`` and ``"a_b"``) never collide on the worktree path — the provider keys
+    its bookkeeping and branch by the raw id, so a path collision would silently
+    corrupt isolation.
 
     Args:
         leaf_id: The leaf's identity.
 
     Returns:
-        A safe single path segment derived from ``leaf_id``.
+        A safe, collision-resistant single path segment derived from ``leaf_id``.
     """
-    safe = _UNSAFE_DIRNAME.sub("_", leaf_id).strip("_")
-    return safe or "leaf"
+    stem = _UNSAFE_DIRNAME.sub("_", leaf_id).strip("_") or "leaf"
+    digest = hashlib.sha256(leaf_id.encode("utf-8")).hexdigest()[:8]
+    return f"{stem}-{digest}"
 
 
 class GitWorktreeProvider:
@@ -87,6 +93,14 @@ class GitWorktreeProvider:
     provider is idempotent per leaf id (a stale same-key worktree+branch is
     reclaimed first) and exception-safe (a partial creation is rolled back before
     the error propagates).
+
+    Host lifecycle contract: the HOST owns this provider's lifecycle and MUST call
+    :meth:`cleanup_all` (for example in a ``finally``) when it is done with the
+    provider. The engine's run-end ``SandboxManager.stop`` removes each per-leaf
+    worktree via the backend ``on_close`` hook, but it deliberately does NOT call
+    :meth:`cleanup_all` — the host may reuse one provider across several runs, so
+    releasing the provider-owned ``workspace_root`` temp tree (and sweeping any
+    worktree a teardown path missed) is the host's responsibility, not the engine's.
 
     Args:
         base_repo: Path to the real base git repository worktrees branch from.

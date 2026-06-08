@@ -58,12 +58,14 @@ def test_run_store_surface_exported_eagerly() -> None:
 
 
 def test_real_git_surface_exported_from_package_root() -> None:
-    """The real-git worktree + PR seam is exported eagerly with no new dependency.
+    """The real-git worktree + PR seam is exported eagerly with no NEW dependency.
 
     ``GitWorktreeProvider`` / ``PullRequestProvider`` / ``PullRequestRef`` /
-    ``LocalPullRequestProvider`` carry no optional dependency (pure stdlib
-    subprocess), so they are eagerly exported and importable from the package root
-    on a base install.
+    ``LocalPullRequestProvider`` add no dependency beyond the existing base/eager
+    stack the package already imports (``deepagents`` + the M5
+    ``LocalSubprocessSandbox`` the git provider roots its backends in); the new code
+    itself is plain ``subprocess`` + stdlib. So they are eagerly exported and
+    importable from the package root on a base install.
     """
     import langchain_dynamic_workflow as ldw
 

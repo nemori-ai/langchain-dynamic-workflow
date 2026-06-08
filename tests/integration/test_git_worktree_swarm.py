@@ -418,7 +418,8 @@ def _resolve_conflict_markers(conflicted: str) -> str:
 
     A deterministic resolver (standing in for an LLM resolver leaf) drops the marker
     lines and keeps both bodies concatenated, so the resolution is reproducible and
-    contains both contributions — enough to re-merge cleanly.
+    contains both contributions. The resolved content IS the merge resolution — it is
+    folded directly into the integrated tree (no second merge pass).
 
     Args:
         conflicted: File content carrying one or more conflict hunks.
@@ -537,9 +538,11 @@ async def _integrate(
     Mirrors the M6 integration pattern: cross-leaf state lives in the script
     variable ``integrated_tree`` (initialized from ``base``), and each patch is
     folded by a journaled merge leaf running a real scratch-repo ``git merge``. A
-    real conflict routes through a resolver leaf and re-merges; a clean merge folds
-    directly. The script owns the loop — the deterministic control-flow inversion at
-    the heart of the engine.
+    clean merge folds its merged tree directly; a real conflict routes through a
+    resolver leaf whose resolved content is folded straight into the merged working
+    tree (completing the merge as ``git add`` + ``git commit`` would — no second
+    merge pass). The script owns the loop — the deterministic control-flow inversion
+    at the heart of the engine.
 
     Args:
         ctx: The orchestration context.
@@ -636,8 +639,9 @@ async def test_swarm_isolation_and_clean_merge_through_run_workflow(tmp_path: Pa
 async def test_conflict_loop_is_actually_taken_and_resolved(tmp_path: Path) -> None:
     # (3) conflict loop (headline): two patches edit the SAME overlapping region of
     # the SAME file -> a real scratch-repo merge conflict -> a resolver leaf resolves
-    # the markers -> a re-merge folds cleanly. Assert the conflict path was ACTUALLY
-    # taken (not clean-short-circuited) and the final tree carries the resolution.
+    # the markers, whose resolved content is folded straight into the integrated tree
+    # (completing the merge, no second merge pass). Assert the conflict path was
+    # ACTUALLY taken (not clean-short-circuited) and the final tree has no markers.
     base = _make_base_repo(tmp_path, {"calc.py": "def add(a, b):\n    return a - b\n"})
     provider = GitWorktreeProvider(base_repo=base)
     manager = SandboxManager(git_worktree_provider=provider)
