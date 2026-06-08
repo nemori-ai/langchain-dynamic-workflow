@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -721,3 +722,40 @@ def test_spawn_failure_without_sink_propagates_unchanged(
         assert excinfo.value is boom
     finally:
         backend.close()
+
+
+def test_root_provided_is_used_and_not_removed_on_close() -> None:
+    # A host-supplied root is used verbatim (no mkdtemp), close fires the on_close
+    # hook exactly once, and the directory is NOT rmtree'd because the provider
+    # owns its lifecycle (a real git worktree removed via `git worktree remove`).
+    existing = tempfile.mkdtemp(prefix="ldw-test-root-")
+    closed: list[bool] = []
+    sb = LocalSubprocessSandbox(
+        identity="L1",
+        policy=ExecPolicy(),
+        exec_gate=threading.BoundedSemaphore(8),
+        root=existing,
+        on_close=lambda: closed.append(True),
+    )
+    try:
+        # Rooted at the provided dir: pwd resolves to it, not a fresh temp dir.
+        assert sb.execute("pwd").output.strip() == os.path.realpath(existing)
+        sb.close()
+        assert closed == [True]  # on_close fired
+        assert os.path.isdir(existing)  # NOT rmtree'd (provider owns lifecycle)
+        sb.close()  # idempotent: on_close fires at most once
+        assert closed == [True]
+    finally:
+        os.rmdir(existing)
+
+
+def test_default_root_still_mkdtemps_and_rmtrees() -> None:
+    # The default path (no root=) is byte-unchanged: it owns a fresh temp root and
+    # rmtrees it on close.
+    sb = LocalSubprocessSandbox(
+        identity="L2", policy=ExecPolicy(), exec_gate=threading.BoundedSemaphore(8)
+    )
+    root = sb.execute("pwd").output.strip()
+    assert os.path.isdir(root)
+    sb.close()
+    assert not os.path.exists(root)  # owns its temp root -> rmtree on close
