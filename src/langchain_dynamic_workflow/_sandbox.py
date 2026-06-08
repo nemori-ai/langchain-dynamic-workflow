@@ -670,6 +670,13 @@ class SandboxManager:
         :meth:`lease` is the path that waits instead. Use :meth:`lease` from the
         engine; ``acquire`` is exposed for direct, single-leaf use.
 
+        Sync escape hatch: unlike :meth:`lease` (which thread-offloads a victim's
+        blocking teardown off the event loop), this synchronous path runs
+        ``reclaim_idle`` / ``_evict_one_idle`` inline, so a reclaimed/evicted real
+        backend's ``close`` (which for a git-worktree backend runs blocking ``git``
+        subprocesses) blocks the caller. That is acceptable for direct single-leaf
+        use off the event loop; on the event loop, use :meth:`lease`.
+
         Args:
             leaf_id: The leaf's derived identity (see :func:`leaf_id_from_key`).
             needs_execution: Whether the leaf requires an isolated execution
