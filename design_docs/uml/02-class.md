@@ -5,8 +5,9 @@ classDiagram
   class run_workflow {
     <<facade>>
     +run_workflow(script, *, roster, config) Any
-    +on_progress / on_span / on_span_begin / on_leaf_event sinks
+    +on_progress / on_span / on_span_begin / on_leaf_event / on_command sinks
     +leaf_event_include_payloads: bool
+    +command_include_payloads: bool
   }
   class WorkflowEngine {
     +run(script, thread_id, config) Any
@@ -80,14 +81,16 @@ classDiagram
   }
   class LocalSubprocessSandbox {
     <<M5 真后端: 全协议 + per-leaf 临时根 + stdlib-only — DANGEROUS OPT-IN 非安全 sandbox>>
-    +execute(command, *, timeout) ExecuteResponse (Popen, 有界抽干, 超时组杀)
+    +execute(command, *, timeout) ExecuteResponse (Popen, 有界抽干, 超时组杀, spawn 前后发 CommandEvent)
     +ls / read / write / edit / grep / glob / upload_files / download_files (真文件 @ 临时根)
     +id property
     +root_path property
+    +set_command_sink(*, sink, leaf_span_id, include_payloads) (引擎接 on_command)
     +close() (删临时根, 幂等)
     -policy: ExecPolicy
     -exec_gate: threading.BoundedSemaphore (一工厂一闸)
     -root: str (tempfile.mkdtemp)
+    -_command_sink: CommandSink or None (默认 no-op)
   }
   class ExecPolicy {
     <<_local_subprocess: frozen+slots, 韧性+准入策略>>
@@ -257,6 +260,18 @@ classDiagram
     -_leaf_span_id: str (构造时闭包持有 → 关联)
     -_include_payloads: bool
   }
+  class CommandEvent {
+    <<_observability: 真 execute 边界的一条命令生命周期边 (start|end)>>
+    +leaf_span_id: str (所属叶 AGENT span id → 关联)
+    +command_id: str (resume 稳定, begin/end 共享)
+    +command: str
+    +phase: str (start|end)
+    +exit_code: int or None (start 为 None)
+    +output: str or None (start 为 None; end 默认截尾)
+    +truncated: bool
+    +duration_s: float or None (start 为 None)
+    +started_at: float
+  }
 
   run_workflow --> WorkflowEngine
   WorkflowEngine --> Ctx
@@ -310,11 +325,13 @@ classDiagram
   SpanRecorder ..> Span : 关闭时 emit (end sink)
   WorkflowEngine ..> LeafEventHandler : 叶调用接缝 append 到 leaf_config.callbacks (miss-only, 闭包持 leaf_span_id)
   LeafEventHandler ..> LeafEvent : normalize 回调边 → on_leaf_event sink
+  WorkflowEngine ..> LocalSubprocessSandbox : lease 真后端时 set_command_sink(on_command, leaf_span_id) (miss-only)
+  LocalSubprocessSandbox ..> CommandEvent : execute spawn 前后 emit (start 然后 end) → on_command sink
 ```
 
 ## 分层归属
 
-- **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`、`create_workflow_tool`(产 `WorkflowTool`)、`create_workflow_middleware`(产 `WorkflowMiddleware`)、`InMemoryWorktreeProvider`/`WorktreeProvider`(worktree 隔离 seam)、`read_only_leaf`/`read_only_builder`(只读裁判叶,deny-write permission,D-G4)、跨叶归约 helper `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`,`_reduce` 纯函数,F)、race 值类型 `RaceCandidate`/`RaceResult`(+ `race_key`,`_race_types` 纯类型,B,配 `ctx.race` 原语)、可观测性值类型与 sink 别名 `Span`/`SpanBegin`/`SpanKind`/`LeafEvent`(+ `SpanSink`/`SpanBeginSink`/`LeafEventSink`,M1,供宿主消费 `run_workflow` 的 `on_span`/`on_span_begin`/`on_leaf_event` 带外边)、**真执行 opt-in 面 `LocalSubprocessSandbox`/`SandboxFactory`/`local_subprocess_factory` + 策略值类型 `ExecPolicy`/`ExecRequest`/`ExecDecision`/`RLimitProfile`(M5,`_local_subprocess`/`_sandbox`,供宿主 `SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))` 注入真本地执行——危险 opt-in,非安全 sandbox)**。`LeafEventHandler` 是引擎内部(不导出)的回调 normalizer,一叶一实例、闭包持 `leaf_span_id` 关联(见 [01 §2b](../01-engine-mechanism.md))。
+- **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`、`create_workflow_tool`(产 `WorkflowTool`)、`create_workflow_middleware`(产 `WorkflowMiddleware`)、`InMemoryWorktreeProvider`/`WorktreeProvider`(worktree 隔离 seam)、`read_only_leaf`/`read_only_builder`(只读裁判叶,deny-write permission,D-G4)、跨叶归约 helper `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`,`_reduce` 纯函数,F)、race 值类型 `RaceCandidate`/`RaceResult`(+ `race_key`,`_race_types` 纯类型,B,配 `ctx.race` 原语)、可观测性值类型与 sink 别名 `Span`/`SpanBegin`/`SpanKind`/`LeafEvent`/`CommandEvent`(+ `SpanSink`/`SpanBeginSink`/`LeafEventSink`/`CommandSink`,供宿主消费 `run_workflow` 的 `on_span`/`on_span_begin`/`on_leaf_event`/`on_command` 带外边——`CommandEvent`/`on_command` 是执行面同构 sink,在真 subprocess 边界发成对命令生命周期边)、**真执行 opt-in 面 `LocalSubprocessSandbox`/`SandboxFactory`/`local_subprocess_factory` + 策略值类型 `ExecPolicy`/`ExecRequest`/`ExecDecision`/`RLimitProfile`(M5,`_local_subprocess`/`_sandbox`,供宿主 `SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))` 注入真本地执行——危险 opt-in,非安全 sandbox)**。`LeafEventHandler` 是引擎内部(不导出)的回调 normalizer,一叶一实例、闭包持 `leaf_span_id` 关联(见 [01 §2b](../01-engine-mechanism.md))。
 - **agent 面(运行时)**：`WorkflowTool`(多命令)。
 - **host 后台机制**：`WorkflowMiddleware` + `BgRunManager` + `BgRunSlot` + `ResultStore`。
 - **跨会话持久化(M3,Layer 2 host-wiring)**：`WorkflowRunStore`(协议)+ `RunSpec`(可 resume 的 launch 描述,携规范 `journal_run_id` 谱系)+ `InMemoryRunStore`(默认、零依赖)+ `SqliteWorkflowStore`(`[sqlite]` extra:统一 sqlite db 文件 + 两条连接——autocommit store 背 registry + `RunScopedJournal` per-run journal、第二连接背持久 `AsyncSqliteSaver` checkpointer)。`_persistence` / `_run_store` 只从 `._engine`(公共墙)import `JournalStore`/`JournalRecord`,故 import-linter Contract 1 把这两模块列入 `source_modules`。零成本重放由持久 journal 交付,checkpointer 是 durable add-on。

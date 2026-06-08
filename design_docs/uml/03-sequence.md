@@ -181,9 +181,9 @@ sequenceDiagram
   end
 ```
 
-**要点**:`on_span_begin` 全 span 类型、打开即发,**不**被 replay 抑制——故 cached 叶子也重发 begin、再配一条 `cached=True`、`duration_s≈0` 的完成 `Span`,渲染成即时命中而非卡住 running chip。`on_leaf_event` 只在 journal **miss** 走真叶子时挂 `LeafEventHandler`(命中走缓存路径根本不进 leaf runner),故**重放叶子零 interior 事件**——replay 策略随控制流自落、无需额外开关。关联靠 handler 实例**构造时闭包持有的 `leaf_span_id`**,不靠 metadata 继承(deepagents subagent 边界丢弃 metadata,只转发 `callbacks`/`tags`/`configurable`)。两条边皆走带外、不进宿主 LLM 上下文(quarantine 保持);`detail` 默认 shape-only,原始 payload 仅 `leaf_event_include_payloads=True` 时带、截断有界。`span_id` 顺序深度-0 path resume 稳定(同源序重放 + 序号每 run 重置),扇出 span 因打开顺序随墙钟不担保。
+**要点**:`on_span_begin` 全 span 类型、打开即发,**不**被 replay 抑制——故 cached 叶子也重发 begin、再配一条 `cached=True`、`duration_s≈0` 的完成 `Span`,渲染成即时命中而非卡住 running chip。`on_leaf_event` 只在 journal **miss** 走真叶子时挂 `LeafEventHandler`(命中走缓存路径根本不进 leaf runner),故**重放叶子零 interior 事件**——replay 策略随控制流自落、无需额外开关。关联靠 handler 实例**构造时闭包持有的 `leaf_span_id`**,不靠 metadata 继承(deepagents subagent 边界丢弃 metadata,只转发 `callbacks`/`tags`/`configurable`)。两条边皆走带外、不进宿主 LLM 上下文(quarantine 保持);`detail` 默认 shape-only,原始 payload 仅 `leaf_event_include_payloads=True` 时带、截断有界。`span_id` 顺序深度-0 path resume 稳定(同源序重放 + 序号每 run 重置),扇出 span 因打开顺序随墙钟不担保。执行叶子真 shell `execute` 的命令生命周期(`on_command` / `CommandEvent`,在 subprocess 边界发成对 begin/end 边、归位到所属叶 `leaf_span_id`)是同一 miss-only 带外可观测性面的执行面同构体,机制见 F 图。
 
-## F — 真本地执行后端（M5:工厂 → lease → 守卫复合 → execute 准入/spawn/抽干/超时组杀 → teardown）
+## F — 真本地执行后端（M5:工厂 → lease → 守卫复合 → execute 准入/spawn/抽干/超时组杀 + on_command → teardown）
 
 ```mermaid
 sequenceDiagram
@@ -195,6 +195,7 @@ sequenceDiagram
   participant DA as leaf deepagents (aexecute → to_thread)
   participant EG as ExecGate (threading.BoundedSemaphore, 一工厂一闸)
   participant BE as before_execute (准入钩子)
+  participant CE as on_command (CommandEvent sink)
   participant P as Popen 子进程 (+ POSIX 进程组)
   participant DR as drain worker 线程
 
@@ -205,6 +206,7 @@ sequenceDiagram
   Note over SM,B: 执行叶 lease (needs_execution=True)
   SM->>F: _new_sandbox(leaf_id) → factory(leaf_id)
   F->>B: LocalSubprocessSandbox(identity, policy, exec_gate) — mkdtemp 临时根
+  SM->>B: set_command_sink(sink=on_command, leaf_span_id, include_payloads) (仅 on_command 接入时, miss-only 由 lease 路天然保持)
   SM->>GB: build_leaf_backend(isolated=B, /shared/ → SharedArtifactStore)
   Note over GB: 引擎 lease/teardown 路径不变; isinstance(B, SandboxBackendProtocol) 闸已纳
 
@@ -219,7 +221,12 @@ sequenceDiagram
   else allow — 真 spawn
     BE-->>B: ExecDecision(allow [可缩超时/降 cap/选 RLimitProfile])
     B->>B: 解析有效超时(取最紧) / output cap / rlimits
-    B->>P: Popen(cwd=临时根, stdout=PIPE, stderr=STDOUT, start_new_session=POSIX) [POSIX 经子 wrapper setrlimit→execvp /bin/sh]
+    opt on_command 已接入
+      B->>B: mint command_id = sha256(leaf_span_id+command+叶内出现序号)[:16]
+      B->>CE: emit CommandEvent(phase=start, command, started_at, exit_code=None)
+    end
+    B->>P: Popen(cwd=临时根, stdout=PIPE, stderr=STDOUT, start_new_session=POSIX) [POSIX 经最小 preexec_fn setrlimit (父预算 soft/hard)]
+    Note over B,P: begin 边已画 running card ⇒ end 边必随, Popen/preexec 失败补发 spawn-error end (同 command_id, exit_code=127) 再抛
     B->>DR: 起 drain worker — 分块读, 过 cap 标 truncated + 续读到 EOF (防满管道)
     B->>P: proc.wait(有效超时) (调用线程)
     alt 超时
@@ -229,15 +236,18 @@ sequenceDiagram
     end
     B->>P: finally reap proc.wait() + join drain + close pipe (无僵尸/孤儿/漏线程/漏 fd)
     DR-->>B: (output, truncated)
+    opt on_command 已接入
+      B->>CE: emit CommandEvent(phase=end, exit_code, output 默认截尾, truncated, duration_s) (同 command_id, card 原地翻 pass/fail)
+    end
     B-->>GB: ExecuteResponse(output, exit_code [124 超时 否则 returncode], truncated)
   end
   B->>EG: release() (finally)
   GB-->>DA: ExecuteResponse
-  Note over DA: 命令文本/输出可观测性复用 M1 on_leaf_event 工具边 (无新命令汇, 岔口 0)
+  Note over CE: 命令文本/输出可观测性走专门带外 sink on_command (on_leaf_event 在执行面的同构 sink), miss-only — journal 命中叶不 lease 不跑 subprocess, InMemorySandbox 不发
 
   Note over SM,B: teardown / eviction
   SM->>B: stop(leaf_id) / reclaim_idle / _evict_one_idle → _close_backend → close()
   B->>B: shutil.rmtree(临时根) (幂等; 子进程已在每次 execute reap)
 ```
 
-**要点**:**执行变真无需改引擎**——只需 build-time 注入工厂;lease/`_GuardedBackend`/teardown 路径原样复用(`_GuardedBackend.execute` 已委派被租隔离后端、`isinstance(SandboxBackendProtocol)` 闸已纳)。`execute` 跑在 deepagents 的 `aexecute → to_thread(self.execute)` worker 上,故 `ExecGate` 是**跨线程** `threading.BoundedSemaphore`(`finally` 必还闸位)、与叶级 asyncio `ConcurrencyGate` **正交**;一工厂一闸 ⇒ 一 run 并发 exec 上限全局。`before_execute` 是**准入控制**(allow / reject 返 126 不 spawn / 缩超时只可收紧 / 降 cap / 选 `RLimitProfile`),非可观测性 sink。有界抽干跑在 worker、调用线程 `wait(超时)`:超时则 POSIX `killpg` SIGTERM→grace→SIGKILL 整组杀(`start_new_session` 连子孙)、码 124;每路 `finally` reap + join + close,**无僵尸/孤儿/漏线程/漏 fd**。rlimit 经**子 wrapper**(`setrlimit` 后 `os.execvp`)非 `preexec_fn`,默认 generous-but-bounded profile ON(POSIX;Windows best-effort 无 rlimit/无进程组)。teardown `close()` 删临时根、幂等。诚实非目标:per-leaf 临时根只界定默认工作目录、**非安全 sandbox**(命令仍能经绝对路径读写宿主 FS / 用网络 / 超 best-effort rlimit 耗资源);container/cgroup/网络隔离与真 git-worktree 后端在 backlog。
+**要点**:**执行变真无需改引擎**——只需 build-time 注入工厂;lease/`_GuardedBackend`/teardown 路径原样复用(`_GuardedBackend.execute` 已委派被租隔离后端、`isinstance(SandboxBackendProtocol)` 闸已纳)。`execute` 跑在 deepagents 的 `aexecute → to_thread(self.execute)` worker 上,故 `ExecGate` 是**跨线程** `threading.BoundedSemaphore`(`finally` 必还闸位)、与叶级 asyncio `ConcurrencyGate` **正交**;一工厂一闸 ⇒ 一 run 并发 exec 上限全局。`before_execute` 是**准入控制**(allow / reject 返 126 不 spawn / 缩超时只可收紧 / 降 cap / 选 `RLimitProfile`),非可观测性 sink。命令可观测性走**专门的带外 sink `on_command`**——execute 体内在 spawn 前后发成对 `CommandEvent`(`"start"`/`"end"`,共享 resume 稳定 `command_id`、携 `leaf_span_id`),是 `on_leaf_event` 在执行面的同构 sink:miss-only(journal 命中叶不 lease 不跑 subprocess 故零 command 事件;`InMemorySandbox` 无真 execute 边界不发),`output` 默认截尾、`command_include_payloads` 才带全量;引擎仅在 lease 真后端时经 `set_command_sink` 接上,begin 边画 running card 后纵 spawn 失败也以同 `command_id`/`exit_code=127` 补发 end 边再抛(card 绝不卡死)。有界抽干跑在 worker、调用线程 `wait(超时)`:超时则 POSIX `killpg` SIGTERM→grace→SIGKILL 整组杀(`start_new_session` 连子孙)、码 124;每路 `finally` reap + join + close,**无僵尸/孤儿/漏线程/漏 fd**。rlimit 经**最小化 `preexec_fn`**(父进程预算 soft/hard 值、子侧只 `setrlimit` 不分配/不 import/不取锁,故 fork-then-exec 窗口内安全;不另起 `python -c` wrapper 省每命令一次解释器启动),默认 generous-but-bounded profile ON(POSIX;Windows best-effort 无 rlimit/无进程组)。teardown `close()` 删临时根、幂等。诚实非目标:per-leaf 临时根只界定默认工作目录、**非安全 sandbox**(命令仍能经绝对路径读写宿主 FS / 用网络 / 超 best-effort rlimit 耗资源);container/cgroup/网络隔离与真 git-worktree 后端在 backlog。
