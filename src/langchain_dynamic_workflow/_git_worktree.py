@@ -141,6 +141,15 @@ class GitWorktreeProvider:
         """The integration branch leaf changes fold toward (host finalization)."""
         return self._integration_branch
 
+    @property
+    def tracked_leaf_ids(self) -> frozenset[str]:
+        """The leaf ids whose worktrees this provider currently holds.
+
+        A read-only snapshot of the live worktrees, exposed so a host (or a test)
+        can verify teardown removed a worktree without reaching into private state.
+        """
+        return frozenset(self._worktrees)
+
     def _run_git(self, cwd: str, *args: str) -> subprocess.CompletedProcess[str]:
         """Run a ``git`` command in ``cwd``, raising :class:`GitWorktreeError` on failure.
 

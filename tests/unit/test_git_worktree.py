@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from langchain_dynamic_workflow._git_worktree import GitWorktreeError, GitWorktreeProvider
+from langchain_dynamic_workflow._local_subprocess import LocalSubprocessSandbox
 
 
 def _git(cwd: str, *args: str) -> None:
@@ -39,16 +40,18 @@ def test_open_worktree_seeds_real_repo_and_collect_is_authoritative(base_repo: s
     provider = GitWorktreeProvider(base_repo=base_repo)
     try:
         sb = provider.open_worktree("L1")
+        assert isinstance(sb, LocalSubprocessSandbox)
         # A real git repo: the committed file is present on a real branch named
         # leaf/<leaf_id>.
-        assert "def add" in sb.read("/calc.py").file_data["content"]
+        seeded = sb.read("/calc.py").file_data
+        assert seeded is not None and "def add" in seeded["content"]
         assert sb.execute("git rev-parse --abbrev-ref HEAD").output.strip() == "leaf/L1"
         # The leaf's real edit (edit, since write refuses to clobber).
         sb.edit("/calc.py", "return a - b", "return a + b")
         changeset = provider.collect("L1")
         assert changeset == {"/calc.py": "def add(a, b):\n    return a + b\n"}
         sb.close()  # on_close -> teardown
-        assert "L1" not in provider._worktrees
+        assert "L1" not in provider.tracked_leaf_ids
     finally:
         provider.cleanup_all()
 
@@ -94,7 +97,7 @@ def test_teardown_is_idempotent(base_repo: str) -> None:
     try:
         provider.open_worktree("L1")
         provider.teardown("L1")
-        assert "L1" not in provider._worktrees
+        assert "L1" not in provider.tracked_leaf_ids
         # Tearing down an already-gone / unknown leaf is a no-op, not an error.
         provider.teardown("L1")
         provider.teardown("never-opened")
