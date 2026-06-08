@@ -153,17 +153,25 @@ def test_offline_host_routes_signoff_request_and_response() -> None:
     """The scripted host launches sign_off on a request and resumes it on an approve reply."""
     model = OfflineHostModel()
 
-    launch = model._generate(  # pyright: ignore[reportPrivateUsage]
-        [HumanMessage(content="I'd like to sign off on the plan before you proceed.")]
-    ).generations[0].message
+    launch = (
+        model._generate(  # pyright: ignore[reportPrivateUsage]
+            [HumanMessage(content="I'd like to sign off on the plan before you proceed.")]
+        )
+        .generations[0]
+        .message
+    )
     assert isinstance(launch, AIMessage)
     assert launch.tool_calls[0]["name"] == "run_live"
     assert launch.tool_calls[0]["args"]["workflow"] == "sign_off"
     assert "signoff_decision" not in launch.tool_calls[0]["args"]
 
-    approve = model._generate(  # pyright: ignore[reportPrivateUsage]
-        [HumanMessage(content="Approved — go ahead and proceed.")]
-    ).generations[0].message
+    approve = (
+        model._generate(  # pyright: ignore[reportPrivateUsage]
+            [HumanMessage(content="Approved — go ahead and proceed.")]
+        )
+        .generations[0]
+        .message
+    )
     assert isinstance(approve, AIMessage)
     call = approve.tool_calls[0]
     assert call["name"] == "run_live"

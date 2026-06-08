@@ -600,9 +600,7 @@ async def run_workflow_live(
     # Capture the gate this resume is deciding (set when the lane parked last turn) so its
     # awaiting card can flip in place to resolved once the decision lands. The ask is held
     # on the lane across the turn boundary (the per-turn adapter cannot remember it).
-    decided_gate_key = (
-        lane.signoff_gate_key if (lane is not None and lane.awaiting_signoff) else ""
-    )
+    decided_gate_key = lane.signoff_gate_key if (lane is not None and lane.awaiting_signoff) else ""
     decided_ask = lane.signoff_ask if (lane is not None and lane.awaiting_signoff) else None
     resolving = resume is not _NO_SIGNOFF and bool(decided_gate_key)
     try:
@@ -636,9 +634,7 @@ async def run_workflow_live(
         return f"Paused for your sign-off: {_signoff_question(park.ask)}"
     # Clean completion: a resume that decided a parked gate flips its card to resolved.
     if resolving:
-        adapter.emit_signoff_resolved(
-            gate_key=decided_gate_key, ask=decided_ask, decision=resume
-        )
+        adapter.emit_signoff_resolved(gate_key=decided_gate_key, ask=decided_ask, decision=resume)
     if lane is not None:
         lane.awaiting_signoff = False
         lane.signoff_ask = None

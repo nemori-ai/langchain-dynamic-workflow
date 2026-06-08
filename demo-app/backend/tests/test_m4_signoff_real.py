@@ -95,9 +95,7 @@ def _real_signoff_setup() -> None:
 
 def _signoff_gate_props(ui_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Pull every ``signoff_gate`` event's props off the host ``ui`` channel, in order."""
-    return [
-        (msg.get("props") or {}) for msg in ui_messages if msg.get("name") == "signoff_gate"
-    ]
+    return [(msg.get("props") or {}) for msg in ui_messages if msg.get("name") == "signoff_gate"]
 
 
 def _run_live_calls(messages: list[Any]) -> list[dict[str, Any]]:

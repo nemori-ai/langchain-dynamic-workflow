@@ -65,9 +65,9 @@ class WorkflowToolSchema(BaseModel):
     is never advertised to the model; the model supplies only these fields.
     """
 
-    command: Literal[
-        "run", "run_script", "status", "resume", "cancel", "runs", "approve"
-    ] = Field(description="Which workflow operation to perform.")
+    command: Literal["run", "run_script", "status", "resume", "cancel", "runs", "approve"] = Field(
+        description="Which workflow operation to perform."
+    )
     workflow: str | None = Field(
         default=None,
         description="The registered workflow name to launch (required for 'run').",

@@ -452,9 +452,7 @@ class BgRunManager:
         self._settle(key, thread_id, BgStatus.DONE, result=result)
         return result
 
-    def _park(
-        self, key: tuple[str, str], thread_id: str, signoff: WorkflowSignoffRequired
-    ) -> None:
+    def _park(self, key: tuple[str, str], thread_id: str, signoff: WorkflowSignoffRequired) -> None:
         """Park a slot at ``AWAITING_SIGNOFF`` and enqueue a sign-off notice.
 
         Stores the ask so the host can read what to approve. The slot stays
@@ -517,8 +515,7 @@ class BgRunManager:
         if slot.status != BgStatus.AWAITING_SIGNOFF:
             coro.close()
             raise BgRunStateError(
-                f"run {run_id!r} is {slot.status.value}, not awaiting sign-off; "
-                "nothing to approve"
+                f"run {run_id!r} is {slot.status.value}, not awaiting sign-off; nothing to approve"
             )
         # Flip status to RUNNING SYNCHRONOUSLY, before scheduling the continuation, to
         # close the check-then-act window: the new task only sets RUNNING once the loop
@@ -529,9 +526,7 @@ class BgRunManager:
         slot.ask = None
         slot.parked_at = None
         slot.status = BgStatus.RUNNING
-        slot.task = asyncio.ensure_future(
-            self._run_wrapped(coro, key=key, thread_id=thread_id)
-        )
+        slot.task = asyncio.ensure_future(self._run_wrapped(coro, key=key, thread_id=thread_id))
         return slot
 
     def _settle(
