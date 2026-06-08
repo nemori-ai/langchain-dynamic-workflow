@@ -30,7 +30,15 @@ from ._local_subprocess import (
     LocalSubprocessSandbox,
     RLimitProfile,
 )
-from ._observability import Span, SpanBegin, SpanBeginSink, SpanKind, SpanSink
+from ._observability import (
+    CommandEvent,
+    CommandSink,
+    Span,
+    SpanBegin,
+    SpanBeginSink,
+    SpanKind,
+    SpanSink,
+)
 from ._progress import ProgressEntry, ProgressKind, ProgressSink
 from ._race_types import RaceCandidate, RaceResult
 from ._reduce import (
@@ -94,6 +102,8 @@ __all__ = [
     "BgRunQuotaExceededError",
     "BgStatus",
     "Budget",
+    "CommandEvent",
+    "CommandSink",
     "Consensus",
     "Ctx",
     "ExecDecision",

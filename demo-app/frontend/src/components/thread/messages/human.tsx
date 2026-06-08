@@ -61,7 +61,10 @@ export function HumanMessage({
       withProviderRunConfig({
         checkpoint: parentCheckpoint,
         streamMode: ["values"],
-        streamSubgraphs: true,
+        // Quarantine: keep nested leaf @task subgraph messages OUT of the chat stream;
+        // leaf activity is surfaced only via the out-of-band Gen-UI cards on the host ui
+        // channel. false is the SDK default. (See thread/index.tsx for the rationale.)
+        streamSubgraphs: false,
         streamResumable: true,
         optimisticValues: (prev) => {
           const values = meta?.firstSeenState?.values;

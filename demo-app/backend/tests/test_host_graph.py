@@ -449,6 +449,60 @@ def test_offline_host_routes_named_preset_through_args() -> None:
     assert "workflow" not in default_args
 
 
+def test_offline_host_routes_make_it_pass_to_fix_loop() -> None:
+    """The "Make it pass" scenario message must reach the ``fix_loop`` preset live.
+
+    The 5th preset scenario is an executable-verification fix loop, and its natural-
+    language request ("fix the code and keep checking it against the tests until they
+    genuinely pass — prove it builds and the tests go green") carries no preset name.
+    Without a routing cue it falls through to the default hello smoke path and the
+    fix_loop is never reachable through the offline host — the end-to-end gap this
+    pins. The offline router must map that intent to ``run_live`` with
+    ``workflow="fix_loop"`` so a key-free user actually drives the loop. Uses the exact
+    scenario message from ``scenarios.json`` so the wired cue covers the real copy.
+    """
+    message = (
+        "I've got a small TypeScript module with a couple of failing unit tests. Please "
+        "actually fix the code and keep checking it against the tests until they genuinely "
+        "pass — don't just tell me it looks right, prove it builds and the tests go green."
+    )
+    name, args = _offline_first_tool_call(message)
+    assert name == "run_live"
+    assert args.get("workflow") == "fix_loop"
+
+
+def test_run_live_description_names_fix_loop_preset() -> None:
+    """``run_live``'s description must enumerate ``fix_loop`` as a resolvable preset.
+
+    Online, a real host model selects a preset from the tool description's vocabulary;
+    if the description names only ``deep_research`` / ``capstone`` the model has no way
+    to reach ``fix_loop`` and the 5th scenario is unreachable through the host. The
+    description must name ``fix_loop`` (and mention its execution surface) so the model
+    can route the "make it pass" intent. This is 术 that belongs in the tool description,
+    not in ``HOST_INSTRUCTIONS`` — guarded separately below.
+    """
+    from host_graph import run_live
+
+    description = run_live.description
+    assert "fix_loop" in description, "run_live description must name the fix_loop preset"
+    assert "deep_research" in description and "capstone" in description
+
+
+def test_host_instructions_stay_free_of_workflow_mechanics() -> None:
+    """``HOST_INSTRUCTIONS`` must keep the 道/术 line — no preset names, no mechanics.
+
+    The mental model (道) lives in the host prompt; the technique (术) — preset names,
+    command vocabulary — belongs in the tool description / SKILL, never the prompt
+    (AGENTS.md). FIX 4 adds ``fix_loop`` to the tool DESCRIPTION; this guards that the
+    same name (and the other preset names) did NOT leak into the host instructions.
+    """
+    from host_graph import HOST_INSTRUCTIONS
+
+    lowered = HOST_INSTRUCTIONS.lower()
+    for mechanic in ("fix_loop", "deep_research", "capstone", "execution_command"):
+        assert mechanic not in lowered, f"{mechanic!r} is 术 — keep it out of HOST_INSTRUCTIONS"
+
+
 def test_is_offline_reflects_openrouter_key_presence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

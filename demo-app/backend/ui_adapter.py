@@ -53,11 +53,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from langchain_dynamic_workflow import LeafEvent, ProgressEntry, Span, SpanBegin, SpanKind
+from langchain_dynamic_workflow import (
+    CommandEvent,
+    LeafEvent,
+    ProgressEntry,
+    ProgressKind,
+    Span,
+    SpanBegin,
+    SpanKind,
+)
 
 UiEmit = Callable[[str, dict[str, Any]], None]
 """Transport callback: deliver one ``(component_name, props)`` Gen-UI event."""
@@ -68,6 +77,7 @@ _PHASE_TIMELINE = "phase_timeline"
 _FANOUT_GRAPH = "fanout_graph"
 _AGENT_SPAN = "agent_span"
 _JOURNAL_BADGE = "journal_badge"
+_EXECUTION_COMMAND = "execution_command"
 
 _FANOUT_KINDS: frozenset[SpanKind] = frozenset({SpanKind.PARALLEL, SpanKind.PIPELINE})
 
@@ -81,6 +91,16 @@ _MAX_SUBTREE_NODES = 200
 class UiAdapter:
     """Translate engine progress/span events into deduplicated Gen-UI component events.
 
+    Thread-safety: ``on_command`` may be invoked OFF the event-loop thread. The engine
+    fires a leaf's real ``execute`` command events from inside ``deepagents``' execute
+    path, which ``deepagents`` marshals onto an ``asyncio.to_thread`` worker — so an
+    ``on_command`` edge runs concurrently with the loop-thread sinks (``on_progress`` /
+    ``on_span`` / ``on_span_begin`` / ``on_leaf_event``) that read and mutate the same
+    shared state (the occurrence ordinals, the seen-set, the command-id map, and the
+    latest-phase marker). A re-entrant lock (:attr:`_lock`) therefore guards every
+    read-modify-write of that shared state, so a worker-thread command edge cannot tear
+    an ordinal bump or a command-id get/set against a concurrent loop-thread sink.
+
     Args:
         emit: The transport callback that delivers a ``(component_name, props)``
             event to the chat. Typically ``ui_bridge.make_host_ui_emit(...)``. The
@@ -90,6 +110,13 @@ class UiAdapter:
 
     def __init__(self, *, emit: UiEmit) -> None:
         self._emit = emit
+        # Guards every read-modify-write of the shared adapter state below. Re-entrant
+        # because on_command holds it across the nested _emit_event call (which also
+        # touches _seen / _occurrences under the same lock). on_command runs on a
+        # to_thread worker while the other sinks run on the loop thread, so this lock is
+        # what makes the cross-thread bookkeeping (ordinal bump, _seen check/add,
+        # _command_event_ids get/set, _latest_phase read) atomic.
+        self._lock = threading.RLock()
         self._seen: set[str] = set()
         # How many times each stable logical key has been seen this run. The Nth
         # occurrence of a key is salted with ordinal N so genuinely-distinct events
@@ -105,6 +132,17 @@ class UiAdapter:
         self._leaf_nodes: defaultdict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         # Leaves whose interior overflowed the node cap, so the re-emit can flag it.
         self._leaf_truncated: set[str] = set()
+        # The latest PHASE marker message the adapter forwarded (e.g. "attempt 2").
+        # on_command fires inside a leaf with no knowledge of the loop counter, so each
+        # execution_command is stamped with this attempt tag (§ risk #5). None until the
+        # script emits its first phase, so the attempt is honest rather than invented.
+        self._latest_phase: str | None = None
+        # Map an engine command_id (shared by a command's start and end edges) to the
+        # adapter-computed event_id minted on the start edge. The end edge reuses it so
+        # both edges share one id and the terminal card flips pass/fail in place, while
+        # the occurrence-ordinal is bumped exactly once per command (on start, the create
+        # edge) rather than diverging across the two edges.
+        self._command_event_ids: dict[str, str] = {}
 
     # --- public engine sinks -------------------------------------------------
 
@@ -118,6 +156,13 @@ class UiAdapter:
             "kind": entry.kind.value,
             "message": entry.message,
         }
+        # Track the latest PHASE marker so a subsequent execution_command can stamp its
+        # owning attempt (e.g. "attempt 2"). Only a PHASE advances the attempt — a LOG
+        # narration line is not a loop boundary and must not retag the next command. The
+        # write is guarded because on_command reads _latest_phase from a worker thread.
+        if entry.kind is ProgressKind.PHASE:
+            with self._lock:
+                self._latest_phase = entry.message
         # A progress line has no run-variant fields, so its full props ARE its stable
         # identity. The occurrence ordinal in _emit_event keeps two distinct lines that
         # render identical truncated text (a real-model verify-phase hazard) separate.
@@ -231,6 +276,106 @@ class UiAdapter:
         }
         self._emit_event(_AGENT_SPAN, subtree_props, event_id=leaf_id, merge=True)
 
+    def on_command(self, event: CommandEvent) -> None:
+        """Map a real-execution command edge to an ``execution_command`` event (never raises).
+
+        Each real shell ``execute`` fires two edges that share one engine ``command_id``:
+        a ``"start"`` edge the instant before the subprocess spawns and an ``"end"`` edge
+        once it is reaped. The start edge **creates** a terminal card in the ``running``
+        state (``exit_code`` still ``None``); the end edge **patches it in place** (the
+        same ``event_id`` with ``merge=True``) flipping the card to ``passed`` (exit 0) or
+        ``failed`` (non-zero) and filling the exit code, output tail, truncation flag, and
+        duration — the same begin->end in-place flip the span running->complete chip uses.
+
+        The card is correlated to its owning leaf via ``leaf_span_id`` (so the frontend
+        nests it beneath that leaf's ``agent_span``) and tagged with the loop ``attempt``
+        the adapter most recently forwarded — ``on_command`` fires inside the leaf with no
+        knowledge of the loop counter, so the adapter stamps the latest phase marker it
+        saw. A replayed (cached) leaf never re-runs its subprocess and so fires no command
+        event; terminal cards are fresh-run only and never fabricated on resume.
+
+        Args:
+            event: One real-execution command lifecycle edge (``"start"`` then ``"end"``).
+        """
+        # The whole body runs under the lock because on_command fires from a to_thread
+        # worker while the loop-thread sinks touch the same shared state. The lock is
+        # re-entrant, so the nested _emit_event below re-acquires it harmlessly.
+        with self._lock:
+            is_end = event.phase == "end"
+            mint_undo: tuple[str, int] | None = None
+            if not is_end:
+                # Start edge: mint the adapter's resume-stable id (excluding run-variant
+                # fields) and remember it under the engine command_id so the end edge
+                # reuses it. The id carries attempt so the same command across two attempts
+                # stays distinct (else the second attempt's start would collide and be
+                # swallowed). The (stable, ordinal) is kept so a swallowed start emit can
+                # undo the ordinal bump AND drop the orphaned command-id entry, keeping the
+                # mint consistent for a retry.
+                event_id, mint_undo = self._mint_command_event_id(event)
+                self._command_event_ids[event.command_id] = event_id
+                status = "running"
+            else:
+                # End edge: reuse the start's id so the card flips in place. If the start
+                # was never seen (an end with no paired begin), mint a fresh id so the card
+                # still renders something honest.
+                event_id = self._command_event_ids.get(event.command_id)
+                if event_id is None:
+                    event_id, _ = self._mint_command_event_id(event)
+                status = "passed" if event.exit_code == 0 else "failed"
+
+            props: dict[str, Any] = {
+                "leaf_span_id": event.leaf_span_id,
+                "command": event.command,
+                "attempt": self._latest_phase,
+                "status": status,
+                "exit_code": event.exit_code,
+                "output": event.output,
+                "truncated": event.truncated,
+                "duration_s": event.duration_s,
+            }
+            # The end edge patches the running card (same event_id), so it merges — and the
+            # merge path bypasses _seen, the same begin/end exemption the span pair uses.
+            delivered = self._emit_event(_EXECUTION_COMMAND, props, event_id=event_id, merge=is_end)
+            # A swallowed start emit must leave no trace: undo the ordinal bump so a retry
+            # re-mints THIS id, and drop the orphaned command-id entry so the retried start
+            # (not the missing end) owns the mapping. Without this, a transient UI outage on
+            # the start edge would strand the command_id -> id mapping and skip an ordinal.
+            if not is_end and not delivered and mint_undo is not None:
+                stable, ordinal = mint_undo
+                self._occurrences[stable] = ordinal
+                self._command_event_ids.pop(event.command_id, None)
+
+    def _mint_command_event_id(self, event: CommandEvent) -> tuple[str, tuple[str, int]]:
+        """Mint a resume-stable ``execution_command`` id and bump its occurrence ordinal.
+
+        The id hashes the stable identity ``(leaf_span_id, command, attempt)`` — the
+        latest forwarded phase as ``attempt`` — and excludes every run-variant field
+        (``exit_code`` / ``output`` / ``duration_s`` / ``status``) so a command's start
+        and end edges share one id and the card flips in place. The per-key occurrence
+        ordinal (bumped once per command, on the create edge) keeps the same command
+        across two attempts on distinct cards while an honest resume — which re-emits the
+        same keys in the same source order — lands on the same ordinals and collapses.
+
+        Must be called with :attr:`_lock` held (the caller, :meth:`on_command`, holds it):
+        the ordinal read-modify-write races a concurrent loop-thread sink otherwise.
+
+        Args:
+            event: The command edge whose stable identity seeds the id.
+
+        Returns:
+            A ``(event_id, (stable, ordinal))`` pair. The second element lets the caller
+            undo the ordinal bump if a swallowed emit means the card never delivered.
+        """
+        dedupe_key = {
+            "leaf_span_id": event.leaf_span_id,
+            "command": event.command,
+            "attempt": self._latest_phase,
+        }
+        stable = self._stable_id(_EXECUTION_COMMAND, dedupe_key)
+        ordinal = self._occurrences[stable]
+        self._occurrences[stable] = ordinal + 1
+        return f"{stable}-{ordinal}", (stable, ordinal)
+
     # --- span mappers --------------------------------------------------------
 
     def _emit_fanout(self, span: Span) -> None:
@@ -329,7 +474,7 @@ class UiAdapter:
         event_id: str | None = None,
         dedupe_key: Mapping[str, Any] | None = None,
         merge: bool = False,
-    ) -> None:
+    ) -> bool:
         """Stamp a resume-stable id, drop duplicates, then emit — swallowing failures.
 
         Two id sources, by event nature:
@@ -373,40 +518,51 @@ class UiAdapter:
                 (the end edge of a leaf folding onto its running begin card). When ``True``
                 the event bypasses seen-suppression and carries the transport merge flag.
 
+        Returns:
+            ``True`` if the event was delivered (or was a deduped no-op the seen-set
+            suppressed), ``False`` only when the transport raised and the emit was
+            swallowed — letting the command path undo its bookkeeping for a clean retry.
+
         Raises:
             ValueError: If neither ``event_id`` nor ``dedupe_key`` is supplied.
         """
-        # For the self-computed (progress) path, remember the (stable_key, ordinal) so a
-        # swallowed failure can undo the ordinal bump; the engine-id path has no ordinal.
-        ordinal_to_undo: tuple[str, int] | None = None
-        if event_id is None:
-            if dedupe_key is None:
-                raise ValueError("_emit_event requires either event_id or dedupe_key")
-            stable = self._stable_id(component, dedupe_key)
-            ordinal = self._occurrences[stable]
-            self._occurrences[stable] = ordinal + 1
-            event_id = f"{stable}-{ordinal}"
-            ordinal_to_undo = (stable, ordinal)
+        # The whole body is guarded so the ordinal read-modify-write and the seen-set
+        # check/add are atomic against a concurrent sink on another thread (on_command
+        # runs on a to_thread worker). The lock is re-entrant, so a caller already holding
+        # it (on_command) re-acquires harmlessly.
+        with self._lock:
+            # For the self-computed (progress) path, remember the (stable_key, ordinal) so a
+            # swallowed failure can undo the ordinal bump; the engine-id path has no ordinal.
+            ordinal_to_undo: tuple[str, int] | None = None
+            if event_id is None:
+                if dedupe_key is None:
+                    raise ValueError("_emit_event requires either event_id or dedupe_key")
+                stable = self._stable_id(component, dedupe_key)
+                ordinal = self._occurrences[stable]
+                self._occurrences[stable] = ordinal + 1
+                event_id = f"{stable}-{ordinal}"
+                ordinal_to_undo = (stable, ordinal)
 
-        # A merge is a deliberate in-place patch of an already-created card, so it must
-        # NOT be dropped by seen-suppression (the create already marked the id seen).
-        if not merge and event_id in self._seen:
-            return
-        props["event_id"] = event_id
-        if merge:
-            props["merge"] = True
-        try:
-            self._emit(component, props)
-        except Exception:
-            # Red line: the engine calls sinks directly; a raising sink would break
-            # orchestration. Swallow and leave the id unseen so a retry can deliver.
-            # For the self-computed path, undo the ordinal bump so a re-delivery reuses
-            # THIS id rather than minting a fresh ordinal.
-            if ordinal_to_undo is not None:
-                stable, ordinal = ordinal_to_undo
-                self._occurrences[stable] = ordinal
-            return
-        self._seen.add(event_id)
+            # A merge is a deliberate in-place patch of an already-created card, so it must
+            # NOT be dropped by seen-suppression (the create already marked the id seen).
+            if not merge and event_id in self._seen:
+                return True
+            props["event_id"] = event_id
+            if merge:
+                props["merge"] = True
+            try:
+                self._emit(component, props)
+            except Exception:
+                # Red line: the engine calls sinks directly; a raising sink would break
+                # orchestration. Swallow and leave the id unseen so a retry can deliver.
+                # For the self-computed path, undo the ordinal bump so a re-delivery reuses
+                # THIS id rather than minting a fresh ordinal.
+                if ordinal_to_undo is not None:
+                    stable, ordinal = ordinal_to_undo
+                    self._occurrences[stable] = ordinal
+                return False
+            self._seen.add(event_id)
+            return True
 
     @staticmethod
     def _stable_id(component: str, dedupe_key: Mapping[str, Any]) -> str:

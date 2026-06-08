@@ -23,12 +23,16 @@ load-bearing behaviors the adapter exists to guarantee:
 
 from __future__ import annotations
 
+import threading
+import time
+from collections import defaultdict
 from typing import Any
 
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from ui_adapter import (
     _AGENT_SPAN,
+    _EXECUTION_COMMAND,
     _FANOUT_GRAPH,
     _JOURNAL_BADGE,
     _PHASE_TIMELINE,
@@ -36,6 +40,7 @@ from ui_adapter import (
 )
 
 from langchain_dynamic_workflow import (
+    CommandEvent,
     Ctx,
     InMemoryJournalStore,
     LeafEvent,
@@ -689,6 +694,229 @@ async def test_cached_leaf_emits_no_subtree_on_resume() -> None:
     )
 
 
+# --- (2f) on_command: execution_command begin/end in-place flip --------------
+
+
+def _command_event(
+    *,
+    leaf_span_id: str = "leaf-1",
+    command_id: str = "cmd-1",
+    command: str = "bun test",
+    phase: str = "start",
+    exit_code: int | None = None,
+    output: str | None = None,
+    truncated: bool = False,
+    duration_s: float | None = None,
+    started_at: float = 1000.0,
+) -> CommandEvent:
+    """A real-execution :class:`CommandEvent` with the engine's actual field shape.
+
+    Defaults model a ``start`` edge (``exit_code``/``output``/``duration_s`` all
+    ``None``); a test flips ``phase="end"`` and supplies the run-variant fields to
+    model the reaped end edge that shares the same ``command_id``.
+
+    Args:
+        leaf_span_id: The owning leaf's span id (correlation key to its AgentSpan).
+        command_id: The engine-minted id shared by this command's start and end edges.
+        command: The shell command string.
+        phase: The lifecycle edge -- ``"start"`` or ``"end"``.
+        exit_code: ``None`` on start; the real subprocess exit code on end.
+        output: ``None`` on start; a bounded/truncated tail on end.
+        truncated: Whether ``output`` was clipped.
+        duration_s: ``None`` on start; wall-clock seconds on end.
+        started_at: Wall-clock epoch seconds at the command's start.
+    """
+    return CommandEvent(
+        leaf_span_id=leaf_span_id,
+        command_id=command_id,
+        command=command,
+        phase=phase,
+        exit_code=exit_code,
+        output=output,
+        truncated=truncated,
+        duration_s=duration_s,
+        started_at=started_at,
+    )
+
+
+def test_on_command_start_maps_to_running_execution_command() -> None:
+    """A start edge maps to an ``execution_command`` running card with a null exit code."""
+    sent, adapter = _collector()
+
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+
+    assert len(sent) == 1
+    component, props = sent[-1]
+    assert component == _EXECUTION_COMMAND
+    assert props["leaf_span_id"] == "leaf-1"
+    assert props["command"] == "bun test"
+    assert props["status"] == "running"
+    assert props["exit_code"] is None
+    assert props.get("event_id")
+    # A start edge is the create: it must NOT carry the merge transport flag.
+    assert "merge" not in props
+
+
+def test_on_command_end_passed_flips_in_place_with_same_event_id() -> None:
+    """An exit-0 end edge shares the start's event_id, merges, and flips to passed."""
+    sent, adapter = _collector()
+
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+    start_props = sent[-1][1]
+    adapter.on_command(
+        _command_event(
+            phase="end",
+            command="bun test",
+            exit_code=0,
+            output="2 pass · 0 fail",
+            truncated=False,
+            duration_s=0.38,
+        )
+    )
+
+    end_component, end_props = sent[-1]
+    assert end_component == _EXECUTION_COMMAND
+    # Same event_id -> the card flips in place (no second card).
+    assert end_props["event_id"] == start_props["event_id"]
+    assert end_props.get("merge") is True
+    assert end_props["status"] == "passed"
+    assert end_props["exit_code"] == 0
+    assert end_props["output"] == "2 pass · 0 fail"
+    assert end_props["duration_s"] == 0.38
+    assert end_props["truncated"] is False
+
+
+def test_on_command_end_nonzero_exit_flips_to_failed() -> None:
+    """A non-zero exit-code end edge flips the card to a failed status."""
+    sent, adapter = _collector()
+
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+    adapter.on_command(
+        _command_event(
+            phase="end",
+            command="bun test",
+            exit_code=1,
+            output="1 pass · 1 fail",
+            truncated=True,
+            duration_s=0.41,
+        )
+    )
+
+    _, end_props = sent[-1]
+    assert end_props["status"] == "failed"
+    assert end_props["exit_code"] == 1
+    assert end_props["truncated"] is True
+
+
+def test_on_command_stamps_the_latest_forwarded_phase_as_attempt() -> None:
+    """``attempt`` comes from the most recent phase marker the adapter forwarded.
+
+    ``on_command`` fires inside the leaf with no knowledge of the loop counter, so the
+    adapter derives ``attempt`` from the latest PHASE entry it forwarded via
+    ``on_progress`` and stamps it onto each ``execution_command`` -- no engine change.
+    """
+    sent, adapter = _collector()
+
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+    assert sent[-1][1]["attempt"] == "attempt 1"
+
+    # A new phase advances; subsequent commands stamp the newer attempt.
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 2"))
+    adapter.on_command(_command_event(phase="start", command="bun test", command_id="cmd-2"))
+    assert sent[-1][1]["attempt"] == "attempt 2"
+
+
+def test_on_command_attempt_is_not_advanced_by_a_log_line() -> None:
+    """Only PHASE markers (not LOG lines) set the ``attempt`` stamp."""
+    sent, adapter = _collector()
+
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.LOG, message="attempt 1 red"))
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+
+    assert sent[-1][1]["attempt"] == "attempt 1"
+
+
+def test_on_command_attempt_is_null_before_any_phase() -> None:
+    """With no phase forwarded yet, ``attempt`` is ``None`` (honest, not invented)."""
+    sent, adapter = _collector()
+
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+
+    assert sent[-1][1]["attempt"] is None
+
+
+def test_on_command_attempt_distinguishes_same_command_across_attempts() -> None:
+    """The same command across two attempts yields two distinct cards (attempt in key).
+
+    Without ``attempt`` in the dedupe key, the second attempt's ``bun test`` start edge
+    would collide with the first attempt's id and be swallowed by ``_seen``. The
+    ``attempt`` stamp keeps them distinct so each attempt renders its own card.
+    """
+    sent, adapter = _collector()
+
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+    adapter.on_command(_command_event(phase="start", command="bun test", command_id="a1"))
+    first_id = sent[-1][1]["event_id"]
+
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 2"))
+    adapter.on_command(_command_event(phase="start", command="bun test", command_id="a2"))
+    second_id = sent[-1][1]["event_id"]
+
+    assert first_id != second_id
+
+
+def test_on_command_resume_reproduces_a_stable_event_id() -> None:
+    """A fresh adapter reproduces the exact same execution_command id sequence.
+
+    A real resume builds a fresh adapter (new host-tool invocation). Replaying the same
+    phase + command stream must reproduce the identical ``event_id`` so the frontend
+    dedupes the re-emit -- the resume-stable invariant the adapter exists to guarantee.
+    """
+
+    def run() -> list[str]:
+        sent: list[Event] = []
+        adapter = UiAdapter(emit=lambda comp, props: sent.append((comp, dict(props))))
+        adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+        adapter.on_command(_command_event(phase="start", command="bun build"))
+        adapter.on_command(_command_event(phase="start", command="bun test", command_id="t"))
+        return [p["event_id"] for c, p in sent if c == _EXECUTION_COMMAND]
+
+    fresh_ids = run()
+    resume_ids = run()
+    assert fresh_ids == resume_ids != []
+
+
+def test_on_command_end_is_not_swallowed_by_seen() -> None:
+    """The deliberate begin->end flip for one command_id must both deliver.
+
+    The end edge shares the begin's ``event_id``; without the begin/end merge exemption
+    ``_seen`` would drop the end as a duplicate and the card would never flip. The end
+    edge rides the same exemption the span begin/end pair uses.
+    """
+    sent, adapter = _collector()
+
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+    adapter.on_command(_command_event(phase="end", command="bun test", exit_code=0, duration_s=0.1))
+
+    cmd_emits = [(c, p) for c, p in sent if c == _EXECUTION_COMMAND]
+    assert len(cmd_emits) == 2, "both the start (create) and end (merge) edges must deliver"
+    assert cmd_emits[0][1]["status"] == "running"
+    assert cmd_emits[1][1]["status"] == "passed"
+
+
+def test_on_command_never_raises_on_a_failing_transport() -> None:
+    """A raising transport must not propagate out of ``on_command``."""
+
+    def boom(_component: str, _props: dict[str, Any]) -> None:
+        raise RuntimeError("ui down")
+
+    adapter = UiAdapter(emit=boom)
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+    adapter.on_command(_command_event(phase="end", command="bun test", exit_code=0, duration_s=0.1))
+
+
 # --- (3) Stable-id dedupe ----------------------------------------------------
 
 
@@ -911,3 +1139,195 @@ def test_emit_failure_does_not_poison_dedupe_set() -> None:
     adapter.on_progress(entry)  # retry succeeds
 
     assert len(delivered) == 1, "a swallowed failure must not block a later retry"
+
+
+# --- (8) on_command cross-thread safety --------------------------------------
+#
+# on_command fires from an asyncio.to_thread worker (deepagents aexecute marshals the
+# leaf's execute through to_thread) while on_progress / on_span run on the event-loop
+# thread. The adapter's on_command read-modify-write regions (occurrence-ordinal bump,
+# _seen check/add, _command_event_ids get/set, _latest_phase read) therefore race the
+# loop-thread sinks. These tests hammer on_command from many worker threads and assert
+# the lock-guarded invariants hold: no id collision (every distinct command-id gets its
+# own card), no lost start->end pairing, and a clean ordinal under contention.
+
+
+class _SlowReadOccurrences(defaultdict[str, int]):
+    """A counter dict whose read returns a STALE value after yielding the GIL.
+
+    The occurrence-ordinal bump is ``ordinal = d[key]; d[key] = ordinal + 1``. Under
+    CPython that pair rarely tears on its own (no GIL yield falls between the two
+    bytecodes), so a naive thread test passes even without the lock. This helper captures
+    the value, sleeps (handing the GIL to peer threads that then read the *same* value),
+    and only then returns the captured-stale ordinal — so two unguarded workers reliably
+    read the same ordinal and mint colliding ids. That makes the lock a genuine
+    regression guard rather than a no-op the GIL hides: the lock-guarded path serializes
+    the whole read-modify-write, so no second reader can observe the stale value.
+    """
+
+    def __getitem__(self, key: str) -> int:
+        value = super().__getitem__(key)  # capture the ordinal NOW
+        time.sleep(0.0005)  # hand the GIL over while still holding the stale value
+        return value
+
+
+def test_on_command_concurrent_starts_mint_distinct_ids_under_contention() -> None:
+    """N concurrent start edges (distinct command ids) yield N distinct event ids.
+
+    Each start edge mints a resume-stable id, bumps the per-key occurrence ordinal, and
+    records the id under the engine ``command_id`` — a read-modify-write over shared
+    adapter state. Without a lock guarding it, two workers can read the same ordinal and
+    mint a colliding event id (one card silently overwrites the other), or corrupt the
+    ``_command_event_ids`` / ``_occurrences`` dicts. The injected
+    :class:`_SlowReadOccurrences` widens the read->write window so the race is
+    deterministic (not GIL-masked); driving many starts from a thread pool and asserting
+    every event id is distinct then pins the lock.
+    """
+    lock = threading.Lock()
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    def emit(component: str, props: dict[str, Any]) -> None:
+        # The collector itself must be thread-safe so any lost ids are the adapter's,
+        # not the test harness's.
+        with lock:
+            sent.append((component, dict(props)))
+
+    adapter = UiAdapter(emit=emit)
+    # Swap in the yield-on-read counter so the ordinal bump's read->write window is wide
+    # enough that an unguarded path interleaves two readers (the lock must serialize it).
+    adapter._occurrences = _SlowReadOccurrences(int)  # type: ignore[assignment]
+    # All commands share the same (leaf_span_id, command, attempt) stable key, so the
+    # ONLY thing keeping their cards distinct is the per-key occurrence ordinal — exactly
+    # the read-modify-write the lock must serialize.
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+    count = 64
+
+    barrier = threading.Barrier(count)
+
+    def fire(i: int) -> None:
+        barrier.wait()  # maximize the contention window
+        adapter.on_command(_command_event(phase="start", command="bun test", command_id=f"c{i}"))
+
+    threads = [threading.Thread(target=fire, args=(i,)) for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    cmd_props = [p for comp, p in sent if comp == _EXECUTION_COMMAND]
+    assert len(cmd_props) == count, "every concurrent start edge must deliver a card"
+    ids = [p["event_id"] for p in cmd_props]
+    unique = len(set(ids))
+    assert unique == count, f"id collision under contention: {unique} unique of {count}"
+
+
+def test_on_command_concurrent_start_end_pairs_flip_in_place() -> None:
+    """Concurrent start->end pairs each flip the SAME card in place (no lost pairing).
+
+    The end edge reads its start's minted id back out of ``_command_event_ids`` so the
+    card flips pass/fail in place. Under concurrency a torn get/set could leave an end
+    edge unable to find its start's id (so it mints a fresh id and the running card never
+    flips). This fires a start then an end for each of N command ids across a thread pool
+    and asserts each command id resolves to exactly ONE event id across both edges.
+    """
+    lock = threading.Lock()
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    def emit(component: str, props: dict[str, Any]) -> None:
+        with lock:
+            sent.append((component, dict(props)))
+
+    adapter = UiAdapter(emit=emit)
+    # Widen the ordinal read->write window (see _SlowReadOccurrences) so an unguarded
+    # path tears, making the lock a genuine guard rather than a GIL-masked no-op.
+    adapter._occurrences = _SlowReadOccurrences(int)  # type: ignore[assignment]
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+    count = 64
+    barrier = threading.Barrier(count)
+
+    def fire(i: int) -> None:
+        cid = f"c{i}"
+        barrier.wait()
+        adapter.on_command(_command_event(phase="start", command="bun test", command_id=cid))
+        adapter.on_command(
+            _command_event(
+                phase="end", command="bun test", command_id=cid, exit_code=0, duration_s=0.1
+            )
+        )
+
+    threads = [threading.Thread(target=fire, args=(i,)) for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Every (start, end) pair must share one event id, and every command must flip to a
+    # terminal (passed) card. Group the delivered command cards by event id.
+    by_id: dict[str, list[str]] = {}
+    for comp, props in sent:
+        if comp != _EXECUTION_COMMAND:
+            continue
+        by_id.setdefault(props["event_id"], []).append(props["status"])
+    # N distinct cards (no two commands collided onto one id).
+    assert len(by_id) == count, f"expected {count} distinct cards, got {len(by_id)}"
+    # Each card saw both its running create and its passed flip (the start->end pairing
+    # was never lost to a torn _command_event_ids access).
+    for event_id, statuses in by_id.items():
+        assert "running" in statuses, f"{event_id} never created its running card"
+        assert "passed" in statuses, f"{event_id} never flipped to passed (lost start->end pairing)"
+
+
+def test_on_command_swallowed_start_undoes_ordinal_and_orphan_for_clean_retry() -> None:
+    """A swallowed start emit leaves no orphaned id mapping or skipped ordinal.
+
+    The start edge mints an id, bumps the per-key occurrence ordinal, and records the id
+    under the engine ``command_id`` BEFORE the emit. If the emit is swallowed (a transient
+    UI outage), the bookkeeping must be undone: the ordinal rewound so a retry re-mints THE
+    SAME id, and the orphaned ``command_id -> id`` entry dropped so the retried start (not
+    a later end with no live card) owns it. Without the undo, a retried start would skip an
+    ordinal (a gap in the card sequence) and the stale mapping would mis-route the end edge.
+    """
+    failures = {"count": 1}
+    delivered: list[dict[str, Any]] = []
+
+    def flaky(component: str, props: dict[str, Any]) -> None:
+        # Fail only the FIRST execution_command emit (the swallowed start), so the phase
+        # marker delivers normally and does not consume the single injected failure.
+        if component == _EXECUTION_COMMAND and failures["count"] > 0:
+            failures["count"] -= 1
+            raise RuntimeError("transient ui outage")
+        if component == _EXECUTION_COMMAND:
+            delivered.append(dict(props))
+
+    adapter = UiAdapter(emit=flaky)
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+
+    start = _command_event(phase="start", command="bun test", command_id="cmd-x")
+    adapter.on_command(start)  # emit fails, swallowed, bookkeeping undone
+    # The orphaned command_id mapping must be gone after a swallowed start.
+    assert "cmd-x" not in adapter._command_event_ids  # internal-state guard
+
+    adapter.on_command(start)  # retry: re-mints the SAME id at the SAME ordinal
+    assert len(delivered) == 1, "the retried start must deliver"
+    retried_id = delivered[-1]["event_id"]
+    # The retry lands on ordinal 0 (the swallowed bump was rewound), not a skipped 1.
+    assert retried_id.endswith("-0"), retried_id
+
+    # The paired end now resolves the retried start's id and flips the card in place.
+    end = _command_event(
+        phase="end", command="bun test", command_id="cmd-x", exit_code=0, duration_s=0.1
+    )
+    adapter.on_command(end)
+    assert delivered[-1]["event_id"] == retried_id, "the end must flip the retried start's card"
+    assert delivered[-1]["status"] == "passed"
+
+
+def test_on_command_class_docstring_notes_off_loop_invocation() -> None:
+    """The adapter class docstring flags that on_command may fire off the event loop.
+
+    A future reader who mutates the on_command path must know it can run from a worker
+    thread (deepagents marshals execute through to_thread). Pinning the note keeps the
+    cross-thread contract discoverable rather than tribal knowledge.
+    """
+    doc = UiAdapter.__doc__ or ""
+    assert "loop" in doc.lower() and "thread" in doc.lower(), doc

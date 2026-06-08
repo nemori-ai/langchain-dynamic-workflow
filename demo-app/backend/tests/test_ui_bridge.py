@@ -26,6 +26,8 @@ honest.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from typing import Any, cast
 
 import pytest
@@ -228,6 +230,66 @@ async def test_emit_swallows_push_failure_and_resets_contextvar(
     # Nothing was streamed or sent because the push failed before writer()/send().
     assert host_writer_events == []
     assert host_send_pairs == []
+
+
+async def test_emit_from_a_genuine_to_thread_worker_reaches_the_host_writer() -> None:
+    """The host-bound emit works when called from an ``asyncio.to_thread`` WORKER thread.
+
+    This is the load-bearing M5 transport claim. The engine fires a leaf's real
+    ``on_command`` edge from inside ``deepagents``' ``execute`` path, which is marshaled
+    onto an ``asyncio.to_thread`` worker — so the command-path emit does NOT run on the
+    event loop thread. ``push_ui_message`` resolves the host writer + ui-channel send off
+    a ``contextvars.ContextVar`` (``var_child_runnable_config``); a worker spawned by
+    ``to_thread`` inherits a COPY of the loop thread's context, so the captured host
+    config must still be reachable and rebindable from that worker.
+
+    The whole live-terminal-card story rides on this: if a worker-thread emit silently
+    failed (the bridge's bare ``except`` would swallow it), every fix-loop terminal card
+    would vanish and the headline M5 UI would never appear — with no test catching it.
+    This test drives the REAL ``make_host_ui_emit`` from a genuine ``to_thread`` worker
+    and asserts (a) the emit ran OFF the loop thread and (b) the event still reached the
+    host writer + host ui-channel send. If this ever fails, the bridge must marshal the
+    push onto the loop thread (``loop.call_soon_threadsafe``) for the command path.
+    """
+    host_writer_events: list[UIMessage] = []
+    host_send_pairs: list[tuple[str, UIMessage]] = []
+    host_config = _make_host_config(writer_sink=host_writer_events, send_sink=host_send_pairs)
+
+    loop_thread_id = threading.get_ident()
+
+    # Capture the emit while the host config is the ambient context (we are "in the host
+    # node" on the loop thread), exactly as a host tool does before entering the engine.
+    token = var_child_runnable_config.set(host_config)
+    try:
+        emit = make_host_ui_emit(anchor=None)
+    finally:
+        var_child_runnable_config.reset(token)
+
+    worker_thread_id: dict[str, int] = {}
+
+    def emit_from_worker() -> None:
+        # This body runs on the to_thread worker, NOT the loop thread — exactly where the
+        # engine's on_command edge invokes the adapter's sink.
+        worker_thread_id["id"] = threading.get_ident()
+        emit("execution_command", {"command": "bun test", "status": "running", "event_id": "cmd-1"})
+
+    # asyncio.to_thread copies the current context into the worker, so the captured host
+    # config travels with it — this is the real engine marshaling path, not a fake.
+    await asyncio.to_thread(emit_from_worker)
+
+    # (a) The emit genuinely ran off the event-loop thread.
+    assert worker_thread_id["id"] != loop_thread_id, "emit did not run on a worker thread"
+
+    # (b) The worker-thread emit still reached the HOST writer + ui-channel send. A bare
+    # except in the bridge would hide a failure here, so this is the guard that the live
+    # terminal card actually streams.
+    assert len(host_writer_events) == 1, "the worker-thread emit must reach the host writer"
+    assert host_writer_events[0]["name"] == "execution_command"
+    assert len(host_send_pairs) == 1
+    state_key, evt = host_send_pairs[0]
+    assert state_key == "ui"
+    assert evt["id"] == "cmd-1"
+    assert cast(UIMessage, evt)["props"]["command"] == "bun test"
 
 
 async def test_merge_true_end_edge_folds_onto_same_id_begin_card() -> None:

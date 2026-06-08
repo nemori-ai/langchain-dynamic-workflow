@@ -5,9 +5,10 @@
  * workflow. The messages are a real user's words (the why/when of the task), never
  * tool mechanics: no command names, no workflow names, no argument shapes.
  *
- * The four presets exercise the headline capabilities: a hard multi-source research
- * task, picking a long-running task back up, a task with no ready-made procedure, and
- * handing off a heavy multi-step job to run detached in the background.
+ * The presets exercise the headline capabilities: a hard multi-source research task,
+ * picking a long-running task back up, a task with no ready-made procedure, handing off
+ * a heavy multi-step job to run detached in the background, and fixing real code in a
+ * loop until its tests genuinely go green (real in-loop executable verification).
  */
 
 interface Scenario {
@@ -50,6 +51,15 @@ const SCENARIOS: readonly Scenario[] = [
       "This is a heavy, multi-step research job — I don't want to babysit every " +
       "step. Please take it off my hands and run the whole thing in the " +
       "background; just let me know how it went once it's done.",
+  },
+  {
+    label: "Make it pass",
+    hint: "fix code until the tests are green",
+    message:
+      "I've got a small TypeScript module with a couple of failing unit tests. " +
+      "Please actually fix the code and keep checking it against the tests until " +
+      "they genuinely pass — don't just tell me it looks right, prove it builds " +
+      "and the tests go green.",
   },
 ];
 

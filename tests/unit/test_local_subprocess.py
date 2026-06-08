@@ -522,3 +522,202 @@ def test_file_api_rejects_a_symlink_escaping_the_root(tmp_path: object) -> None:
         assert backend.read(f"/{outside}").error is not None
     finally:
         backend.close()
+
+
+# --- on_command sink (M5 C1) ------------------------------------------------
+
+
+def test_on_command_fires_begin_then_end_for_a_real_command() -> None:
+    # With a wired command sink, a real execute fires a begin edge (phase="start",
+    # exit_code=None) BEFORE the subprocess and an end edge (phase="end", the real
+    # exit code) AFTER — the two edges share one resume-stable command_id so a UI
+    # card can flip in place. Correlated to the owning leaf via leaf_span_id.
+    from langchain_dynamic_workflow._observability import CommandEvent
+
+    events: list[CommandEvent] = []
+    backend = _backend()
+    backend.set_command_sink(sink=events.append, leaf_span_id="span-abc")
+    try:
+        result = backend.execute(f'{sys.executable} -c "print(2 + 40)"')
+        assert "42" in result.output
+    finally:
+        backend.close()
+
+    assert len(events) == 2
+    begin, end = events
+    assert begin.phase == "start"
+    assert end.phase == "end"
+    # begin precedes end (emission order is the firing order).
+    assert begin.leaf_span_id == end.leaf_span_id == "span-abc"
+    assert begin.command_id == end.command_id  # one command, one id (flip in place)
+    assert begin.command == end.command
+    assert begin.exit_code is None  # not known at start
+    assert end.exit_code == 0  # the real exit code
+    assert begin.output is None  # no output until the command finishes
+    assert end.output is not None and "42" in end.output
+    assert begin.duration_s is None
+    assert end.duration_s is not None and end.duration_s >= 0.0
+    assert begin.started_at > 0.0
+
+
+def test_on_command_end_carries_a_nonzero_exit_code() -> None:
+    # A failing command's real non-zero exit code rides the end edge, so the
+    # orchestration's branch-on-exit-code story is visible in the terminal card.
+    from langchain_dynamic_workflow._observability import CommandEvent
+
+    events: list[CommandEvent] = []
+    backend = _backend()
+    backend.set_command_sink(sink=events.append, leaf_span_id="span-fail")
+    try:
+        result = backend.execute(f'{sys.executable} -c "import sys; sys.exit(3)"')
+        assert result.exit_code == 3
+    finally:
+        backend.close()
+
+    end = events[-1]
+    assert end.phase == "end"
+    assert end.exit_code == 3
+
+
+def test_on_command_id_is_distinct_per_occurrence_within_a_leaf() -> None:
+    # Two executes of the SAME command in one leaf get DISTINCT command_ids (the
+    # occurrence ordinal salts them apart), so a fix-loop's repeated `bun test`
+    # stacks as separate cards rather than collapsing onto one id.
+    from langchain_dynamic_workflow._observability import CommandEvent
+
+    events: list[CommandEvent] = []
+    backend = _backend()
+    backend.set_command_sink(sink=events.append, leaf_span_id="span-loop")
+    cmd = f'{sys.executable} -c "print(1)"'
+    try:
+        backend.execute(cmd)
+        backend.execute(cmd)
+    finally:
+        backend.close()
+
+    starts = [e for e in events if e.phase == "start"]
+    assert len(starts) == 2
+    assert starts[0].command_id != starts[1].command_id  # distinct occurrences
+    # Each occurrence's begin/end still share their own id.
+    ends = [e for e in events if e.phase == "end"]
+    assert {s.command_id for s in starts} == {e.command_id for e in ends}
+
+
+def test_on_command_output_is_shape_only_by_default_and_truncated_honestly() -> None:
+    # By default (include_payloads=False) the end edge carries only a bounded tail
+    # of the output and flags truncated honestly when it had to clip — never the
+    # full multi-KB body. Guards the redaction policy.
+    from langchain_dynamic_workflow._observability import CommandEvent
+
+    events: list[CommandEvent] = []
+    backend = _backend()
+    backend.set_command_sink(sink=events.append, leaf_span_id="span-big")
+    try:
+        # Print far more than any small command-event tail budget.
+        backend.execute(f'{sys.executable} -c "print(\\"z\\" * 50000)"')
+    finally:
+        backend.close()
+
+    end = events[-1]
+    assert end.phase == "end"
+    assert end.output is not None
+    # The forwarded output is a small bounded tail, not the full 50 KB body.
+    assert len(end.output.encode()) < 50000
+    assert end.truncated is True  # honestly flagged as clipped
+
+
+def test_on_command_full_output_only_when_payloads_opted_in() -> None:
+    # With include_payloads=True the end edge carries the full captured output (up
+    # to the backend's own output cap), so an operator can opt into the raw tail.
+    from langchain_dynamic_workflow._observability import CommandEvent
+
+    events: list[CommandEvent] = []
+    backend = _backend(ExecPolicy(output_cap_bytes=1_000_000))
+    backend.set_command_sink(sink=events.append, leaf_span_id="span-full", include_payloads=True)
+    try:
+        backend.execute(f'{sys.executable} -c "print(\\"q\\" * 5000)"')
+    finally:
+        backend.close()
+
+    end = events[-1]
+    assert end.output is not None
+    assert end.output.count("q") >= 5000  # the full body, not a clipped tail
+    assert end.truncated is False  # the backend itself did not clip under the big cap
+
+
+def test_no_command_sink_means_no_events_default_zero_cost() -> None:
+    # Without set_command_sink the backend never fires command events: the sink is
+    # default-no-op, so execute is byte-for-byte the prior behavior.
+    backend = _backend()
+    try:
+        result = backend.execute(f'{sys.executable} -c "print(99)"')
+        assert "99" in result.output
+        assert result.exit_code == 0  # unchanged path, no observation overhead
+    finally:
+        backend.close()
+
+
+def test_on_command_spawn_failure_still_fires_a_terminal_end_edge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the subprocess never spawns (Popen raises — EMFILE/ENOMEM, a preexec rlimit
+    # failure between fork and exec, etc.) AFTER the begin edge already painted a
+    # "running" card, the backend MUST still fire a terminal end edge so the card is
+    # never stuck "running" forever. The end carries the spawn-error sentinel, the
+    # SAME command_id as the begin, and the original exception still propagates.
+    from langchain_dynamic_workflow._local_subprocess import EXIT_SPAWN_ERROR
+    from langchain_dynamic_workflow._observability import CommandEvent
+
+    boom = OSError(24, "Too many open files")
+
+    def _raise(*_args: object, **_kwargs: object) -> object:
+        raise boom
+
+    # Patch Popen on the subprocess module as seen from the backend's call site.
+    monkeypatch.setattr("langchain_dynamic_workflow._local_subprocess.subprocess.Popen", _raise)
+
+    events: list[CommandEvent] = []
+    backend = _backend()
+    backend.set_command_sink(sink=events.append, leaf_span_id="span-spawn")
+    try:
+        with pytest.raises(OSError) as excinfo:
+            backend.execute(f'{sys.executable} -c "print(1)"')
+        assert excinfo.value is boom  # original exception preserved for callers
+    finally:
+        backend.close()
+
+    # Both edges fired even though the subprocess never started.
+    assert len(events) == 2
+    begin, end = events
+    assert begin.phase == "start"
+    assert begin.exit_code is None
+    assert end.phase == "end"
+    assert end.command_id == begin.command_id  # same card flips in place
+    assert end.leaf_span_id == begin.leaf_span_id == "span-spawn"
+    assert end.exit_code == EXIT_SPAWN_ERROR  # honest spawn-failure sentinel
+    assert end.truncated is False
+    assert end.duration_s is not None and end.duration_s >= 0.0
+    # The end output is an honest tail naming the failure, not a fake success.
+    assert end.output is not None and "Too many open files" in end.output
+
+
+def test_spawn_failure_without_sink_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The unobserved path (no sink wired) stays byte-identical: a Popen failure
+    # propagates the original exception with no event machinery in the way.
+    boom = OSError(12, "Cannot allocate memory")
+
+    def _raise(*_args: object, **_kwargs: object) -> object:
+        raise boom
+
+    # Patch Popen on the subprocess module as seen from the backend's call site.
+    monkeypatch.setattr("langchain_dynamic_workflow._local_subprocess.subprocess.Popen", _raise)
+
+    backend = _backend()
+    try:
+        with pytest.raises(OSError) as excinfo:
+            backend.execute(f'{sys.executable} -c "print(1)"')
+        assert excinfo.value is boom
+    finally:
+        backend.close()

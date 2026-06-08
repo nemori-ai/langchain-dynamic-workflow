@@ -27,6 +27,7 @@ from _models import cache_middleware, resolve_leaf_model, resolve_openrouter_key
 from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
+from langgraph.config import get_config
 from pydantic import BaseModel
 
 from langchain_dynamic_workflow import (
@@ -74,6 +75,54 @@ class Verdict(BaseModel):
 
     refuted: bool
     reason: str
+
+
+class EditedFile(BaseModel):
+    """One source file the ``code_fixer`` leaf wrote or edited during an attempt.
+
+    The fix loop threads these forward through a SCRIPT VARIABLE: a leaf writes the
+    files it was handed into its fresh sandbox, edits them, and returns the edited set so
+    the script can seed the NEXT attempt with the accumulated source — cross-attempt state
+    lives in the script, not a persistent workspace.
+
+    Attributes:
+        path: The file's path relative to the leaf's workspace (e.g. ``src/sum.ts``).
+        content: The file's full contents after this attempt's edits.
+    """
+
+    path: str
+    content: str
+
+
+class FixResult(BaseModel):
+    """One fix-loop attempt's outcome, carrying the REAL build/test exit code.
+
+    The ``code_fixer`` leaf writes the source files it was handed into its fresh sandbox,
+    runs the build/test command, transcribes the REAL exit code it observed from its
+    execute tool's output, edits the source, and returns this object. The orchestration
+    script branches on :attr:`exit_code` (``== 0`` is green) — never on leaf prose — and
+    threads :attr:`edited_files` into the next attempt when red.
+
+    Trust boundary: :attr:`exit_code` is the exit code the leaf *transcribed* from its
+    real tool output, so it is only as honest as the leaf's transcription; the engine's
+    independent ``on_command`` end events are the ground-truth display of what really ran.
+    Surfacing the real exit code directly to the orchestration (full determinism) is out
+    of scope here.
+
+    Attributes:
+        exit_code: The REAL build/test command exit code the leaf observed (``0`` is
+            green; non-zero is red). The orchestration gate.
+        edited_files: The source files after this attempt's edits, threaded forward into
+            the next attempt so the script accumulates the fix across attempts.
+        failure_tail: A short tail of the failing build/test output, carried forward to
+            the next attempt's prompt when red; empty when green.
+        summary: A one-line human-readable summary of what the attempt did.
+    """
+
+    exit_code: int
+    edited_files: list[EditedFile]
+    failure_tail: str
+    summary: str
 
 
 # ── deep_research prompts ─────────────────────────────────────────────────────
@@ -254,6 +303,171 @@ async def capstone(ctx: Ctx, args: dict[str, Any]) -> str:
     return f"synthesized {len(survivors)} surviving findings: " + " | ".join(sorted(survivors))
 
 
+# ── fix_loop orchestration (real in-loop executable verification, M5) ──────────
+
+# The default retry budget for the fix loop. Bounded so an all-red fixer cannot loop
+# forever — the loop returns an honest "still red" after this many attempts.
+DEFAULT_FIX_ATTEMPTS = 3
+
+# The hard upper bound on the retry budget. A caller-supplied max_attempts is clamped into
+# [1, _MAX_FIX_ATTEMPTS] so a hostile or fat-fingered argument can neither disable the loop
+# (zero/negative) nor let it run unbounded (a resource-exhaustion guard).
+_MAX_FIX_ATTEMPTS = 8
+
+# A tiny TypeScript module with a REAL bug plus a bun test that fails against it: sum()
+# ignores its inputs and returns 0, so `sum(-1, -1)` is 0 rather than -2 and the negative
+# case fails. The SCRIPT seeds the first attempt with these files; the code_fixer leaf
+# writes the files it is handed into its fresh sandbox, runs `bun test` for a real exit
+# code (red), edits src/sum.ts to actually add its inputs, and returns the edited files so
+# the script threads them into the next attempt — cross-attempt state lives in a script
+# variable, not a persistent workspace.
+SEED_SUM_MODULE = "export function sum(a: number, b: number): number {\n  return 0;\n}\n"
+SEED_SUM_TEST = (
+    'import { expect, test } from "bun:test";\n'
+    'import { sum } from "./sum";\n\n'
+    'test("adds two positives", () => {\n'
+    "  expect(sum(2, 3)).toBe(5);\n"
+    "});\n\n"
+    'test("adds negatives", () => {\n'
+    "  expect(sum(-1, -1)).toBe(-2);\n"
+    "});\n"
+)
+FIX_TEST_COMMAND = "bun test"
+
+
+def _clamp_max_attempts(raw: Any) -> int:
+    """Parse and clamp a caller-supplied ``max_attempts`` into a safe bounded range.
+
+    The value reaches here from untrusted workflow args, so it may be missing, non-numeric,
+    zero, negative, or absurdly large. A value that parses as an int is clamped into
+    ``[1, _MAX_FIX_ATTEMPTS]``; a value that does not parse falls back to the default — so
+    the loop can neither be disabled nor run unbounded, and a bad argument never crashes.
+
+    Args:
+        raw: The caller-supplied ``max_attempts`` argument (any type).
+
+    Returns:
+        A bounded attempt count in ``[1, _MAX_FIX_ATTEMPTS]``.
+    """
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_FIX_ATTEMPTS
+    return max(1, min(parsed, _MAX_FIX_ATTEMPTS))
+
+
+def _render_files(files: list[EditedFile]) -> str:
+    """Render the current source files for an attempt's prompt (path + contents block)."""
+    return "\n".join(f"{f.path}:\n{f.content}" for f in files)
+
+
+def _fix_prompt(attempt: int, files: list[EditedFile], last_failure: str) -> str:
+    """Build the code_fixer prompt for one attempt, threading the CURRENT source files.
+
+    The current source files live in a SCRIPT VARIABLE and are handed to the leaf EVERY
+    attempt (not seeded only on the first): attempt 1 carries the buggy seed; a retry
+    carries the prior attempt's edited files plus the real failure tail, so the leaf fixes
+    the source as it actually stands. The prompt drives the leaf to write the handed files
+    into its fresh sandbox, run the test command, transcribe the REAL exit code, edit the
+    source, and return both the edited files and the exit code it observed.
+
+    Args:
+        attempt: The 1-based attempt number.
+        files: The current source files (seed on attempt 1, threaded edits on a retry).
+        last_failure: The previous attempt's real failure tail, or empty on attempt 1.
+
+    Returns:
+        The leaf prompt for this attempt.
+    """
+    retry = (
+        ""
+        if not last_failure
+        else (
+            "The previous attempt's test run still failed. Here is the real failure "
+            f"tail:\n{last_failure}\n\n"
+        )
+    )
+    return (
+        "You are fixing a small TypeScript module until its tests genuinely pass.\n\n"
+        + retry
+        + "Write these files into your workspace exactly as given, then run the test "
+        "command and read its REAL exit code:\n\n"
+        + _render_files(files)
+        + f"\n\nTest command: {FIX_TEST_COMMAND}\n\n"
+        "Use your execute tool to run the test command and read the real exit code "
+        "(zero means the tests passed). Edit src/sum.ts so the tests pass — do not edit "
+        "the test file. Set `exit_code` to the REAL exit code the test command returned "
+        "(0 means green). Return the full contents of every file you wrote or edited in "
+        "`edited_files` (so the source carries forward). When the exit code is non-zero, "
+        "put the real failure output tail in `failure_tail`. Give a one-line `summary`."
+    )
+
+
+async def fix_loop(ctx: Ctx, args: dict[str, Any]) -> str:
+    """Edit code, test it for real, and retry until the REAL exit code goes green.
+
+    A SCRIPT-OWNED loop, the dynamic-workflow thesis made concrete: cross-attempt state —
+    the current source files — lives in a SCRIPT VARIABLE seeded from the buggy ``SEED``
+    fixture, not a persistent workspace. Each attempt hands the leaf the current files,
+    the leaf writes them into its fresh sandbox, runs the real test command, transcribes
+    the REAL exit code, edits the source, and returns a :class:`FixResult`. The script
+    branches on the REAL ``exit_code`` (``== 0`` is green) — NEVER on a model boolean —
+    and threads the leaf's ``edited_files`` into the next attempt's prompt when red, so
+    the fix accumulates across attempts. The script formats NO UI; the terminal cards
+    appear automatically through the engine's ``on_command`` sink. The loop stops on the
+    first green attempt or when the bounded retry budget is spent (an honest "still red"
+    return, never a false pass).
+
+    Trust boundary: the gate is the exit code the leaf TRANSCRIBED from its real tool
+    output — only as honest as that transcription. The engine's ``on_command`` end events
+    are the independent ground-truth display. Surfacing the real exit code directly to the
+    orchestration (full determinism) is out of scope here.
+
+    Args:
+        ctx: The orchestration context supplied by ``run_workflow``.
+        args: Workflow arguments; ``max_attempts`` bounds the retry budget (default 3,
+            clamped into ``[1, _MAX_FIX_ATTEMPTS]``; a non-numeric value falls back).
+
+    Returns:
+        The green attempt's summary, or an honest "still red" message with the last
+        failure tail when the budget is exhausted.
+    """
+    max_attempts = _clamp_max_attempts(args.get("max_attempts", DEFAULT_FIX_ATTEMPTS))
+    # The current source files — the cross-attempt state — live in THIS script variable,
+    # seeded from the buggy fixture and rethreaded with each attempt's edits below.
+    files: list[EditedFile] = [
+        EditedFile(path="src/sum.ts", content=SEED_SUM_MODULE),
+        EditedFile(path="src/sum.test.ts", content=SEED_SUM_TEST),
+    ]
+    last_failure = ""
+    for attempt in range(1, max_attempts + 1):
+        ctx.phase(f"attempt {attempt}")
+        # A shared-isolation execution leaf: it writes the handed files into its fresh
+        # sandbox, runs the real build/test via execute (exit code is REAL under M5), and
+        # hands back the edited files + the exit code it transcribed. Worktree isolation is
+        # M6; here the execution runs in the per-leaf LocalSubprocessSandbox temp dir.
+        result = await ctx.agent(
+            _fix_prompt(attempt, files, last_failure),
+            agent_type="code_fixer",
+            isolation="shared",
+            schema=FixResult,
+        )
+        # Gate on the REAL exit code, NOT a model boolean: a leaf that lies in its prose
+        # cannot false-green because the script reads exit_code, the ground-truth signal.
+        if result.exit_code == 0:
+            ctx.log(f"green on attempt {attempt}")
+            return f"green on attempt {attempt}: {result.summary}"
+        # Red: thread the leaf's edited files forward (the script variable accumulates the
+        # fix) and carry the failure tail into the next attempt's prompt.
+        if result.edited_files:
+            files = result.edited_files
+        last_failure = result.failure_tail
+        ctx.log(
+            f"attempt {attempt} red (exit {result.exit_code}): {result.failure_tail.strip()[:50]}"
+        )
+    return f"still red after {max_attempts} attempts; last failure:\n{last_failure}"
+
+
 # ── leaves (real deepagents when a key is present, deterministic fakes offline) ──
 
 
@@ -398,41 +612,120 @@ def _build_capstone_skeptic(*, response_format: Any = None, api_key: str | None 
     return RunnableLambda(_leaf)
 
 
+def _build_code_fixer(*, response_format: Any = None, api_key: str | None = None) -> Any:
+    """Build the ``code_fixer`` execution leaf, forwarding ``response_format`` (FixResult).
+
+    The real path is a ``create_deep_agent`` wired with a ``backend`` factory that reads
+    the engine-leased per-leaf sandbox from the leaf config at call time
+    (``configurable['sandbox_backend']``), so the leaf's ``execute`` tool runs real shell
+    commands (``bun test``) in an isolated temp directory for a TRUE exit code. The leaf
+    is driven by :func:`_fix_prompt` to write the seeded module, run the test, fix the
+    source, and re-run until green, returning a :class:`FixResult`.
+
+    The offline path is a deterministic fake that exercises the SCRIPT-OWNED threading
+    loop with no model and no bun: it inspects the source the SCRIPT threaded into the
+    prompt, edits ``src/sum.ts`` into the correct ``return a + b`` form, and returns that
+    edited file. It transcribes the REAL-shaped ``exit_code`` for the source AS HANDED IN
+    — non-zero while the threaded source still carries the seed bug (``return 0``), zero
+    once the threaded source already carries the fix. So the loop goes red(attempt 1, seed)
+    -> green(attempt 2, threaded edit) genuinely off the exit code and the script variable,
+    not a prompt sniff — the real exit-code path is covered by the gated real E2E.
+
+    Args:
+        response_format: The structured schema (``FixResult``) the real leaf returns.
+        api_key: The per-run OpenRouter key captured at roster-build time (or ``None``
+            to fall back to the env key).
+
+    Returns:
+        A real execution deepagent when a key is in force, else the deterministic fake.
+    """
+    model = resolve_leaf_model(api_key=api_key)
+    if model is not None:
+        # The engine leases a per-leaf real sandbox (needs_execution=True) and threads it
+        # into the leaf config under 'sandbox_backend'. A backend factory reads it at call
+        # time (the backend is per-leaf, resolved at runtime, not at construction), so the
+        # leaf's execute tool runs against the real LocalSubprocessSandbox.
+        def _backend_factory(_runtime: Any) -> Any:
+            # deepagents hands the factory a Runtime with no ``.config``; read the
+            # engine-leased per-leaf sandbox off the run-config contextvar via langgraph's
+            # get_config instead (the canonical pattern in the engine's real-exec test).
+            configurable = (get_config() or {}).get("configurable") or {}
+            return configurable["sandbox_backend"]
+
+        return create_deep_agent(
+            model=model,
+            backend=_backend_factory,
+            response_format=response_format,
+            middleware=cache_middleware(),
+        )
+
+    schema: Any = response_format.schema if response_format is not None else FixResult
+    # The correct module: sum actually adds its inputs, so bun test would exit 0.
+    fixed_module = "export function sum(a: number, b: number): number {\n  return a + b;\n}\n"
+
+    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        prompt = inp["messages"][-1].text if inp["messages"] else ""
+        # Read the source the SCRIPT threaded into this prompt: if it still carries the seed
+        # bug (`return 0`), the real `bun test` would exit non-zero; once the threaded source
+        # already carries the fix (`return a + b`), it would exit zero. The fake transcribes
+        # the exit code for the source AS HANDED IN, then edits sum.ts into the fixed form and
+        # threads it forward — so the loop's red->green emerges from the script variable.
+        source_already_fixed = "return a + b;" in prompt
+        edited = [EditedFile(path="src/sum.ts", content=fixed_module)]
+        if source_already_fixed:
+            fix = schema.model_validate(
+                {
+                    "exit_code": 0,
+                    "edited_files": [f.model_dump() for f in edited],
+                    "failure_tail": "",
+                    "summary": "threaded source adds its inputs; bun test exited 0",
+                }
+            )
+            reply = "tests pass"
+        else:
+            fix = schema.model_validate(
+                {
+                    "exit_code": 1,
+                    "edited_files": [f.model_dump() for f in edited],
+                    "failure_tail": (
+                        "FAIL src/sum.test.ts > adds negatives\n"
+                        "  expect(sum(-1, -1)).toBe(-2)  // got 0\n"
+                        "  1 pass · 1 fail"
+                    ),
+                    "summary": "edited src/sum.ts to add its inputs; the handed seed was still red",
+                }
+            )
+            reply = "tests still failing"
+        return {
+            "messages": [*inp["messages"], AIMessage(content=reply)],
+            "structured_response": fix,
+        }
+
+    return RunnableLambda(_leaf)
+
+
 # ── roster + registry ─────────────────────────────────────────────────────────
 
 
-def make_roster() -> Roster:
-    """Build the demo leaf roster shared by both preset workflows.
+def _register_reasoning_roles(roster: Roster, *, api_key: str | None) -> Roster:
+    """Register every PURE-REASONING leaf role onto ``roster`` and return it.
 
-    Registers the roles ``deep_research`` and ``capstone`` need: ``researcher``,
-    ``writer``, ``refiner``, ``extractor`` (structured), ``skeptic`` (a read-only
-    adversarial judge over a claim), and ``capstone_skeptic`` (the same kind of
-    read-only judge over a refined finding). With an OpenRouter key in force each leaf
-    is a real ``create_deep_agent``; with no key the roster serves deterministic fake
-    leaves so an offline run is fully reproducible. An ``echo`` leaf is also kept for
-    ``hello_workflow``, which makes no ``agent()`` calls but still requires a roster.
+    These roles (``researcher`` / ``writer`` / ``refiner`` / ``extractor`` / ``skeptic``
+    / ``capstone_skeptic`` / ``echo``) reason in-context only — none is ``needs_execution``,
+    so none can reach the real execution sandbox. Shared by :func:`make_roster` (which
+    then adds the ``code_fixer`` execution leaf) and :func:`make_reasoning_roster` (which
+    does not), so the reasoning roster is provably a strict subset of the full one.
 
-    Per-session key capture. The leaf models are baked into their deepagents when this
-    roster is built. Since the roster is built inside the host node — where the run
-    config is visible — the per-run OpenRouter key is resolved ONCE here and threaded
-    into every leaf builder. The schema-aware builders (``extractor`` / ``skeptic`` /
-    ``capstone_skeptic``) are invoked LATER by the engine, deep inside the nested
-    workflow substrate where the host run config is no longer visible, so the captured
-    key is bound into them now via ``functools.partial`` rather than re-resolved at call
-    time. The eager leaves (``researcher`` / ``writer`` / ``refiner``) are built here
-    directly with the same captured key.
+    Args:
+        roster: The roster to register the reasoning roles onto (mutated and returned).
+        api_key: The per-run OpenRouter key captured in the host node context, threaded
+            into every leaf builder (or ``None`` to fall back to the env key).
 
     Returns:
-        A :class:`~langchain_dynamic_workflow.Roster` with every preset role.
+        The same ``roster``, with every reasoning role registered, for fluent chaining.
     """
-    # Resolve the per-run OpenRouter key once, here in the host node context, so every
-    # leaf — eager or schema-aware — is built with the SAME in-force key. Resolving it
-    # inside a builder would be too late: the schema-aware builders run inside the nested
-    # engine substrate where the per-run config is not visible.
-    api_key = resolve_openrouter_key()
     return (
-        Roster()
-        .register(
+        roster.register(
             "researcher",
             _build_text_leaf("researcher", api_key=api_key, web_search=True),
             description="Researches one angle (web search).",
@@ -466,15 +759,81 @@ def make_roster() -> Roster:
     )
 
 
+def make_roster() -> Roster:
+    """Build the demo leaf roster shared by both preset workflows.
+
+    Registers the reasoning roles (``researcher``, ``writer``, ``refiner``, ``extractor``,
+    ``skeptic``, ``capstone_skeptic``, ``echo``) plus ``code_fixer`` (an EXECUTION leaf,
+    ``needs_execution=True``, that edits code and runs the real build/test until green —
+    the ``fix_loop`` preset's leaf). With an OpenRouter key in force each leaf is a real
+    ``create_deep_agent``; with no key the roster serves deterministic fake leaves so an
+    offline run is fully reproducible.
+
+    Trust boundary: this FULL roster — which can reach the real ``LocalSubprocessSandbox``
+    via ``code_fixer`` — is for the TRUSTED preset path only (``run_workflow_live``, whose
+    ``agent()`` calls are fixed in code). The meta layer, which runs an LLM-authored script
+    whose ``agent_type`` choices the AST gate does not constrain, must instead use
+    :func:`make_reasoning_roster` so an authored script cannot reach real execution.
+
+    Per-session key capture. The leaf models are baked into their deepagents when this
+    roster is built. Since the roster is built inside the host node — where the run
+    config is visible — the per-run OpenRouter key is resolved ONCE here and threaded
+    into every leaf builder. The schema-aware builders (``extractor`` / ``skeptic`` /
+    ``capstone_skeptic`` / ``code_fixer``) are invoked LATER by the engine, deep inside the
+    nested workflow substrate where the host run config is no longer visible, so the
+    captured key is bound into them now via ``functools.partial`` rather than re-resolved
+    at call time. The eager leaves (``researcher`` / ``writer`` / ``refiner``) are built
+    here directly with the same captured key.
+
+    Returns:
+        A :class:`~langchain_dynamic_workflow.Roster` with every preset role, including the
+        execution leaf.
+    """
+    # Resolve the per-run OpenRouter key once, here in the host node context, so every
+    # leaf — eager or schema-aware — is built with the SAME in-force key. Resolving it
+    # inside a builder would be too late: the schema-aware builders run inside the nested
+    # engine substrate where the per-run config is not visible.
+    api_key = resolve_openrouter_key()
+    roster = _register_reasoning_roles(Roster(), api_key=api_key)
+    return roster.register(
+        "code_fixer",
+        builder=partial(_build_code_fixer, api_key=api_key),
+        description="Edits code and runs the real build/test until green (execution leaf).",
+        needs_execution=True,
+    )
+
+
+def make_reasoning_roster() -> Roster:
+    """Build a REASONING-ONLY roster for the untrusted meta (authored-source) path.
+
+    The AST gate validates an LLM-authored script's *source* but does NOT constrain which
+    ``agent_type`` it calls — so an authored script that crossed the gate could otherwise
+    call ``ctx.agent(..., agent_type="code_fixer")`` and reach the real shell. This roster
+    registers every pure-reasoning role but OMITS ``code_fixer`` (and any other
+    ``needs_execution`` leaf), so an authored script has no execution leaf to reach no
+    matter what it asks for — a defense-in-depth boundary on top of the gate. The trusted
+    preset path uses the full :func:`make_roster` instead.
+
+    Returns:
+        A :class:`~langchain_dynamic_workflow.Roster` with only pure-reasoning roles (no
+        ``needs_execution`` leaf).
+    """
+    api_key = resolve_openrouter_key()
+    return _register_reasoning_roles(Roster(), api_key=api_key)
+
+
 def make_workflows() -> WorkflowRegistry:
     """Register the preset named workflows the host can launch by name.
 
     Returns:
-        A :class:`~langchain_dynamic_workflow.WorkflowRegistry` with ``deep_research``
-        and ``capstone``.
+        A :class:`~langchain_dynamic_workflow.WorkflowRegistry` with ``deep_research``,
+        ``capstone``, and ``fix_loop``.
     """
     return (
-        WorkflowRegistry().register("deep_research", deep_research).register("capstone", capstone)
+        WorkflowRegistry()
+        .register("deep_research", deep_research)
+        .register("capstone", capstone)
+        .register("fix_loop", fix_loop)
     )
 
 
@@ -503,10 +862,14 @@ async def hello_workflow(ctx: Ctx) -> str:
 
 __all__: list[str] = [
     "Claim",
+    "EditedFile",
+    "FixResult",
     "Verdict",
     "capstone",
     "deep_research",
+    "fix_loop",
     "hello_workflow",
+    "make_reasoning_roster",
     "make_roster",
     "make_workflows",
 ]

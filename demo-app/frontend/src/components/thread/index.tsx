@@ -226,7 +226,12 @@ export function Thread() {
       { messages: [...toolMessages, newHumanMessage], context },
       withProviderRunConfig({
         streamMode: ["values"],
-        streamSubgraphs: true,
+        // Quarantine: keep nested leaf @task subgraph messages OUT of the chat stream.
+        // A workflow's leaf agents run in isolated context; their raw LLM trajectory must
+        // not leak into the transcript (it would render as concurrent typing blocks).
+        // Leaf activity is surfaced only via the out-of-band Gen-UI cards on the host ui
+        // channel (agent_span / terminal_card / phase_timeline). false is the SDK default.
+        streamSubgraphs: false,
         streamResumable: true,
         optimisticValues: (prev) => ({
           ...prev,
@@ -261,7 +266,12 @@ export function Thread() {
       withProviderRunConfig({
         checkpoint: parentCheckpoint,
         streamMode: ["values"],
-        streamSubgraphs: true,
+        // Quarantine: keep nested leaf @task subgraph messages OUT of the chat stream.
+        // A workflow's leaf agents run in isolated context; their raw LLM trajectory must
+        // not leak into the transcript (it would render as concurrent typing blocks).
+        // Leaf activity is surfaced only via the out-of-band Gen-UI cards on the host ui
+        // channel (agent_span / terminal_card / phase_timeline). false is the SDK default.
+        streamSubgraphs: false,
         streamResumable: true,
       }),
     );

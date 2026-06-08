@@ -5,7 +5,7 @@ The demo states three sync invariants that an adversarial review found broken:
 * the README "Fixed models" table must name the SAME ids the code ships
   (:data:`HOST_MODEL` / :data:`LEAF_MODEL` in ``_models.py``) — the table had drifted
   to stale ids (``claude-3.5-sonnet`` / ``gpt-4o-mini``) the code does not use; and
-* the four preset-scenario messages in ``scenarios.json`` must match the frontend's
+* the preset-scenario messages in ``scenarios.json`` must match the frontend's
   ``ScenarioPanel`` inline copy byte-for-byte — the live #4 button had drifted into a
   self-contradicting "show me the progress as it goes" wording for a background run.
 
@@ -95,7 +95,7 @@ def test_readme_model_table_matches_code_constants() -> None:
 def test_scenario_panel_messages_match_scenarios_json() -> None:
     """The frontend ``ScenarioPanel`` and ``scenarios.json`` carry identical scenarios.
 
-    ``scenarios.json`` is the canonical wording; the frontend hardcodes the same four
+    ``scenarios.json`` is the canonical wording; the frontend hardcodes the same
     messages. This pins ``label`` / ``hint`` / ``message`` byte-for-byte across both so
     the drift the review found — the #4 button promising live progress while the JSON
     (and the actual background behavior) says "let me know once it's done" — fails here.
@@ -103,8 +103,8 @@ def test_scenario_panel_messages_match_scenarios_json() -> None:
     canonical = json.loads(_SCENARIOS_JSON.read_text(encoding="utf-8"))["scenarios"]
     frontend = _scenario_panel_messages()
 
-    assert len(frontend) == len(canonical) == 4, (
-        f"expected 4 scenarios on both sides, got json={len(canonical)} frontend={len(frontend)}"
+    assert len(frontend) == len(canonical) == 5, (
+        f"expected 5 scenarios on both sides, got json={len(canonical)} frontend={len(frontend)}"
     )
 
     for index, (json_scenario, (label, hint, message)) in enumerate(
@@ -119,4 +119,36 @@ def test_scenario_panel_messages_match_scenarios_json() -> None:
         assert json_scenario["message"] == message, (
             f"scenario[{index}] message drift:\n  json={json_scenario['message']!r}\n"
             f"  frontend={message!r}"
+        )
+
+
+def test_readme_scenario_count_matches_scenarios_json() -> None:
+    """The README must document exactly as many scenarios as ``scenarios.json`` ships.
+
+    The README's "scenarios" section enumerates one ``### N. <title>`` subsection per
+    preset button. ``scenarios.json`` is the canonical source of how many presets exist,
+    so the README's count must equal ``len(scenarios)`` — pinning it here fails loudly
+    when a new preset is added to the JSON (and the frontend) but the README still claims
+    the old count, the exact drift the review found (README said "four scenarios" after a
+    fifth, "Make it pass", was added).
+    """
+    canonical = json.loads(_SCENARIOS_JSON.read_text(encoding="utf-8"))["scenarios"]
+    readme = _README.read_text(encoding="utf-8")
+
+    # One numbered subsection ("### 1. ...", "### 2. ...", ...) per documented scenario.
+    numbered_subsections = re.findall(r"^### \d+\.\s", readme, flags=re.MULTILINE)
+    assert len(numbered_subsections) == len(canonical), (
+        f"README documents {len(numbered_subsections)} numbered scenario subsections but "
+        f"scenarios.json ships {len(canonical)}; update the README to match the presets"
+    )
+
+    # The prose count words must not lag behind either: a stale "four scenarios" while the
+    # JSON ships five is the same drift in narrative form. Guard the cardinal words that
+    # named the old count so they cannot silently survive a count change.
+    stale_counts = {4: ("four scenarios", "four preset buttons", "the same four")}
+    forbidden = stale_counts.get(len(canonical) - 1, ())
+    for phrase in forbidden:
+        assert phrase.lower() not in readme.lower(), (
+            f"README still says {phrase!r} but scenarios.json now ships {len(canonical)} "
+            "scenarios; the prose count drifted"
         )

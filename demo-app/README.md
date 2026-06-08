@@ -140,13 +140,14 @@ online-path only; the offline scripted path stays deterministic and credential-f
 
 ---
 
-## The four scenarios
+## The five scenarios
 
-The chat ships four preset buttons. Their canonical wording lives in
-`scenarios.json`; the frontend's `ScenarioPanel` carries the same four messages, and
-a backend doc-sync test pins the two copies byte-for-byte so they cannot drift. Each
-is phrased as a real user's request, not a tool instruction — click one, or type your
-own. Here is what each one is built to *show*:
+The chat ships five preset buttons. Their canonical wording lives in
+`scenarios.json`; the frontend's `ScenarioPanel` carries the same five messages, and
+a backend doc-sync test pins the two copies byte-for-byte (and pins the README's
+scenario count to the same source) so they cannot drift. Each is phrased as a real
+user's request, not a tool instruction — click one, or type your own. Here is what each
+one is built to *show*:
 
 ### 1. Deep research — a hard, multi-source question
 > *"I need a thorough, fact-checked answer on the main trade-offs between
@@ -192,6 +193,28 @@ Background delegation. The host launches the workflow **detached** so the chat t
 returns immediately, then reports the run's lifecycle status and, once it settles,
 the final result. This is the "fire it off and tell me how it went" shape — see the
 limitation below on what a detached run can and can't show.
+
+### 5. Make it pass — fix code until the tests are green
+> *"I've got a small TypeScript module with a couple of failing unit tests. Please
+> actually fix the code and keep checking it against the tests until they genuinely
+> pass..."*
+
+**In-loop executable verification.** This is the dynamic-workflow thesis at its most
+literal: the host launches a **script-owned retry loop** that does not trust the
+model's word for "it's fixed" — it *runs the tests* and branches on the **real exit
+code**. Each attempt hands a `code_fixer` leaf the current source, the leaf writes the
+files into a per-leaf sandbox, runs `bun test` for a TRUE exit code, edits the source,
+and returns its work; the script reads the exit code, and on red threads the leaf's
+edited files into the next attempt's prompt. The cross-attempt state — the current
+source files — lives in a **script variable**, not a persistent workspace, so you watch
+the loop accumulate the fix without the model holding it in context. Every real command
+streams an `execution_command` event the UI renders as a **TerminalCard** whose header
+chip flips from `running` to `exit 0` (green) or `exit N` (red) in place. The loop stops
+on the first green exit or returns an honest "still red" when the bounded retry budget is
+spent — never a false pass. (Offline-fake caveat: with no key the `code_fixer` is a
+deterministic fake that runs no subprocess, so the offline run proves the script-owned
+loop and the real exit-code gating logic but emits no live TerminalCard; add a key to see
+a real model shell out and the cards stream.)
 
 ---
 

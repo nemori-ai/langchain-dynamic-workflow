@@ -23,12 +23,14 @@ from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_dynamic_workflow import (
     Ctx,
     ExecPolicy,
+    InMemoryJournalStore,
     Roster,
     SandboxManager,
     local_subprocess_factory,
     run_workflow,
 )
 from langchain_dynamic_workflow._local_subprocess import LocalSubprocessSandbox
+from langchain_dynamic_workflow._observability import CommandEvent
 from langchain_dynamic_workflow._sandbox import SharedArtifactStore, build_leaf_backend
 
 
@@ -150,3 +152,142 @@ async def test_run_workflow_tears_down_real_temp_dirs_after_the_run() -> None:
     assert len(seen_roots) == 2
     assert seen_roots[0] != seen_roots[1]  # two leaves => two distinct temp roots
     assert all(not os.path.exists(root) for root in seen_roots)  # all torn down
+
+
+# --- on_command sink through run_workflow (M5 C1) ---------------------------
+
+
+async def test_on_command_fires_begin_and_end_through_run_workflow() -> None:
+    # The engine wires on_command into the per-leaf real sandbox: an execution leaf
+    # that runs a real command fires a begin+end CommandEvent pair correlated to the
+    # owning leaf's span, with the real exit code on the end edge. The script does
+    # not format any UI; the events appear from inside the real sandbox boundary.
+    roster = Roster().register(
+        "runner", _exec_leaf(f'{sys.executable} -c "print(6 * 7)"'), needs_execution=True
+    )
+    manager = SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy()))
+    events: list[CommandEvent] = []
+
+    async def orchestrate(ctx: Ctx) -> str:
+        return await ctx.agent("run it", agent_type="runner")
+
+    result = await run_workflow(
+        orchestrate,
+        roster=roster,
+        sandbox_manager=manager,
+        thread_id="t-cmd",
+        on_command=events.append,
+    )
+    assert "42" in result
+
+    assert len(events) == 2
+    begin, end = events
+    assert begin.phase == "start" and end.phase == "end"
+    assert begin.command_id == end.command_id
+    assert begin.leaf_span_id == end.leaf_span_id
+    assert begin.leaf_span_id  # a real span id was threaded down to the sandbox
+    assert end.exit_code == 0
+    assert end.output is not None and "42" in end.output
+
+
+async def test_on_command_correlates_to_the_leaf_agent_span_id() -> None:
+    # The CommandEvent.leaf_span_id must equal the owning AGENT span's id (the same
+    # id on_span_begin emits), so a consumer files the terminal card under the right
+    # AgentSpan — the whole point of the correlation key.
+    from langchain_dynamic_workflow import SpanBegin, SpanKind
+
+    roster = Roster().register(
+        "runner", _exec_leaf(f'{sys.executable} -c "print(1)"'), needs_execution=True
+    )
+    manager = SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy()))
+    commands: list[CommandEvent] = []
+    begins: list[SpanBegin] = []
+
+    async def orchestrate(ctx: Ctx) -> str:
+        return await ctx.agent("go", agent_type="runner")
+
+    await run_workflow(
+        orchestrate,
+        roster=roster,
+        sandbox_manager=manager,
+        thread_id="t-corr",
+        on_command=commands.append,
+        on_span_begin=begins.append,
+    )
+
+    agent_begin = next(b for b in begins if b.kind is SpanKind.AGENT)
+    assert commands  # the leaf ran a real command
+    assert {e.leaf_span_id for e in commands} == {agent_begin.span_id}
+
+
+async def test_on_command_does_not_fire_on_a_journal_hit() -> None:
+    # LOCKED replay policy (C1, miss-only): a cached leaf is skipped wholesale on
+    # resume — execute never runs — so on_command MUST stay silent for a replayed
+    # leaf. Re-emitting terminal output for a command that did not run would be a lie.
+    roster = Roster().register(
+        "runner", _exec_leaf(f'{sys.executable} -c "print(7)"'), needs_execution=True
+    )
+    journal = InMemoryJournalStore()
+
+    async def orchestrate(ctx: Ctx) -> str:
+        return await ctx.agent("go", agent_type="runner")
+
+    # Fresh run: a real command fires begin+end.
+    first_manager = SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy()))
+    first: list[CommandEvent] = []
+    result_one = await run_workflow(
+        orchestrate,
+        roster=roster,
+        journal=journal,
+        sandbox_manager=first_manager,
+        thread_id="t-miss",
+        on_command=first.append,
+    )
+    assert "7" in result_one
+    assert first, "the fresh run's leaf fires command events"
+
+    # Resume the SAME journal: the leaf is a journal hit, so no subprocess runs and
+    # no command event fires (miss-only).
+    second_manager = SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy()))
+    second: list[CommandEvent] = []
+    result_two = await run_workflow(
+        orchestrate,
+        roster=roster,
+        journal=journal,
+        sandbox_manager=second_manager,
+        thread_id="t-miss",
+        on_command=second.append,
+    )
+    assert result_two == result_one  # replayed result identical
+    assert second == []  # ZERO command events on the journal hit (miss-only)
+
+
+async def test_on_command_default_none_is_zero_cost_and_result_identical() -> None:
+    # Default-None on_command => no sink wired => the leaf's result is byte-identical
+    # with and without the command sink (quarantine preserved; sink is out-of-band).
+    roster_a = Roster().register(
+        "runner", _exec_leaf(f'{sys.executable} -c "print(5)"'), needs_execution=True
+    )
+    roster_b = Roster().register(
+        "runner", _exec_leaf(f'{sys.executable} -c "print(5)"'), needs_execution=True
+    )
+
+    async def orchestrate(ctx: Ctx) -> str:
+        return await ctx.agent("go", agent_type="runner")
+
+    without = await run_workflow(
+        orchestrate,
+        roster=roster_a,
+        sandbox_manager=SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy())),
+        thread_id="t-without",
+    )
+    events: list[CommandEvent] = []
+    with_sink = await run_workflow(
+        orchestrate,
+        roster=roster_b,
+        sandbox_manager=SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy())),
+        thread_id="t-with",
+        on_command=events.append,
+    )
+    assert without == with_sink
+    assert events  # the sink path did fire (else the equality is vacuous)
