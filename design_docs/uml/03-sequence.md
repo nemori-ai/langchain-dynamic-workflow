@@ -299,3 +299,51 @@ sequenceDiagram
 ```
 
 **要点**:签核门**走 journal,不用 LangGraph 原生 `interrupt`**(C8 spike 否决:checkpointer 的 `@task` index 缓存与 content-hash journal 短路在 resume 时错位,实测叶 B 拿到叶 A 缓存)。park 与 approve 是**两次独立 `run_workflow` 调用**,各持自己的 per-call `InMemorySaver`,journal 是唯一跨调用缓存 ⇒ 无 `@task` index 错位、`checkpointer=None` 即可、跨进程骑持久 journal。门按 `signoff_key(position, tag)` 取键(序号 = 本 run 第几个 checkpoint 调用),故 `ctx.checkpoint` 是 **depth-0 原语**(fan-out 内序号竞争 → 抛 `WorkflowCheckpointError`,已并入 `WORKFLOW_CONTROL_FLOW_SIGNALS` fail-loud)。`AWAITING_SIGNOFF` 非终态、计入 `active_run_count`(abandoned park 由 `sweep` 经 `park_ttl_seconds` 过期回收)。`approve` **只批准本进程在活的 parked run**:`BgRunManager.approve` 先同步翻 `RUNNING` 再排续跑(杜绝双批竞争出孤儿续跑),就地复用 parked slot(**同 run_id**,卡片据 id 跨暂停原地更新);UNKNOWN(swept/跨进程)拒批——parked 态未持久化,无法核实确在门上(评审 M1)。`approve`(注入人工值)与 `resume`(崩溃重放、无值注入)是不同动词。脚本体在 approve 时从头重执行 ⇒ 门前叶决策走 journal 重放免费,但非幂等脚本副作用重复(D4 边界);**进度叙述不再重发**(park 时持久 progress_count)。安全:门入确定性序列(漂移 fail-loud)、决策须 JSON-可序列化(消费前序列化)、注入决策无门消费 → fail-loud、authored 脚本经 AST gate 禁 `ctx.checkpoint`。机制见 [01 §14](../01-engine-mechanism.md),host 接线见 [02 §11](../02-architecture.md)。
+
+## H — 真 git worktree refactor-swarm（M6:每叶真分支 → 真改+权威 collect → scratch-repo 真 merge 冲突循环 → PR host finalization）
+
+```mermaid
+sequenceDiagram
+  participant H as host (run_refactor_swarm_live)
+  participant S as 脚本 refactor_swarm
+  participant P as GitWorktreeProvider
+  participant Lx as fixer 叶 (isolation=worktree)
+  participant Mg as merge 叶 (scratch-repo)
+  participant Rv as resolver 叶
+  participant J as journal (content-hash)
+  participant PRp as LocalPullRequestProvider
+
+  H->>P: 构造(base_repo=已播种 temp 仓库, integration_branch)
+  H->>S: run_workflow(refactor_swarm, sandbox_manager=SandboxManager(git_worktree_provider=P))
+  Note over S,J: phase fix — parallel,每文件一 fixer(各自真分支真工作树)
+  S->>Lx: ctx.agent(fix, isolation=worktree, schema=GitPatch{files: dict[str,str]})
+  alt journal miss(首跑)
+    Lx->>P: open_worktree(leaf_id) = git worktree add -b leaf/<id>(幂等 R4 + 异常安全 R3)
+    Lx->>Lx: 真改文件(模型/fake 在真 worktree 磁盘上写)
+    Lx->>P: collect(leaf_id) = 真 git diff(权威, R5)→ 折进 outcome.state(off-loop)
+    Lx->>J: put(leaf-key, 经 model_validate 覆写 files=权威 diff;schema-less/缺字段/错类型 fail-loud)
+    Lx->>P: close()→on_close→teardown(worktree remove + branch -D, off slot 锁 R8)
+  else journal hit(resume)
+    J-->>Lx: 重放权威 changeset — 不进 @task、不建 worktree、零真 git
+  end
+  Note over S,J: phase verify — 每 patch 2-vote read-only judge(survives)
+  Note over S,Rv: phase integrate — 脚本拥有 fold,跨叶状态走脚本变量 integrated_tree
+  loop 每个 approved patch
+    S->>Mg: merge 叶:scratch repo(commit base / branch ours=integrated_tree / branch theirs=patch / git merge)
+    Mg->>J: put(MergeResult{clean|conflict, files/conflicts})
+    alt 真 git 冲突
+      S->>Rv: resolver 叶(冲突标记入 → 解决内容出)
+      Rv->>J: put(Resolution)
+      S->>S: integrated_tree = 解决后树
+    else 干净
+      S->>S: integrated_tree = merged
+    end
+  end
+  S-->>H: return RefactorResult{integrated_tree, PrIntent}(纯,journaled 叶组成)
+  Note over H,PRp: host finalization — 移出确定性 replay(R1)
+  H->>PRp: open(branch, title, body, integration_branch)(幂等 check-existing-then-create)
+  PRp-->>H: PullRequestRef → emit pull_request 卡(stable event_id)
+  H->>P: cleanup_all()(finally;扫 workspace_root)
+```
+
+**要点**:M6 把 D-G2 的真 git-worktree 接缝兑现,配对 M5 成 Bun 级 epic。**确定性命门**:每个 git 物理变更都在叶子 `@task` 边界内——fixer 的 `git worktree add` 在 `open_worktree`(leaf 执行期)、真 merge 在 merge 叶的 scratch repo 内;`ctx.agent` 派发前查 journal,命中即 return、**不进 `leaf_task`、不建 worktree、零真 git 重跑**(计数 fake 实证)。**三处承重决策**:① **PR/integration 物化 = host finalization,移出 replay**(R1——副作用须在叶边界或 replay 之外,否则 resume 重开);② **worktree 叶权威变更集 = leaf task 内真 `git diff`**(R5,经 `model_validate` 覆写 schema `files`、非模型自报,镜像 M5 据真 exit code);③ **整合用 merge 叶内一次性 scratch-repo 真 `git merge`**(R7,比 merge-file 忠于 branch 语义且自给自足 resume-safe,**不**做长命 integration worktree 累积 merge——那不重跑 git 无法 resume-safe)。`open_worktree` 幂等(R4 同键 reclaim 陈旧)+ 异常安全(R3 回滚半成品);worktree 移除绑后端 `close()` 的 `on_close`、所有 teardown 路自动触发(无新 manager 钩子);阻塞 git(add + teardown)经 `_admit_slot` thread-offload 出 slot 锁(R8,锁内 POP 牺牲 slot + `_pending` 占位防超配)。`cleanup_all()` 由 **host 在 `finally` 调**(引擎不调,host 可跨 run 复用 provider)。collect 删除 v1 fail-loud(`dict[str,str]` 无 tombstone)。安全(R6):真 git 执行叶只在 host-trusted roster,untrusted authored-script 走 reasoning-only roster + ExecPolicy admission。机制见 [01 §8c](../01-engine-mechanism.md),host 接线见 [02 §7](../02-architecture.md)。
