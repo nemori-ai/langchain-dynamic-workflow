@@ -685,13 +685,36 @@ async def test_conflict_loop_is_actually_taken_and_resolved(tmp_path: Path) -> N
         provider.cleanup_all()
 
 
+class _CountingGitWorktreeProvider(GitWorktreeProvider):
+    """A GitWorktreeProvider that counts real ``open_worktree`` / ``collect`` calls.
+
+    Lets the resume test prove the journal short-circuit performs ZERO real worktree
+    git work on the second run — not merely zero merges. Each real call increments a
+    counter; a journal hit (which never enters ``leaf_task``) leaves them unchanged.
+    """
+
+    def __init__(self, *, base_repo: str) -> None:
+        super().__init__(base_repo=base_repo)
+        self.open_calls = 0
+        self.collect_calls = 0
+
+    def open_worktree(self, leaf_id: str) -> SandboxBackendProtocol:
+        self.open_calls += 1
+        return super().open_worktree(leaf_id)
+
+    def collect(self, leaf_id: str) -> dict[str, str]:
+        self.collect_calls += 1
+        return super().collect(leaf_id)
+
+
 async def test_resume_hits_journal_with_zero_real_git_reruns(tmp_path: Path) -> None:
     # (4) resume: the SAME journal across two run_workflow calls. The first run does
-    # the real worktree fixes + real merges; the second run short-circuits every leaf
-    # from the journal, so NO real git runs again (the merge counter is unchanged)
+    # the real worktree fixes (open_worktree + collect) + real merges; the second run
+    # short-circuits every leaf from the journal, so NO real git runs again — the
+    # merge counter AND the provider's open_worktree/collect counters are unchanged —
     # and the integrated tree is restored byte-for-byte.
     base = _make_base_repo(tmp_path, {"calc.py": "def add(a, b):\n    return a - b\n"})
-    provider = GitWorktreeProvider(base_repo=base)
+    provider = _CountingGitWorktreeProvider(base_repo=base)
     manager = SandboxManager(git_worktree_provider=provider)
     merge_calls = [0]
     roster = (
@@ -721,11 +744,15 @@ async def test_resume_hits_journal_with_zero_real_git_reruns(tmp_path: Path) -> 
             thread_id="t-resume-1",
         )
         merges_after_first = merge_calls[0]
+        opens_after_first = provider.open_calls
+        collects_after_first = provider.collect_calls
         assert merges_after_first >= 1  # the first run really merged
+        assert opens_after_first >= 1  # the first run really created a worktree
+        assert collects_after_first >= 1  # the first run really collected a diff
         assert first["integrated"]["/calc.py"] == "def add(a, b):\n    return a + b\n"
 
-        # Second run on the SAME journal: every leaf is a journal hit, so no real
-        # git (worktree add OR merge) runs again.
+        # Second run on the SAME journal: every leaf is a journal hit, so no real git
+        # runs again — no second open_worktree, no second collect, no second merge.
         second = await run_workflow(
             orchestrate,
             roster=roster,
@@ -734,6 +761,8 @@ async def test_resume_hits_journal_with_zero_real_git_reruns(tmp_path: Path) -> 
             thread_id="t-resume-2",
         )
         assert merge_calls[0] == merges_after_first  # ZERO real merge re-runs
+        assert provider.open_calls == opens_after_first  # ZERO real worktree re-creates
+        assert provider.collect_calls == collects_after_first  # ZERO real collect re-runs
         assert second["integrated"] == first["integrated"]  # restored byte-for-byte
     finally:
         provider.cleanup_all()
