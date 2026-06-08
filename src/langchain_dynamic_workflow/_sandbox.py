@@ -614,6 +614,16 @@ class SandboxManager:
         """How many isolated execution sandboxes are currently live."""
         return len(self._slots)
 
+    @property
+    def git_worktree_provider(self) -> GitWorktreeProvider | None:
+        """The real-git worktree provider, or ``None`` when not configured.
+
+        Exposed so the engine can collect a worktree leaf's authoritative real
+        ``git diff`` while the lease is still held (before the worktree is torn
+        down on ``close``), without the engine reaching into a private field.
+        """
+        return self._git_worktree_provider
+
     def reclaim_idle(self) -> int:
         """Reclaim every idle sandbox whose idle or hard TTL has elapsed.
 

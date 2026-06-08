@@ -39,6 +39,26 @@ from ._roster import Roster
 from ._sandbox import leaf_id_from_key
 from ._schema import to_pydantic_model
 
+WORKTREE_CHANGESET_KEY = "__ldw_worktree_changeset__"
+"""Reserved key under which the engine folds a worktree leaf's authoritative diff.
+
+For a real-git worktree execution leaf the engine collects the leaf's real
+``git diff`` while the lease is still held and stashes it in the leaf's output
+state under this key (so it rides into the content-hash journal). ``agent()`` then
+treats that on-disk truth as the authoritative changeset, overriding any file bytes
+the model self-reported in its schema. The double-underscore name keeps it from
+colliding with a real leaf-state key.
+"""
+
+_WORKTREE_FILES_FIELD = "files"
+"""Schema field whose value the authoritative worktree changeset overrides.
+
+A worktree fixer's structured schema reports its change under ``files``; when the
+engine folds in the real ``git diff``, ``agent()`` overrides exactly this field so
+the model-claimed bytes can never win over the on-disk truth. Other metadata
+fields (``summary`` and the like) are left untouched.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class LeafOutcome:
@@ -603,6 +623,17 @@ class Ctx:
             folded_obj: str | BaseModel
             if structured_model is not None:
                 folded_obj = fold_structured(outcome.state, structured_model)
+                # Authoritative changeset (R5): a real-git worktree leaf has its real
+                # `git diff` folded into the leaf state by the engine. When present,
+                # override exactly the schema's `files` field with that on-disk truth
+                # so the model's self-reported file bytes can never win over what the
+                # leaf actually wrote — mirroring M5's "gate on the real exit code,
+                # not the model's boolean". Other metadata (summary, etc.) is kept.
+                # The override happens BEFORE model_dump_json, so the authoritative
+                # changeset is what gets journaled and replayed on resume.
+                changeset = outcome.state.get(WORKTREE_CHANGESET_KEY)
+                if changeset is not None and _WORKTREE_FILES_FIELD in type(folded_obj).model_fields:
+                    folded_obj = folded_obj.model_copy(update={_WORKTREE_FILES_FIELD: changeset})
                 # Dump by alias with round-trip semantics so a schema with field
                 # aliases survives resume: model_validate_json (the replay path)
                 # validates by alias by default, so the stored JSON must use aliases

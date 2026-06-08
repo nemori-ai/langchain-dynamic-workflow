@@ -14,8 +14,13 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
+from typing import Any
 
-from langchain_dynamic_workflow import SandboxManager
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
+from pydantic import BaseModel
+
+from langchain_dynamic_workflow import Ctx, Roster, SandboxManager, run_workflow
 from langchain_dynamic_workflow._git_worktree import GitWorktreeProvider
 
 
@@ -110,4 +115,64 @@ async def test_blocking_git_does_not_run_under_the_slot_lock(tmp_path: Path) -> 
     finally:
         await manager.stop("L1")
         await manager.stop("L2")
+        provider.cleanup_all()
+
+
+# --- T5: the engine folds the real git diff as the AUTHORITATIVE changeset ------
+
+
+class _Patch(BaseModel):
+    """A fixer's self-reported change. ``files`` is what the model CLAIMS it wrote."""
+
+    summary: str
+    files: dict[str, str]
+
+
+def _lying_fixer_builder(*, response_format: object = None) -> Runnable[Any, Any]:
+    """A fixer that writes the truth to disk but LIES in its self-reported schema.
+
+    It edits ``/calc.py`` on the real worktree disk to ``a + b`` (the truth), but
+    returns a ``_Patch`` whose ``files`` claims ``a * b`` (the lie). The engine must
+    make the real ``git diff`` authoritative, so the changeset the script receives
+    is the disk truth (``a + b``), never the model's self-report (``a * b``). This
+    mirrors M5's "gate on the real exit code, not the model's boolean".
+    """
+
+    async def _call(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        configurable = (config or {}).get("configurable", {})
+        backend = configurable["sandbox_backend"]
+        # The real edit on the real worktree disk: a - b -> a + b.
+        await backend.aedit("/calc.py", "return a - b", "return a + b")
+        lie = _Patch(
+            summary="fixed the operator",
+            files={"/calc.py": "def add(a, b):\n    return a * b\n"},  # LIE
+        )
+        return {
+            "messages": [*inp["messages"], AIMessage(content="done")],
+            "structured_response": lie,
+        }
+
+    return RunnableLambda(_call)
+
+
+async def test_engine_makes_real_git_diff_authoritative_over_model_self_report(
+    tmp_path: Path,
+) -> None:
+    base = _make_base_repo(tmp_path, {"calc.py": "def add(a, b):\n    return a - b\n"})
+    provider = GitWorktreeProvider(base_repo=base)
+    manager = SandboxManager(git_worktree_provider=provider)
+    roster = Roster().register("fixer", builder=_lying_fixer_builder, needs_execution=True)
+
+    async def orchestrate(ctx: Ctx) -> _Patch:
+        return await ctx.agent("fix calc", agent_type="fixer", schema=_Patch, isolation="worktree")
+
+    try:
+        patch = await run_workflow(
+            orchestrate, roster=roster, sandbox_manager=manager, thread_id="t-authoritative"
+        )
+        # The metadata the model reported is preserved.
+        assert patch.summary == "fixed the operator"
+        # But the changeset is the DISK TRUTH (a + b), not the model's lie (a * b).
+        assert patch.files == {"/calc.py": "def add(a, b):\n    return a + b\n"}
+    finally:
         provider.cleanup_all()

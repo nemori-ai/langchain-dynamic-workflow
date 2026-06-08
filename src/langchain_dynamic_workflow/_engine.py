@@ -26,7 +26,7 @@ from ._concurrency import (
     resolve_max_concurrency,
     with_max_concurrency,
 )
-from ._context import UNSET, Ctx, LeafOutcome, WorkflowResolver
+from ._context import UNSET, WORKTREE_CHANGESET_KEY, Ctx, LeafOutcome, WorkflowResolver
 from ._determinism import CallSequenceGuard
 from ._errors import WorkflowCheckpointError, WorkflowSignoffRequired
 
@@ -318,7 +318,24 @@ async def run_workflow(
                 # Reasoning leaf: hand its StateBackend through unwrapped (it
                 # allocates no sandbox and does no /shared/ hand-off).
                 configurable["sandbox_backend"] = backend
-            return await _invoke()
+            payload = await _invoke()
+            # Authoritative changeset for a real-git worktree leaf (R5): while the
+            # lease is STILL HELD (the worktree not yet torn down on close), read
+            # the real `git diff` of the leaf's tree and fold it into the leaf's
+            # journaled state under a reserved key. The script then treats this real
+            # on-disk truth as authoritative over any file bytes the model
+            # self-reported in its schema — mirroring M5's "gate on the real exit
+            # code, not the model's boolean". Folding it into the @task payload's
+            # state makes it ride into the content-hash journal, so a resume replays
+            # the same authoritative changeset with no real git re-run.
+            git_provider = (
+                sandbox_manager.git_worktree_provider
+                if needs_execution and isolation == "worktree"
+                else None
+            )
+            if git_provider is not None:
+                payload["state"][WORKTREE_CHANGESET_KEY] = git_provider.collect(leaf_id)
+            return payload
 
     async def leaf_runner(
         agent_type: str,
