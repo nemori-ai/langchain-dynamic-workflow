@@ -270,6 +270,331 @@ async def test_run_workflow_live_runs_refactor_swarm_and_finalizes_pr_card(
     assert card.get("integration_branch")
 
 
+# --- F-D3: conflict resolution is validated, retried, and fails loud (not blindly trusted) -
+
+
+def _markered_then_clean_resolver_builder(calls: list[int]) -> Any:
+    """A conflict_resolver fake that returns marker-laden files on attempt 1, clean on 2.
+
+    Mirrors a real resolver that botches its first try: attempt 1 echoes the conflicted
+    content verbatim (markers intact), attempt 2 flattens them. ``calls[0]`` counts real
+    invocations so the test can assert the script RETRIED rather than accepting the first.
+    """
+    from workflows import Resolution, _flatten_conflict_markers, _parse_conflicts_from_prompt
+
+    def _builder(*, response_format: Any = None) -> Any:
+        async def _leaf(inp: dict[str, Any], config: Any = None) -> dict[str, Any]:
+            from langchain_core.messages import AIMessage
+
+            calls[0] += 1
+            prompt = inp["messages"][-1].text if inp["messages"] else ""
+            conflicts = _parse_conflicts_from_prompt(prompt)
+            if calls[0] == 1:
+                # Attempt 1: BLINDLY return the conflicted content with markers intact.
+                resolved = dict(conflicts)
+            else:
+                # Attempt 2: actually flatten the markers (a clean resolution).
+                resolved = {p: _flatten_conflict_markers(t) for p, t in conflicts.items()}
+            return {
+                "messages": [*inp["messages"], AIMessage(content="resolved")],
+                "structured_response": Resolution(files=resolved),
+            }
+
+        from langchain_core.runnables import RunnableLambda
+
+        return RunnableLambda(_leaf)
+
+    return _builder
+
+
+def _never_clean_resolver_builder() -> Any:
+    """A conflict_resolver fake that ALWAYS leaves markers (never produces a clean tree)."""
+    from workflows import Resolution, _parse_conflicts_from_prompt
+
+    def _builder(*, response_format: Any = None) -> Any:
+        async def _leaf(inp: dict[str, Any], config: Any = None) -> dict[str, Any]:
+            from langchain_core.messages import AIMessage
+
+            prompt = inp["messages"][-1].text if inp["messages"] else ""
+            conflicts = _parse_conflicts_from_prompt(prompt)
+            return {
+                "messages": [*inp["messages"], AIMessage(content="resolved")],
+                "structured_response": Resolution(files=dict(conflicts)),  # markers intact
+            }
+
+        from langchain_core.runnables import RunnableLambda
+
+        return RunnableLambda(_leaf)
+
+    return _builder
+
+
+def _roster_with_resolver(resolver_builder: Any) -> Any:
+    """Build the full host roster with ``conflict_resolver`` swapped for ``resolver_builder``."""
+    roster = make_roster()
+    roster.register(
+        "conflict_resolver",
+        builder=resolver_builder,
+        description="test fixture resolver",
+    )
+    return roster
+
+
+async def test_resolver_retries_when_first_attempt_leaves_markers(tmp_path: Path) -> None:
+    """A resolver that returns markers on attempt 1 then clean on attempt 2 → retry succeeds.
+
+    The fold must NOT blindly trust the resolver: it validates the resolved files carry no
+    conflict markers and, on failure, retries the resolver leaf with feedback. A fake that
+    botches its first try and fixes it on the second proves the retry loop runs and lands a
+    clean tree (no markers), exactly M5's "gate on the real artifact, not the model's word".
+    """
+    calls = [0]
+    provider, manager = _make_worktree_manager(tmp_path)
+    roster = _roster_with_resolver(_markered_then_clean_resolver_builder(calls))
+    try:
+        result = await run_workflow(
+            lambda ctx: refactor_swarm(ctx, {}),
+            roster=roster,
+            workflows=make_workflows(),
+            sandbox_manager=manager,
+            thread_id="t-resolver-retry",
+        )
+        assert isinstance(result, RefactorResult)
+        assert result.conflict_resolved is True
+        # The resolver was invoked at least twice (attempt 1 markered → retry → attempt 2 clean).
+        assert calls[0] >= 2, f"the fold must RETRY a marker-laden resolution; calls={calls[0]}"
+        # The final tree carries no markers (the validated clean resolution folded in).
+        calc = result.integrated_tree["/calc.py"]
+        assert "<<<<<<<" not in calc and "=======" not in calc and ">>>>>>>" not in calc, calc
+    finally:
+        provider.cleanup_all()
+
+
+async def test_resolver_that_never_cleans_fails_loud(tmp_path: Path) -> None:
+    """A resolver that always leaves markers exhausts the retry bound and FAILS LOUD.
+
+    The fold must never fold a marker-laden tree (a broken merge) or open a PR over it. A
+    resolver that never produces a clean tree must raise a clear error after the bound, not
+    silently integrate conflict markers — the fail-loud half of "don't trust the model".
+    """
+    provider, manager = _make_worktree_manager(tmp_path)
+    roster = _roster_with_resolver(_never_clean_resolver_builder())
+    try:
+        with pytest.raises(ValueError, match="conflict"):
+            await run_workflow(
+                lambda ctx: refactor_swarm(ctx, {}),
+                roster=roster,
+                workflows=make_workflows(),
+                sandbox_manager=manager,
+                thread_id="t-resolver-never-clean",
+            )
+    finally:
+        provider.cleanup_all()
+
+
+async def test_resolver_that_drops_a_conflicted_file_fails_loud(tmp_path: Path) -> None:
+    """A resolver that omits a conflicted path is rejected (every conflict must be resolved)."""
+    from workflows import Resolution
+
+    def _dropping_builder(*, response_format: Any = None) -> Any:
+        async def _leaf(inp: dict[str, Any], config: Any = None) -> dict[str, Any]:
+            from langchain_core.messages import AIMessage
+
+            # Return an EMPTY resolution: every conflicted path is missing.
+            return {
+                "messages": [*inp["messages"], AIMessage(content="resolved")],
+                "structured_response": Resolution(files={}),
+            }
+
+        from langchain_core.runnables import RunnableLambda
+
+        return RunnableLambda(_leaf)
+
+    provider, manager = _make_worktree_manager(tmp_path)
+    roster = _roster_with_resolver(_dropping_builder)
+    try:
+        with pytest.raises(ValueError, match="conflict"):
+            await run_workflow(
+                lambda ctx: refactor_swarm(ctx, {}),
+                roster=roster,
+                workflows=make_workflows(),
+                sandbox_manager=manager,
+                thread_id="t-resolver-drops-file",
+            )
+    finally:
+        provider.cleanup_all()
+
+
+# --- F-D1: host finalization MATERIALIZES the integrated tree into the integration branch -
+
+
+def _git_show(repo: str, ref: str, path: str) -> str:
+    """Return the content of ``path`` at ``ref`` in ``repo`` via ``git show`` (or '' if absent)."""
+    completed = subprocess.run(
+        ["git", "-C", repo, "show", f"{ref}:{path}"],
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout if completed.returncode == 0 else ""
+
+
+async def test_host_materializes_integrated_tree_into_integration_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host run writes the integrated tree to the integration branch in the base repo.
+
+    F-D1: opening a PR ref is hollow unless a real branch carries the merged files. The host
+    must materialize ``result.integrated_tree`` into ``provider.integration_branch`` in the
+    base repo (real ``git`` commit) BEFORE opening the PR ref, so the PR references a branch
+    that actually carries the merged content. Asserts ``git show <integration_branch>:calc.py``
+    equals the merged calc (both competing fixes, no markers) and that helper.py is present.
+    """
+    base_repo = _seed_base_repo(tmp_path)
+    monkeypatch.setenv("LDW_DEMO_REFACTOR_BASE_REPO", base_repo)
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    adapter = UiAdapter(emit=lambda comp, props: events.append((comp, dict(props))))
+    lane = _ResumeLane(thread_id="t::refactor_swarm_materialize")
+
+    await run_workflow_live("refactor_swarm", {}, adapter=adapter, lane=lane)
+
+    # The integration branch (default ldw/integration) must exist in the base repo and carry
+    # the integrated tree — the merged calc.py keeps BOTH competing fixes with no markers.
+    integration_branch = "ldw/integration"
+    calc = _git_show(base_repo, integration_branch, "calc.py")
+    assert calc, (
+        f"the integration branch {integration_branch!r} must carry calc.py in the base repo; "
+        "host finalization must MATERIALIZE the integrated tree, not just open a hollow PR ref"
+    )
+    assert "<<<<<<<" not in calc and ">>>>>>>" not in calc, calc
+    assert "return a + b" in calc and "return abs(a) + abs(b)" in calc, calc
+    # The clean helper.py fix is materialized too.
+    helper = _git_show(base_repo, integration_branch, "helper.py")
+    assert helper == "VALUE = 42\n", helper
+
+
+# --- F-D2: the host-created base repo temp dir is cleaned up (no leak) --------------------
+
+
+async def test_host_created_base_repo_is_cleaned_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A host run that creates its own base repo leaves no ``ldw-refactor-base-*`` dir behind.
+
+    F-D2: ``_seed_refactor_base_repo`` mkdtemps ``ldw-refactor-base-*`` and ``cleanup_all``
+    does NOT reclaim it; the host must remove it in ``finally`` (only when host-created, never
+    a test-injected one). With no injected repo, the host creates its own — and must clean it
+    up. Asserts no new ``ldw-refactor-base-*`` temp dir survives the run.
+    """
+    import tempfile as _tempfile
+
+    # Ensure no injected repo, so the host creates (and must clean up) its own.
+    monkeypatch.delenv("LDW_DEMO_REFACTOR_BASE_REPO", raising=False)
+    tmp_root = Path(_tempfile.gettempdir())
+    before = {p.name for p in tmp_root.glob("ldw-refactor-base-*")}
+
+    adapter = UiAdapter(emit=lambda _c, _p: None)
+    lane = _ResumeLane(thread_id="t::refactor_swarm_cleanup")
+    await run_workflow_live("refactor_swarm", {}, adapter=adapter, lane=lane)
+
+    after = {p.name for p in tmp_root.glob("ldw-refactor-base-*")}
+    leaked = after - before
+    assert not leaked, f"host run leaked base-repo temp dir(s): {leaked}"
+
+
+async def test_injected_base_repo_is_NOT_removed_by_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A test-injected base repo (via env) is the test's to own — the host must NOT remove it."""
+    base_repo = _seed_base_repo(tmp_path)
+    monkeypatch.setenv("LDW_DEMO_REFACTOR_BASE_REPO", base_repo)
+
+    adapter = UiAdapter(emit=lambda _c, _p: None)
+    lane = _ResumeLane(thread_id="t::refactor_swarm_injected")
+    await run_workflow_live("refactor_swarm", {}, adapter=adapter, lane=lane)
+
+    # The injected repo must still exist after the run (the host did not delete it).
+    assert Path(base_repo).is_dir(), "the host must NOT remove a test-injected base repo"
+
+
+# --- F-D4: cross-turn PR idempotency is realized through the host path ---------------------
+
+
+async def test_host_path_pr_idempotent_across_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two host runs on the same branch → the second PR card is created=False (idempotent).
+
+    F-D4: the production entry passes no ``pr_provider``, so a fresh provider per turn would
+    always return ``created=True``/``number=1`` and the "PR updated" UI state could never
+    render. A module-scope PR provider must persist across turns so the second finalization
+    of the same branch returns the existing PR (``created=False``). Driven through the host
+    path (``run_refactor_swarm_live`` with no injected provider) so it proves the production
+    wiring, not just an injected provider.
+    """
+    import host_graph
+
+    base_repo = _seed_base_repo(tmp_path)
+    monkeypatch.setenv("LDW_DEMO_REFACTOR_BASE_REPO", base_repo)
+    # Reset the module-scope PR provider so this test starts from a clean PR namespace.
+    host_graph._REFACTOR_PR_PROVIDER = host_graph.LocalPullRequestProvider()
+
+    cards: list[dict[str, Any]] = []
+    adapter = UiAdapter(emit=lambda c, p: cards.append(dict(p)) if c == "pull_request" else None)
+    lane = _ResumeLane(thread_id="t::refactor_swarm_idem")
+
+    await host_graph.run_refactor_swarm_live({}, adapter=adapter, lane=lane)
+    first_card = cards[-1]
+    assert first_card["created"] is True, f"first finalization must create the PR: {first_card}"
+
+    # A second host run on the SAME branch must re-open the SAME PR (created=False), proving
+    # the PR provider persists across turns (module scope), not rebuilt per turn.
+    adapter2 = UiAdapter(emit=lambda c, p: cards.append(dict(p)) if c == "pull_request" else None)
+    lane2 = _ResumeLane(thread_id="t::refactor_swarm_idem")
+    await host_graph.run_refactor_swarm_live({}, adapter=adapter2, lane=lane2)
+    second_card = cards[-1]
+    assert second_card["created"] is False, (
+        f"second finalization of the same branch must re-open the SAME PR (created=False); "
+        f"got {second_card}"
+    )
+    assert second_card["number"] == first_card["number"], "the re-opened PR must keep its number"
+
+
+# --- F-D5: the worktree fixer backend runs under the same admission policy as code_fixer --
+
+
+async def test_refactor_provider_constructed_with_exec_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host builds the GitWorktreeProvider with ``_make_exec_policy()`` (admission + cap).
+
+    F-D5: a real ``git_fixer`` deepagent carries an ``execute`` tool, so its worktree backend
+    must run under the SAME admission hook + output cap as the fix_loop's ``code_fixer`` (the
+    denylist rejecting ``rm -rf`` / ``curl|sh`` / fork bombs / sudo / net egress + the output
+    cap), not a bare default policy. Spies on the GitWorktreeProvider constructor and asserts
+    a non-None ``policy`` carrying the admission hook is passed.
+    """
+    import host_graph
+
+    captured: dict[str, Any] = {}
+    real_provider_cls = host_graph.GitWorktreeProvider
+
+    def _spy_provider(*args: Any, **kwargs: Any) -> Any:
+        captured["policy"] = kwargs.get("policy")
+        return real_provider_cls(*args, **kwargs)
+
+    monkeypatch.setattr(host_graph, "GitWorktreeProvider", _spy_provider)
+    monkeypatch.setenv("LDW_DEMO_REFACTOR_BASE_REPO", _seed_base_repo(tmp_path))
+
+    adapter = UiAdapter(emit=lambda _c, _p: None)
+    lane = _ResumeLane(thread_id="t::refactor_swarm_policy")
+    await host_graph.run_refactor_swarm_live({}, adapter=adapter, lane=lane)
+
+    policy = captured.get("policy")
+    assert policy is not None, "the GitWorktreeProvider must be built with an ExecPolicy (F-D5)"
+    assert policy.before_execute is not None, (
+        "the worktree provider's policy must carry the admission hook (the same as code_fixer)"
+    )
+
+
 def test_git_fixer_is_host_trusted_only_not_in_reasoning_roster() -> None:
     """The needs_execution ``git_fixer`` is on the host roster ONLY, never reasoning (R6).
 

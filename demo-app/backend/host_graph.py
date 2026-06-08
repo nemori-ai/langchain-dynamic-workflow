@@ -25,6 +25,7 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -251,9 +252,10 @@ def _seed_refactor_base_repo() -> str:
     Builds a fresh temp git repo committing the buggy ``REFACTOR_BASE_TREE`` so the swarm's
     git-worktree fixers branch from it. A test may inject a pre-seeded repo via the
     ``LDW_DEMO_REFACTOR_BASE_REPO`` env var to own the fixture's git state; absent that, a
-    private temp repo is created here. The temp dir is intentionally NOT removed by this
-    function — the provider's ``cleanup_all`` (and the OS temp sweep) reclaim it; the host
-    holds it only for the duration of one run.
+    private temp repo is created here. The provider's ``cleanup_all`` does NOT reclaim this
+    temp dir (it only removes the provider's worktree roots), so the host removes it in its
+    ``finally`` — but ONLY when the host created it (a test-injected repo is the test's to
+    own and is never removed by the host).
 
     DANGEROUS OPT-IN: the resulting :class:`GitWorktreeProvider` spawns real ``git`` on the
     host with the calling user's permissions; it is not a security sandbox. It is built only
@@ -278,6 +280,56 @@ def _seed_refactor_base_repo() -> str:
     _git("add", "-A")
     _git("commit", "-qm", "seed")
     return repo
+
+
+def _materialize_integration_branch(
+    base_repo: str, integration_branch: str, tree: dict[str, str]
+) -> None:
+    """Commit the integrated tree onto ``integration_branch`` in ``base_repo`` via real git.
+
+    F-D1: a PR ref is hollow unless a real branch carries the merged files. This writes every
+    ``path -> content`` of the workflow's integrated tree into a branch in the base repo so
+    the PR the host opens references a branch that actually carries the merged content. It
+    builds the commit in a throwaway ``git worktree`` checked out at the base commit (so the
+    base repo's primary working tree is never disturbed), replaces its files with the
+    integrated tree, ``git add -A``, and commits onto ``integration_branch`` — created fresh
+    each run (``-B``) so a re-run re-materializes idempotently rather than diverging.
+
+    Args:
+        base_repo: The base git repository the swarm branched from.
+        integration_branch: The branch name to commit the integrated tree onto.
+        tree: The integrated source tree (``path -> content``, protocol-absolute paths).
+    """
+    work = tempfile.mkdtemp(prefix="ldw-refactor-integration-")
+
+    def _git_base(*args: str) -> None:
+        subprocess.run(["git", "-C", base_repo, *args], check=True, capture_output=True)
+
+    def _git_work(*args: str) -> None:
+        subprocess.run(["git", "-C", work, *args], check=True, capture_output=True)
+
+    try:
+        # A throwaway worktree at the base commit, on a fresh integration branch (-B), so the
+        # base repo's primary checkout is untouched and a re-run re-materializes cleanly.
+        _git_base("worktree", "add", "--force", "-B", integration_branch, work, "HEAD")
+        _git_work("config", "user.email", "demo@ldw")
+        _git_work("config", "user.name", "ldw-demo")
+        # Replace the tree with the integrated content (overwrite + add any new files). The
+        # integrated tree carries every base file, so no base path is left stale.
+        for path, content in tree.items():
+            dest = Path(work) / path.lstrip("/")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content)
+        _git_work("add", "-A")
+        _git_work("commit", "-qm", "refactor swarm: integrated patches", "--allow-empty")
+    finally:
+        # Detach the worktree (the branch + its commit live on in base_repo) and remove the dir.
+        subprocess.run(
+            ["git", "-C", base_repo, "worktree", "remove", "--force", work],
+            check=False,
+            capture_output=True,
+        )
+        shutil.rmtree(work, ignore_errors=True)
 
 
 class _ResumeLane:
@@ -334,6 +386,13 @@ class _ResumeLane:
 # thread reuses the first turn's journal and replays its leaves as cache hits. A fresh
 # process (a server restart) starts empty, which is the honest in-memory-store bound.
 _RESUME_LANES: dict[str, _ResumeLane] = {}
+
+# The refactor_swarm host-finalization PR provider, held at MODULE scope so it survives
+# across host turns within a process (F-D4): re-finalizing the same branch on a later turn
+# returns the SAME PR (created=False), so the "PR updated" UI state can actually render.
+# A per-call provider would mint a fresh number=1/created=True every turn. A fresh process
+# starts empty, the honest in-memory-store bound (matching the resume lanes).
+_REFACTOR_PR_PROVIDER: PullRequestProvider = LocalPullRequestProvider()
 
 _NO_SIGNOFF = object()
 """Sentinel for ``run_workflow_live``: run/replay with no human sign-off value injected.
@@ -632,7 +691,9 @@ async def run_refactor_swarm_live(
     """
     workflows = make_workflows()
     workflow_fn = workflows.resolve(REFACTOR_SWARM)
-    pr_provider = pr_provider if pr_provider is not None else LocalPullRequestProvider()
+    # Default to the MODULE-SCOPE PR provider (F-D4) so re-finalizing the same branch on a
+    # later turn returns the existing PR (created=False); a test may inject its own.
+    pr_provider = pr_provider if pr_provider is not None else _REFACTOR_PR_PROVIDER
 
     async def _orchestrate(ctx: Ctx) -> Any:
         return await workflow_fn(ctx, args)
@@ -642,8 +703,16 @@ async def run_refactor_swarm_live(
         if lane is not None
         else {}
     )
-    # The HOST owns the worktree provider lifecycle and MUST cleanup_all() in finally.
-    provider = GitWorktreeProvider(base_repo=_seed_refactor_base_repo())
+    # The HOST owns the worktree provider lifecycle and MUST cleanup_all() in finally. Capture
+    # the base repo path so host finalization can MATERIALIZE the integrated tree into the
+    # integration branch (F-D1), and remember whether the host created it (so finally cleans
+    # up only a host-created repo, never a test-injected one — F-D2).
+    base_repo = _seed_refactor_base_repo()
+    host_created_base_repo = not os.environ.get(_REFACTOR_BASE_REPO_ENV)
+    # Worktree fixers run under the SAME admission hook + output cap as the fix_loop's
+    # code_fixer (F-D5): a real git_fixer deepagent carries an execute tool, so it must not
+    # run under a bare default policy with no denylist or cap.
+    provider = GitWorktreeProvider(base_repo=base_repo, policy=_make_exec_policy())
     manager = SandboxManager(git_worktree_provider=provider)
     try:
         result = await run_workflow(
@@ -663,6 +732,12 @@ async def run_refactor_swarm_live(
         # workflow returned only the pure integrated result + PR intent; the dangerous,
         # idempotent PR write is the host's job. Tolerate a degraded non-RefactorResult.
         if isinstance(result, RefactorResult):
+            # F-D1: MATERIALIZE the integrated tree into the integration branch FIRST, so the
+            # PR ref references a real branch that actually carries the merged files — the PR
+            # is not hollow. Done with real git in the base repo (no engine code touched).
+            _materialize_integration_branch(
+                base_repo, provider.integration_branch, result.integrated_tree
+            )
             ref = pr_provider.open(
                 branch=result.pr.branch,
                 title=result.pr.title,
@@ -684,7 +759,13 @@ async def run_refactor_swarm_live(
             )
         return str(result)
     finally:
+        # The HOST owns the worktree provider lifecycle: cleanup_all() removes the per-leaf
+        # worktree roots and the provider's OWN workspace_root temp tree.
         provider.cleanup_all()
+        # F-D2: cleanup_all does NOT reclaim the seeded base repo — remove it here, but only
+        # when the host created it (never a test-injected repo, which is the test's to own).
+        if host_created_base_repo:
+            shutil.rmtree(base_repo, ignore_errors=True)
 
 
 async def run_workflow_live(

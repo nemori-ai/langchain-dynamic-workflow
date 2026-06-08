@@ -808,6 +808,130 @@ def _flatten_conflict_markers(conflicted: str) -> str:
     return "".join(out)
 
 
+# Git conflict-hunk marker prefixes. A resolved file that still carries ANY of these is a
+# broken (un-resolved) merge and must never be folded into the integrated tree or a PR.
+_CONFLICT_MARKERS: tuple[str, ...] = ("<<<<<<<", "=======", ">>>>>>>")
+
+# How many times the conflict resolver leaf is retried before the fold FAILS LOUD. The fold
+# gates on the real artifact (no markers, every conflicted file present), not the model's
+# word — a small bounded retry tolerates a botched first try without looping forever.
+_MAX_RESOLVE_ATTEMPTS = 2
+
+
+def _has_conflict_markers(text: str) -> bool:
+    """Return ``True`` if any line of ``text`` begins with a git conflict marker."""
+    return any(
+        line.startswith(_CONFLICT_MARKERS) for line in (ln.rstrip("\n") for ln in text.splitlines())
+    )
+
+
+def _invalid_resolution_files(
+    conflicts: dict[str, str], resolved: dict[str, str]
+) -> dict[str, str]:
+    """Return the conflicted files a resolution failed to resolve (missing or marker-laden).
+
+    A resolution is valid only when every conflicted path is present AND carries no remaining
+    conflict markers. This returns the offending subset — keyed by path — so a retry can feed
+    back exactly which files still need resolving (missing files map to their original
+    conflicted content so the retry sees the markers it must remove).
+
+    Args:
+        conflicts: The merge's conflicted files (``path -> conflicted content``).
+        resolved: The resolver's returned files (``path -> resolved content``).
+
+    Returns:
+        A ``path -> content`` map of the still-invalid files (empty when the resolution is
+        valid). A missing path maps to its original conflicted content; a present-but-dirty
+        path maps to the resolver's still-markered content.
+    """
+    invalid: dict[str, str] = {}
+    for path, conflicted in conflicts.items():
+        if path not in resolved:
+            invalid[path] = conflicted
+        elif _has_conflict_markers(resolved[path]):
+            invalid[path] = resolved[path]
+    return invalid
+
+
+# Sentinel delimiting the machine-readable conflicts JSON block in the resolver prompt. The
+# real model reads the prose instructions; an offline fake extracts the JSON between these
+# markers (see _parse_conflicts_from_prompt) — so one prompt serves both paths.
+_CONFLICTS_JSON_BEGIN = "<<<CONFLICTS_JSON>>>"
+_CONFLICTS_JSON_END = "<<<END_CONFLICTS_JSON>>>"
+
+
+def _resolve_conflict_prompt(conflicts: dict[str, str], *, attempt: int, retry_files: str) -> str:
+    """Build the prescriptive conflict-resolver prompt for one attempt.
+
+    The prompt is content-distinct per attempt (it carries the attempt number and, on a
+    retry, the files still carrying markers), so the engine's content-hash journal does NOT
+    short-circuit a retry to the prior attempt's result. It carries prose instructions for a
+    real model AND a machine-readable conflicts JSON block (between
+    :data:`_CONFLICTS_JSON_BEGIN` / :data:`_CONFLICTS_JSON_END`) an offline fake parses, so
+    one prompt serves both the real and offline paths.
+
+    Args:
+        conflicts: The merge's conflicted files (``path -> conflicted content with markers``).
+        attempt: The 1-based resolver attempt number.
+        retry_files: On a retry, a rendered list of the files that still had markers / were
+            missing on the prior attempt; empty on the first attempt.
+
+    Returns:
+        The resolver leaf prompt for this attempt.
+    """
+    retry = (
+        ""
+        if not retry_files
+        else (
+            "Your previous attempt did NOT fully resolve these files — they still carry "
+            f"conflict markers or were missing:\n{retry_files}\n\n"
+        )
+    )
+    rendered = "\n".join(
+        f"--- {path} ---\n{content}" for path, content in sorted(conflicts.items())
+    )
+    conflicts_json = json.dumps(conflicts, sort_keys=True)
+    return (
+        "You are resolving git merge conflicts. For EACH conflicted file below, return its "
+        "fully-merged content in `files` keyed by the same path. Remove EVERY "
+        "`<<<<<<<` / `=======` / `>>>>>>>` conflict marker line and keep the correct merged "
+        "content from both sides — no marker may remain in any returned file, and every "
+        f"conflicted path MUST be present in your `files`.\n\n{retry}"
+        f"Attempt {attempt}.\nConflicted files:\n{rendered}\n\n"
+        f"{_CONFLICTS_JSON_BEGIN}\n{conflicts_json}\n{_CONFLICTS_JSON_END}"
+    )
+
+
+def _parse_conflicts_from_prompt(prompt: str) -> dict[str, str]:
+    """Extract the conflicts JSON block an offline resolver fake resolves.
+
+    Reads the JSON object between :data:`_CONFLICTS_JSON_BEGIN` / :data:`_CONFLICTS_JSON_END`
+    in a resolver prompt built by :func:`_resolve_conflict_prompt`. Falls back to parsing the
+    whole prompt as JSON (so a caller that passes raw JSON still works) and to an empty map
+    when neither yields an object.
+
+    Args:
+        prompt: The resolver leaf's prompt text.
+
+    Returns:
+        The conflicted files (``path -> conflicted content``), or an empty map when absent.
+    """
+    begin = prompt.find(_CONFLICTS_JSON_BEGIN)
+    end = prompt.find(_CONFLICTS_JSON_END)
+    if begin != -1 and end != -1 and end > begin:
+        block = prompt[begin + len(_CONFLICTS_JSON_BEGIN) : end].strip()
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError:
+            parsed = {}
+    else:
+        try:
+            parsed = json.loads(prompt)
+        except json.JSONDecodeError:
+            parsed = {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _refactor_fix_prompt(target: RefactorTarget) -> str:
     """Build the git fixer prompt for one target file (real-model path)."""
     return (
@@ -831,6 +955,58 @@ def _refactor_verify_prompt(summary: str, files: dict[str, str], voter: int) -> 
         "sound, safe change. Set `refuted` to true ONLY if the patch is clearly wrong, "
         "unsafe, or introduces a regression; otherwise set it to false. Give one sentence "
         f"of `reason`.\nPatch summary: {summary}\nPatched files:\n{rendered}"
+    )
+
+
+async def _resolve_conflict(ctx: Ctx, conflicts: dict[str, str]) -> dict[str, str]:
+    """Drive the conflict resolver leaf, VALIDATING its output, retrying, then failing loud.
+
+    A real resolver can omit a conflicted file or leave ``<<<<<<<`` / ``=======`` /
+    ``>>>>>>>`` markers behind. Folding such output would integrate a broken merge and open a
+    PR over it, so this gates on the real artifact: after each resolver attempt it checks
+    every conflicted path is present and marker-free, and on failure RETRIES the resolver
+    (feeding back exactly which files still need work) up to :data:`_MAX_RESOLVE_ATTEMPTS`.
+    If no attempt lands a clean resolution, it FAILS LOUD rather than folding markers — the
+    same "don't trust the model; verify the artifact" discipline the M5 fix loop uses.
+
+    Each attempt's prompt is content-distinct (it carries the attempt number and the retry
+    feedback), so the engine's content-hash journal does not short-circuit a retry to the
+    prior attempt's cached result.
+
+    Args:
+        ctx: The orchestration context (for the resolver ``ctx.agent`` calls + logging).
+        conflicts: The merge's conflicted files (``path -> conflicted content with markers``).
+
+    Returns:
+        The validated, marker-free resolution (``path -> resolved content``) for every
+        conflicted file.
+
+    Raises:
+        ValueError: If the resolver never produces a valid (complete, marker-free)
+            resolution within :data:`_MAX_RESOLVE_ATTEMPTS` attempts.
+    """
+    retry_files = ""
+    invalid: dict[str, str] = {}
+    for attempt in range(1, _MAX_RESOLVE_ATTEMPTS + 1):
+        resolution = await ctx.agent(
+            _resolve_conflict_prompt(conflicts, attempt=attempt, retry_files=retry_files),
+            agent_type="conflict_resolver",
+            schema=Resolution,
+        )
+        invalid = _invalid_resolution_files(conflicts, resolution.files)
+        if not invalid:
+            return {path: resolution.files[path] for path in conflicts}
+        # Still invalid: feed back which files are unresolved so the retry's prompt is both
+        # actionable and content-distinct (so the journal does not replay attempt N's result).
+        retry_files = "\n".join(
+            f"--- {path} ---\n{content}" for path, content in sorted(invalid.items())
+        )
+        ctx.log(f"resolver attempt {attempt} left {len(invalid)} file(s) unresolved; retrying")
+    raise ValueError(
+        "conflict resolution failed: the resolver left "
+        f"{len(invalid)} file(s) with conflict markers or missing after "
+        f"{_MAX_RESOLVE_ATTEMPTS} attempts ({sorted(invalid)}); refusing to fold a broken "
+        "merge or open a PR over it"
     )
 
 
@@ -932,16 +1108,14 @@ async def refactor_swarm(ctx: Ctx, args: dict[str, Any]) -> RefactorResult:
             integrated = merged.files
             continue
         any_conflict = True
-        # Real conflict: a resolver leaf flattens git's markers; the resolved content IS the
-        # merge resolution. Fold it into the merged working tree (which already carries the
-        # auto-merged non-conflicting files) — completing the merge, as `git add` + commit would.
-        resolution = await ctx.agent(
-            json.dumps(merged.conflicts, sort_keys=True),
-            agent_type="conflict_resolver",
-            schema=Resolution,
-        )
+        # Real conflict: a resolver leaf flattens git's markers. DON'T trust it blindly —
+        # validate the resolution carries no remaining markers and resolves every conflicted
+        # file, retrying with feedback up to a bound, and FAIL LOUD if it never lands a clean
+        # tree (mirroring M5's "gate on the real artifact, not the model's word"). Only a
+        # validated, marker-free resolution is folded into the merged working tree.
+        resolved_files = await _resolve_conflict(ctx, merged.conflicts)
         integrated = dict(merged.files)
-        integrated.update(resolution.files)
+        integrated.update(resolved_files)
     ctx.log(f"integrated {len(approved)} patches (conflict resolved: {any_conflict})")
 
     body = (
@@ -1316,10 +1490,13 @@ def _build_conflict_resolver(*, response_format: Any = None, api_key: str | None
 
     Resolves git conflict markers into clean, marker-free content. The real path is a
     ``create_deep_agent`` (a reasoning leaf — it merges intent, it does not execute), driven
-    to return a :class:`Resolution`. The offline path deterministically flattens the
-    conflict hunks (:func:`_flatten_conflict_markers`), keeping BOTH sides' contributions so
-    the resolution is reproducible and contains every fixer's change — the same mechanic the
-    engine integration test mirrors.
+    by the prescriptive :func:`_resolve_conflict_prompt` to return a :class:`Resolution` with
+    every conflicted file present and every marker removed. The script does not trust the
+    result blindly — :func:`_resolve_conflict` validates it (no markers, all files present),
+    retries with feedback, and fails loud otherwise. The offline path deterministically
+    flattens the conflict hunks (:func:`_flatten_conflict_markers`) parsed from the prompt's
+    machine-readable conflicts block, keeping BOTH sides' contributions so the resolution is
+    reproducible — the same mechanic the engine integration test mirrors.
 
     Args:
         response_format: The structured schema (``Resolution``) the real leaf returns.
@@ -1332,7 +1509,8 @@ def _build_conflict_resolver(*, response_format: Any = None, api_key: str | None
         )
 
     async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
-        conflicts = json.loads(inp["messages"][-1].text if inp["messages"] else "{}")
+        prompt = inp["messages"][-1].text if inp["messages"] else ""
+        conflicts = _parse_conflicts_from_prompt(prompt)
         resolved = {path: _flatten_conflict_markers(text) for path, text in conflicts.items()}
         return {
             "messages": [*inp["messages"], AIMessage(content="resolved the conflict")],
