@@ -777,25 +777,12 @@ class SandboxManager:
         Returns:
             The leaf's slot with ``in_use`` already incremented for the caller.
         """
+        victims: list[SandboxBackendProtocol] = []
         async with self._slot_freed:
             while True:
-                # Wait for room at quota, in three escalating steps:
-                #   1. reclaim TTL-expired idle sandboxes (frees slots cleanly);
-                #   2. if still full, evict the least-recently-used *idle* sandbox to
-                #      admit this new leaf (a slot held only for find-or-create reuse
-                #      is yielded so distinct new work is not starved under a bounded
-                #      pool with no TTL — without this the pool deadlocks once every
-                #      slot holds an idle-but-alive sandbox);
-                #   3. only when every slot is genuinely in use, park until a release.
-                # A leaf reusing an already-live sandbox (same leaf_id) never waits
-                # and is never evicted — it is not new work, so its workspace stays.
-                while self._would_exceed_quota(leaf_id):
-                    self.reclaim_idle()
-                    if not self._would_exceed_quota(leaf_id):
-                        break
-                    if self._evict_one_idle():
-                        break
-                    await self._slot_freed.wait()
+                # Reuse / park decisions come FIRST, before any eviction, so a leaf
+                # reusing its own already-live sandbox never evicts a sibling, and a
+                # second lease of a leaf already being built just parks.
                 existing = self._slots.get(leaf_id)
                 if existing is not None:
                     # Find-or-create reuse: another lease (or a prior one) already
@@ -807,10 +794,34 @@ class SandboxManager:
                     # park until it installs the slot, then re-check from the top.
                     await self._slot_freed.wait()
                     continue
-                # We are the builder: claim the leaf so a concurrent lease parks, and
-                # so the quota counts this in-flight build (see _would_exceed_quota).
+                # Make room at quota, in three escalating steps:
+                #   1. reclaim TTL-expired idle sandboxes (frees slots cleanly);
+                #   2. if still full, evict the least-recently-used *idle* sandbox;
+                #   3. only when every slot is genuinely in use, park until a release.
+                # H3: a victim's teardown (close -> on_close -> git subprocesses) is
+                # blocking, so it must NOT run under the lock or on the event loop.
+                # Victims are POPPED from the pool here (freeing the quota) but their
+                # backends are CLOSED OFF-loop only AFTER this leaf claims the freed
+                # capacity via self._pending below — so the lock-release window of the
+                # off-loop close cannot let a concurrent lease over-allocate past the
+                # cap (the pending claim keeps the quota accounting honest).
+                if self._would_exceed_quota(leaf_id):
+                    victims.extend(self._pop_expired_idle())
+                    if self._would_exceed_quota(leaf_id):
+                        evicted = self._pop_one_idle()
+                        if evicted is not None:
+                            victims.append(evicted)
+                        elif not victims:
+                            # Every slot is genuinely in use: park until a release.
+                            await self._slot_freed.wait()
+                            continue
+                # Room exists (or was just freed). Claim it: mark this leaf pending so
+                # a concurrent lease counts it toward the quota and parks, then close
+                # the popped victims off-loop (lock released) before building.
                 self._pending.add(leaf_id)
                 break
+            if victims:
+                await self._close_backends_off_loop(victims)
         # Build the backend OUTSIDE the lock (R8): a git provider's worktree add is
         # blocking, so thread-offload it and never run it on the event loop.
         try:
@@ -841,6 +852,32 @@ class SandboxManager:
             # change the pending count other leases wait on, so wake them to re-check.
             self._slot_freed.notify_all()
             return slot
+
+    async def _close_backends_off_loop(self, backends: list[SandboxBackendProtocol]) -> None:
+        """Close popped victim backends OFF the event loop (H3).
+
+        The victim slots were already removed from the pool under the lock, so the
+        quota is free; this releases the ``self._slot_freed`` lock (held by the
+        caller), closes each backend on a worker thread via ``asyncio.to_thread``
+        (a real-git backend's ``close`` runs blocking ``git worktree remove`` /
+        ``git branch -D`` subprocesses), then re-acquires the lock and wakes parked
+        leases (the pool changed). Releasing the lock during the blocking teardown is
+        what keeps a single slow ``git`` teardown from wedging the event loop or
+        stalling an unrelated lease. Must be called while holding ``self._slot_freed``.
+
+        Args:
+            backends: The popped backends to close off-loop.
+        """
+        # Release the caller-held condition lock for the blocking teardown, then
+        # re-acquire it before returning so the caller's `async with` stays balanced.
+        self._slot_freed.release()
+        try:
+            for backend in backends:
+                await asyncio.to_thread(_close_backend, backend)
+        finally:
+            await self._slot_freed.acquire()
+        # The pool freed slots while unlocked; wake parked leases to re-check quota.
+        self._slot_freed.notify_all()
 
     def _would_exceed_quota(self, leaf_id: str) -> bool:
         """Whether admitting a *new* sandbox for ``leaf_id`` would breach the cap.
@@ -896,6 +933,49 @@ class SandboxManager:
         _close_backend(self._slots[lru_leaf_id].sandbox)
         del self._slots[lru_leaf_id]
         return True
+
+    def _pop_expired_idle(self) -> list[SandboxBackendProtocol]:
+        """Pop every TTL-expired idle slot, returning their backends UNCLOSED.
+
+        The deferred-close half of :meth:`reclaim_idle`, for the async admit path:
+        a slot is removed from the pool immediately (so the quota frees) but its
+        backend is NOT closed here — the caller closes the returned backends OFF the
+        event loop (a real-git backend's ``close`` runs blocking ``git`` subprocesses,
+        which must never run under the slot lock or on the loop, R8/H3). Must be
+        called while holding ``self._slot_freed``.
+
+        Returns:
+            The backends of the popped slots, for the caller to close off-loop.
+        """
+        now = self._clock()
+        expired = [
+            leaf_id
+            for leaf_id, slot in self._slots.items()
+            if slot.in_use == 0 and self._is_expired(slot, now)
+        ]
+        return [self._slots.pop(leaf_id).sandbox for leaf_id in expired]
+
+    def _pop_one_idle(self) -> SandboxBackendProtocol | None:
+        """Pop the LRU idle slot, returning its backend UNCLOSED (or ``None``).
+
+        The deferred-close half of :meth:`_evict_one_idle`, for the async admit
+        path: the LRU idle slot is removed from the pool immediately (freeing the
+        quota) but its backend is NOT closed here — the caller closes it OFF the
+        event loop. Must be called while holding ``self._slot_freed``.
+
+        Returns:
+            The popped backend, or ``None`` when every live slot is in use.
+        """
+        idle = [
+            (slot.last_used_at, leaf_id)
+            for leaf_id, slot in self._slots.items()
+            if slot.in_use == 0
+        ]
+        if not idle:
+            return None
+        idle.sort()
+        _, lru_leaf_id = idle[0]
+        return self._slots.pop(lru_leaf_id).sandbox
 
     async def stop(self, leaf_id: str) -> None:
         """Tear down and release the sandbox held by ``leaf_id`` (idempotent).
