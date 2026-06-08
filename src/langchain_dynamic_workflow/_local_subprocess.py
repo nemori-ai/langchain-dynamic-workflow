@@ -25,12 +25,15 @@ is an explicit, host-constructed opt-in.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import json
 import os
 import shutil
 import signal
 import subprocess
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import IO, Literal
@@ -58,6 +61,8 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 
+from ._observability import CommandEvent, CommandSink
+
 EXIT_TIMEOUT = 124
 """Exit-code sentinel reported when a command is killed for exceeding its timeout."""
 
@@ -69,6 +74,14 @@ _DEFAULT_REJECT_REASON = "execution rejected by policy"
 
 _DRAIN_CHUNK_BYTES = 65536
 """Read granularity for the bounded output drain, in bytes."""
+
+_COMMAND_EVENT_TAIL_BYTES = 4096
+"""Shape-only tail (last N bytes) of output surfaced on a CommandEvent by default.
+
+Far below the backend's own multi-hundred-KB output cap: a command event is a UI
+telemetry edge, not a transcript, so it carries only a small honest tail unless the
+sink is wired with payloads opted in.
+"""
 
 
 ExecOutcome = Literal["allow", "reject"]
@@ -461,11 +474,98 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         # The private per-leaf working directory. Created eagerly so the file
         # operations and execute share one real filesystem from the first call.
         self._root = tempfile.mkdtemp(prefix=f"ldw-exec-{identity}-")
+        # Command-event observability (M5 C1). Default no-op: a sandbox with no
+        # wired sink fires nothing, so execute stays byte-for-byte the prior path.
+        # set_command_sink threads in the owning leaf's span id + the sink the
+        # engine forwards. The per-command occurrence counter, guarded by a lock
+        # because several executes can run concurrently on to_thread workers,
+        # salts the resume-stable command_id so repeated identical commands in one
+        # leaf get distinct ids (a fix-loop's stacked `bun test` cards).
+        self._command_sink: CommandSink | None = None
+        self._command_leaf_span_id: str = ""
+        self._command_include_payloads: bool = False
+        self._command_occurrences: dict[str, int] = {}
+        self._command_lock = threading.Lock()
 
     @property
     def id(self) -> str:
         """The owning leaf identity (unique per sandbox instance)."""
         return self._identity
+
+    def set_command_sink(
+        self,
+        *,
+        sink: CommandSink,
+        leaf_span_id: str,
+        include_payloads: bool = False,
+    ) -> None:
+        """Wire a command-lifecycle sink correlated to the owning leaf's span.
+
+        Each subsequent real :meth:`execute` fires a ``"start"`` edge before the
+        subprocess and an ``"end"`` edge after it, both stamped with
+        ``leaf_span_id`` so a consumer files the terminal card under the right
+        AGENT span. The engine calls this once per leased execution leaf, threading
+        the leaf's resume-stable span id minted by the span recorder.
+
+        Args:
+            sink: The callback receiving each :class:`CommandEvent` (start then end).
+            leaf_span_id: The owning leaf's span id, stamped onto every event.
+            include_payloads: When ``True``, the end edge carries the full captured
+                output (up to the backend's own output cap); the default ``False``
+                bounds it to a small honest tail.
+        """
+        self._command_sink = sink
+        self._command_leaf_span_id = leaf_span_id
+        self._command_include_payloads = include_payloads
+
+    def _mint_command_id(self, command: str) -> str:
+        """Mint a resume-stable command id from span id + command + occurrence.
+
+        The id is a truncated SHA-256 over ``(leaf_span_id, command, ordinal)`` so
+        it reproduces under a deterministic resume; the per-command occurrence
+        ordinal distinguishes repeated identical commands in one leaf while keeping
+        a single command's begin and end edges on one shared id.
+
+        Args:
+            command: The shell command string the id identifies.
+
+        Returns:
+            A 16-char hex id shared by this command occurrence's begin and end.
+        """
+        with self._command_lock:
+            ordinal = self._command_occurrences.get(command, 0)
+            self._command_occurrences[command] = ordinal + 1
+        payload = {
+            "leaf_span_id": self._command_leaf_span_id,
+            "command": command,
+            "ordinal": ordinal,
+        }
+        encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
+    def _redact_command_output(self, output: str, truncated: bool) -> tuple[str, bool]:
+        """Bound an end edge's output to a shape-only tail unless payloads opt in.
+
+        With payloads opted in the full captured output rides through unchanged
+        (already bounded by the backend's output cap). Otherwise the output is
+        clipped to its last :data:`_COMMAND_EVENT_TAIL_BYTES` bytes and the
+        truncation flag is OR'd with the backend's own clip, so the surfaced
+        ``truncated`` is honest about either source of clipping.
+
+        Args:
+            output: The combined output the drain captured (already cap-bounded).
+            truncated: Whether the backend's drain already clipped at its cap.
+
+        Returns:
+            A ``(redacted_output, truncated)`` pair for the end edge.
+        """
+        if self._command_include_payloads:
+            return output, truncated
+        encoded = output.encode("utf-8")
+        if len(encoded) <= _COMMAND_EVENT_TAIL_BYTES:
+            return output, truncated
+        tail = encoded[-_COMMAND_EVENT_TAIL_BYTES:].decode("utf-8", errors="replace")
+        return tail, True
 
     @property
     def root_path(self) -> str:
@@ -587,6 +687,31 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         # process-group kill reaches it and every descendant.
         rlimit_setters = _build_rlimit_setters(rlimits)
         preexec = _rlimit_preexec(rlimit_setters) if rlimit_setters else None
+        # Mint one resume-stable command id shared by this command's begin and end
+        # edges, then fire the begin edge the instant before the subprocess spawns
+        # (the real execute boundary), so a consumer paints a "running" terminal
+        # card immediately. Minting/firing only when a sink is wired keeps the
+        # unobserved path zero-cost.
+        command_id = ""
+        started_at = 0.0
+        monotonic_start = 0.0
+        if self._command_sink is not None:
+            command_id = self._mint_command_id(command)
+            started_at = time.time()
+            monotonic_start = time.monotonic()
+            self._command_sink(
+                CommandEvent(
+                    leaf_span_id=self._command_leaf_span_id,
+                    command_id=command_id,
+                    command=command,
+                    phase="start",
+                    exit_code=None,
+                    output=None,
+                    truncated=False,
+                    duration_s=None,
+                    started_at=started_at,
+                )
+            )
         proc = subprocess.Popen(
             command,
             shell=True,
@@ -644,6 +769,25 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
                 proc.stdout.close()
         output, truncated = drained.get("result", ("", False))
         exit_code = EXIT_TIMEOUT if timed_out else proc.returncode
+        # Fire the end edge once the child is reaped: the real exit code, a redacted
+        # output tail (full only when payloads opt in), an honest truncation flag,
+        # and the wall-clock duration — the same command_id as the begin edge so a
+        # UI card flips pass/fail in place.
+        if self._command_sink is not None:
+            redacted, command_truncated = self._redact_command_output(output, truncated)
+            self._command_sink(
+                CommandEvent(
+                    leaf_span_id=self._command_leaf_span_id,
+                    command_id=command_id,
+                    command=command,
+                    phase="end",
+                    exit_code=exit_code,
+                    output=redacted,
+                    truncated=command_truncated,
+                    duration_s=time.monotonic() - monotonic_start,
+                    started_at=started_at,
+                )
+            )
         return ExecuteResponse(
             output=output,
             exit_code=exit_code,

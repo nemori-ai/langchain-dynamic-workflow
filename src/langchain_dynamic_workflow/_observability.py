@@ -128,11 +128,60 @@ class Span:
     error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class CommandEvent:
+    """One lifecycle edge of a real shell ``execute`` at the subprocess boundary.
+
+    Emitted in pairs — a ``"start"`` edge the instant before the subprocess spawns
+    and an ``"end"`` edge once it has been reaped — so a consumer can paint a
+    terminal card the moment a command begins and flip it pass/fail in place when
+    it completes. The two edges of one command share a :attr:`command_id`, and the
+    event correlates to the owning leaf via :attr:`leaf_span_id` (the leaf's AGENT
+    span id). Fires only at a *real* execute boundary: a leaf served from the
+    journal never re-runs its subprocess, so a replayed leaf emits no command event.
+
+    Honesty / redaction: :attr:`command`, :attr:`exit_code`, and :attr:`duration_s`
+    are always safe to surface; :attr:`output` is bounded to a small tail and
+    :attr:`truncated` flagged honestly by default, with the full captured output
+    surfaced only when the sink is wired with payloads opted in.
+
+    Attributes:
+        leaf_span_id: The owning leaf's span id (correlation key to its AGENT span).
+        command_id: A resume-stable id shared by this command's start and end edges,
+            derived from ``(leaf_span_id, command, occurrence-ordinal-within-leaf)``.
+        command: The shell command string (display-safe).
+        phase: The edge -- ``"start"`` or ``"end"``.
+        exit_code: ``None`` on the start edge; the real subprocess exit code on end.
+        output: ``None`` on the start edge; a bounded/truncated tail of the combined
+            stdout+stderr on end (shape-only by default; full output opt-in).
+        truncated: Whether :attr:`output` was clipped (by the event tail budget or
+            by the backend's own output cap). Always ``False`` on the start edge.
+        duration_s: ``None`` on the start edge; the command's wall-clock seconds on
+            end.
+        started_at: Wall-clock epoch seconds at the start of the command (carried on
+            both edges so an end edge can render an elapsed even if the start was
+            missed).
+    """
+
+    leaf_span_id: str
+    command_id: str
+    command: str
+    phase: str
+    exit_code: int | None
+    output: str | None
+    truncated: bool
+    duration_s: float | None
+    started_at: float
+
+
 SpanSink = Callable[[Span], None]
 """Receives each completed span (e.g. a collector, or a tracer adapter)."""
 
 SpanBeginSink = Callable[[SpanBegin], None]
 """Receives a span-open edge for the running state and the elapsed timer."""
+
+CommandSink = Callable[[CommandEvent], None]
+"""Receives each real-execution command lifecycle edge (start then end)."""
 
 
 def _noop_sink(_span: Span) -> None:

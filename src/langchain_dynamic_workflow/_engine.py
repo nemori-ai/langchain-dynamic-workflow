@@ -42,7 +42,8 @@ from ._journal import (
     JournalRecord as JournalRecord,  # re-exported for Layer-2 persistence on the public wall
 )
 from ._leaf_events import LeafEventHandler, LeafEventSink
-from ._observability import SpanBeginSink, SpanRecorder, SpanSink
+from ._local_subprocess import LocalSubprocessSandbox
+from ._observability import CommandSink, SpanBeginSink, SpanRecorder, SpanSink
 from ._progress import ProgressEntry, ProgressLog, ProgressSink
 from ._roster import Roster
 from ._sandbox import SandboxManager, SharedArtifactStore, build_leaf_backend
@@ -71,6 +72,8 @@ async def run_workflow(
     on_span_begin: SpanBeginSink | None = None,
     on_leaf_event: LeafEventSink | None = None,
     leaf_event_include_payloads: bool = False,
+    on_command: CommandSink | None = None,
+    command_include_payloads: bool = False,
     sandbox_manager: SandboxManager | None = None,
     workflows: WorkflowResolver | None = None,
 ) -> Any:
@@ -129,6 +132,25 @@ async def run_workflow(
             carries bounded raw payloads (truncated tool input/output, model text);
             the default ``False`` keeps ``detail`` shape-only (node kind/name/timing),
             so leaf internals are not streamed unless the caller opts in.
+        on_command: Optional sink receiving a ``CommandEvent`` for each real shell
+            ``execute`` an execution leaf runs, fired from inside the leaf's
+            ``LocalSubprocessSandbox`` at the subprocess boundary: a begin edge
+            (``command``, ``started_at``, ``exit_code=None``) before the subprocess
+            and an end edge (``exit_code``, bounded ``output``, ``duration_s``) after.
+            Both edges share a resume-stable ``command_id`` and carry the owning
+            leaf's ``leaf_span_id`` (the AGENT span id), so a consumer files the
+            terminal card under the right span and flips it pass/fail in place. The
+            sink fires only on real execution: a leaf served from the journal runs no
+            subprocess, so a replayed (cached) leaf emits no command events. It
+            reaches the sandbox only when a ``sandbox_manager`` whose factory
+            produces ``LocalSubprocessSandbox`` backends is wired (the offline
+            in-memory backend runs no subprocess and emits none). When omitted, no
+            command sink is attached (zero cost).
+        command_include_payloads: When ``True``, each end ``CommandEvent``'s
+            ``output`` carries the full captured output (bounded only by the sandbox
+            output cap); the default ``False`` bounds it to a small honest tail and
+            flags ``truncated``, so command output is not surfaced in full unless the
+            caller opts in.
         sandbox_manager: Optional per-leaf sandbox lifecycle manager. When
             supplied, a leaf whose roster entry is ``needs_execution`` is leased an
             isolated execution backend (keyed by its derived, resume-stable
@@ -259,6 +281,23 @@ async def run_workflow(
                 # sandbox after the run; the lease itself keeps it live for reuse.
                 leased_execution_leaf_ids.add(leaf_id)
             if needs_execution and isinstance(backend, SandboxBackendProtocol):
+                # Thread the command sink into the real sandbox so each subprocess
+                # execute fires begin/end CommandEvents correlated to THIS leaf's
+                # span. Only a LocalSubprocessSandbox runs a real subprocess; the
+                # offline in-memory backend has no execute boundary to observe. The
+                # sink reaches the sandbox here on the leased (real-execution) path,
+                # so a journal hit -- which never leases or runs the leaf body --
+                # never wires it, honoring the miss-only replay policy by construction.
+                if (
+                    on_command is not None
+                    and leaf_span_id
+                    and isinstance(backend, LocalSubprocessSandbox)
+                ):
+                    backend.set_command_sink(
+                        sink=on_command,
+                        leaf_span_id=leaf_span_id,
+                        include_payloads=command_include_payloads,
+                    )
                 # Give the execution leaf the /shared/ hand-off route on top of its
                 # isolated sandbox: non-shared paths stay private, /shared/ paths go
                 # to the run-shared store under this leaf's producer namespace.
