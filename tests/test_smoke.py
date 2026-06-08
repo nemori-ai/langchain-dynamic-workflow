@@ -57,6 +57,26 @@ def test_run_store_surface_exported_eagerly() -> None:
         assert hasattr(ldw, name), f"{name} not importable from the package root"
 
 
+def test_real_git_surface_exported_from_package_root() -> None:
+    """The real-git worktree + PR seam is exported eagerly with no new dependency.
+
+    ``GitWorktreeProvider`` / ``PullRequestProvider`` / ``PullRequestRef`` /
+    ``LocalPullRequestProvider`` carry no optional dependency (pure stdlib
+    subprocess), so they are eagerly exported and importable from the package root
+    on a base install.
+    """
+    import langchain_dynamic_workflow as ldw
+
+    for name in (
+        "GitWorktreeProvider",
+        "PullRequestProvider",
+        "PullRequestRef",
+        "LocalPullRequestProvider",
+    ):
+        assert name in ldw.__all__, f"{name} missing from __all__"
+        assert hasattr(ldw, name), f"{name} not importable from the package root"
+
+
 def test_sqlite_store_is_lazily_resolved_not_eagerly_imported() -> None:
     """``SqliteWorkflowStore`` resolves only on access, via the package getattr.
 

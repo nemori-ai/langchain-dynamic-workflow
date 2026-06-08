@@ -22,6 +22,7 @@ from ._errors import (
     WorkflowScriptError,
     WorkflowSignoffRequired,
 )
+from ._git_worktree import GitWorktreeProvider
 from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal_key, race_key
 from ._leaf_events import LeafEvent, LeafEventSink
 from ._leaves import read_only_builder, read_only_leaf
@@ -42,6 +43,7 @@ from ._observability import (
     SpanSink,
 )
 from ._progress import ProgressEntry, ProgressKind, ProgressSink
+from ._pull_request import LocalPullRequestProvider, PullRequestProvider, PullRequestRef
 from ._race_types import RaceCandidate, RaceResult
 from ._reduce import (
     Consensus,
@@ -111,6 +113,7 @@ __all__ = [
     "ExecDecision",
     "ExecPolicy",
     "ExecRequest",
+    "GitWorktreeProvider",
     "InMemoryJournalStore",
     "InMemoryRunStore",
     "InMemoryWorktreeProvider",
@@ -118,11 +121,14 @@ __all__ = [
     "JournalStore",
     "LeafEvent",
     "LeafEventSink",
+    "LocalPullRequestProvider",
     "LocalSubprocessSandbox",
     "Orchestrator",
     "ProgressEntry",
     "ProgressKind",
     "ProgressSink",
+    "PullRequestProvider",
+    "PullRequestRef",
     "RLimitProfile",
     "RaceCandidate",
     "RaceResult",
