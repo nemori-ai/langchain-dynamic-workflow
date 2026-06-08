@@ -120,3 +120,35 @@ def test_scenario_panel_messages_match_scenarios_json() -> None:
             f"scenario[{index}] message drift:\n  json={json_scenario['message']!r}\n"
             f"  frontend={message!r}"
         )
+
+
+def test_readme_scenario_count_matches_scenarios_json() -> None:
+    """The README must document exactly as many scenarios as ``scenarios.json`` ships.
+
+    The README's "scenarios" section enumerates one ``### N. <title>`` subsection per
+    preset button. ``scenarios.json`` is the canonical source of how many presets exist,
+    so the README's count must equal ``len(scenarios)`` — pinning it here fails loudly
+    when a new preset is added to the JSON (and the frontend) but the README still claims
+    the old count, the exact drift the review found (README said "four scenarios" after a
+    fifth, "Make it pass", was added).
+    """
+    canonical = json.loads(_SCENARIOS_JSON.read_text(encoding="utf-8"))["scenarios"]
+    readme = _README.read_text(encoding="utf-8")
+
+    # One numbered subsection ("### 1. ...", "### 2. ...", ...) per documented scenario.
+    numbered_subsections = re.findall(r"^### \d+\.\s", readme, flags=re.MULTILINE)
+    assert len(numbered_subsections) == len(canonical), (
+        f"README documents {len(numbered_subsections)} numbered scenario subsections but "
+        f"scenarios.json ships {len(canonical)}; update the README to match the presets"
+    )
+
+    # The prose count words must not lag behind either: a stale "four scenarios" while the
+    # JSON ships five is the same drift in narrative form. Guard the cardinal words that
+    # named the old count so they cannot silently survive a count change.
+    stale_counts = {4: ("four scenarios", "four preset buttons", "the same four")}
+    forbidden = stale_counts.get(len(canonical) - 1, ())
+    for phrase in forbidden:
+        assert phrase.lower() not in readme.lower(), (
+            f"README still says {phrase!r} but scenarios.json now ships {len(canonical)} "
+            "scenarios; the prose count drifted"
+        )

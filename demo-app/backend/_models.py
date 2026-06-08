@@ -141,12 +141,33 @@ _LIVE_CUES = (
     "pick it back up",
     "where you left off",
     "resume",
+    # Fix-loop (executable-verification) intent. The 5th preset scenario's request
+    # names no preset and reads as a plain user ask ("fix the code and keep checking it
+    # against the tests until they go green"), so it would otherwise fall through to the
+    # hello smoke path. These cue phrases route that intent to the live tool; the matching
+    # _WORKFLOW_CUES entries then resolve it to the fix_loop preset. Drawn from the
+    # scenario copy and natural variants, and checked (against scenarios.json) to be
+    # distinctive enough that no other scenario message trips them.
+    "tests go green",
+    "prove it builds",
+    "failing unit tests",
+    "fix the code",
+    "make it pass",
 )
 
 # Cue word -> preset workflow name. A request naming a preset routes the offline host
 # to THAT preset, not just the default; absent any named cue the host falls back to the
 # tool's own default workflow (so the args stay empty and the preset is chosen there).
-_WORKFLOW_CUES: dict[str, str] = {"capstone": "capstone"}
+# The fix-loop cues all map to the fix_loop preset so the executable-verification intent
+# reaches the real in-loop build/test leaf, not the default deep_research.
+_WORKFLOW_CUES: dict[str, str] = {
+    "capstone": "capstone",
+    "tests go green": "fix_loop",
+    "prove it builds": "fix_loop",
+    "failing unit tests": "fix_loop",
+    "fix the code": "fix_loop",
+    "make it pass": "fix_loop",
+}
 
 # Cue phrases routing the offline host to the meta layer (run_meta_script): the user has
 # no ready-made procedure and wants the host to compose one on the spot. Checked BEFORE

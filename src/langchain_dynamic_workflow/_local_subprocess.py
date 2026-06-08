@@ -69,6 +69,18 @@ EXIT_TIMEOUT = 124
 EXIT_REJECTED = 126
 """Exit-code sentinel reported when admission control rejects a command unspawned."""
 
+EXIT_SPAWN_ERROR = 127
+"""Exit-code sentinel surfaced on the command end edge when the subprocess never spawns.
+
+Used only on the observability edge when the begin edge already fired but the
+subprocess could not be created or reaped (for example ``OSError`` EMFILE/ENOMEM
+from ``Popen``, or a ``preexec_fn`` failure between fork and exec). It guarantees the
+"running" card painted by the begin edge gets a terminal end edge instead of being
+stuck forever; the original exception is always re-raised so callers see the real
+failure. The value mirrors the shell convention for a command that could not be
+executed (127).
+"""
+
 _DEFAULT_REJECT_REASON = "execution rejected by policy"
 """Output text used when admission rejects a command without giving a reason."""
 
@@ -519,12 +531,18 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         self._command_include_payloads = include_payloads
 
     def _mint_command_id(self, command: str) -> str:
-        """Mint a resume-stable command id from span id + command + occurrence.
+        """Mint a command id from span id + command + occurrence ordinal.
 
-        The id is a truncated SHA-256 over ``(leaf_span_id, command, ordinal)`` so
-        it reproduces under a deterministic resume; the per-command occurrence
-        ordinal distinguishes repeated identical commands in one leaf while keeping
-        a single command's begin and end edges on one shared id.
+        The id is a truncated SHA-256 over ``(leaf_span_id, command, ordinal)``. It
+        is deterministic within a single fresh run: the same begin/end edge pair
+        would reproduce the same id on a deterministic re-execution of that run. It
+        is NOT a correlation key across a resume — command events are
+        fresh-execution-only (a leaf served from the journal never re-runs its
+        subprocess, so it emits no command event), so no consumer should try to
+        correlate a resumed, cached leaf back to a prior run's command by this id.
+        The per-command occurrence ordinal distinguishes repeated identical commands
+        in one leaf while keeping a single command's begin and end edges on one
+        shared id.
 
         Args:
             command: The shell command string the id identifies.
@@ -566,6 +584,54 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
             return output, truncated
         tail = encoded[-_COMMAND_EVENT_TAIL_BYTES:].decode("utf-8", errors="replace")
         return tail, True
+
+    def _emit_command_end(
+        self,
+        *,
+        command: str,
+        command_id: str,
+        exit_code: int,
+        output: str,
+        truncated: bool,
+        started_at: float,
+        monotonic_start: float,
+    ) -> None:
+        """Fire the terminal ``"end"`` edge for a command whose begin edge fired.
+
+        Centralizes the end-edge emission so both the normal completion path and the
+        spawn-failure guard paint the same shape of terminal card (same
+        ``command_id`` as the begin edge, a redacted output tail, an honest
+        truncation flag, and a wall-clock duration). The caller is responsible for
+        having a wired sink; this method assumes one is present.
+
+        Args:
+            command: The shell command string the edge describes.
+            command_id: The id shared with this command's begin edge.
+            exit_code: The real subprocess exit code, or a sentinel
+                (:data:`EXIT_TIMEOUT` / :data:`EXIT_SPAWN_ERROR`) when the process
+                never produced one.
+            output: The captured (or honest-failure) output before redaction.
+            truncated: Whether ``output`` was already clipped by the drain.
+            started_at: The begin edge's wall-clock epoch seconds.
+            monotonic_start: The begin edge's monotonic start used for the duration.
+        """
+        sink = self._command_sink
+        if sink is None:  # pragma: no cover - guarded by callers
+            return
+        redacted, command_truncated = self._redact_command_output(output, truncated)
+        sink(
+            CommandEvent(
+                leaf_span_id=self._command_leaf_span_id,
+                command_id=command_id,
+                command=command,
+                phase="end",
+                exit_code=exit_code,
+                output=redacted,
+                truncated=command_truncated,
+                duration_s=time.monotonic() - monotonic_start,
+                started_at=started_at,
+            )
+        )
 
     @property
     def root_path(self) -> str:
@@ -695,6 +761,7 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         command_id = ""
         started_at = 0.0
         monotonic_start = 0.0
+        begin_edge_fired = False
         if self._command_sink is not None:
             command_id = self._mint_command_id(command)
             started_at = time.time()
@@ -712,6 +779,69 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
                     started_at=started_at,
                 )
             )
+            begin_edge_fired = True
+        # Once the begin edge has painted a "running" card, a terminal end edge MUST
+        # follow even if the subprocess path raises before completion — Popen failing
+        # (OSError EMFILE/ENOMEM) or a preexec rlimit-setter dying between fork and
+        # exec would otherwise strand the card "running" forever, and command events
+        # are miss-only so a resume never corrects it. On any such failure emit an
+        # honest spawn-error end edge with the SAME command_id, then re-raise so the
+        # caller still sees the original exception. The unobserved path (no begin
+        # edge) takes no extra work and re-raises byte-identically.
+        try:
+            return self._spawn_drain_and_emit_end(
+                command=command,
+                command_id=command_id,
+                preexec=preexec,
+                effective_timeout=effective_timeout,
+                output_cap_bytes=output_cap_bytes,
+                started_at=started_at,
+                monotonic_start=monotonic_start,
+            )
+        except BaseException as error:
+            if begin_edge_fired:
+                self._emit_command_end(
+                    command=command,
+                    command_id=command_id,
+                    exit_code=EXIT_SPAWN_ERROR,
+                    output=f"command failed to spawn or reap: {error!r}",
+                    truncated=False,
+                    started_at=started_at,
+                    monotonic_start=monotonic_start,
+                )
+            raise
+
+    def _spawn_drain_and_emit_end(
+        self,
+        *,
+        command: str,
+        command_id: str,
+        preexec: Callable[[], None] | None,
+        effective_timeout: int,
+        output_cap_bytes: int,
+        started_at: float,
+        monotonic_start: float,
+    ) -> ExecuteResponse:
+        """Spawn the child, drain it under the deadline, then fire the end edge.
+
+        Split out of :meth:`_execute_admitted` so the spawn-failure guard there can
+        wrap the whole subprocess lifecycle in a single ``try`` and guarantee a
+        terminal end edge for any begin edge that already fired.
+
+        Args:
+            command: The full shell command string to run.
+            command_id: The id shared with this command's begin edge (empty when no
+                sink is wired).
+            preexec: The pre-built POSIX rlimit ``preexec_fn``, or ``None``.
+            effective_timeout: The resolved bounded timeout, in seconds.
+            output_cap_bytes: The resolved combined-output byte cap.
+            started_at: The begin edge's wall-clock epoch seconds (0.0 when no sink).
+            monotonic_start: The begin edge's monotonic start (0.0 when no sink).
+
+        Returns:
+            The execution response with the bounded output, exit code, and
+            truncation flag.
+        """
         proc = subprocess.Popen(
             command,
             shell=True,
@@ -774,19 +904,14 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         # and the wall-clock duration — the same command_id as the begin edge so a
         # UI card flips pass/fail in place.
         if self._command_sink is not None:
-            redacted, command_truncated = self._redact_command_output(output, truncated)
-            self._command_sink(
-                CommandEvent(
-                    leaf_span_id=self._command_leaf_span_id,
-                    command_id=command_id,
-                    command=command,
-                    phase="end",
-                    exit_code=exit_code,
-                    output=redacted,
-                    truncated=command_truncated,
-                    duration_s=time.monotonic() - monotonic_start,
-                    started_at=started_at,
-                )
+            self._emit_command_end(
+                command=command,
+                command_id=command_id,
+                exit_code=exit_code,
+                output=output,
+                truncated=truncated,
+                started_at=started_at,
+                monotonic_start=monotonic_start,
             )
         return ExecuteResponse(
             output=output,

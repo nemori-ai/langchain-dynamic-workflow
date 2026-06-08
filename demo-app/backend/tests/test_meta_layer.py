@@ -128,6 +128,55 @@ async def test_run_meta_script_gate_pass_through_tool_layer_via_host_graph() -> 
     assert "fanout_graph" in components, components
 
 
+async def test_run_meta_script_live_uses_a_reasoning_only_roster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The meta path runs the LLM-authored script against a roster with NO execution leaf.
+
+    Security boundary (defense in depth): the AST gate validates the authored *source*
+    but does NOT constrain which ``agent_type`` the script calls — so an LLM-authored
+    script that crossed the gate could still call ``ctx.agent(..., agent_type="code_fixer")``
+    and reach the real ``LocalSubprocessSandbox`` shell. The meta path must therefore hand
+    the runner a REASONING-ONLY roster: every reasoning role resolvable, but no
+    ``needs_execution`` role registered (no ``code_fixer``), so an authored script cannot
+    reach real execution no matter what it asks for. The trusted preset path
+    (``run_workflow_live``) keeps the full roster and is unaffected.
+
+    This spies on the roster handed to ``run_workflow_from_source`` and asserts (a)
+    ``code_fixer`` is not resolvable and (b) no reasoning role is ``needs_execution``.
+    """
+    import host_graph
+
+    captured: dict[str, Any] = {}
+    real_runner = host_graph.run_workflow_from_source
+
+    async def _spy_runner(*args: Any, **kwargs: Any) -> Any:
+        captured["roster"] = kwargs.get("roster")
+        return await real_runner(*args, **kwargs)
+
+    monkeypatch.setattr(host_graph, "run_workflow_from_source", _spy_runner)
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    sink: Any = lambda comp, props: events.append((comp, dict(props)))  # noqa: E731
+    adapter = UiAdapter(emit=sink)
+    await host_graph.run_meta_script_live(submit_rejected=False, adapter=adapter, emit=sink)
+
+    roster = captured["roster"]
+    assert roster is not None, "the meta path did not run the authored script"
+
+    # (a) No execution leaf is reachable: code_fixer (the only needs_execution role) must
+    # NOT be registered on the meta roster, so an authored ctx.agent(agent_type=...) call
+    # for it fails loud rather than spawning a real subprocess.
+    with pytest.raises(KeyError):
+        roster.resolve("code_fixer")
+
+    # (b) Every reasoning role the authored script needs IS resolvable and is pure
+    # reasoning (no needs_execution), so the meta path still runs but never executes shell.
+    for role in ("researcher", "writer"):
+        entry = roster.resolve(role)
+        assert entry.needs_execution is False, f"{role} must be reasoning-only on the meta roster"
+
+
 def _offline_first_tool_call(prompt: str) -> tuple[str, dict[str, Any]]:
     """Drive the offline host one turn on ``prompt``; return the tool name and its args."""
     from _models import OfflineHostModel

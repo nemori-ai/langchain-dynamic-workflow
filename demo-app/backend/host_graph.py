@@ -22,6 +22,8 @@ tested without a node context.
 from __future__ import annotations
 
 import hashlib
+import re
+import shlex
 from typing import Annotated, Any
 
 from _meta_fixtures import AUTHORED_SCRIPT, META_TOPICS, REJECTED_SCRIPT
@@ -36,13 +38,15 @@ from langgraph.graph.ui import AnyUIMessage, ui_message_reducer
 from langgraph.prebuilt import InjectedState
 from ui_adapter import UiAdapter
 from ui_bridge import UiEmit, make_host_ui_emit
-from workflows import hello_workflow, make_roster, make_workflows
+from workflows import hello_workflow, make_reasoning_roster, make_roster, make_workflows
 
 from langchain_dynamic_workflow import (
     BgRunManager,
     BgStatus,
     Ctx,
+    ExecDecision,
     ExecPolicy,
+    ExecRequest,
     InMemoryJournalStore,
     JournalStore,
     SandboxManager,
@@ -75,29 +79,149 @@ DEFAULT_LIVE_WORKFLOW = "deep_research"
 _EXEC_TIMEOUT_SECONDS = 60
 _EXEC_OUTPUT_CAP_BYTES = 64 * 1024
 
+# Defense-in-depth admission allowlist for the demo's LLM-driven execution. The fix loop
+# only ever needs the test runner, so the safe set is the program *prefixes* a realistic
+# fixer shells out for: the test/build toolchain plus benign read/inspect ops. The leading
+# program token of a command must be on this set for the command to be admitted.
+_SAFE_PROGRAMS: frozenset[str] = frozenset(
+    {
+        "bun",
+        "node",
+        "npm",
+        "npx",
+        "pnpm",
+        "yarn",
+        "tsc",
+        "deno",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "grep",
+        "find",
+        "echo",
+        "pwd",
+        "which",
+        "wc",
+        "mkdir",
+        "touch",
+        "true",
+        "test",
+    }
+)
 
-def _make_sandbox_manager() -> SandboxManager:
-    """Build a per-run sandbox manager backing real execution leaves.
+# Obviously dangerous shapes refused regardless of the leading program — a hard denylist
+# that takes precedence over the safe-program allowlist (so e.g. `cat /etc/passwd` is
+# rejected even though `cat` is otherwise safe). Each pattern targets a destructive or
+# exfiltrating shape: a recursive root/home delete, a pipe-to-shell of remote content, a
+# fork bomb, a read of a sensitive system path, and a privilege escalation prefix.
+_DANGEROUS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\brm\b.*\s-[a-z]*[rf]"),  # rm -rf / -fr style recursive/force delete
+    re.compile(r"[|;&]\s*(?:sh|bash|zsh)\b"),  # pipe/chain into a shell (curl ... | sh)
+    re.compile(r":\(\)\s*\{"),  # classic fork bomb :(){ :|:& };:
+    re.compile(r"/etc/(?:passwd|shadow)\b"),  # reading sensitive system files
+    re.compile(r"~/\.ssh\b|/\.ssh/"),  # ssh key material
+    re.compile(r"\b(?:sudo|doas|su)\b"),  # privilege escalation
+    re.compile(r"\b(?:curl|wget|nc|ncat|telnet)\b"),  # network egress / reverse shell
+)
 
-    Returns a :class:`SandboxManager` whose factory produces real
-    ``LocalSubprocessSandbox`` backends under a bounded :class:`ExecPolicy` (a per-command
-    timeout and an output cap). A ``needs_execution`` leaf (the ``fix_loop`` preset's
-    ``code_fixer``) is leased one of these so its ``execute`` tool runs real shell
-    commands for a true exit code; a pure-reasoning leaf allocates none. The offline path
-    never reaches a real ``execute`` — its fake leaves return a structured result without
-    running a subprocess — so the manager is additive and offline runs are unaffected.
 
-    DANGEROUS OPT-IN: ``LocalSubprocessSandbox`` runs real shell commands on the host with
-    the calling user's permissions and is not a security sandbox.
+def fix_loop_admission(request: ExecRequest) -> ExecDecision:
+    """Admit the intended fix-loop command shape; reject obviously dangerous ones.
+
+    A defense-in-depth admission hook on top of the per-leaf real sandbox: even with the
+    fix-loop driven by an LLM, the only command that should reach the host's shell is the
+    test/build toolchain plus benign read ops. A command is REJECTED when it matches a hard
+    denylist (a recursive delete, a pipe-to-shell, a fork bomb, a sensitive-path read,
+    privilege escalation, or network egress) — this takes precedence so a safe program used
+    dangerously (``cat /etc/passwd``) is still refused. Otherwise it is admitted only when
+    its leading program is on the safe allowlist; anything else is rejected with a reason.
+
+    This is the demo's belt-and-suspenders boundary, not a security sandbox:
+    ``LocalSubprocessSandbox`` runs with the calling user's permissions, so the hook reduces
+    the blast radius of an LLM-driven command but does not contain a determined adversary.
+
+    Args:
+        request: The admission request for one ``execute``, carrying the command string.
 
     Returns:
-        A fresh per-run :class:`SandboxManager` wired for real local-subprocess execution.
+        An :class:`ExecDecision` admitting the command (``"allow"``) or refusing it
+        (``"reject"``) with a short reason, evaluated before any subprocess spawns.
     """
-    policy = ExecPolicy(
+    command = request.command.strip()
+    if not command:
+        return ExecDecision(outcome="reject", reason="empty command")
+    for pattern in _DANGEROUS_PATTERNS:
+        if pattern.search(command):
+            return ExecDecision(
+                outcome="reject", reason=f"command matches a denied dangerous shape: {command!r}"
+            )
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        # An unbalanced quote / malformed shell word — refuse rather than guess.
+        return ExecDecision(outcome="reject", reason=f"unparseable command: {command!r}")
+    if not tokens:
+        return ExecDecision(outcome="reject", reason="no program token")
+    program = tokens[0].rsplit("/", 1)[-1]  # strip any leading path to the bare program
+    if program in _SAFE_PROGRAMS:
+        return ExecDecision(outcome="allow")
+    return ExecDecision(
+        outcome="reject", reason=f"program {program!r} is not on the demo's safe allowlist"
+    )
+
+
+# The admission hook the real-execution sandbox enforces, exported so a test can drive it
+# directly and the fix-loop wiring can pin it onto the ExecPolicy.
+FIX_LOOP_ADMISSION = fix_loop_admission
+
+
+def _make_exec_policy() -> ExecPolicy:
+    """Build the bounded :class:`ExecPolicy` the real-execution sandboxes run under.
+
+    Carries the per-command timeout, output cap, and the :func:`fix_loop_admission`
+    admission hook (the defense-in-depth allowlist). Factored out so a test can assert the
+    hook is wired and exercise it through a real sandbox boundary.
+
+    Returns:
+        The :class:`ExecPolicy` for the demo's real local-subprocess execution.
+    """
+    return ExecPolicy(
         default_timeout=_EXEC_TIMEOUT_SECONDS,
         output_cap_bytes=_EXEC_OUTPUT_CAP_BYTES,
+        before_execute=FIX_LOOP_ADMISSION,
     )
-    return SandboxManager(sandbox_factory=local_subprocess_factory(policy))
+
+
+def _make_sandbox_manager() -> SandboxManager:
+    """Build a per-run sandbox manager, real-execution only when a leaf key is in force.
+
+    When a provider key is in force (:func:`~_models.is_offline` is ``False``) the returned
+    :class:`SandboxManager` produces real ``LocalSubprocessSandbox`` backends under
+    :func:`_make_exec_policy` (a per-command timeout, an output cap, and the
+    :func:`fix_loop_admission` allowlist). A ``needs_execution`` leaf (the ``fix_loop``
+    preset's ``code_fixer``) is leased one of these so its ``execute`` tool runs real shell
+    commands for a true exit code; a pure-reasoning leaf allocates none.
+
+    Offline (no key), no real sandbox is built: the manager falls back to the engine's
+    default offline backend, so no ``LocalSubprocessSandbox`` is ever leased and no
+    subprocess can run — the fake leaves return a structured result without shelling out.
+    This keeps the dangerous real-execution opt-in scoped to a keyed session rather than
+    leased on every (including offline) run.
+
+    DANGEROUS OPT-IN: when keyed, ``LocalSubprocessSandbox`` runs real shell commands on the
+    host with the calling user's permissions and is not a security sandbox; the admission
+    hook reduces but does not eliminate that risk.
+
+    Returns:
+        A fresh per-run :class:`SandboxManager` — real-execution when keyed, the default
+        offline backend otherwise.
+    """
+    if is_offline():
+        # No key in force: never build a real subprocess backend. The default manager
+        # seeds an offline in-memory backend, so no execute ever spawns a subprocess.
+        return SandboxManager()
+    return SandboxManager(sandbox_factory=local_subprocess_factory(_make_exec_policy()))
 
 
 class _ResumeLane:
@@ -287,7 +411,14 @@ async def run_meta_script_live(*, submit_rejected: bool, adapter: UiAdapter, emi
       returns a short rejection notice.
 
     Security boundary: the gate stops an accidental slip, not a determined adversary —
-    an in-process restricted ``exec`` is not a security sandbox.
+    an in-process restricted ``exec`` is not a security sandbox. Defense in depth on top
+    of the gate: the admitted script runs against a REASONING-ONLY roster
+    (:func:`~workflows.make_reasoning_roster`), which omits the ``code_fixer`` execution
+    leaf. The gate validates the authored source but does NOT constrain which
+    ``agent_type`` it calls, so without this an authored script could call
+    ``ctx.agent(..., agent_type="code_fixer")`` and reach the real shell. With no
+    execution leaf registered, an authored script has nothing to reach — the trusted
+    preset path (``run_workflow_live``) keeps the full roster.
 
     Args:
         submit_rejected: Select the gate-fail fixture when ``True``, else the gate-pass
@@ -312,9 +443,13 @@ async def run_meta_script_live(*, submit_rejected: bool, adapter: UiAdapter, emi
         return f"The authored script was rejected by the AST gate and nothing ran.\n{exc}"
 
     _emit_meta_script(emit, source=source, gate=_GATE_PASSED, reason=None)
+    # REASONING-ONLY roster (no code_fixer / no needs_execution leaf): the gate does not
+    # constrain the authored script's agent_type, so an execution-capable roster would let
+    # an authored ctx.agent(agent_type="code_fixer") reach the real shell. The sandbox
+    # manager is still passed for parity but is moot — no leaf on this roster can lease it.
     result = await run_workflow_from_source(
         source,
-        roster=make_roster(),
+        roster=make_reasoning_roster(),
         args={"topics": META_TOPICS},
         on_progress=adapter.on_progress,
         on_span=adapter.on_span,
@@ -444,13 +579,25 @@ async def run_live(
 ) -> str:
     """Run a named preset workflow live, streaming its orchestration into the UI.
 
-    Resolves ``workflow`` (e.g. ``deep_research`` or ``capstone``) from the preset
-    registry and runs it inline against the real roster. Each engine progress/span
-    event flows through a :class:`~ui_adapter.UiAdapter`, which maps it to a Gen-UI
-    component (``phase_timeline`` for phases/logs, ``fanout_graph`` for parallel /
-    pipeline fan-out, ``agent_span`` / ``journal_badge`` for leaves) with a stable
-    content ``event_id`` for dedupe, and pushes it live from inside the same node
-    context — so the chat shows the control-flow inversion as it happens.
+    Resolves ``workflow`` from the preset registry and runs it inline against the real
+    roster. The resolvable presets are:
+
+    * ``deep_research`` (the default) — fan out web searches across sub-questions,
+      cross-check the findings, and synthesize a cited answer.
+    * ``capstone`` — a heavier multi-phase research-and-reconcile scenario.
+    * ``fix_loop`` — an executable-verification loop for a "make it pass / get the tests
+      green" request: it edits code in a worktree leaf, then actually builds and runs the
+      tests, branches on the REAL exit code, and retries until green. Each real command
+      streams an ``execution_command`` event the UI renders as a TerminalCard that flips
+      pass/fail in place — pick this when the user wants the code proven to build and the
+      tests proven to pass, not just reviewed as looking correct.
+
+    Each engine progress/span event flows through a :class:`~ui_adapter.UiAdapter`, which
+    maps it to a Gen-UI component (``phase_timeline`` for phases/logs, ``fanout_graph``
+    for parallel / pipeline fan-out, ``agent_span`` / ``journal_badge`` for leaves,
+    ``execution_command`` / TerminalCard for ``fix_loop``'s real build/test commands)
+    with a stable content ``event_id`` for dedupe, and pushes it live from inside the
+    same node context — so the chat shows the control-flow inversion as it happens.
 
     The run is threaded through a durable :class:`_ResumeLane` keyed on this host
     thread and the workflow name, so a second turn on the same thread (e.g. "pick it
@@ -460,7 +607,8 @@ async def run_live(
 
     Args:
         state: Injected graph state (used to anchor UI events to the host turn).
-        workflow: The preset workflow to run; defaults to ``deep_research``.
+        workflow: The preset workflow to run — ``deep_research`` (default), ``capstone``,
+            or ``fix_loop`` (the executable-verification build/test loop).
         workflow_args: Optional workflow arguments (e.g. ``{"question": "..."}``).
             When omitted the preset uses its own defaults. Named ``workflow_args``
             rather than ``args`` on purpose: LangChain's tool-schema generation mangles

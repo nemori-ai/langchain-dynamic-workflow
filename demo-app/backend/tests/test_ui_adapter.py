@@ -23,6 +23,9 @@ load-bearing behaviors the adapter exists to guarantee:
 
 from __future__ import annotations
 
+import threading
+import time
+from collections import defaultdict
 from typing import Any
 
 from langchain_core.messages import AIMessage
@@ -1136,3 +1139,195 @@ def test_emit_failure_does_not_poison_dedupe_set() -> None:
     adapter.on_progress(entry)  # retry succeeds
 
     assert len(delivered) == 1, "a swallowed failure must not block a later retry"
+
+
+# --- (8) on_command cross-thread safety --------------------------------------
+#
+# on_command fires from an asyncio.to_thread worker (deepagents aexecute marshals the
+# leaf's execute through to_thread) while on_progress / on_span run on the event-loop
+# thread. The adapter's on_command read-modify-write regions (occurrence-ordinal bump,
+# _seen check/add, _command_event_ids get/set, _latest_phase read) therefore race the
+# loop-thread sinks. These tests hammer on_command from many worker threads and assert
+# the lock-guarded invariants hold: no id collision (every distinct command-id gets its
+# own card), no lost start->end pairing, and a clean ordinal under contention.
+
+
+class _SlowReadOccurrences(defaultdict[str, int]):
+    """A counter dict whose read returns a STALE value after yielding the GIL.
+
+    The occurrence-ordinal bump is ``ordinal = d[key]; d[key] = ordinal + 1``. Under
+    CPython that pair rarely tears on its own (no GIL yield falls between the two
+    bytecodes), so a naive thread test passes even without the lock. This helper captures
+    the value, sleeps (handing the GIL to peer threads that then read the *same* value),
+    and only then returns the captured-stale ordinal — so two unguarded workers reliably
+    read the same ordinal and mint colliding ids. That makes the lock a genuine
+    regression guard rather than a no-op the GIL hides: the lock-guarded path serializes
+    the whole read-modify-write, so no second reader can observe the stale value.
+    """
+
+    def __getitem__(self, key: str) -> int:
+        value = super().__getitem__(key)  # capture the ordinal NOW
+        time.sleep(0.0005)  # hand the GIL over while still holding the stale value
+        return value
+
+
+def test_on_command_concurrent_starts_mint_distinct_ids_under_contention() -> None:
+    """N concurrent start edges (distinct command ids) yield N distinct event ids.
+
+    Each start edge mints a resume-stable id, bumps the per-key occurrence ordinal, and
+    records the id under the engine ``command_id`` — a read-modify-write over shared
+    adapter state. Without a lock guarding it, two workers can read the same ordinal and
+    mint a colliding event id (one card silently overwrites the other), or corrupt the
+    ``_command_event_ids`` / ``_occurrences`` dicts. The injected
+    :class:`_SlowReadOccurrences` widens the read->write window so the race is
+    deterministic (not GIL-masked); driving many starts from a thread pool and asserting
+    every event id is distinct then pins the lock.
+    """
+    lock = threading.Lock()
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    def emit(component: str, props: dict[str, Any]) -> None:
+        # The collector itself must be thread-safe so any lost ids are the adapter's,
+        # not the test harness's.
+        with lock:
+            sent.append((component, dict(props)))
+
+    adapter = UiAdapter(emit=emit)
+    # Swap in the yield-on-read counter so the ordinal bump's read->write window is wide
+    # enough that an unguarded path interleaves two readers (the lock must serialize it).
+    adapter._occurrences = _SlowReadOccurrences(int)  # type: ignore[assignment]
+    # All commands share the same (leaf_span_id, command, attempt) stable key, so the
+    # ONLY thing keeping their cards distinct is the per-key occurrence ordinal — exactly
+    # the read-modify-write the lock must serialize.
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+    count = 64
+
+    barrier = threading.Barrier(count)
+
+    def fire(i: int) -> None:
+        barrier.wait()  # maximize the contention window
+        adapter.on_command(_command_event(phase="start", command="bun test", command_id=f"c{i}"))
+
+    threads = [threading.Thread(target=fire, args=(i,)) for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    cmd_props = [p for comp, p in sent if comp == _EXECUTION_COMMAND]
+    assert len(cmd_props) == count, "every concurrent start edge must deliver a card"
+    ids = [p["event_id"] for p in cmd_props]
+    unique = len(set(ids))
+    assert unique == count, f"id collision under contention: {unique} unique of {count}"
+
+
+def test_on_command_concurrent_start_end_pairs_flip_in_place() -> None:
+    """Concurrent start->end pairs each flip the SAME card in place (no lost pairing).
+
+    The end edge reads its start's minted id back out of ``_command_event_ids`` so the
+    card flips pass/fail in place. Under concurrency a torn get/set could leave an end
+    edge unable to find its start's id (so it mints a fresh id and the running card never
+    flips). This fires a start then an end for each of N command ids across a thread pool
+    and asserts each command id resolves to exactly ONE event id across both edges.
+    """
+    lock = threading.Lock()
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    def emit(component: str, props: dict[str, Any]) -> None:
+        with lock:
+            sent.append((component, dict(props)))
+
+    adapter = UiAdapter(emit=emit)
+    # Widen the ordinal read->write window (see _SlowReadOccurrences) so an unguarded
+    # path tears, making the lock a genuine guard rather than a GIL-masked no-op.
+    adapter._occurrences = _SlowReadOccurrences(int)  # type: ignore[assignment]
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+    count = 64
+    barrier = threading.Barrier(count)
+
+    def fire(i: int) -> None:
+        cid = f"c{i}"
+        barrier.wait()
+        adapter.on_command(_command_event(phase="start", command="bun test", command_id=cid))
+        adapter.on_command(
+            _command_event(
+                phase="end", command="bun test", command_id=cid, exit_code=0, duration_s=0.1
+            )
+        )
+
+    threads = [threading.Thread(target=fire, args=(i,)) for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Every (start, end) pair must share one event id, and every command must flip to a
+    # terminal (passed) card. Group the delivered command cards by event id.
+    by_id: dict[str, list[str]] = {}
+    for comp, props in sent:
+        if comp != _EXECUTION_COMMAND:
+            continue
+        by_id.setdefault(props["event_id"], []).append(props["status"])
+    # N distinct cards (no two commands collided onto one id).
+    assert len(by_id) == count, f"expected {count} distinct cards, got {len(by_id)}"
+    # Each card saw both its running create and its passed flip (the start->end pairing
+    # was never lost to a torn _command_event_ids access).
+    for event_id, statuses in by_id.items():
+        assert "running" in statuses, f"{event_id} never created its running card"
+        assert "passed" in statuses, f"{event_id} never flipped to passed (lost start->end pairing)"
+
+
+def test_on_command_swallowed_start_undoes_ordinal_and_orphan_for_clean_retry() -> None:
+    """A swallowed start emit leaves no orphaned id mapping or skipped ordinal.
+
+    The start edge mints an id, bumps the per-key occurrence ordinal, and records the id
+    under the engine ``command_id`` BEFORE the emit. If the emit is swallowed (a transient
+    UI outage), the bookkeeping must be undone: the ordinal rewound so a retry re-mints THE
+    SAME id, and the orphaned ``command_id -> id`` entry dropped so the retried start (not
+    a later end with no live card) owns it. Without the undo, a retried start would skip an
+    ordinal (a gap in the card sequence) and the stale mapping would mis-route the end edge.
+    """
+    failures = {"count": 1}
+    delivered: list[dict[str, Any]] = []
+
+    def flaky(component: str, props: dict[str, Any]) -> None:
+        # Fail only the FIRST execution_command emit (the swallowed start), so the phase
+        # marker delivers normally and does not consume the single injected failure.
+        if component == _EXECUTION_COMMAND and failures["count"] > 0:
+            failures["count"] -= 1
+            raise RuntimeError("transient ui outage")
+        if component == _EXECUTION_COMMAND:
+            delivered.append(dict(props))
+
+    adapter = UiAdapter(emit=flaky)
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+
+    start = _command_event(phase="start", command="bun test", command_id="cmd-x")
+    adapter.on_command(start)  # emit fails, swallowed, bookkeeping undone
+    # The orphaned command_id mapping must be gone after a swallowed start.
+    assert "cmd-x" not in adapter._command_event_ids  # internal-state guard
+
+    adapter.on_command(start)  # retry: re-mints the SAME id at the SAME ordinal
+    assert len(delivered) == 1, "the retried start must deliver"
+    retried_id = delivered[-1]["event_id"]
+    # The retry lands on ordinal 0 (the swallowed bump was rewound), not a skipped 1.
+    assert retried_id.endswith("-0"), retried_id
+
+    # The paired end now resolves the retried start's id and flips the card in place.
+    end = _command_event(
+        phase="end", command="bun test", command_id="cmd-x", exit_code=0, duration_s=0.1
+    )
+    adapter.on_command(end)
+    assert delivered[-1]["event_id"] == retried_id, "the end must flip the retried start's card"
+    assert delivered[-1]["status"] == "passed"
+
+
+def test_on_command_class_docstring_notes_off_loop_invocation() -> None:
+    """The adapter class docstring flags that on_command may fire off the event loop.
+
+    A future reader who mutates the on_command path must know it can run from a worker
+    thread (deepagents marshals execute through to_thread). Pinning the note keeps the
+    cross-thread contract discoverable rather than tribal knowledge.
+    """
+    doc = UiAdapter.__doc__ or ""
+    assert "loop" in doc.lower() and "thread" in doc.lower(), doc

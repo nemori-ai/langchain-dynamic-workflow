@@ -12,10 +12,13 @@
  *
  * Because both edges land on the same card, the header chip flips from a sky `running`
  * state to an emerald `exit 0` (passed) or rose `exit N` (failed) state without a second
- * card appearing. The card correlates to its owning leaf via `leaf_span_id` (the frontend
- * nests it beneath that leaf's AgentSpan via the message_id filter) and is tagged with the
- * loop `attempt` the adapter stamped from the latest phase marker it saw (a free-form
- * string such as "attempt 1", or null when no phase preceded the command).
+ * card appearing. Cards render inline in the same host message group, ordered by emit
+ * time — they do NOT visually nest beneath the owning leaf's AgentSpan (the message_id
+ * filter groups every event onto the one host message, it does not parent a card under a
+ * sibling span). The card carries `leaf_span_id` for future correlation, but the renderer
+ * does not yet use it for visual nesting. The card is tagged with the loop `attempt` the
+ * adapter stamped from the latest phase marker it saw (a free-form string such as
+ * "attempt 1", or null when no phase preceded the command).
  *
  * Honesty: the START edge shows the command is running, but the captured `output` only
  * arrives whole on the END edge — the subprocess runs outside the LangChain graph, so this
@@ -58,13 +61,17 @@ export function TerminalCard(props: {
       ? "border-emerald-200 bg-emerald-50/60"
       : "border-rose-200 bg-rose-50/60";
 
-  // Header label: "running" while live, otherwise "exit {code}" plus the wall-clock.
+  // Header label: "running" while live; once terminal, "exit {code}" when a real exit
+  // code arrived. Honesty: a degraded Fidelity-A payload may carry a terminal status
+  // with a null exit_code (a verdict folded in without on_command's begin/end edges) —
+  // then the header shows the code-less verdict ("passed"/"failed") rather than
+  // inventing an "exit 0" it never received.
   const exitLabel =
     props.exit_code != null
       ? `exit ${props.exit_code}`
       : isPassed
-        ? "exit 0"
-        : "exit ?";
+        ? "passed"
+        : "failed";
 
   return (
     <div

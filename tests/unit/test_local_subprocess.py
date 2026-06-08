@@ -655,3 +655,69 @@ def test_no_command_sink_means_no_events_default_zero_cost() -> None:
         assert result.exit_code == 0  # unchanged path, no observation overhead
     finally:
         backend.close()
+
+
+def test_on_command_spawn_failure_still_fires_a_terminal_end_edge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the subprocess never spawns (Popen raises — EMFILE/ENOMEM, a preexec rlimit
+    # failure between fork and exec, etc.) AFTER the begin edge already painted a
+    # "running" card, the backend MUST still fire a terminal end edge so the card is
+    # never stuck "running" forever. The end carries the spawn-error sentinel, the
+    # SAME command_id as the begin, and the original exception still propagates.
+    from langchain_dynamic_workflow._local_subprocess import EXIT_SPAWN_ERROR
+    from langchain_dynamic_workflow._observability import CommandEvent
+
+    boom = OSError(24, "Too many open files")
+
+    def _raise(*_args: object, **_kwargs: object) -> object:
+        raise boom
+
+    # Patch Popen on the subprocess module as seen from the backend's call site.
+    monkeypatch.setattr("langchain_dynamic_workflow._local_subprocess.subprocess.Popen", _raise)
+
+    events: list[CommandEvent] = []
+    backend = _backend()
+    backend.set_command_sink(sink=events.append, leaf_span_id="span-spawn")
+    try:
+        with pytest.raises(OSError) as excinfo:
+            backend.execute(f'{sys.executable} -c "print(1)"')
+        assert excinfo.value is boom  # original exception preserved for callers
+    finally:
+        backend.close()
+
+    # Both edges fired even though the subprocess never started.
+    assert len(events) == 2
+    begin, end = events
+    assert begin.phase == "start"
+    assert begin.exit_code is None
+    assert end.phase == "end"
+    assert end.command_id == begin.command_id  # same card flips in place
+    assert end.leaf_span_id == begin.leaf_span_id == "span-spawn"
+    assert end.exit_code == EXIT_SPAWN_ERROR  # honest spawn-failure sentinel
+    assert end.truncated is False
+    assert end.duration_s is not None and end.duration_s >= 0.0
+    # The end output is an honest tail naming the failure, not a fake success.
+    assert end.output is not None and "Too many open files" in end.output
+
+
+def test_spawn_failure_without_sink_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The unobserved path (no sink wired) stays byte-identical: a Popen failure
+    # propagates the original exception with no event machinery in the way.
+    boom = OSError(12, "Cannot allocate memory")
+
+    def _raise(*_args: object, **_kwargs: object) -> object:
+        raise boom
+
+    # Patch Popen on the subprocess module as seen from the backend's call site.
+    monkeypatch.setattr("langchain_dynamic_workflow._local_subprocess.subprocess.Popen", _raise)
+
+    backend = _backend()
+    try:
+        with pytest.raises(OSError) as excinfo:
+            backend.execute(f'{sys.executable} -c "print(1)"')
+        assert excinfo.value is boom
+    finally:
+        backend.close()
