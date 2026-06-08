@@ -24,11 +24,12 @@ from ._budget import Budget
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
 from ._determinism import CallSequenceGuard
 from ._errors import (
-    WorkflowBudgetExceededError,
-    WorkflowDeterminismError,
+    WORKFLOW_CONTROL_FLOW_SIGNALS,
+    WorkflowCheckpointError,
     WorkflowNestingError,
+    WorkflowSignoffRequired,
 )
-from ._journal import JournalRecord, JournalStore, journal_key, race_key
+from ._journal import JournalRecord, JournalStore, journal_key, race_key, signoff_key
 from ._observability import SpanKind, SpanRecorder
 from ._pipeline import Stage, run_pipeline
 from ._progress import ProgressKind, ProgressLog
@@ -173,6 +174,14 @@ asyncio task and restored on frame exit.
 """
 
 
+class _Unset:
+    """Sentinel type distinguishing "no resume value" from "resume with ``None``"."""
+
+
+UNSET = _Unset()
+"""Default for a sign-off resume: no human value is being injected this run."""
+
+
 class Ctx:
     """Deterministic orchestration context handed to a workflow script.
 
@@ -194,6 +203,9 @@ class Ctx:
             ``agent``/``parallel``/``pipeline`` call emits a completed span. A
             silent no-op recorder is created when omitted, so observability costs
             nothing until a sink is wired.
+        pending_signoff: Optional human value injected at the next un-decided
+            ``ctx.checkpoint`` sign-off gate (an approve resume sets it). Omitted
+            (the ``UNSET`` default) on a fresh run or a crash-resume replay.
     """
 
     def __init__(
@@ -208,10 +220,20 @@ class Ctx:
         progress: ProgressLog | None = None,
         workflows: WorkflowResolver | None = None,
         spans: SpanRecorder | None = None,
+        pending_signoff: Any = UNSET,
     ) -> None:
         self._roster = roster
         self._journal = journal
         self._leaf_runner = leaf_runner
+        # The human value to inject at the next un-decided sign-off gate this run
+        # (set by an approve resume). Consumed by the first ``checkpoint`` that has
+        # no journaled decision; gates already approved on a prior run replay their
+        # decision from the journal and never consume it. ``UNSET`` (not ``None``)
+        # marks "no value injected" so approving with ``None`` is honored.
+        self._pending_signoff = pending_signoff
+        # Ordinal of the next ``checkpoint`` call on the sequential path; keys each
+        # gate's journaled decision so gates stay distinct and replay in order.
+        self._signoff_count = 0
         self._gate = (
             gate if gate is not None else ConcurrencyGate(limit=resolve_max_concurrency(None))
         )
@@ -236,6 +258,16 @@ class Ctx:
     def progress_entry_count(self) -> int:
         """How many progress entries were recorded this run (for journal persistence)."""
         return len(self._progress.entries)
+
+    @property
+    def has_unconsumed_signoff(self) -> bool:
+        """Whether an injected sign-off resume value was never consumed by a gate.
+
+        ``True`` when the run was given a ``resume`` decision but completed without
+        reaching an un-decided ``ctx.checkpoint`` gate to consume it — the engine uses
+        this to fail loud rather than let a human sign-off decision vanish silently.
+        """
+        return not isinstance(self._pending_signoff, _Unset)
 
     @property
     def budget(self) -> Budget:
@@ -306,6 +338,89 @@ class Ctx:
             return await workflow_fn(self, args or {})
         finally:
             _WORKFLOW_DEPTH.reset(token)
+
+    async def checkpoint(self, ask: Any, *, tag: str = "") -> Any:
+        """Pause the run for a human sign-off and return the value they supply.
+
+        Surfaces ``ask`` (the question or context for the person deciding) and
+        parks the run until the host approves it with a value, which becomes this
+        call's return value. The decision is journaled like a leaf result, keyed by
+        the gate's ordinal position, so an approve re-runs the script from the top
+        with completed leaves and already-approved gates replayed from the journal
+        at zero model cost, and only this un-decided gate consumes the new value.
+        Sign-off semantics are a pattern, not extra API: the script interprets the
+        returned value (e.g. an ``{"approved": bool}`` mapping it agreed with the
+        host).
+
+        This is a sequential-orchestration-path (depth-0) primitive: calling it
+        from inside a ``parallel`` / ``pipeline`` / ``race`` fan-out frame raises
+        :class:`WorkflowCheckpointError`. A gate is identified by its ordinal among
+        the run's ``checkpoint`` calls; inside a fan-out that ordinal would race
+        across concurrent frames and become non-deterministic, breaking replay, and
+        a set of concurrently-reached gates has no well-defined order to present for
+        sequential human sign-off.
+
+        Args:
+            ask: The human-facing question/context surfaced while the run is
+                parked; carried on the raised :class:`WorkflowSignoffRequired`.
+            tag: Optional label for the gate, folded into its journal key and
+                echoed back on the parked status.
+
+        Returns:
+            The value supplied on approve (``run_workflow(..., resume=value)``).
+
+        Raises:
+            WorkflowCheckpointError: If called from inside a fan-out frame.
+            WorkflowSignoffRequired: If this gate has no journaled decision and no
+                resume value is pending — the run parks here.
+        """
+        if _FANOUT_DEPTH.get() > 0:
+            raise WorkflowCheckpointError(
+                "ctx.checkpoint must run on the sequential orchestration path, not "
+                "inside a parallel/pipeline/race fan-out frame: a gate is keyed by its "
+                "ordinal position, which would race across concurrent frames and break "
+                "deterministic replay, and concurrently-reached gates have no order to "
+                "present for sequential human sign-off."
+            )
+        position = self._signoff_count
+        self._signoff_count += 1
+        key = signoff_key(position=position, tag=tag)
+        # Determinism backstop: record this gate's key in the SAME ordered sequence as
+        # leaf calls, so a replay whose gate order/identity drifts (an inserted/removed
+        # leaf or gate before it, or a different tag at this position) fails loud here
+        # rather than silently binding a journaled decision to a different gate — a leaf
+        # diverges loud, and a gate must too. A gate's identity is (position, tag): the
+        # ``ask`` is excluded from the key because it may carry non-deterministic content
+        # (e.g. a model-produced assessment), so DISTINCT gates MUST use DISTINCT tags,
+        # and editing the script's gate/leaf structure invalidates a parked journal (same
+        # boundary as leaf keys). The guard catches drift across a full resume; across a
+        # single park→approve the sequence is not yet persisted (it records, not validates).
+        self._sequence_guard.observe(key)
+        # A gate approved on a prior run replays its decision from the journal at
+        # zero cost, keeping the run deterministic across the human pause.
+        recorded = await self._journal.get(key)
+        if recorded is not None:
+            return json.loads(recorded.result)
+        # The first un-decided gate consumes the pending resume value (an approve);
+        # record it so a later resume replays this gate instead of re-asking.
+        if not isinstance(self._pending_signoff, _Unset):
+            decision = self._pending_signoff
+            # Serialize BEFORE consuming the pending value: the decision is journaled as
+            # the gate's record, so a non-JSON-serializable decision must fail with a clear
+            # error and leave the gate un-decided (still re-approvable) rather than losing
+            # the value and parking unjournaled.
+            try:
+                serialized = json.dumps(decision)
+            except TypeError as exc:
+                raise WorkflowCheckpointError(
+                    "ctx.checkpoint decision (the resume value) must be JSON-serializable "
+                    f"— it is journaled as the gate's recorded decision: {exc}"
+                ) from exc
+            self._pending_signoff = UNSET
+            await self._journal.put(key, JournalRecord(result=serialized, usage=0))
+            return decision
+        # No decision and nothing to inject: park here for a human sign-off.
+        raise WorkflowSignoffRequired(ask, tag=tag, gate_key=key)
 
     @overload
     async def agent(
@@ -542,9 +657,10 @@ class Ctx:
         async def _guarded(thunk: Callable[[], Awaitable[T]]) -> T | None:
             try:
                 return await thunk()
-            except (WorkflowBudgetExceededError, WorkflowDeterminismError):
+            except WORKFLOW_CONTROL_FLOW_SIGNALS:
                 # Engine control-flow signals must fail loud, never be masked as a
-                # leaf failure: re-raise so the barrier surfaces them.
+                # leaf failure: re-raise so the barrier surfaces them. Includes a
+                # checkpoint reached from inside a fan-out frame (a depth-0 primitive).
                 raise
             except Exception:
                 # Failure isolation: one bad leaf must not abort the barrier.
@@ -811,9 +927,7 @@ class Ctx:
                     for task in sorted(done, key=lambda finished: index_of[finished]):
                         error = task.exception()
                         if error is not None:
-                            if isinstance(
-                                error, (WorkflowBudgetExceededError, WorkflowDeterminismError)
-                            ):
+                            if isinstance(error, WORKFLOW_CONTROL_FLOW_SIGNALS):
                                 # Engine control-flow signal: fail loud, never mask.
                                 to_raise = error
                                 break

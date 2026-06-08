@@ -51,6 +51,7 @@ from langchain_dynamic_workflow import (
     JournalStore,
     SandboxManager,
     WorkflowScriptError,
+    WorkflowSignoffRequired,
     compile_workflow_source,
     local_subprocess_factory,
     run_workflow,
@@ -247,14 +248,30 @@ class _ResumeLane:
             ``@entrypoint`` thread.
         thread_id: The engine ``thread_id`` for the lane's durable run (distinct from
             the host graph's own thread id).
+        awaiting_signoff: ``True`` while the lane's last run parked at a ``ctx.checkpoint``
+            sign-off gate and is waiting for a human decision on the next turn.
+        signoff_ask: The ask payload the parked gate surfaced (the question + context the
+            human is deciding), or ``None`` when not parked.
+        signoff_gate_key: The parked gate's content-hash key, used as the sign-off card's
+            stable id so the awaiting card flips in place to approved/rejected on resume.
     """
 
-    __slots__ = ("checkpointer", "journal", "thread_id")
+    __slots__ = (
+        "awaiting_signoff",
+        "checkpointer",
+        "journal",
+        "signoff_ask",
+        "signoff_gate_key",
+        "thread_id",
+    )
 
     def __init__(self, thread_id: str) -> None:
         self.journal: JournalStore = InMemoryJournalStore()
         self.checkpointer: BaseCheckpointSaver[Any] = InMemorySaver()
         self.thread_id = thread_id
+        self.awaiting_signoff: bool = False
+        self.signoff_ask: Any = None
+        self.signoff_gate_key: str = ""
 
 
 # Durable lanes keyed on "<host_thread_id>::<workflow_name>". Held at module scope so
@@ -262,6 +279,23 @@ class _ResumeLane:
 # thread reuses the first turn's journal and replays its leaves as cache hits. A fresh
 # process (a server restart) starts empty, which is the honest in-memory-store bound.
 _RESUME_LANES: dict[str, _ResumeLane] = {}
+
+_NO_SIGNOFF = object()
+"""Sentinel for ``run_workflow_live``: run/replay with no human sign-off value injected.
+
+Distinct from ``None`` so an approve can inject a falsy/empty decision; when passed,
+``run_workflow`` is called without ``resume`` (its own unset default), leaving the
+fresh / "pick it back up" replay path unchanged.
+"""
+
+
+def _signoff_question(ask: Any) -> str:
+    """Extract the human-facing question from a ``ctx.checkpoint`` ask payload."""
+    if isinstance(ask, dict):
+        question = ask.get("ask")
+        if isinstance(question, str) and question:
+            return question
+    return "approve to proceed?"
 
 
 def _host_thread_id() -> str:
@@ -503,7 +537,12 @@ async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str
 
 
 async def run_workflow_live(
-    name: str, args: dict[str, Any], *, adapter: UiAdapter, lane: _ResumeLane | None = None
+    name: str,
+    args: dict[str, Any],
+    *,
+    adapter: UiAdapter,
+    lane: _ResumeLane | None = None,
+    resume: Any = _NO_SIGNOFF,
 ) -> str:
     """Resolve a named preset workflow and run it inline, streaming via ``adapter``.
 
@@ -555,19 +594,55 @@ async def run_workflow_live(
         if lane is not None
         else {}
     )
-    result = await run_workflow(
-        _orchestrate,
-        roster=make_roster(),
-        on_progress=adapter.on_progress,
-        on_span=adapter.on_span,
-        on_span_begin=adapter.on_span_begin,
-        on_leaf_event=adapter.on_leaf_event,
-        leaf_event_include_payloads=False,
-        on_command=adapter.on_command,
-        sandbox_manager=_make_sandbox_manager(),
-        workflows=workflows,
-        **durable,
+    # A sign-off approve injects the human decision at the next un-decided gate; a fresh
+    # run or a plain "pick it back up" resume passes no value (the sentinel default).
+    resume_kwargs: dict[str, Any] = {} if resume is _NO_SIGNOFF else {"resume": resume}
+    # Capture the gate this resume is deciding (set when the lane parked last turn) so its
+    # awaiting card can flip in place to resolved once the decision lands. The ask is held
+    # on the lane across the turn boundary (the per-turn adapter cannot remember it).
+    decided_gate_key = (
+        lane.signoff_gate_key if (lane is not None and lane.awaiting_signoff) else ""
     )
+    decided_ask = lane.signoff_ask if (lane is not None and lane.awaiting_signoff) else None
+    resolving = resume is not _NO_SIGNOFF and bool(decided_gate_key)
+    try:
+        result = await run_workflow(
+            _orchestrate,
+            roster=make_roster(),
+            on_progress=adapter.on_progress,
+            on_span=adapter.on_span,
+            on_span_begin=adapter.on_span_begin,
+            on_leaf_event=adapter.on_leaf_event,
+            leaf_event_include_payloads=False,
+            on_command=adapter.on_command,
+            sandbox_manager=_make_sandbox_manager(),
+            workflows=workflows,
+            **durable,
+            **resume_kwargs,
+        )
+    except WorkflowSignoffRequired as park:
+        # The script paused for a human. If this call was itself approving an earlier
+        # gate that then re-parked at a LATER one, flip the earlier card to resolved
+        # first, then surface the new gate's awaiting card and remember it on the lane.
+        if resolving:
+            adapter.emit_signoff_resolved(
+                gate_key=decided_gate_key, ask=decided_ask, decision=resume
+            )
+        if lane is not None:
+            lane.awaiting_signoff = True
+            lane.signoff_ask = park.ask
+            lane.signoff_gate_key = park.gate_key
+        adapter.emit_signoff_request(gate_key=park.gate_key, ask=park.ask)
+        return f"Paused for your sign-off: {_signoff_question(park.ask)}"
+    # Clean completion: a resume that decided a parked gate flips its card to resolved.
+    if resolving:
+        adapter.emit_signoff_resolved(
+            gate_key=decided_gate_key, ask=decided_ask, decision=resume
+        )
+    if lane is not None:
+        lane.awaiting_signoff = False
+        lane.signoff_ask = None
+        lane.signoff_gate_key = ""
     return str(result)
 
 
@@ -576,6 +651,7 @@ async def run_live(
     state: Annotated[dict[str, Any], InjectedState],
     workflow: str = DEFAULT_LIVE_WORKFLOW,
     workflow_args: dict[str, Any] | None = None,
+    signoff_decision: dict[str, Any] | None = None,
 ) -> str:
     """Run a named preset workflow live, streaming its orchestration into the UI.
 
@@ -591,6 +667,11 @@ async def run_live(
       streams an ``execution_command`` event the UI renders as a TerminalCard that flips
       pass/fail in place — pick this when the user wants the code proven to build and the
       tests proven to pass, not just reviewed as looking correct.
+    * ``sign_off`` — an in-run human sign-off: it assesses a plan, then PAUSES for a
+      person and surfaces a ``signoff_gate`` card. When the user answers (approves or
+      declines), call this tool again with the SAME ``workflow="sign_off"`` and a
+      ``signoff_decision`` carrying their answer; the run continues from the gate, the
+      assessment replays from the journal at zero cost, and the card flips to resolved.
 
     Each engine progress/span event flows through a :class:`~ui_adapter.UiAdapter`, which
     maps it to a Gen-UI component (``phase_timeline`` for phases/logs, ``fanout_graph``
@@ -608,23 +689,36 @@ async def run_live(
     Args:
         state: Injected graph state (used to anchor UI events to the host turn).
         workflow: The preset workflow to run — ``deep_research`` (default), ``capstone``,
-            or ``fix_loop`` (the executable-verification build/test loop).
+            ``fix_loop`` (the executable-verification build/test loop), or ``sign_off``
+            (the in-run human sign-off gate).
         workflow_args: Optional workflow arguments (e.g. ``{"question": "..."}``).
             When omitted the preset uses its own defaults. Named ``workflow_args``
             rather than ``args`` on purpose: LangChain's tool-schema generation mangles
             a parameter literally named ``args`` into ``v__args`` (typed as an array),
             and then passes that mangled keyword back on invocation, raising
             ``unexpected keyword argument 'v__args'``. A non-reserved name avoids it.
+        signoff_decision: The human's answer to a pending ``sign_off`` gate, e.g.
+            ``{"approved": true, "note": "..."}``. Pass it (with ``workflow="sign_off"``)
+            on the turn the user approves or declines, so the paused run continues with
+            their decision. Omitted on a fresh run or a non-sign-off workflow.
 
     Returns:
-        A short human-readable summary including the workflow's result.
+        A short human-readable summary including the workflow's result (or a note that
+        the run paused for a sign-off).
     """
     anchor = _anchor_message(state.get("messages", []))
     emit = make_host_ui_emit(anchor=anchor)
     _emit_run_status(emit)
     adapter = UiAdapter(emit=emit)
     lane = _resume_lane(workflow)
-    result = await run_workflow_live(workflow, workflow_args or {}, adapter=adapter, lane=lane)
+    resume: Any = signoff_decision if signoff_decision is not None else _NO_SIGNOFF
+    result = await run_workflow_live(
+        workflow, workflow_args or {}, adapter=adapter, lane=lane, resume=resume
+    )
+    # A sign-off pause is not a finish: keep the honest "Paused ..." wording so the
+    # offline reply and the host both report the run is waiting, not done.
+    if result.startswith("Paused for your sign-off"):
+        return f"Workflow {workflow!r}: {result}"
     return f"Workflow {workflow!r} finished: {result}"
 
 

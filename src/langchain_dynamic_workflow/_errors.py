@@ -43,6 +43,51 @@ class WorkflowNestingError(RuntimeError):
     """
 
 
+class WorkflowSignoffRequired(RuntimeError):
+    """Raised by ``run_workflow`` when the script parked at an in-run sign-off gate.
+
+    A script pauses for a human with ``ctx.checkpoint(ask)``: when the gate has no
+    journaled decision and no resume value is pending, the call raises this and it
+    propagates out of ``run_workflow`` so the caller (the background run manager)
+    parks the run in an ``AWAITING_SIGNOFF`` state rather than settling it done. It
+    is a control-flow signal, not a failure: the run is intact and resumes when the
+    host supplies a value via ``run_workflow(..., resume=value)`` against the same
+    journal, which records the decision and replays completed work at zero cost.
+
+    Attributes:
+        ask: The payload the script passed to ``ctx.checkpoint`` — the question or
+            context shown to the human deciding the sign-off.
+        tag: The optional label the script attached to the gate (empty when none).
+        gate_key: The gate's content-hash journal key, for correlation.
+    """
+
+    def __init__(self, ask: object, *, tag: str = "", gate_key: str = "") -> None:
+        """Carry the sign-off ask, its label, and the gate's journal key.
+
+        Args:
+            ask: The payload passed to ``ctx.checkpoint`` (the human-facing ask).
+            tag: The optional gate label.
+            gate_key: The gate's content-hash journal key for correlation.
+        """
+        super().__init__(f"workflow parked at sign-off gate (tag={tag!r})")
+        self.ask = ask
+        self.tag = tag
+        self.gate_key = gate_key
+
+
+class WorkflowCheckpointError(RuntimeError):
+    """Raised when ``ctx.checkpoint`` is called from inside a fan-out frame.
+
+    ``ctx.checkpoint`` is a depth-0 (sequential orchestration) primitive. A gate is
+    identified by its ordinal position among the run's ``checkpoint`` calls; inside
+    a ``parallel`` / ``pipeline`` / ``race`` frame that ordinal would race across
+    concurrent frames and become non-deterministic, breaking the journal replay that
+    serves an already-approved gate, and a set of concurrently-reached gates has no
+    well-defined order to present for sequential human sign-off. The engine refuses
+    it rather than producing an unresumable run.
+    """
+
+
 class WorkflowScriptError(RuntimeError):
     """Raised when an LLM-authored orchestration script is rejected before execution.
 
@@ -60,3 +105,18 @@ class WorkflowScriptError(RuntimeError):
     you authored yourself; for adversarial input use an out-of-process isolation
     backend.
     """
+
+
+WORKFLOW_CONTROL_FLOW_SIGNALS: tuple[type[Exception], ...] = (
+    WorkflowBudgetExceededError,
+    WorkflowDeterminismError,
+    WorkflowCheckpointError,
+)
+"""Engine signals that must fail loud inside a fan-out, never be masked as ``None``.
+
+``parallel`` / ``pipeline`` / ``race`` isolate an ordinary leaf failure as a quiet
+``None`` hole, but these signals indicate the run itself is no longer sound (an
+exhausted budget, a replay divergence, or a checkpoint reached from a fan-out
+frame). They are re-raised after the barrier/drain settles instead of being
+swallowed, so the breach surfaces rather than corrupting the result with a hole.
+"""

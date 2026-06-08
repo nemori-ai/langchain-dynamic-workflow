@@ -26,8 +26,9 @@ from ._concurrency import (
     resolve_max_concurrency,
     with_max_concurrency,
 )
-from ._context import Ctx, LeafOutcome, WorkflowResolver
+from ._context import UNSET, Ctx, LeafOutcome, WorkflowResolver
 from ._determinism import CallSequenceGuard
+from ._errors import WorkflowCheckpointError, WorkflowSignoffRequired
 
 # Re-exported on the engine's public core entry so the host-facing surface
 # (tool / middleware / persistence) constructs per-run journal stores and reads
@@ -65,6 +66,7 @@ async def run_workflow(
     journal: JournalStore | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     thread_id: str = "default",
+    resume: Any = UNSET,
     max_concurrency: int | None = None,
     budget: int | None = None,
     on_progress: ProgressSink | None = None,
@@ -86,6 +88,14 @@ async def run_workflow(
             Pass the *same* instance across calls to get cached-result resume.
         checkpointer: LangGraph checkpointer; defaults to an in-memory saver.
         thread_id: Durable-execution thread id.
+        resume: Value injected at the next un-decided ``ctx.checkpoint`` sign-off so
+            the run continues past the gate (the value becomes ``checkpoint()``'s
+            return and is journaled as that gate's decision). Omit it (the ``UNSET``
+            default) for a fresh run or a crash-resume replay. Approving against the
+            *same* journal the run parked with replays completed leaves and
+            already-approved gates at zero model cost; a fresh journal still
+            approves correctly but re-runs prior work, so the host reuses the
+            origin run's journal.
         budget: Optional shared token ceiling for all leaves in this run. When a
             leaf would push spend past the cap the next ``agent()`` raises
             :class:`~langchain_dynamic_workflow.WorkflowBudgetExceededError`;
@@ -367,9 +377,20 @@ async def run_workflow(
             progress=progress,
             workflows=workflows,
             spans=span_recorder,
+            pending_signoff=resume,
         )
         try:
             result = await orchestrate(ctx)
+        except WorkflowSignoffRequired:
+            # A sign-off pause is a DESIGNED stop, not a crash: persist the progress
+            # count (and only that) so the approve replay does not re-deliver the
+            # phase/log narration already shown before the gate. The call sequence is
+            # deliberately NOT persisted here — the approve issues MORE calls past the
+            # gate, and a partial recorded sequence would trip the determinism guard's
+            # "extra calls" check. The completed leaves are already journaled (inside
+            # agent()), so the gate-front work still replays free on approve.
+            await journal_store.put_progress_count(ctx.progress_entry_count)
+            raise
         finally:
             # Lifecycle finale: stop every execution sandbox leased this run,
             # whether the script returned cleanly or raised. A lease deliberately
@@ -388,6 +409,18 @@ async def run_workflow(
         # here, after the script has finished issuing calls. Runs before
         # put_sequence so a divergent replay never overwrites the record with a
         # shorter sequence.
+        # Fail loud if a sign-off decision was injected but no gate consumed it: the run
+        # completed (or had no un-decided gate) yet a human decision was supplied, so
+        # silently dropping it would lose a sign-off — exactly the action that must not
+        # fail quietly. (resume is UNSET on a fresh run / crash-resume, so this is a
+        # no-op there.) This is the engine-level backstop for an approve aimed at a run
+        # that was not actually paused at a gate.
+        if resume is not UNSET and ctx.has_unconsumed_signoff:
+            raise WorkflowCheckpointError(
+                "a sign-off decision was supplied (resume=) but the run completed without "
+                "an un-decided ctx.checkpoint gate to consume it — the decision was not "
+                "applied. The run was likely not actually paused for a sign-off."
+            )
         sequence_guard.finalize()
         # Persist run-level state only after the script completes successfully. This
         # is deliberately asymmetric with the per-leaf journal: each completed leaf
@@ -411,5 +444,9 @@ async def run_workflow(
     # The gate is the precise cap; the substrate semaphore is pinned high (never
     # None/unbounded) so it stays explicit without fighting the gate.
     config = with_max_concurrency(base_config, HARD_CEILING)
+    # A parked ``ctx.checkpoint`` raises WorkflowSignoffRequired straight out of the
+    # entrypoint body (it is journaled, not a LangGraph interrupt), so the caller
+    # sees it here without any in-band sentinel to unwrap. The resume value, when
+    # set, was threaded into the Ctx and is consumed at the first un-decided gate.
     result: Any = await _run.ainvoke({}, config=config)  # pyright: ignore[reportUnknownMemberType]
     return result

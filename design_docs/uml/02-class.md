@@ -19,6 +19,7 @@ classDiagram
     +parallel(thunks) list
     +pipeline(items, *stages) list
     +race(candidates, *, win, win_tag) RaceResult
+    +checkpoint(ask, *, tag) Any (HITL 签核门:journal 记决策/注入 pending/否则 raise WorkflowSignoffRequired;depth-0 守卫)
     +phase(title)
     +log(msg)
     +budget
@@ -139,13 +140,16 @@ classDiagram
   class BgRunManager {
     +start(coro, run_id, thread_id) BgRunSlot
     +poll(run_id) Status
+    +approve(coro, *, run_id, thread_id) BgRunSlot (就地续跑 parked slot,同 run_id)
+    +get_signoff(run_id) ask or None
     +drain_notifications(thread_id)
   }
   class BgRunSlot {
     +run_id
-    +status
+    +status (含非终态 AWAITING_SIGNOFF:计入 active、不被 TTL sweep)
     +task: asyncio.Task
     +result
+    +ask (AWAITING_SIGNOFF 时的签核 ask,否则 None)
   }
   class ResultStore { <<protocol: memory|sandbox>> }
   class WorkflowRunStore {

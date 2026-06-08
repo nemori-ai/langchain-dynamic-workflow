@@ -78,6 +78,7 @@ _FANOUT_GRAPH = "fanout_graph"
 _AGENT_SPAN = "agent_span"
 _JOURNAL_BADGE = "journal_badge"
 _EXECUTION_COMMAND = "execution_command"
+_SIGNOFF_GATE = "signoff_gate"
 
 _FANOUT_KINDS: frozenset[SpanKind] = frozenset({SpanKind.PARALLEL, SpanKind.PIPELINE})
 
@@ -86,6 +87,20 @@ _FANOUT_KINDS: frozenset[SpanKind] = frozenset({SpanKind.PARALLEL, SpanKind.PIPE
 # resource exhaustion. Once the cap is hit, further runs are dropped and the re-emit
 # carries a ``truncated`` flag so the frontend can say so honestly.
 _MAX_SUBTREE_NODES = 200
+
+
+def _split_signoff_ask(ask: Any) -> tuple[str, str]:
+    """Split a ``ctx.checkpoint`` ask payload into (question, detail) display strings.
+
+    The ask is the mapping the script passed to ``ctx.checkpoint`` (e.g. ``{"ask": ...,
+    "summary": ...}``). Returns the human-facing question and an optional supporting
+    detail, both as plain strings (empty when absent), tolerating a non-mapping ask.
+    """
+    if isinstance(ask, dict):
+        question = str(ask.get("ask", "") or "")
+        detail = str(ask.get("summary", "") or "")
+        return (question or "Approve to proceed?", detail)
+    return (str(ask) if ask is not None else "Approve to proceed?", "")
 
 
 class UiAdapter:
@@ -344,6 +359,53 @@ class UiAdapter:
                 stable, ordinal = mint_undo
                 self._occurrences[stable] = ordinal
                 self._command_event_ids.pop(event.command_id, None)
+
+    # --- host-driven sign-off card (M4 in-run HITL) --------------------------
+
+    def emit_signoff_request(self, *, gate_key: str, ask: Any) -> None:
+        """Emit an awaiting ``signoff_gate`` card for a parked sign-off (never raises).
+
+        Called from the host when an inline run parks at ``ctx.checkpoint``. The card's
+        id is derived from the gate's content key so the matching :meth:`emit_signoff_resolved`
+        flips this exact card in place — even across the turn boundary between the park and
+        the human's answer (the adapter is per-turn, so the gate key, not adapter state, is
+        what correlates the two edges).
+
+        Args:
+            gate_key: The parked gate's content-hash key (its stable card identity).
+            ask: The ask payload the gate surfaced (a mapping with ``ask`` / ``summary``).
+        """
+        question, detail = _split_signoff_ask(ask)
+        props: dict[str, Any] = {
+            "status": "awaiting",
+            "question": question,
+            "detail": detail,
+            "attempt": self._latest_phase,
+        }
+        self._emit_event(_SIGNOFF_GATE, props, event_id=f"signoff-{gate_key}")
+
+    def emit_signoff_resolved(self, *, gate_key: str, ask: Any, decision: Any) -> None:
+        """Flip a sign-off card to approved/rejected in place (never raises).
+
+        Re-sends the question/detail (from ``ask``, carried across turns by the host's
+        resume lane) alongside the resolved status so the merged card stays complete.
+
+        Args:
+            gate_key: The gate key whose awaiting card to resolve (same id as the request).
+            ask: The same ask payload the request carried (for the persisted question/detail).
+            decision: The human decision (``{"approved": bool, "note": str}`` or a bool).
+        """
+        question, detail = _split_signoff_ask(ask)
+        approved = bool(decision.get("approved")) if isinstance(decision, dict) else bool(decision)
+        note = str(decision.get("note", "") or "") if isinstance(decision, dict) else ""
+        props: dict[str, Any] = {
+            "status": "approved" if approved else "rejected",
+            "question": question,
+            "detail": detail,
+            "note": note,
+            "attempt": self._latest_phase,
+        }
+        self._emit_event(_SIGNOFF_GATE, props, event_id=f"signoff-{gate_key}", merge=True)
 
     def _mint_command_event_id(self, event: CommandEvent) -> tuple[str, tuple[str, int]]:
         """Mint a resume-stable ``execution_command`` id and bump its occurrence ordinal.

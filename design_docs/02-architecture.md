@@ -208,3 +208,28 @@ await store.aclose()
 store = await SqliteWorkflowStore.open("workflows.db")
 # 重建同样接线的 host,host 经 workflow tool 的 resume(run_id)续跑
 ```
+
+## 11. 运行中 HITL 签核接线（M4,host 面）
+
+脚本以 `ctx.checkpoint(ask, *, tag="")` 暂停等人工签核;host 经 workflow tool 观测并续跑。机制(journal 驱动的门、为何弃 LangGraph interrupt、载重不变量)见 [01 §14](01-engine-mechanism.md);本节是 host 面接线。
+
+```python
+# 一个会停下等签核的工作流(脚本拥有暂停点,门前叶重放免费)
+async def gated(ctx, args):
+    assessment = await ctx.agent("评估部署计划风险", agent_type="auditor")
+    decision = await ctx.checkpoint({"ask": "批准部署?", "summary": assessment}, tag="deploy")
+    if not decision.get("approved"):
+        return f"held: {decision.get('note', '未批准')}"
+    return f"proceeding: {assessment}"
+
+# host 经 workflow tool:run → 停在门(status=awaiting_signoff,带 ask)→ approve(注入决策)→ 续跑
+# - status <run_id>  : awaiting_signoff 时回 ask + 如何 approve
+# - approve <run_id> : args 携人工决策(如 {"approved": true, "note": "..."}),喂回暂停的 run
+```
+
+- **新态 `BgStatus.AWAITING_SIGNOFF`**(非终态、计入 active):parked run 占一个 slot 直到 approve/cancel;`get_signoff(run_id)` 取 ask;`runs`/`status` 暴露它。abandoned 的 park 由 `sweep` 经 `park_ttl_seconds` 过期回收(防永久占 quota)。
+- **`approve` 命令(本进程在活的 parked run)**:复用 parked slot、**同 run_id** 就地续跑(`BgRunManager.approve` 先同步翻 `RUNNING` 杜绝双批竞争),demo 卡片据 id 跨暂停原地更新。**只批准本进程在活的 parked run**——parked 态(哪道门、ask)只在内存 manager、未持久化,故 swept/跨进程的 `UNKNOWN` run 拒批(以免把非 parked run 推过人没看过的门);跨会话 HITL 待持久 park 态,列后续里程碑。与 `resume`(崩溃重放、无值注入)是不同动词。
+- **决策载体**:`approve` 复用 tool 的 `args` 作人工决策 dict(脚本 `ctx.checkpoint` 的返回值,须 JSON-可序列化);术(命令名/参数形状)只入 tool description / `help` / SKILL.md,绝不入 demo prompt(道/术线)。
+- **安全/防御**:authored(meta)脚本经 AST gate **禁调 `ctx.checkpoint`**(签核是注册工作流能力);引擎对"注入决策却无门消费"**fail-loud**;门入确定性序列,漂移 fail-loud。
+
+demo 消费(`run_workflow_live` 内联捕 `WorkflowSignoffRequired` → 经 `_ResumeLane` 跨轮持久 journal 续跑 + `signoff_gate` Gen-UI 卡片原地翻面)见 demo-app;集成示例见 [`examples/features/signoff.py`](../examples/features/signoff.py);时序见 [uml/03-sequence.md](uml/03-sequence.md) G 图。

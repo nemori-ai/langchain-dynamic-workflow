@@ -1,5 +1,5 @@
 {
-  "_comment": "Canonical wording for the demo's preset-scenario buttons. The frontend ScenarioPanel hardcodes the same four messages (it does not read this file at runtime), and the backend doc-sync test (tests/test_doc_sync.py) pins the two copies byte-for-byte so they cannot drift. Messages are a real user's words (the why/when of the task) — never tool mechanics.",
+  "_comment": "Canonical wording for the demo's preset-scenario buttons. The frontend ScenarioPanel hardcodes the same messages (it does not read this file at runtime), and the backend doc-sync test (tests/test_doc_sync.py) pins the two copies byte-for-byte so they cannot drift. Messages are a real user's words (the why/when of the task) — never tool mechanics.",
   "scenarios": [
     {
       "label": "Deep research",
@@ -25,6 +25,11 @@
       "label": "Make it pass",
       "hint": "fix code until the tests are green",
       "message": "I've got a small TypeScript module with a couple of failing unit tests. Please actually fix the code and keep checking it against the tests until they genuinely pass — don't just tell me it looks right, prove it builds and the tests go green."
+    },
+    {
+      "label": "Sign off mid-run",
+      "hint": "pause for human approval",
+      "message": "Before you actually run the staging deployment, I want to sign off on the plan myself — walk me through the riskiest steps and pause for my approval before you proceed."
     }
   ]
 }

@@ -67,6 +67,15 @@ def test_rejects_dunder_attribute_access() -> None:
     assert "__class__" in str(exc.value)
 
 
+def test_rejects_ctx_checkpoint_in_authored_script() -> None:
+    # Review M3: ctx.checkpoint (in-run human sign-off) is a registered-workflow
+    # capability, not an authored-script one — an authored run has no resume lane and
+    # could park a quota slot forever. The gate denies it (defense-in-depth).
+    with pytest.raises(WorkflowScriptError) as exc:
+        validate_workflow_source(_wrap("d = await ctx.checkpoint('approve?')\n"))
+    assert "checkpoint" in str(exc.value)
+
+
 def test_rejects_subclasses_escape_chain() -> None:
     # The classic sandbox escape: walk the type tree to reach arbitrary classes.
     with pytest.raises(WorkflowScriptError):

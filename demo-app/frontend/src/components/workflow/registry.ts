@@ -6,6 +6,7 @@ import { JournalBadge } from "./JournalBadge";
 import { MetaScriptViewer } from "./MetaScriptViewer";
 import { PhaseTimeline } from "./PhaseTimeline";
 import { RunStatusBanner } from "./RunStatusBanner";
+import { SignoffGate } from "./SignoffGate";
 import { TerminalCard } from "./TerminalCard";
 
 /**
@@ -45,4 +46,5 @@ export const workflowComponents: Record<
   meta_script: MetaScriptViewer as React.FunctionComponent,
   run_status: RunStatusBanner as React.FunctionComponent,
   execution_command: TerminalCard as React.FunctionComponent,
+  signoff_gate: SignoffGate as React.FunctionComponent,
 };

@@ -27,7 +27,7 @@ from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from ._background import BgRunManager, BgRunQuotaExceededError, BgStatus
+from ._background import BgRunManager, BgRunQuotaExceededError, BgRunStateError, BgStatus
 
 # The meta-layer codegen (AST gate + restricted exec) and its error type sit in
 # Layer 2 alongside this tool; the `run_script` command compiles an untrusted
@@ -65,9 +65,9 @@ class WorkflowToolSchema(BaseModel):
     is never advertised to the model; the model supplies only these fields.
     """
 
-    command: Literal["run", "run_script", "status", "resume", "cancel", "runs"] = Field(
-        description="Which workflow operation to perform."
-    )
+    command: Literal[
+        "run", "run_script", "status", "resume", "cancel", "runs", "approve"
+    ] = Field(description="Which workflow operation to perform.")
     workflow: str | None = Field(
         default=None,
         description="The registered workflow name to launch (required for 'run').",
@@ -81,11 +81,17 @@ class WorkflowToolSchema(BaseModel):
     )
     run_id: str | None = Field(
         default=None,
-        description="The target run id (required for 'status' / 'resume' / 'cancel').",
+        description=(
+            "The target run id (required for 'status' / 'resume' / 'cancel' / 'approve')."
+        ),
     )
     args: dict[str, Any] | None = Field(
         default=None,
-        description="Optional arguments for the launched workflow (for 'run' / 'run_script').",
+        description=(
+            "Optional arguments for the launched workflow (for 'run' / 'run_script'); "
+            "for 'approve' it carries the human sign-off decision passed back into the "
+            "paused run (e.g. {'approved': true, 'note': '...'})."
+        ),
     )
 
 
@@ -104,13 +110,20 @@ Commands (pass `command`):
     Use only scripts you author yourself: the gate stops an accidental slip, not a
     determined adversary (it is not a security sandbox).
 - `status`: given a `run_id`, return the run's current status and — once done —
-    its result. A large result is summarized and offloaded behind a handle.
+    its result. A large result is summarized and offloaded behind a handle. A run
+    that paused for a human sign-off reports `awaiting_signoff` and shows the `ask`.
 - `resume`: given a finished or interrupted `run_id`, re-run the same workflow
     against its journal so completed steps replay at zero cost. Returns a new run.
-- `cancel`: given a `run_id`, stop an in-flight run.
+    (Use `approve`, not `resume`, to answer a sign-off — `resume` injects no value.)
+- `cancel`: given a `run_id`, stop an in-flight run (including one awaiting sign-off).
 - `runs`: list every run you launched on this thread with its workflow label and
     live status (and a short outcome preview once settled), so you can see all of
     them at once instead of polling each `run_id`. Takes no arguments.
+- `approve`: answer a run that is `awaiting_signoff`. Given its `run_id` and `args`
+    as the decision (e.g. {"approved": true, "note": "..."}), feed the value back
+    into the paused run so it continues under the same `run_id`. Completed steps and
+    already-approved gates replay at zero cost; the run may pause again at a later
+    gate or finish.
 """
 
 
@@ -362,6 +375,12 @@ def create_workflow_tool(
             return f"status: unknown run_id {run_id!r} (never launched, or already reclaimed)."
         if status in {BgStatus.PENDING, BgStatus.RUNNING}:
             return f"status: run {run_id!r} is {status.value}; no result yet."
+        if status == BgStatus.AWAITING_SIGNOFF:
+            ask = manager.get_signoff(run_id, thread_id=thread_id)
+            return (
+                f"status: run {run_id!r} is awaiting sign-off.\nask: {ask}\n"
+                "Answer it with command='approve', this run_id, and args as the decision."
+            )
         result = manager.get_result(run_id, thread_id=thread_id)
         if result.status == BgStatus.FAILED:
             return f"status: run {run_id!r} failed: {result.detail or result.summary}"
@@ -402,6 +421,74 @@ def create_workflow_tool(
             update={
                 "messages": [ToolMessage(message, tool_call_id=runtime.tool_call_id)],
                 WORKFLOW_RUNS_STATE_KEY: [_launch_record(new_run_id, label=label)],
+            }
+        )
+
+    async def _approve_command(
+        runtime: _ToolRuntime, *, run_id: str | None, args: dict[str, Any] | None
+    ) -> str | _Command:
+        if not run_id:
+            return "approve: a 'run_id' is required."
+        thread_id = _host_thread_id(runtime)
+        status = manager.poll(run_id, thread_id=thread_id)
+        # ONLY a run parked AND live on THIS process can be approved. The parked state
+        # (which gate, the ask) lives in the in-memory manager, not the run store, so a
+        # run that is UNKNOWN here — swept after settling, or parked in another (dead)
+        # process — cannot be verified as genuinely awaiting a sign-off. Relaunching it
+        # from its persisted spec would risk advancing a NON-parked run past a gate no
+        # human saw, or silently dropping the decision; so refuse rather than guess.
+        if status == BgStatus.UNKNOWN:
+            return (
+                f"approve: run {run_id!r} is not awaiting sign-off on this process "
+                "(unknown, already settled, or parked elsewhere); a sign-off can only be "
+                "approved where its parked run is live. Check command='runs'."
+            )
+        if status != BgStatus.AWAITING_SIGNOFF:
+            return f"approve: run {run_id!r} is {status.value}, not awaiting sign-off."
+        spec = await run_store.load_spec(run_id)
+        if spec is None:
+            return f"approve: unknown run_id {run_id!r}; nothing to approve."
+        workflow_fn = _resolve_spec(spec)
+        # Continue the SAME run in place (its slot, its run_id) so a host tracking the
+        # run by id follows it across the pause. Completed leaves and already-approved
+        # gates replay at zero cost from the origin journal; the decision is injected at
+        # the next un-decided gate (and the engine fails loud if none consumes it).
+        canonical = spec.journal_run_id or run_id
+        origin_journal: JournalStore = run_store.journal_for(canonical)
+        spec_args = spec.args
+        decision = args or {}
+
+        async def _orchestrate(ctx: Any) -> Any:
+            return await workflow_fn(ctx, spec_args)
+
+        async def _coro() -> str:
+            result = await run_workflow(
+                _orchestrate,
+                roster=roster,
+                journal=origin_journal,
+                checkpointer=checkpointer,
+                thread_id=canonical,
+                resume=decision,
+                max_concurrency=max_concurrency,
+                budget=budget,
+                workflows=workflows,
+            )
+            return result if isinstance(result, str) else str(result)
+
+        try:
+            manager.approve(_coro(), run_id=run_id, thread_id=thread_id)
+        except (KeyError, BgRunStateError) as exc:
+            return f"approve: {exc}"
+        message = (
+            f"Approved the sign-off for run {run_id!r}; it is continuing in the "
+            "background under the same run_id. A completion notification will arrive "
+            "before your next reply, or it may pause again at a later gate (check with "
+            "command='status')."
+        )
+        return Command(
+            update={
+                "messages": [ToolMessage(message, tool_call_id=runtime.tool_call_id)],
+                WORKFLOW_RUNS_STATE_KEY: [_launch_record(run_id, label=spec.label)],
             }
         )
 
@@ -459,9 +546,11 @@ def create_workflow_tool(
             return await _cancel_command(runtime, run_id=run_id)
         if command == "runs":
             return _runs_command(runtime)
+        if command == "approve":
+            return await _approve_command(runtime, run_id=run_id, args=args)
         return (
             f"unknown command {command!r}; expected one of: "
-            "run, run_script, status, resume, cancel, runs."
+            "run, run_script, status, resume, cancel, runs, approve."
         )
 
     # Under ``from __future__ import annotations`` the ``runtime`` annotation is a

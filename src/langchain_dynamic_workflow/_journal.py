@@ -99,6 +99,34 @@ def race_key(*, candidate_keys: Sequence[str], win_tag: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def signoff_key(*, position: int, tag: str) -> str:
+    """Compute the content-hash journal key for a ``ctx.checkpoint`` sign-off gate.
+
+    A sign-off decision is journaled like a leaf result so a resumed run replays an
+    already-approved gate from the journal at zero cost and only an un-decided gate
+    parks. The key is the SHA-256 of the gate's ordinal position in the sequential
+    orchestration path plus its optional tag, under a ``"signoff"`` namespace marker
+    so it can never collide with a leaf :func:`journal_key` or a :func:`race_key`.
+    The ``ask`` payload is intentionally excluded — it is display-only (like a
+    leaf's ``label``) and must never partition the gate's identity across replay.
+
+    Args:
+        position: The gate's zero-based ordinal among the run's ``checkpoint``
+            calls (deterministic on the sequential, depth-0 path).
+        tag: The caller-supplied gate label (empty when none).
+
+    Returns:
+        A hex SHA-256 digest uniquely identifying this sign-off gate.
+    """
+    payload: dict[str, Any] = {
+        "kind": "signoff",
+        "position": position,
+        "tag": tag,
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 @runtime_checkable
 class JournalStore(Protocol):
     """Storage backend for journaled leaf results and the call sequence.

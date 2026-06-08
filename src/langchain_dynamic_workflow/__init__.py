@@ -16,9 +16,11 @@ from ._context import Ctx
 from ._engine import Orchestrator, run_workflow
 from ._errors import (
     WorkflowBudgetExceededError,
+    WorkflowCheckpointError,
     WorkflowDeterminismError,
     WorkflowNestingError,
     WorkflowScriptError,
+    WorkflowSignoffRequired,
 )
 from ._journal import InMemoryJournalStore, JournalRecord, JournalStore, journal_key, race_key
 from ._leaf_events import LeafEvent, LeafEventSink
@@ -138,11 +140,13 @@ __all__ = [
     "SpanKind",
     "SpanSink",
     "WorkflowBudgetExceededError",
+    "WorkflowCheckpointError",
     "WorkflowDeterminismError",
     "WorkflowNestingError",
     "WorkflowRegistry",
     "WorkflowRunStore",
     "WorkflowScriptError",
+    "WorkflowSignoffRequired",
     "WorktreeProvider",
     "__version__",
     "compile_workflow_source",

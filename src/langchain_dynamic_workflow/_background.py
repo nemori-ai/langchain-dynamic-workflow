@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from ._errors import WorkflowSignoffRequired
+
 
 class BgStatus(StrEnum):
     """Lifecycle status of a background run.
@@ -40,6 +42,9 @@ class BgStatus(StrEnum):
         DONE: The run finished successfully; its result is available.
         FAILED: The run raised; the error detail is available.
         CANCELLED: The run was cancelled before completing.
+        AWAITING_SIGNOFF: The run paused at an in-run ``ctx.checkpoint`` gate and
+            waits for a human value (non-terminal); the ask is readable and an
+            ``approve`` continues the same run. Still counts as in-flight.
         UNKNOWN: No slot exists for the queried key (never created, or reclaimed).
     """
 
@@ -48,6 +53,7 @@ class BgStatus(StrEnum):
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    AWAITING_SIGNOFF = "awaiting_signoff"
     UNKNOWN = "unknown"
 
 
@@ -64,6 +70,15 @@ class BgRunQuotaExceededError(RuntimeError):
     runs. A host that asks to launch another while the quota is full is refused
     loud rather than having its run fanned out onto the event loop unbounded — the
     bounded-queue / resource-exhaustion guard for host-initiated background work.
+    """
+
+
+class BgRunStateError(RuntimeError):
+    """Raised when an operation does not match a run's current lifecycle state.
+
+    For example, approving a run that is not awaiting a sign-off (it is still
+    running, already done, or was cancelled): there is nothing to continue, so the
+    manager refuses loud rather than relaunching a run in the wrong state.
     """
 
 
@@ -202,6 +217,10 @@ class BgRunSlot:
         result: The successful result text once ``DONE``, else ``None``.
         handle: The offload handle when the result was offloaded, else ``None``.
         error: The error string once ``FAILED``, else ``None``.
+        ask: The sign-off ask payload while ``AWAITING_SIGNOFF`` (what the human is
+            deciding), else ``None``. Cleared when the run is approved.
+        parked_at: Monotonic timestamp when the run parked at a sign-off gate, else
+            ``None``. Drives the park-TTL expiry in ``sweep``; cleared on approve.
     """
 
     run_id: str
@@ -214,6 +233,8 @@ class BgRunSlot:
     result: str | None = None
     handle: str | None = None
     error: str | None = None
+    ask: Any = None
+    parked_at: float | None = None
 
 
 def _composite_key(thread_id: str, run_id: str) -> tuple[str, str]:
@@ -242,6 +263,10 @@ class BgRunManager:
             unbounded; a positive value makes ``start`` refuse a new run with
             :class:`BgRunQuotaExceededError` once that many runs are in flight,
             bounding host-initiated background fan-out against resource exhaustion.
+        park_ttl_seconds: How long a run parked at a sign-off gate is held before
+            ``sweep`` expires it (→ ``CANCELLED`` + notice), so an abandoned sign-off
+            does not hold a quota slot forever. Generous by default (a human decision
+            may take a long time); a live sign-off still completes on approve.
     """
 
     def __init__(
@@ -250,6 +275,7 @@ class BgRunManager:
         result_store: ResultStore | None = None,
         idle_ttl_seconds: float = 3600.0,
         max_concurrent_runs: int | None = None,
+        park_ttl_seconds: float = 86400.0,
     ) -> None:
         if max_concurrent_runs is not None and max_concurrent_runs <= 0:
             # 0/negative is not a meaningful quota: it would refuse every run
@@ -262,6 +288,11 @@ class BgRunManager:
         self._result_store = result_store if result_store is not None else ResultStore()
         self._idle_ttl_seconds = idle_ttl_seconds
         self._max_concurrent_runs = max_concurrent_runs
+        # A parked (AWAITING_SIGNOFF) run holds a quota slot until approved/cancelled; an
+        # abandoned one would hold it forever. ``sweep`` expires a park idle past this TTL
+        # (→ CANCELLED + notice), a defended bound on parked-run resource hold. Generous
+        # by default (a human sign-off may legitimately take a long time); host-tunable.
+        self._park_ttl_seconds = park_ttl_seconds
         self._slots: dict[tuple[str, str], BgRunSlot] = {}
         # Pending completion notices keyed by host thread, drained FIFO.
         self._notices: dict[str, list[Notice]] = {}
@@ -298,6 +329,10 @@ class BgRunManager:
             return _summarize(slot.error or "run failed", max_chars=_SNAPSHOT_SUMMARY_MAX_CHARS)
         if slot.status == BgStatus.CANCELLED:
             return slot.error or "cancelled"
+        if slot.status == BgStatus.AWAITING_SIGNOFF:
+            return _summarize(
+                f"awaiting sign-off: {slot.ask}", max_chars=_SNAPSHOT_SUMMARY_MAX_CHARS
+            )
         return None  # PENDING / RUNNING: no outcome yet
 
     def list_runs(self, thread_id: str) -> list[RunSnapshot]:
@@ -403,6 +438,12 @@ class BgRunManager:
         except asyncio.CancelledError:
             self._settle(key, thread_id, BgStatus.CANCELLED, error="cancelled")
             raise
+        except WorkflowSignoffRequired as park:
+            # The run paused at an in-run sign-off gate: park it (non-terminal) so
+            # the host can approve it later, rather than recording it as a failure.
+            # Must precede the generic Exception handler (it is a RuntimeError).
+            self._park(key, thread_id, park)
+            return ""
         except Exception as exc:
             # A background run must never crash the event loop: convert any failure
             # into a FAILED settle carrying the error text for the host.
@@ -410,6 +451,88 @@ class BgRunManager:
             return ""
         self._settle(key, thread_id, BgStatus.DONE, result=result)
         return result
+
+    def _park(
+        self, key: tuple[str, str], thread_id: str, signoff: WorkflowSignoffRequired
+    ) -> None:
+        """Park a slot at ``AWAITING_SIGNOFF`` and enqueue a sign-off notice.
+
+        Stores the ask so the host can read what to approve. The slot stays
+        non-terminal (``settled_at`` unset) so the TTL sweep never reclaims a run
+        that is merely waiting for a person; a host that abandons it can ``cancel``.
+        """
+        slot = self._slots.get(key)
+        if slot is None:
+            return
+        slot.status = BgStatus.AWAITING_SIGNOFF
+        slot.ask = signoff.ask
+        slot.parked_at = time.monotonic()
+        summary = _summarize(
+            f"awaiting sign-off: {signoff.ask}", max_chars=_SNAPSHOT_SUMMARY_MAX_CHARS
+        )
+        self._notices.setdefault(thread_id, []).append(
+            Notice(
+                run_id=slot.run_id,
+                thread_id=thread_id,
+                status=BgStatus.AWAITING_SIGNOFF,
+                summary=summary,
+            )
+        )
+
+    def approve(
+        self,
+        coro: Coroutine[Any, Any, str],
+        *,
+        run_id: str,
+        thread_id: str,
+    ) -> BgRunSlot:
+        """Continue a parked (``AWAITING_SIGNOFF``) run with a sign-off continuation.
+
+        Relaunches the run *in place* under the same ``run_id`` (so a host tracking
+        the run by id follows it across the human pause) by replacing the slot's
+        task with ``coro`` — a fresh ``run_workflow(..., resume=value)`` against the
+        same journal that records the human value at the gate and replays completed
+        work for free. The continuation may settle the run or park it again at a
+        later gate (re-arming the same slot).
+
+        Args:
+            coro: The continuation coroutine (a resuming ``run_workflow``); must
+                resolve to the run's result text.
+            run_id: The parked run to continue.
+            thread_id: The owning host thread.
+
+        Returns:
+            The re-armed :class:`BgRunSlot`.
+
+        Raises:
+            KeyError: If no slot exists for the run (the passed coro is closed).
+            BgRunStateError: If the run is not awaiting sign-off (the coro is
+                closed so a refused approve leaks no unawaited coroutine).
+        """
+        key = _composite_key(thread_id, run_id)
+        slot = self._slots.get(key)
+        if slot is None:
+            coro.close()
+            raise KeyError(f"unknown run_id {run_id!r}")
+        if slot.status != BgStatus.AWAITING_SIGNOFF:
+            coro.close()
+            raise BgRunStateError(
+                f"run {run_id!r} is {slot.status.value}, not awaiting sign-off; "
+                "nothing to approve"
+            )
+        # Flip status to RUNNING SYNCHRONOUSLY, before scheduling the continuation, to
+        # close the check-then-act window: the new task only sets RUNNING once the loop
+        # schedules it (in _run_wrapped), so without this a second approve racing the
+        # loop would still see AWAITING_SIGNOFF, pass the guard, and orphan the first
+        # continuation — two run_workflow continuations against one journal. With the
+        # synchronous flip a duplicate approve sees RUNNING and is refused above.
+        slot.ask = None
+        slot.parked_at = None
+        slot.status = BgStatus.RUNNING
+        slot.task = asyncio.ensure_future(
+            self._run_wrapped(coro, key=key, thread_id=thread_id)
+        )
+        return slot
 
     def _settle(
         self,
@@ -525,8 +648,24 @@ class BgRunManager:
                 ),
                 detail=slot.error,
             )
-        # Pending / running / cancelled: no value yet (or never).
+        # Pending / running / cancelled / awaiting-signoff: no value yet (or never).
         return RunResult(status=slot.status, value=None, summary=slot.status.value)
+
+    def get_signoff(self, run_id: str, *, thread_id: str | None = None) -> Any | None:
+        """Return the sign-off ask for a parked run, else ``None``.
+
+        Args:
+            run_id: The run to inspect.
+            thread_id: Optional owning thread to disambiguate the composite key.
+
+        Returns:
+            The ask payload while the run is ``AWAITING_SIGNOFF``, else ``None``
+            (the run is not parked, or no slot exists).
+        """
+        slot = self._find(run_id, thread_id)
+        if slot is None or slot.status != BgStatus.AWAITING_SIGNOFF:
+            return None
+        return slot.ask
 
     def drain_notifications(self, thread_id: str) -> list[Notice]:
         """Pop and return all pending completion notices for ``thread_id``.
@@ -575,11 +714,14 @@ class BgRunManager:
             )
 
     def sweep(self, *, now: float | None = None) -> list[str]:
-        """Reclaim settled slots whose idle TTL has elapsed.
+        """Expire stale parked runs and reclaim settled slots past their idle TTL.
 
-        A slot is reclaimable once it is in a terminal status and has been
-        settled for at least ``idle_ttl_seconds``. Reclaiming drops the slot and
-        any offloaded payload it owns.
+        Two-stage: (1) a run parked at a sign-off gate past ``park_ttl_seconds`` is
+        EXPIRED — settled to ``CANCELLED`` with an "expired" notice, so an abandoned
+        sign-off stops holding a quota slot forever (a defended resource bound; an
+        active sign-off still completes on approve). (2) A run in a terminal status
+        settled for at least ``idle_ttl_seconds`` is RECLAIMED — its slot and any
+        offloaded payload are dropped.
 
         Args:
             now: Optional monotonic timestamp override (for deterministic tests).
@@ -591,6 +733,17 @@ class BgRunManager:
         reclaimed: list[str] = []
         for key in list(self._slots):
             slot = self._slots[key]
+            # Stage 1: expire an abandoned parked run so it stops holding a quota slot.
+            if (
+                slot.status == BgStatus.AWAITING_SIGNOFF
+                and slot.parked_at is not None
+                and moment - slot.parked_at >= self._park_ttl_seconds
+            ):
+                slot.parked_at = None
+                self._settle(
+                    key, slot.thread_id, BgStatus.CANCELLED, error="sign-off expired (park TTL)"
+                )
+                continue  # now terminal; a later sweep reclaims it past idle_ttl
             if slot.status not in _TERMINAL_STATUSES or slot.settled_at is None:
                 continue
             if moment - slot.settled_at >= self._idle_ttl_seconds:

@@ -103,8 +103,8 @@ def test_scenario_panel_messages_match_scenarios_json() -> None:
     canonical = json.loads(_SCENARIOS_JSON.read_text(encoding="utf-8"))["scenarios"]
     frontend = _scenario_panel_messages()
 
-    assert len(frontend) == len(canonical) == 5, (
-        f"expected 5 scenarios on both sides, got json={len(canonical)} frontend={len(frontend)}"
+    assert len(frontend) == len(canonical) == 6, (
+        f"expected 6 scenarios on both sides, got json={len(canonical)} frontend={len(frontend)}"
     )
 
     for index, (json_scenario, (label, hint, message)) in enumerate(

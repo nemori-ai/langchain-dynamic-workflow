@@ -119,6 +119,14 @@ _REPLY_META_REJECTED = (
     "The AST gate rejected the script I composed, so nothing ran — the rejection reason "
     "is shown above (offline demo mode; set a model key for live model runs)."
 )
+_REPLY_SIGNOFF_PAUSED = (
+    "I've paused for your sign-off — review the gate above, then approve or decline and "
+    "I'll continue from there (offline demo mode; set a model key for live model runs)."
+)
+# Marker in a ``run_live`` ToolMessage that distinguishes the sign-off PAUSE outcome (the
+# run parked at a ctx.checkpoint gate) from a normal completed run. Kept in sync with the
+# paused-return text in ``host_graph.run_workflow_live``.
+_SIGNOFF_PAUSED_MARKER = "paused for your sign-off"
 
 # Marker in a ``run_meta_script`` ToolMessage that distinguishes the gate-FAIL outcome
 # from the gate-PASS one (both share the tool name). Kept in sync with the tool's
@@ -153,6 +161,15 @@ _LIVE_CUES = (
     "failing unit tests",
     "fix the code",
     "make it pass",
+    # In-run HITL sign-off intent. The sign-off scenario asks the host to pause for a human
+    # decision mid-run; these phrases route that intent to the live tool, and the matching
+    # _WORKFLOW_CUES entries resolve it to the sign_off preset. Kept distinct from the
+    # approve/reject RESPONSE cues below (which carry a decision into a paused run).
+    "sign off",
+    "sign-off",
+    "your approval before",
+    "approve before i",
+    "approve before you",
 )
 
 # Cue word -> preset workflow name. A request naming a preset routes the offline host
@@ -167,7 +184,20 @@ _WORKFLOW_CUES: dict[str, str] = {
     "failing unit tests": "fix_loop",
     "fix the code": "fix_loop",
     "make it pass": "fix_loop",
+    "sign off": "sign_off",
+    "sign-off": "sign_off",
+    "your approval before": "sign_off",
+    "approve before i": "sign_off",
+    "approve before you": "sign_off",
 }
+
+# A reply to a PENDING sign-off (the SignoffGate buttons submit these natural phrases, and
+# a user may type their own). Matching one routes the offline host to resume the paused
+# sign_off run with the decision rather than launching a fresh run. The approve cues are
+# deliberately specific (the button's exact wording + common approvals) so a LAUNCH request
+# like "...your approval before I proceed" does not trip them.
+_SIGNOFF_APPROVE_CUES = ("approved", "go ahead and proceed", "looks good", "lgtm", "ship it")
+_SIGNOFF_REJECT_CUES = ("hold off", "don't proceed", "do not proceed", "decline", "reject")
 
 # Cue phrases routing the offline host to the meta layer (run_meta_script): the user has
 # no ready-made procedure and wants the host to compose one on the spot. Checked BEFORE
@@ -315,7 +345,27 @@ def _post_tool_reply(tool_message: ToolMessage) -> str:
     content = str(tool_message.content).lower()
     if tool_message.name == _META_TOOL_NAME and _META_REJECTED_MARKER in content:
         return _REPLY_META_REJECTED
+    if tool_message.name == _LIVE_TOOL_NAME and _SIGNOFF_PAUSED_MARKER in content:
+        return _REPLY_SIGNOFF_PAUSED
     return _REPLY_LIVE_STREAMED
+
+
+def _signoff_response(messages: Sequence[BaseMessage]) -> dict[str, Any] | None:
+    """Return the sign-off decision the latest user turn carries, or ``None``.
+
+    Detects a reply to a pending sign-off (the SignoffGate buttons submit natural approve
+    / decline phrases, or the user types their own) and maps it to the decision payload
+    fed back into the paused ``sign_off`` run. Returns ``None`` when the turn is not a
+    sign-off response, so a fresh request falls through to the normal routing.
+    """
+    text = _latest_user_text(messages)
+    if text is None:
+        return None
+    if any(cue in text for cue in _SIGNOFF_APPROVE_CUES):
+        return {"approved": True, "note": ""}
+    if any(cue in text for cue in _SIGNOFF_REJECT_CUES):
+        return {"approved": False, "note": "reviewer declined"}
+    return None
 
 
 def _requested_workflow(messages: Sequence[BaseMessage]) -> str | None:
@@ -364,8 +414,23 @@ class OfflineHostModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         this_turn_tool = _tool_message_this_turn(messages)
+        signoff_decision = None if this_turn_tool is not None else _signoff_response(messages)
         if this_turn_tool is not None:
             message = AIMessage(content=_post_tool_reply(this_turn_tool))
+        elif signoff_decision is not None:
+            # A reply to a pending sign-off: resume the paused sign_off run with the
+            # decision (the run continues from the gate, replaying earlier work for free).
+            verb = "Approving" if signoff_decision["approved"] else "Declining"
+            message = AIMessage(
+                content=f"{verb} the sign-off and continuing the run now.",
+                tool_calls=[
+                    {
+                        "name": _LIVE_TOOL_NAME,
+                        "args": {"workflow": "sign_off", "signoff_decision": signoff_decision},
+                        "id": "signoff-call-1",
+                    }
+                ],
+            )
         elif _wants_meta_run(messages):
             # No ready-made playbook: author a script and submit it through the meta
             # layer. A "show me a rejected/blocked script" cue flips submit_rejected on
