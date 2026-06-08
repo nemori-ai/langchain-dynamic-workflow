@@ -140,10 +140,10 @@ online-path only; the offline scripted path stays deterministic and credential-f
 
 ---
 
-## The six scenarios
+## The seven scenarios
 
-The chat ships six preset buttons. Their canonical wording lives in
-`scenarios.json`; the frontend's `ScenarioPanel` carries the same six messages, and
+The chat ships seven preset buttons. Their canonical wording lives in
+`scenarios.json`; the frontend's `ScenarioPanel` carries the same seven messages, and
 a backend doc-sync test pins the two copies byte-for-byte (and pins the README's
 scenario count to the same source) so they cannot drift. Each is phrased as a real
 user's request, not a tool instruction — click one, or type your own. Here is what each
@@ -231,8 +231,32 @@ script branches on the **real human decision** (not a model guess), and the card
 in place to `approved` / `rejected` while the run proceeds or holds. The pause and
 resume ride the engine's content-hash journal — the same persistence substrate as
 "pick it back up" — so the gate is deterministic and resumable, not a fragile
-mid-flight interrupt. (Cross-gate state rides the script's own variables; real
-per-leaf git worktrees are a later milestone.)
+mid-flight interrupt. (Cross-gate state rides the script's own variables.)
+
+### 7. Refactor swarm — parallel fixes merged into a PR
+> *"There are a few separate bugs in this little module I'd like fixed all at once.
+> Please have several helpers each take a fix in parallel, review the patches, merge
+> them together into one change — sorting out any conflicts — and open a pull
+> request with the result."*
+
+**A real-git fix swarm with a merge-conflict loop.** The host fans out fixers across a
+buggy module in a **parallel barrier**, and each fixer works in its OWN real `git
+worktree` on its own `leaf/<id>` branch — fully isolated from its siblings. The engine
+folds each leaf's real `git diff` in as the **authoritative changeset** (a model's
+self-report can never override the on-disk truth). A two-vote read-only judge reviews
+every patch, then a **script-owned integrate loop** folds the approved patches into one
+tree with a real three-way `git merge`. Because two fixers rewrite the SAME line two
+different ways, the fold hits a **genuine merge conflict**: a resolver leaf flattens
+git's `<<<<<<<` markers, and the resolution folds straight in — you watch the real
+`git merge` commands stream as TerminalCards and the phases walk fix → verify →
+integrate. Opening the PR is a side effect that must NOT live inside the deterministic
+replay (a journaled leaf short-circuits on resume), so the workflow returns only the
+pure integrated tree plus a **PR intent**, and the **host** opens the pull request once,
+*after* the run returns (host finalization), surfacing a **PullRequestCard** with the PR
+ref. (Offline-fake caveat: with no key the fixers are deterministic fakes that still
+edit a real worktree on disk — so the isolation, the authoritative git-diff collect, and
+the real scratch-repo merge conflict are all genuinely exercised — but no real model
+authors the fixes; add a key to see a real model drive each fix.)
 
 ---
 

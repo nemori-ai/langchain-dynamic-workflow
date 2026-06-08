@@ -47,6 +47,12 @@ leaf's interior callback subtree is additionally folded onto its ``agent_span`` 
 ``on_leaf_event``: a bounded, shape-only ``subtree`` prop merged in place so the chat
 can drill into the leaf's run tree. A cached (replayed) leaf fires no interior events,
 so it never carries a ``subtree`` — the cache-hit story stays the ``journal_badge``.
+
+Two cards are host-driven rather than engine-event-driven: ``signoff_gate`` (an in-run
+human sign-off, emitted around a ``ctx.checkpoint`` park) and ``pull_request`` (a
+host-finalized PR, emitted after ``run_workflow`` returns). Both carry a stable
+``event_id`` derived from their content key (the gate key / the PR branch) so a later
+turn's re-emit lands on the same card.
 """
 
 from __future__ import annotations
@@ -79,6 +85,7 @@ _AGENT_SPAN = "agent_span"
 _JOURNAL_BADGE = "journal_badge"
 _EXECUTION_COMMAND = "execution_command"
 _SIGNOFF_GATE = "signoff_gate"
+_PULL_REQUEST = "pull_request"
 
 _FANOUT_KINDS: frozenset[SpanKind] = frozenset({SpanKind.PARALLEL, SpanKind.PIPELINE})
 
@@ -406,6 +413,48 @@ class UiAdapter:
             "attempt": self._latest_phase,
         }
         self._emit_event(_SIGNOFF_GATE, props, event_id=f"signoff-{gate_key}", merge=True)
+
+    # --- host-driven pull-request card (M6 host finalization) ----------------
+
+    def emit_pull_request(
+        self,
+        *,
+        number: int,
+        branch: str,
+        url: str,
+        integration_branch: str,
+        title: str,
+        created: bool,
+    ) -> None:
+        """Emit a ``pull_request`` card for a host-finalized PR (never raises).
+
+        Called from the host AFTER ``run_workflow`` returns, once it has opened (or
+        idempotently re-opened) the workflow's PR intent through a
+        ``LocalPullRequestProvider``. The card's id is derived from the PR's source branch
+        so a re-finalization on a later turn (the idempotent re-open path) lands on the SAME
+        card rather than appending a duplicate — mirroring the stable-``event_id`` pattern
+        the sign-off card uses across the turn boundary. Stamped with the latest phase
+        marker the adapter saw, for consistency with the other cards.
+
+        Args:
+            number: The PR number the provider assigned.
+            branch: The source branch the PR was opened from (its stable card identity).
+            url: The PR's address (``local://pr/<number>`` for the offline provider).
+            integration_branch: The branch the PR targets (not ``main``).
+            title: The PR title.
+            created: ``True`` when this call newly created the PR, ``False`` on an
+                idempotent re-open of an existing one for the same branch.
+        """
+        props: dict[str, Any] = {
+            "number": number,
+            "branch": branch,
+            "url": url,
+            "integration_branch": integration_branch,
+            "title": title,
+            "created": created,
+            "attempt": self._latest_phase,
+        }
+        self._emit_event(_PULL_REQUEST, props, event_id=f"pr-{branch}")
 
     def _mint_command_event_id(self, event: CommandEvent) -> tuple[str, tuple[str, int]]:
         """Mint a resume-stable ``execution_command`` id and bump its occurrence ordinal.

@@ -103,8 +103,8 @@ def test_scenario_panel_messages_match_scenarios_json() -> None:
     canonical = json.loads(_SCENARIOS_JSON.read_text(encoding="utf-8"))["scenarios"]
     frontend = _scenario_panel_messages()
 
-    assert len(frontend) == len(canonical) == 6, (
-        f"expected 6 scenarios on both sides, got json={len(canonical)} frontend={len(frontend)}"
+    assert len(frontend) == len(canonical) == 7, (
+        f"expected 7 scenarios on both sides, got json={len(canonical)} frontend={len(frontend)}"
     )
 
     for index, (json_scenario, (label, hint, message)) in enumerate(
@@ -144,8 +144,12 @@ def test_readme_scenario_count_matches_scenarios_json() -> None:
 
     # The prose count words must not lag behind either: a stale "four scenarios" while the
     # JSON ships five is the same drift in narrative form. Guard the cardinal words that
-    # named the old count so they cannot silently survive a count change.
-    stale_counts = {4: ("four scenarios", "four preset buttons", "the same four")}
+    # named the old count so they cannot silently survive a count change. Keyed by the
+    # PREVIOUS count, so adding a scenario forbids the prose words that named the old one.
+    stale_counts = {
+        4: ("four scenarios", "four preset buttons", "the same four"),
+        6: ("six scenarios", "six preset buttons", "the same six"),
+    }
     forbidden = stale_counts.get(len(canonical) - 1, ())
     for phrase in forbidden:
         assert phrase.lower() not in readme.lower(), (

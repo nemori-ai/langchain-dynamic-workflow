@@ -22,8 +22,12 @@ tested without a node context.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shlex
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Annotated, Any
 
 from _meta_fixtures import AUTHORED_SCRIPT, META_TOPICS, REJECTED_SCRIPT
@@ -38,7 +42,14 @@ from langgraph.graph.ui import AnyUIMessage, ui_message_reducer
 from langgraph.prebuilt import InjectedState
 from ui_adapter import UiAdapter
 from ui_bridge import UiEmit, make_host_ui_emit
-from workflows import hello_workflow, make_reasoning_roster, make_roster, make_workflows
+from workflows import (
+    REFACTOR_BASE_TREE,
+    RefactorResult,
+    hello_workflow,
+    make_reasoning_roster,
+    make_roster,
+    make_workflows,
+)
 
 from langchain_dynamic_workflow import (
     BgRunManager,
@@ -47,8 +58,11 @@ from langchain_dynamic_workflow import (
     ExecDecision,
     ExecPolicy,
     ExecRequest,
+    GitWorktreeProvider,
     InMemoryJournalStore,
     JournalStore,
+    LocalPullRequestProvider,
+    PullRequestProvider,
     SandboxManager,
     WorkflowScriptError,
     WorkflowSignoffRequired,
@@ -223,6 +237,47 @@ def _make_sandbox_manager() -> SandboxManager:
         # seeds an offline in-memory backend, so no execute ever spawns a subprocess.
         return SandboxManager()
     return SandboxManager(sandbox_factory=local_subprocess_factory(_make_exec_policy()))
+
+
+# The refactor_swarm preset name and the env override a test uses to inject a pre-seeded
+# base repo (so the test owns the fixture's git state); absent it, the host seeds its own.
+REFACTOR_SWARM = "refactor_swarm"
+_REFACTOR_BASE_REPO_ENV = "LDW_DEMO_REFACTOR_BASE_REPO"
+
+
+def _seed_refactor_base_repo() -> str:
+    """Seed (or reuse) a real git base repo carrying the ``refactor_swarm`` buggy fixture.
+
+    Builds a fresh temp git repo committing the buggy ``REFACTOR_BASE_TREE`` so the swarm's
+    git-worktree fixers branch from it. A test may inject a pre-seeded repo via the
+    ``LDW_DEMO_REFACTOR_BASE_REPO`` env var to own the fixture's git state; absent that, a
+    private temp repo is created here. The temp dir is intentionally NOT removed by this
+    function — the provider's ``cleanup_all`` (and the OS temp sweep) reclaim it; the host
+    holds it only for the duration of one run.
+
+    DANGEROUS OPT-IN: the resulting :class:`GitWorktreeProvider` spawns real ``git`` on the
+    host with the calling user's permissions; it is not a security sandbox. It is built only
+    for this TRUSTED preset path, never for an untrusted authored script.
+
+    Returns:
+        The absolute path to the seeded base git repository.
+    """
+    injected = os.environ.get(_REFACTOR_BASE_REPO_ENV)
+    if injected:
+        return injected
+    repo = tempfile.mkdtemp(prefix="ldw-refactor-base-")
+
+    def _git(*args: str) -> None:
+        subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True)
+
+    _git("init", "-q")
+    _git("config", "user.email", "demo@ldw")
+    _git("config", "user.name", "ldw-demo")
+    for path, content in REFACTOR_BASE_TREE.items():
+        (Path(repo) / path.lstrip("/")).write_text(content)
+    _git("add", "-A")
+    _git("commit", "-qm", "seed")
+    return repo
 
 
 class _ResumeLane:
@@ -536,6 +591,102 @@ async def run_hello_demo(state: Annotated[dict[str, Any], InjectedState]) -> str
     return f"Demo workflow finished: {result}"
 
 
+async def run_refactor_swarm_live(
+    args: dict[str, Any],
+    *,
+    adapter: UiAdapter,
+    lane: _ResumeLane | None = None,
+    pr_provider: PullRequestProvider | None = None,
+) -> str:
+    """Run ``refactor_swarm`` over a real ``git worktree`` provider, then finalize the PR.
+
+    The M6 consumer slice's host path, kept free of the node-context machinery so it can
+    be exercised directly in tests. It:
+
+    1. Constructs a real :class:`GitWorktreeProvider` over a temp git repo seeded with the
+       buggy fixture and a ``SandboxManager(git_worktree_provider=...)``, so the swarm's
+       ``isolation="worktree"`` fixers each lease a real worktree on their own branch.
+    2. Runs the swarm inline through ``run_workflow`` with the adapter's sinks wired, so its
+       phases, parallel fan-out, leaf spans, and the integrate phase's real ``git merge``
+       commands stream live (``streamSubgraphs`` stays false — leaf activity surfaces only
+       as host-channel cards). The git merge commands surface automatically via the engine.
+    3. HOST FINALIZATION (R1): after the run returns, opens the PR ONCE via a
+       :class:`LocalPullRequestProvider` from the workflow's pure :class:`RefactorResult`
+       PR intent — idempotently, so a re-finalization on a later turn returns the same PR —
+       and emits a ``pull_request`` card. The PR provider is NEVER called from inside the
+       orchestration script.
+    4. Calls ``provider.cleanup_all()`` in a ``finally`` (the HOST owns the worktree
+       provider's lifecycle), so no leaf worktree or temp tree leaks even on error.
+
+    Args:
+        args: Workflow arguments forwarded to the swarm (the fixture is fixed today).
+        adapter: The :class:`~ui_adapter.UiAdapter` whose sinks stream the run.
+        lane: Optional durable :class:`_ResumeLane` whose journal / checkpointer /
+            ``thread_id`` make the run resumable; absent, per-call in-memory defaults.
+        pr_provider: The :class:`PullRequestProvider` for host finalization; defaults to a
+            fresh :class:`LocalPullRequestProvider` (a test may inject a shared one to
+            assert idempotency across calls).
+
+    Returns:
+        A short human-readable summary naming the integrated result and the opened PR.
+    """
+    workflows = make_workflows()
+    workflow_fn = workflows.resolve(REFACTOR_SWARM)
+    pr_provider = pr_provider if pr_provider is not None else LocalPullRequestProvider()
+
+    async def _orchestrate(ctx: Ctx) -> Any:
+        return await workflow_fn(ctx, args)
+
+    durable: dict[str, Any] = (
+        {"journal": lane.journal, "checkpointer": lane.checkpointer, "thread_id": lane.thread_id}
+        if lane is not None
+        else {}
+    )
+    # The HOST owns the worktree provider lifecycle and MUST cleanup_all() in finally.
+    provider = GitWorktreeProvider(base_repo=_seed_refactor_base_repo())
+    manager = SandboxManager(git_worktree_provider=provider)
+    try:
+        result = await run_workflow(
+            _orchestrate,
+            roster=make_roster(),
+            on_progress=adapter.on_progress,
+            on_span=adapter.on_span,
+            on_span_begin=adapter.on_span_begin,
+            on_leaf_event=adapter.on_leaf_event,
+            leaf_event_include_payloads=False,
+            on_command=adapter.on_command,
+            sandbox_manager=manager,
+            workflows=workflows,
+            **durable,
+        )
+        # HOST FINALIZATION (R1): open the PR OUTSIDE the workflow, after it returns. The
+        # workflow returned only the pure integrated result + PR intent; the dangerous,
+        # idempotent PR write is the host's job. Tolerate a degraded non-RefactorResult.
+        if isinstance(result, RefactorResult):
+            ref = pr_provider.open(
+                branch=result.pr.branch,
+                title=result.pr.title,
+                body=result.pr.body,
+                integration_branch=provider.integration_branch,
+            )
+            adapter.emit_pull_request(
+                number=ref.number,
+                branch=ref.branch,
+                url=ref.url,
+                integration_branch=ref.integration_branch,
+                title=result.pr.title,
+                created=ref.created,
+            )
+            conflict = "resolved a merge conflict" if result.conflict_resolved else "no conflicts"
+            return (
+                f"Refactor swarm integrated {len(result.approved)} patches ({conflict}); "
+                f"opened PR #{ref.number} on {ref.branch} -> {ref.integration_branch}."
+            )
+        return str(result)
+    finally:
+        provider.cleanup_all()
+
+
 async def run_workflow_live(
     name: str,
     args: dict[str, Any],
@@ -581,6 +732,12 @@ async def run_workflow_live(
         KeyError: If ``name`` is not a registered preset (the registry lists the
             available names).
     """
+    # refactor_swarm has a distinct shape: a real git-worktree provider lifecycle plus
+    # host PR finalization after the run, so it delegates to its own dedicated path. (It
+    # takes no human sign-off, so the resume sentinel does not apply.)
+    if name == REFACTOR_SWARM:
+        return await run_refactor_swarm_live(args, adapter=adapter, lane=lane)
+
     workflows = make_workflows()
     workflow_fn = workflows.resolve(name)  # fail-loud on an unknown name
 
@@ -668,6 +825,12 @@ async def run_live(
       declines), call this tool again with the SAME ``workflow="sign_off"`` and a
       ``signoff_decision`` carrying their answer; the run continues from the gate, the
       assessment replays from the journal at zero cost, and the card flips to resolved.
+    * ``refactor_swarm`` — a real-git fix swarm: it fans out fixers across a buggy module,
+      each working in its OWN real ``git worktree`` branch, has reviewers vote on every
+      patch, then folds the approved patches into one integrated tree with a real
+      ``git merge`` — resolving a genuine merge conflict along the way — and opens a pull
+      request for the result. Pick this when the user wants several fixes made in parallel
+      and merged into a single reviewed change/PR, not a single-file edit-and-test loop.
 
     Each engine progress/span event flows through a :class:`~ui_adapter.UiAdapter`, which
     maps it to a Gen-UI component (``phase_timeline`` for phases/logs, ``fanout_graph``
@@ -685,8 +848,9 @@ async def run_live(
     Args:
         state: Injected graph state (used to anchor UI events to the host turn).
         workflow: The preset workflow to run — ``deep_research`` (default), ``capstone``,
-            ``fix_loop`` (the executable-verification build/test loop), or ``sign_off``
-            (the in-run human sign-off gate).
+            ``fix_loop`` (the executable-verification build/test loop), ``sign_off``
+            (the in-run human sign-off gate), or ``refactor_swarm`` (the real-git fix swarm
+            with a merge-conflict fold and a PR).
         workflow_args: Optional workflow arguments (e.g. ``{"question": "..."}``).
             When omitted the preset uses its own defaults. Named ``workflow_args``
             rather than ``args`` on purpose: LangChain's tool-schema generation mangles
