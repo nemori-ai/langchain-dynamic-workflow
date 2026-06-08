@@ -468,6 +468,73 @@ async def fix_loop(ctx: Ctx, args: dict[str, Any]) -> str:
     return f"still red after {max_attempts} attempts; last failure:\n{last_failure}"
 
 
+# ── in-run HITL sign-off (M4): pause mid-run for a human decision, then proceed ──
+
+DEFAULT_SIGNOFF_TOPIC = "the staging deployment plan"
+"""The thing a sign-off run asks a human to approve when ``args`` names none."""
+
+
+def _assess_prompt(topic: str) -> str:
+    """Prompt the assessment leaf to produce a brief, sign-off-ready risk summary."""
+    return (
+        f"Assess {topic} and produce a concise risk summary a human reviewer can sign off "
+        "on: name the two or three highest-risk steps and give a clear recommendation. "
+        "Keep it short."
+    )
+
+
+def _proceed_prompt(topic: str, assessment: str, note: str) -> str:
+    """Prompt the report leaf to record the approved go-ahead (folding in any note)."""
+    extra = f" Incorporate the reviewer's note: {note}." if note else ""
+    return (
+        f"The reviewer approved proceeding with {topic}. Write the short go-ahead summary "
+        f"that records the decision alongside the assessment.{extra}\n\nAssessment:\n{assessment}"
+    )
+
+
+async def sign_off(ctx: Ctx, args: dict[str, Any]) -> str:
+    """Assess a plan, PAUSE for a human sign-off, then proceed or hold on the decision.
+
+    The M4 in-run-HITL thesis made concrete: a reasoning leaf produces a risk
+    assessment, then the SCRIPT pauses at ``ctx.checkpoint`` for a person — the run
+    parks (``AWAITING_SIGNOFF``), the host surfaces the ask, and an approve feeds the
+    decision back as the call's return value. The script branches on the REAL human
+    decision (``approved``), never a model guess: an approval proceeds to publish the
+    go-ahead, a rejection holds and records the reviewer's note. The pre-gate
+    assessment replays from the journal at zero cost on approve; cross-gate state rides
+    this script's own variables, not a workspace (worktree persistence is M6). The
+    script formats no UI — the sign-off card appears through the host's park handling.
+
+    Args:
+        ctx: The orchestration context supplied by ``run_workflow``.
+        args: Workflow arguments; ``topic`` names what is being signed off (default
+            ``"the staging deployment plan"``).
+
+    Returns:
+        A short message recording whether the plan was published (approved) or held
+        (rejected), with the reviewer's note when one was supplied.
+    """
+    topic = str(args.get("topic") or DEFAULT_SIGNOFF_TOPIC)
+    ctx.phase("assess")
+    assessment = await ctx.agent(_assess_prompt(topic), agent_type="researcher")
+    ctx.phase("sign-off")
+    # The script PAUSES here for a human. The run parks until the host approves with a
+    # decision; whatever the host supplies becomes this call's return value.
+    decision = await ctx.checkpoint(
+        {"ask": f"Approve proceeding with {topic}?", "summary": assessment},
+        tag="proceed",
+    )
+    approved = bool(decision.get("approved")) if isinstance(decision, dict) else bool(decision)
+    note = str(decision.get("note", "")) if isinstance(decision, dict) else ""
+    if not approved:
+        ctx.log("sign-off declined; holding the plan")
+        held = f"held: reviewer did not approve {topic}"
+        return f"{held} ({note})" if note else held
+    ctx.phase("proceed")
+    report = await ctx.agent(_proceed_prompt(topic, assessment, note), agent_type="writer")
+    return f"proceeded with {topic}: {report}"
+
+
 # ── leaves (real deepagents when a key is present, deterministic fakes offline) ──
 
 
@@ -827,13 +894,14 @@ def make_workflows() -> WorkflowRegistry:
 
     Returns:
         A :class:`~langchain_dynamic_workflow.WorkflowRegistry` with ``deep_research``,
-        ``capstone``, and ``fix_loop``.
+        ``capstone``, ``fix_loop``, and ``sign_off``.
     """
     return (
         WorkflowRegistry()
         .register("deep_research", deep_research)
         .register("capstone", capstone)
         .register("fix_loop", fix_loop)
+        .register("sign_off", sign_off)
     )
 
 

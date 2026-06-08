@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ._concurrency import ConcurrencyGate
-from ._errors import WorkflowBudgetExceededError, WorkflowDeterminismError
+from ._errors import WORKFLOW_CONTROL_FLOW_SIGNALS
 
 Stage = Callable[[Any, Any, int], Awaitable[Any]]
 """A pipeline stage: ``(prev_result, original_item, index) -> next_result``."""
@@ -128,7 +128,7 @@ async def run_pipeline(
                     next_payload = await stage_fn(
                         envelope.payload, envelope.original, envelope.index
                     )
-                except (WorkflowBudgetExceededError, WorkflowDeterminismError) as exc:
+                except WORKFLOW_CONTROL_FLOW_SIGNALS as exc:
                     # Engine control-flow signal: do NOT mask as a leaf failure.
                     # Record the first one, drop this item, and let the run drain
                     # and re-raise after teardown (fail loud).

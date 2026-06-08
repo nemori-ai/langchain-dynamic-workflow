@@ -18,9 +18,9 @@
 | **M2** | **B 早退/取消（race）** | CONFIRMED-GAP | parallel 严格 barrier、无 first-wins/在飞取消 | 高 | 中 | 核心调度器 | ✅ 已落地 · [`02-b-journaled-race.md`](02-b-journaled-race.md) |
 | **M3.5** | **多并行 run 可观测性 + quota 接线** | NO-GAP（机制已全，残 ergonomics） | run/run_script 已后台并发、每 run 隔离 journal/budget/gate；缺聚合 `runs` 命令、`workflow_runs` 落定不刷新、quota 接线静默忽略 | 中（直接答需求 ②） | 低 | 现有 `BgRunManager`（无硬依赖，**可先于 M3**） | ✅ 已落地 · [`03-m3.5-run-observability.md`](03-m3.5-run-observability.md) |
 | **M3** | **D 跨会话持久** | CONFIRMED-GAP（超集赢面：跨进程零成本 resume，CC 仅同会话） | 接缝在但只有内存 store/saver、host 用进程内 dict | 高（超集赢面） | 中 | journal/checkpointer 接缝 | ✅ 已落地 · [`04-m3-cross-session-persistence.md`](04-m3-cross-session-persistence.md) |
-| **M4** | **C 运行中 HITL 签核** | CONFIRMED-GAP（底座现成） | 全无 interrupt/pause；LangGraph `interrupt` 未 import 暴露 | 中–高（超集赢面） | 中 | M3（持久化）+ LangGraph interrupt | 待写 |
-| **M5** | **A 循环内可执行验证** | CONFIRMED-GAP | worktree seeding 有，但 execute 是离线 no-op echo、无真子进程/exit-code gating | 最高（Bun 旗舰案） | 高 | G2 worktree | 待写 |
-| **M6** | **I 真 git worktree + 分支/PR** | CONFIRMED-GAP（接缝预留） | 只有 InMemoryWorktreeProvider；无真 git/分支/PR | 高 | 高 | M5（真执行） | 待写 |
+| **M4** | **C 运行中 HITL 签核** | CONFIRMED-GAP（底座现成） | 全无 interrupt/pause；LangGraph `interrupt` 未 import 暴露 | 中–高（超集赢面） | 中 | M3（持久化，✅） | ✅ 已落地 · [`05-m4-c-in-run-hitl.md`](05-m4-c-in-run-hitl.md) |
+| **M5** | **A 循环内可执行验证** | CONFIRMED-GAP | worktree seeding 有，但 execute 是离线 no-op echo、无真子进程/exit-code gating | 最高（Bun 旗舰案） | 高 | G2 worktree | ✅ 已落地（引擎 #14 + demo 消费 #15） |
+| **M6** | **I 真 git worktree + 分支/PR** | CONFIRMED-GAP（接缝预留） | 只有 InMemoryWorktreeProvider；无真 git/分支/PR | 高 | 高 | M5（真执行，✅ 已解锁） | 待写 |
 | **M7** | **H 拓扑序 fan-out + 深层命名嵌套** | CONFIRMED + PARTIAL | 无 DAG/偏序调度；`workflow()` 硬限 1 层 | 中 | 中–高 | 核心调度器 | 待写 |
 
 **后续里程碑（待写）：**
@@ -132,13 +132,15 @@
 
 **验收门：** #7 OpenHands 式"合并进集成分支前人审"或 #6 安全审计"风险分级后签核再出报告"为 E2E；集成示例展示暂停→批准→续跑。
 
-**依赖：** M3（持久化——HITL 暂停天然需要跨会话存活）+ LangGraph interrupt。
+**依赖：** M3（持久化——HITL 暂停天然需要跨会话存活，**✅ 已落地**）+ LangGraph interrupt。
 
-### M5 · A — 循环内可执行验证（real execution backend）
+### M5 · A — 循环内可执行验证（real execution backend）【✅ 已落地】
 
 **目标：** 让 worktree leaf 能在循环内**真实 build + 跑测试**并把 exit-code/输出喂回脚本分支（in-loop executable verifier），而非现在的 LLM 评审循环。
 
-**对比证据（现状）：** worktree seeding 有（`_sandbox.py:455-476`）；但 `execute` 是离线 no-op echo、永远 exit_code=0、不起 shell（`_sandbox.py:175-189`，`_GuardedBackend.execute` 仅委派 `:905-907`）；`src/` 无任何真 subprocess（grep clean）；无 exit-code gating、无慢命令纪律钩子。
+**落地形态（as-built）：** 引擎侧 `LocalSubprocessSandbox`（完整 `SandboxBackendProtocol`）——真子进程执行、POSIX rlimits 经 `preexec_fn`、超时→进程组 kill（SIGTERM→宽限→SIGKILL，exit 124）、有界输出 drain、exit-code gating、可插拔 `SandboxManager(sandbox_factory=...)`、`ExecPolicy`/`ExecGate` admission（危险操作 opt-in，**非** sandbox）；外加命令可观测 `on_command`/`CommandEvent` sink（keyword-only、默认 no-op、miss-only、在真子进程执行边界触发、关联 leaf span）。demo 消费切片：`fix_loop` 预设——**脚本拥有循环、跨轮状态走脚本变量**（无持久 workspace、不依赖 M6），分支据**真 exit code**（非模型布尔）；`TerminalCard` Gen-UI 卡（running/passed/failed 原地翻面）；`code_fixer` 执行 roster；"Make it pass" 场景。引擎 PR #14（`665d030`）+ demo 消费 PR #15（`6bfd42d`），机制详见 [`design_docs/01-engine-mechanism.md`](../01-engine-mechanism.md)、接线见 [`design_docs/02-architecture.md`](../02-architecture.md)。
+
+**对比证据（落地前现状）：** worktree seeding 有（`_sandbox.py:455-476`）；但 `execute` 是离线 no-op echo、永远 exit_code=0、不起 shell（`_sandbox.py:175-189`，`_GuardedBackend.execute` 仅委派 `:905-907`）；`src/` 无任何真 subprocess（grep clean）；无 exit-code gating、无慢命令纪律钩子。
 
 **范围（重）：** 真执行后端（真 subprocess/shell，带超时与资源界）；脚本可读 `ExecuteResponse.exit_code/output` 分支；吞吐纪律钩子（禁慢命令/fast-path，对应 Bun"禁 git/cargo"）。安全：执行必须在 AST-gated/sandboxed 路径内（遵 AGENTS.md 安全红线）。
 
@@ -156,7 +158,7 @@
 
 **验收门：** #7 OpenHands 式 refactor swarm（分支隔离→verifier→PR 进集成分支）缩比 E2E；集成示例展示真 git worktree 接线。
 
-**依赖：** M5（真执行——分支里要能 build/test）。
+**依赖：** M5（真执行——分支里要能 build/test，**✅ 已落地，本里程碑已解锁**）。M5 的 `fix_loop` 已暴露对跨轮 worktree 隔离的诉求（当时以脚本变量兜底，正式隔离顺延至本里程碑）。
 
 ### M7 · H — 拓扑序 fan-out + 深层命名嵌套
 
@@ -199,7 +201,9 @@ M1 的真模型 E2E 过程中浮现两条值得后续处理的信号：
 - **M2（B race）**：✅ 已落地。`ctx.race` best-of-N 早退/取消原语 + `_race_types`（`RaceCandidate`/`RaceResult`）+ `race_key`（content-hash journal，namespaced + win_tag-folded）+ `SpanKind.RACE`；两值类型经包根导出 + `run_script` 命名空间注入；SKILL.md 增补 race quality / parallel-vs-race / win_tag footgun 范式；`examples/13` AI-SRE 多假设 race demo。真流式与混合 schema race 为明确非目标；**E（批处理人体工学）已拆出为自己的后续里程碑（待写）。** Codex 跨模型评审驱动两处修复：replay 改记 winner 的 leaf-key（杜绝与后续相同 `agent()` 调用的预算双计）、teardown 的 depth/任务创建移入 `try`（对齐 `parallel`/`pipeline`），全门 347 passed。Plan = [`02-b-journaled-race.md`](02-b-journaled-race.md)。
 - **M3.5（多并行 run 可观测性）**：✅ 已落地（fast-follow，先于 M3）。聚合 `runs` 命令（`BgRunManager.list_runs` → `RunSnapshot` 只读快照，工具 join workflow label）+ `workflow_runs` 落定刷新（`merge_workflow_runs` reducer 按 `run_id` upsert，`abefore_model` 落定改写终态）+ quota 接线去歧义（**偏离调研字面建议**:不往 `create_workflow_tool` 加 `max_concurrent_runs`——它不构造 manager,加了要么被忽略要么双源;改为 `create_workflow_middleware` 在显式 `manager` + `max_concurrent_runs` 同传时抛 `ValueError`,quota 归 `BgRunManager`)。`examples/14` host 多-run 聚合视图 demo + 集成测试。Plan = [`03-m3.5-run-observability.md`](03-m3.5-run-observability.md)。
 - **M3（D 跨会话持久）**：✅ 已落地（超集 CC）。`WorkflowRunStore` 协议 + `RunSpec`（携规范 `journal_run_id` 谱系）+ `InMemoryRunStore`（默认、零依赖）+ `SqliteWorkflowStore`（`[sqlite]` extra：一个统一 sqlite db 文件、run_id 命名空间化四表 `run_specs`/`journal_records`/`journal_sequence`/`journal_progress`，外加第二条连接上的持久 `AsyncSqliteSaver` checkpointer），包根 lazy 导出、base 安装保持零依赖。头条——**全新进程指向同一 db 文件按 `run_id` resume、完成叶从持久 journal 零模型成本重放**——已交付且真模型 + 真子进程 E2E 钉死（journal 交付零成本、checkpointer 是 durable add-on）。评审驱动的硬化：journal-lineage 规范 id（`journal_run_id` 同 key journal 谱系与 checkpoint thread，host thread 仅 key manager slot，distinct run 不撞、resume 重接原 thread）、per-run checkpoint thread、save-before-start（spec 先于 `manager.start` 持久、quota 拒入则 `delete_spec` 回滚）、schema-version guard（`PRAGMA user_version` fail-loud on incompatible）、strict-msgpack 诚实（叶子状态保持 msgpack-friendly）。Plan = [`04-m3-cross-session-persistence.md`](04-m3-cross-session-persistence.md)。
+- **M5（A 循环内可执行验证）**：✅ 已落地（双轨：引擎 #14 + demo 消费 #15）。引擎 `LocalSubprocessSandbox`（真子进程 + rlimits + 超时进程组 kill + exit-code gating + `SandboxManager(sandbox_factory=...)` + `ExecPolicy`/`ExecGate` admission）+ 命令可观测 `on_command`/`CommandEvent`（keyword-only、默认 no-op、miss-only、真执行边界触发、关联 leaf span）。demo 消费 `fix_loop`（脚本拥有循环、跨轮状态走脚本变量、分支据真 exit code）+ `TerminalCard` + `code_fixer` roster + "Make it pass" 场景。五层验收过门（gate → 双轨评审 Codex 抓两处 in-house 漏掉的 HIGH → /cso → 真模型 host-driven E2E 抓两处仅真跑暴露的 blocker → 用户实测 leaf-quarantine UI 泄漏修复）。无独立 plan 文件（经 demo-app 切片落地）。
 - **M1.5（多阶段 / 并行-run 作者范式，doc-only）**：**待写**。补 SKILL.md 多阶段脚本结构 / scout-then-fan-out / host 多并行 run 范式 + 作者陷阱;搭后续顺风车。
-- **M4–M7**：roadmap 已排定，impl plan 逐里程碑增补。E（批处理人体工学）从 M2 拆出，作后续里程碑待写。
+- **M4（C 运行中 HITL 签核）**：✅ 已落地（超集 CC——运行中接受人工输入）。`ctx.checkpoint` **journal 驱动的签核门**(C8 spike 否决 LangGraph 原生 `interrupt`:其 index-based `@task` 缓存与 content-hash journal 短路在 resume 时错位)——脚本暂停抛 `WorkflowSignoffRequired`、host 经 `approve` 命令注入决策续跑、门前叶零成本重放。新态 `BgStatus.AWAITING_SIGNOFF` + `BgRunManager.approve`(同步翻 RUNNING 杜绝双批);双轨:引擎 + demo 消费(`sign_off` 预设 + `SignoffGate` 卡片 + 内联 park/resume via `_ResumeLane`)。双轨评审(Codex `gpt-5.5` + in-house,7 findings 全修:approve 竞争、跨进程授权缺口、门键漂移、park 配额泄漏、AST gate 禁 checkpoint、进度重叙、JSON 决策)。真模型 host-driven 两轮 E2E 实跑过门(真 host 自主 route→park→经 `signoff_decision` 答门→proceed)。Plan = [`05-m4-c-in-run-hitl.md`](05-m4-c-in-run-hitl.md)。
+- **M6–M7**：roadmap 已排定,impl plan 逐里程碑增补。M6（I 真 git/PR）已被 M5 解锁。E（批处理人体工学）从 M2 拆出,作后续里程碑待写。
 
-> **执行序列：** M1 F ✅ → M2 B(race) ✅ →〔M3.5 多并行 run 可观测性 ✅ + M1.5 doc-only（待写），轻量 fast-follow，可先于 M3〕→ M3 D ✅ → M4 C → M5 A → M6 I → M7 H（E 批处理人体工学已从 M2 拆出，作后续里程碑待写）。F 首刀（接 G1+G4，纯编排层最干净）；B 紧随修核心原语；M3.5/M1.5 收口需求②并点亮需求①已有能力；D 已落地（跨进程零成本 resume，超集 CC）；C 承 M3 持久化走超集；A/I 配对成重基建 epic；H 收尾引擎机制增强（吸收需求①的命名嵌套 + DAG 残项）。
+> **执行序列：** M1 F ✅ → M2 B(race) ✅ →〔M3.5 多并行 run 可观测性 ✅ + M1.5 doc-only（待写），轻量 fast-follow，可先于 M3〕→ M3 D ✅ → M5 A ✅（提前于 M4 落地，重基建先行）→ M4 C ✅ → M6 I（已解锁，下一刀）→ M7 H（E 批处理人体工学已从 M2 拆出，作后续里程碑待写）。F 首刀（接 G1+G4，纯编排层最干净）；B 紧随修核心原语；M3.5/M1.5 收口需求②并点亮需求①已有能力；D 已落地（跨进程零成本 resume，超集 CC）；C 承 M3 持久化走超集；A/I 配对成重基建 epic；H 收尾引擎机制增强（吸收需求①的命名嵌套 + DAG 残项）。

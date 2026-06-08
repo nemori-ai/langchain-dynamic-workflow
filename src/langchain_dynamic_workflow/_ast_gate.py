@@ -19,6 +19,9 @@ What the gate rejects:
 - ``str.format`` / ``str.format_map`` — a format spec can traverse attributes
   (``"{0.__class__}".format(obj)``), a vector a source scan of the string literal
   cannot see; f-strings carry no such risk and are allowed.
+- ``ctx.checkpoint`` — in-run human sign-off is a registered-workflow capability,
+  not an authored-script one (an authored run has no resume lane and could park a
+  quota slot indefinitely).
 
 What the gate deliberately ignores: determinism. Non-determinism that changes the
 observable ``agent()`` call pattern is caught at runtime by the journal-divergence
@@ -63,6 +66,16 @@ _BANNED_NAMES = frozenset(
 _BANNED_ATTRS = frozenset({"format", "format_map"})
 """String-formatting methods that can traverse attributes via a format spec."""
 
+_BANNED_CTX_METHODS = frozenset({"checkpoint"})
+"""``ctx`` methods an authored script may not call.
+
+``ctx.checkpoint`` pauses a run for a human sign-off (parking it indefinitely). That
+is a deliberate capability of a *registered* (trusted, hand-written) workflow, not of
+an LLM-authored script: an authored run has no resume lane to be approved against and
+could park a quota slot forever, so the gate denies it (defense-in-depth alongside the
+reasoning-only roster, which already restricts which ``agent_type`` an authored script
+can reach)."""
+
 
 def validate_workflow_source(source: str) -> None:
     """Reject an untrusted orchestration script that violates the security gate.
@@ -102,6 +115,14 @@ def validate_workflow_source(source: str) -> None:
             elif node.attr in _BANNED_ATTRS:
                 violations.append(
                     (node.lineno, f"str.{node.attr}() attribute access (use an f-string instead)")
+                )
+            elif node.attr in _BANNED_CTX_METHODS:
+                violations.append(
+                    (
+                        node.lineno,
+                        f"ctx.{node.attr}() is not allowed in an authored script "
+                        "(in-run human sign-off is a registered-workflow capability)",
+                    )
                 )
         elif isinstance(node, ast.Name):
             if _DUNDER_PATTERN.match(node.id):

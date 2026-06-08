@@ -247,6 +247,33 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 
 接线:`create_workflow_middleware(roster, workflows=wf, store=store, checkpointer=store.checkpointer, ...)`(或 `create_workflow_tool` 同 `store=`/`checkpointer=` kwargs);`store=` 省略时回落 `InMemoryRunStore`。详细 host 接线见 [02 §10](02-architecture.md),时序见 [uml/03-sequence.md](uml/03-sequence.md) D 图。
 
+## 14. 运行中 HITL 签核（M4,已落地——超集 Claude Code）
+
+脚本可在阶段间**暂停等人工签核**再续:`ctx.checkpoint(ask, *, tag="")` 把运行停在一道门,host 拿到决策后以 `run_workflow(..., resume=value)` 续跑,该 value 即 `checkpoint()` 的返回值。Claude Code 运行中不接受输入,本端口超集之。
+
+### 关键决策:签核门走 journal,**不**用 LangGraph 原生 `interrupt`（C8 spike 否决）
+
+spike(`@entrypoint`+`@task` 真跑 interrupt/resume,langgraph 1.2.2)证实 interrupt 路线有**致命缺陷**:checkpointer 的 `@task` 重放缓存是 **index-based**(第 N 次 `leaf_task` 调用 → 缓存槽 N),而 `agent()` 在 journal 命中时**短路、不调 `leaf_task`**;于是 resume 时前置叶 A 走 journal 短路、不调 task,叶 B 的 task 调用落到槽 0,被 checkpointer 喂回 **A 的缓存**(实测复现 `b == A 的结果`)。M3 崩溃-resume 靠 resume 侧 `checkpointer=None` 规避,但 interrupt-resume 本要复用同一 checkpointer,矛盾炸出。**故弃 interrupt,改 journal 驱动**:与"journal 是真相源、checkpointer 是 add-on"哲学(§13b 不变量 a)一致,且无需 checkpointer(H7 消失)。
+
+### 机制（journal 驱动的签核门）
+
+`ctx.checkpoint`:门按 `signoff_key(position, tag)` 取键(position = 本 run 第几个 checkpoint 调用,namespaced `"signoff"`,与 leaf/race 键不撞);查 journal——① 有记录决策 → 重放(零成本);② 无记录但有待注入的 `pending_signoff`(来自 approve) → 写入决策并消费、返回;③ 否则 raise `WorkflowSignoffRequired(ask, tag, gate_key)`。park 与 approve 是**两次独立 `run_workflow` 调用**,各自一次 `.ainvoke`(各持自己的 per-call `InMemorySaver`),journal 是唯一跨调用缓存——`@task` index 缓存绝不跨两次,故不会错位。`run_workflow(resume=)` 经 `Ctx(pending_signoff=)` 注入,首个未决门消费;`UNSET`(常量命名的共享哨兵,非 `None`)区分"未注入"与"注入 None"。
+
+### 载重不变量
+
+| # | 不变量 | 为何载重 |
+|---|---|---|
+| (a) | **签核是 depth-0 原语(fan-out 守卫)** | 门由序号(checkpoint 调用顺序)定身份;在 `parallel`/`pipeline`/`race` 帧内,序号会被并发 thunk 竞争 → 键非确定 → 重放崩,且并发到达的多门无序可供顺序人审。`_FANOUT_DEPTH>0` 时抛 `WorkflowCheckpointError`,并将其并入共享 `WORKFLOW_CONTROL_FLOW_SIGNALS`,故 fan-out 内触发会 fail-loud(绝不被 mask 成 `None` 空洞)。 |
+| (b) | **脚本体在 approve 时从头重执行(D4 边界)** | journal 重放门的**决策**(零成本),但脚本**代码**重跑:门前 `agent()` 走 journal 缓存,但脚本里的非幂等副作用(如外部 append)会重复。最终**结果**正确;副作用重复是已记录边界(同 §13b 失败-重试语义)。**进度叙述不再重发**——签核 park 被当作 designed-stop(非崩溃),引擎在 park 时持久 `progress_count`(仅它、不持久 sequence,以免 approve 多出的调用触发 determinism guard 的 extra-calls 检查),故 approve 不重叙门前 phase/log(评审 M4 硬化)。 |
+| (c) | **无 checkpointer 要求(对比 interrupt)** | 决策走 journal 注入,非 checkpointer 的 interrupt 状态。`checkpointer=None` 即可工作;同会话 approve 复用内存 journal,持久 journal(§13b)让门前工作跨进程零成本重放。 |
+| (d) | **/shared/ artifact 不跨签核门存活** | per-run `SharedArtifactStore` 在 approve 重启时重建为空;门前叶重放其**结果**但不重填 `/shared/`——同崩溃-resume 边界。跨门状态须走脚本变量(M5 fix_loop 范式),真 worktree 持久是 M6。 |
+| (e) | **门入确定性序列(漂移 fail-loud)** | `checkpoint` 把门键 `signoff_key(position, tag)` 经 `sequence_guard.observe` 记入与叶调用同一条有序序列,故全量 resume 时门顺序/身份漂移(前面插/删了叶或门、或同位换了 tag)**失声而抛**而非把决策静默绑错门(叶漂移 fail-loud,门也须)。门身份是 `(position, tag)`——`ask` 因可能携非确定内容(如模型评估)被排除出键,故**不同门必须用不同 tag**,且编辑脚本门/叶结构会作废 parked journal(同叶键边界)。评审 M5 硬化。 |
+| (f) | **决策必 JSON-可序列化 + 消费前序列化** | 决策被 `json.dumps` 记进 journal;`checkpoint` 在**消费 pending 之前**序列化,故非 JSON 决策抛清晰 `WorkflowCheckpointError` 且门保持未决(仍可重批),不丢值不留半门。评审 Codex#4 硬化。 |
+
+### host 面(BgRunManager + workflow tool)
+
+`BgStatus.AWAITING_SIGNOFF`(**非终态**,计入 `active_run_count`)。`_run_wrapped` 在 `CancelledError` 之后、泛 `Exception` 之前捕 `WorkflowSignoffRequired` → `_park`(存 ask、记 `parked_at`、入一条 notice)。`BgRunManager.approve(coro, run_id, thread_id)` 就地复用 parked slot(**同 run_id**,host 据 id 跨暂停追踪),且**先同步把 slot 翻 `RUNNING` 再排续跑**——杜绝双 approve 竞争(否则第二次 approve 仍见 `AWAITING_SIGNOFF`、过守卫、孤儿化第一个续跑,两个续跑撞同一 journal,评审 H1)。workflow tool 的 `approve` **只批准本进程在活的 parked run**:parked 态(在哪道门、ask)只在内存 manager、未持久化,故 swept/跨进程的 `UNKNOWN` run 无法核实其确在门上——从持久 spec 重启会有把**非 parked run 推过人没看过的门**的授权缺口(评审 M1/Codex#3),故拒批;跨会话 HITL 待持久 park 态,列后续里程碑。引擎兜底:注入了 `resume` 决策却无门消费(run 完成时 `pending_signoff` 仍在)→ **fail-loud** `WorkflowCheckpointError`(签核决策绝不静默丢)。abandoned 的 park 由 `sweep` 经 `park_ttl_seconds` 过期成 `CANCELLED`(防永久占 quota,评审 M2;活的签核仍能 approve)。AST gate **禁 authored 脚本调 `ctx.checkpoint`**(签核是注册工作流能力,authored run 无 resume lane、且会占 quota——评审 M3,防御纵深叠在 reasoning-only roster 上)。`status`/`runs` 暴露 `awaiting_signoff` + ask;`resume`(崩溃重放,无值注入)与 `approve`(注入人工决策)是不同动词。详见 [02 §11](02-architecture.md),时序见 [uml/03-sequence.md](uml/03-sequence.md) G 图。
+
 ---
 
 > 信源(版本锚定 langgraph 1.2.2 / langchain 1.3.2 / langchain-core 1.4.0 / deepagents 0.6.7):见 `research/`。

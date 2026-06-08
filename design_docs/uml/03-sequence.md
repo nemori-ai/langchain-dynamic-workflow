@@ -251,3 +251,51 @@ sequenceDiagram
 ```
 
 **要点**:**执行变真无需改引擎**——只需 build-time 注入工厂;lease/`_GuardedBackend`/teardown 路径原样复用(`_GuardedBackend.execute` 已委派被租隔离后端、`isinstance(SandboxBackendProtocol)` 闸已纳)。`execute` 跑在 deepagents 的 `aexecute → to_thread(self.execute)` worker 上,故 `ExecGate` 是**跨线程** `threading.BoundedSemaphore`(`finally` 必还闸位)、与叶级 asyncio `ConcurrencyGate` **正交**;一工厂一闸 ⇒ 一 run 并发 exec 上限全局。`before_execute` 是**准入控制**(allow / reject 返 126 不 spawn / 缩超时只可收紧 / 降 cap / 选 `RLimitProfile`),非可观测性 sink。命令可观测性走**专门的带外 sink `on_command`**——execute 体内在 spawn 前后发成对 `CommandEvent`(`"start"`/`"end"`,共享 resume 稳定 `command_id`、携 `leaf_span_id`),是 `on_leaf_event` 在执行面的同构 sink:miss-only(journal 命中叶不 lease 不跑 subprocess 故零 command 事件;`InMemorySandbox` 无真 execute 边界不发),`output` 默认截尾、`command_include_payloads` 才带全量;引擎仅在 lease 真后端时经 `set_command_sink` 接上,begin 边画 running card 后纵 spawn 失败也以同 `command_id`/`exit_code=127` 补发 end 边再抛(card 绝不卡死)。有界抽干跑在 worker、调用线程 `wait(超时)`:超时则 POSIX `killpg` SIGTERM→grace→SIGKILL 整组杀(`start_new_session` 连子孙)、码 124;每路 `finally` reap + join + close,**无僵尸/孤儿/漏线程/漏 fd**。rlimit 经**最小化 `preexec_fn`**(父进程预算 soft/hard 值、子侧只 `setrlimit` 不分配/不 import/不取锁,故 fork-then-exec 窗口内安全;不另起 `python -c` wrapper 省每命令一次解释器启动),默认 generous-but-bounded profile ON(POSIX;Windows best-effort 无 rlimit/无进程组)。teardown `close()` 删临时根、幂等。诚实非目标:per-leaf 临时根只界定默认工作目录、**非安全 sandbox**(命令仍能经绝对路径读写宿主 FS / 用网络 / 超 best-effort rlimit 耗资源);container/cgroup/网络隔离与真 git-worktree 后端在 backlog。
+
+## G — 运行中 HITL 签核（M4:暂停在门 → AWAITING_SIGNOFF → approve 注入决策续跑）
+
+```mermaid
+sequenceDiagram
+  participant U as 人(host/UI)
+  participant T as workflow tool
+  participant M as BgRunManager
+  participant W as run_workflow (一次 .ainvoke)
+  participant C as Ctx.checkpoint
+  participant J as journal (per-run, 跨调用持久)
+
+  Note over U,J: 回合 1 — run 停在签核门
+  U->>T: run <workflow>
+  T->>M: start(coro = run_workflow(...))  (后台)
+  M->>W: 执行脚本
+  W->>C: ctx.agent(门前叶) → 记入 journal
+  W->>C: ctx.checkpoint(ask, tag)
+  C->>J: get(signoff_key(position, tag))
+  alt 无记录决策 且 无 pending_signoff
+    C-->>W: raise WorkflowSignoffRequired(ask, gate_key)
+    W-->>M: 异常冒泡(注:门前叶已 journal,但 finalize/put_sequence 不跑 → D4 重叙述边界)
+    M->>M: _run_wrapped 捕获 → _park: slot.status=AWAITING_SIGNOFF, slot.ask=ask, 入 notice
+  end
+  U->>T: status <run_id>
+  T-->>U: awaiting_signoff + ask(如何 approve)
+
+  Note over U,J: 回合 2 — approve 注入人工决策,续跑
+  U->>T: approve <run_id> args={"approved": true, ...}
+  alt 本进程在活的 parked slot (status==AWAITING_SIGNOFF)
+    T->>M: approve(coro2 = run_workflow(resume=decision), run_id) — 先同步翻 RUNNING(杜绝双批竞争)再就地替换 slot.task(同 run_id)
+  else UNKNOWN(swept / 跨进程)— parked 态未持久化,无法核实确在门上
+    T-->>U: 拒批("not awaiting sign-off on this process";以免把非 parked run 推过门)
+  end
+  M->>W: 重执行脚本(从头)
+  W->>C: ctx.agent(门前叶) → journal 命中,零成本重放
+  W->>C: ctx.checkpoint(ask, tag)
+  C->>J: get(signoff_key(position, tag))
+  alt 无记录决策 但有 pending_signoff
+    C->>J: put(signoff_key, decision) 并消费 pending
+    C-->>W: 返回 decision(脚本据真人工决策分支)
+  end
+  W-->>M: 干净返回结果 → slot.status=DONE
+  U->>T: status <run_id> → done + result
+  Note over T,J: demo 内联路:run_workflow_live 捕 WorkflowSignoffRequired,经 _ResumeLane 跨轮持久 journal 续跑;awaiting/approved 卡片同 event_id=signoff-{gate_key} 原地翻面
+```
+
+**要点**:签核门**走 journal,不用 LangGraph 原生 `interrupt`**(C8 spike 否决:checkpointer 的 `@task` index 缓存与 content-hash journal 短路在 resume 时错位,实测叶 B 拿到叶 A 缓存)。park 与 approve 是**两次独立 `run_workflow` 调用**,各持自己的 per-call `InMemorySaver`,journal 是唯一跨调用缓存 ⇒ 无 `@task` index 错位、`checkpointer=None` 即可、跨进程骑持久 journal。门按 `signoff_key(position, tag)` 取键(序号 = 本 run 第几个 checkpoint 调用),故 `ctx.checkpoint` 是 **depth-0 原语**(fan-out 内序号竞争 → 抛 `WorkflowCheckpointError`,已并入 `WORKFLOW_CONTROL_FLOW_SIGNALS` fail-loud)。`AWAITING_SIGNOFF` 非终态、计入 `active_run_count`(abandoned park 由 `sweep` 经 `park_ttl_seconds` 过期回收)。`approve` **只批准本进程在活的 parked run**:`BgRunManager.approve` 先同步翻 `RUNNING` 再排续跑(杜绝双批竞争出孤儿续跑),就地复用 parked slot(**同 run_id**,卡片据 id 跨暂停原地更新);UNKNOWN(swept/跨进程)拒批——parked 态未持久化,无法核实确在门上(评审 M1)。`approve`(注入人工值)与 `resume`(崩溃重放、无值注入)是不同动词。脚本体在 approve 时从头重执行 ⇒ 门前叶决策走 journal 重放免费,但非幂等脚本副作用重复(D4 边界);**进度叙述不再重发**(park 时持久 progress_count)。安全:门入确定性序列(漂移 fail-loud)、决策须 JSON-可序列化(消费前序列化)、注入决策无门消费 → fail-loud、authored 脚本经 AST gate 禁 `ctx.checkpoint`。机制见 [01 §14](../01-engine-mechanism.md),host 接线见 [02 §11](../02-architecture.md)。

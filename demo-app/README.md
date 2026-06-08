@@ -140,10 +140,10 @@ online-path only; the offline scripted path stays deterministic and credential-f
 
 ---
 
-## The five scenarios
+## The six scenarios
 
-The chat ships five preset buttons. Their canonical wording lives in
-`scenarios.json`; the frontend's `ScenarioPanel` carries the same five messages, and
+The chat ships six preset buttons. Their canonical wording lives in
+`scenarios.json`; the frontend's `ScenarioPanel` carries the same six messages, and
 a backend doc-sync test pins the two copies byte-for-byte (and pins the README's
 scenario count to the same source) so they cannot drift. Each is phrased as a real
 user's request, not a tool instruction — click one, or type your own. Here is what each
@@ -215,6 +215,24 @@ spent — never a false pass. (Offline-fake caveat: with no key the `code_fixer`
 deterministic fake that runs no subprocess, so the offline run proves the script-owned
 loop and the real exit-code gating logic but emits no live TerminalCard; add a key to see
 a real model shell out and the cards stream.)
+
+### 6. Sign off mid-run — pause for human approval
+> *"Before you actually run the staging deployment, I want to sign off on the plan
+> myself — walk me through the riskiest steps and pause for my approval before you
+> proceed."*
+
+**In-run human-in-the-loop sign-off.** The host assesses the plan, then the
+**script pauses** at a `ctx.checkpoint` gate and waits for a person — superset over
+Claude Code, which takes no input mid-run. The run parks (status `awaiting_signoff`)
+and surfaces a **SignoffGate** card with the question and Approve / Reject buttons.
+Clicking one (or just typing your answer) feeds the decision back into the *same*
+paused run: the pre-gate assessment **replays from the journal at zero cost**, the
+script branches on the **real human decision** (not a model guess), and the card flips
+in place to `approved` / `rejected` while the run proceeds or holds. The pause and
+resume ride the engine's content-hash journal — the same persistence substrate as
+"pick it back up" — so the gate is deterministic and resumable, not a fragile
+mid-flight interrupt. (Cross-gate state rides the script's own variables; real
+per-leaf git worktrees are a later milestone.)
 
 ---
 

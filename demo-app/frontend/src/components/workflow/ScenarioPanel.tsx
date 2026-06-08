@@ -7,8 +7,9 @@
  *
  * The presets exercise the headline capabilities: a hard multi-source research task,
  * picking a long-running task back up, a task with no ready-made procedure, handing off
- * a heavy multi-step job to run detached in the background, and fixing real code in a
- * loop until its tests genuinely go green (real in-loop executable verification).
+ * a heavy multi-step job to run detached in the background, fixing real code in a loop
+ * until its tests genuinely go green (real in-loop executable verification), and pausing
+ * mid-run for a human sign-off before proceeding.
  */
 
 interface Scenario {
@@ -60,6 +61,14 @@ const SCENARIOS: readonly Scenario[] = [
       "Please actually fix the code and keep checking it against the tests until " +
       "they genuinely pass — don't just tell me it looks right, prove it builds " +
       "and the tests go green.",
+  },
+  {
+    label: "Sign off mid-run",
+    hint: "pause for human approval",
+    message:
+      "Before you actually run the staging deployment, I want to sign off on the " +
+      "plan myself — walk me through the riskiest steps and pause for my approval " +
+      "before you proceed.",
   },
 ];
 
