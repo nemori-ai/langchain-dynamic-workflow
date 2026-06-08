@@ -22,7 +22,7 @@ The set has exactly two layers, with different rules:
   search → extract → adversarial verify → synthesize) on live models with native web
   search and prompt caching. A flagship is expensive to maintain and is **not added
   casually** — the bar is a genuinely new end-to-end story, not a new single feature.
-- **Feature demos** (`features/`, 16 demos): each demonstrates **exactly one**
+- **Feature demos** (`features/`, 17 demos): each demonstrates **exactly one**
   mechanism, runs **fully offline and deterministically**, and needs **no API key**.
   They use the shared scripted fakes in `_shared/offline_models.py`, so they are fast,
   reproducible, and safe to run in CI.
@@ -36,7 +36,7 @@ This table is the authoritative index of every demo. The two flagships:
 | `flagship/deep_research_preset` | Real-model host drives the **registered** `deep_research` workflow: parallel search → extract → adversarial verify → synthesize, with native web search + prompt caching; schema-as-handoff and reduce are embedded in the registered workflow. |
 | `flagship/deep_research_authored` | Real-model host **authors** the deep-research script live and submits it via `run_script` (AST-gate happy path), then runs it on the same web-search + caching leaf stack. |
 
-The 16 feature demos, one mechanism each:
+The 17 feature demos, one mechanism each:
 
 | Demo | Single mechanism |
 |---|---|
@@ -52,6 +52,7 @@ The 16 feature demos, one mechanism each:
 | `features/persistence` | cross-session sqlite store: proc1 launches → "restart" → proc2 resumes, zero-cost replay (an offline counter proves the replay is free). |
 | `features/sandbox` | per-leaf sandbox isolation + `/shared/` artifact handoff. |
 | `features/worktree` | worktree-isolated fix swarm (parallel fixers cannot see each other's edits). |
+| `features/git_worktree` | real-`git` worktree fix swarm: per-leaf `git worktree` isolation, the engine folds the real `git diff` as the authoritative changeset, a script-owned `git merge` conflict loop resolves an overlap, and the host opens a PR (zero API key; needs `git` on PATH). |
 | `features/readonly_judge` | `read_only_leaf`: a judge is denied at the tool boundary even when asked to write. |
 | `features/ast_gate` | meta-layer safety seam: an unsafe script → precise AST-gate rejection → rewrite → run. |
 | `features/host_integration` | `create_workflow_tool` / `create_workflow_middleware` wired into a scripted host; the host launches N background runs and views the aggregate runs board. |
@@ -68,7 +69,9 @@ Read in this order to build up from a single leaf to the full flagships:
 5. `race` — best-of-N early exit and journaled cancel.
 6. `nesting` — composing a named sub-workflow.
 7. `host_integration` — wiring the runtime into a host and watching many runs.
-8. `sandbox` → `worktree` → `readonly_judge` — isolation and tool-boundary guards.
+8. `sandbox` → `worktree` → `git_worktree` → `readonly_judge` — isolation
+   (in-memory then real-`git`, with an authoritative diff + script-owned merge) and
+   tool-boundary guards.
 9. `ast_gate` — the meta-layer reject-and-retry seam.
 10. `flagship/deep_research_preset` → `flagship/deep_research_authored` — the full
     real-model combination, registered vs. authored live.

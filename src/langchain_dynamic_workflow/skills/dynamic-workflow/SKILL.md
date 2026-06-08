@@ -441,6 +441,64 @@ decision: the second silently replays the first's winner instead of applying you
 new criterion. A race that finds **no** winner is not journaled (a resume may retry
 it); if you want every result regardless of a bar, use `parallel`, not `race`.
 
+**Real-git worktree fix swarm with a script-owned conflict loop.** When the work
+is *editing a real repository* — a fix swarm, a codemod, a migration — give each
+file-mutating leaf its own real `git worktree` (an isolation the host wires once).
+Each leaf branches from the base repo, edits on its own tree, and cannot see a
+sibling's edits; the changeset folded back is the **real `git diff`** of that tree,
+not whatever the model claims it wrote — so a leaf that drifts from its own
+self-report cannot corrupt the integration. A worktree leaf's `schema` must carry a
+`files: dict[str, str]` field for that authoritative diff to land in; the engine
+fills it from the on-disk truth and overrides the model's bytes.
+
+The point of control-flow inversion here is that **the script owns the merge**, not
+a model. Fan out the fixers in parallel, keep the approved patches, then fold them
+into an integration tree in a deterministic Python loop — one journaled merge leaf
+per patch running a real three-way `git merge`. On a clean merge, take its merged
+tree; on a real conflict, route to a resolver leaf, then fold its resolution into
+the working tree (completing the merge as a hand-resolution would). The loop, the
+merge order, and the conflict branch are ordinary code over journaled leaves, so a
+resume replays every merge from the journal and re-runs no real git. Materializing
+the result — opening the pull request, pushing the branch — is a **side effect the
+host does once, after the run returns**, never inside the orchestration (a journaled
+replay would otherwise skip or duplicate it).
+
+```python
+async def orchestrate(ctx, args):
+    # Each fixer edits its OWN git worktree; the engine folds the real git diff
+    # into `files` (the schema MUST declare files: dict[str, str]).
+    patches = await ctx.parallel(
+        [
+            lambda t=t: ctx.agent(
+                f"Fix {t}", agent_type="fixer", isolation="worktree",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "files": {"type": "object", "additionalProperties": {"type": "string"}},
+                    },
+                    "required": ["summary", "files"],
+                    "additionalProperties": False,
+                },
+            )
+            for t in sorted(args["targets"])
+        ]
+    )
+    # The SCRIPT owns the merge: fold each patch into the integration tree with a
+    # journaled merge leaf; on a real conflict, a resolver leaf resolves the markers.
+    integrated = dict(args["base"])
+    for patch in [p for p in patches if p is not None]:
+        merged = await ctx.agent(_merge_request(args["base"], integrated, patch.files),
+                                 agent_type="merge", schema=MERGE_SCHEMA)
+        if merged.clean:
+            integrated = merged.files
+            continue
+        resolution = await ctx.agent(_conflict_request(merged.conflicts),
+                                     agent_type="resolver", schema=RESOLUTION_SCHEMA)
+        integrated = {**merged.files, **resolution.files}
+    return integrated  # the host opens the PR once, AFTER this returns
+```
+
 ## Authoring a script for `run_script`
 
 When no registered workflow fits, write the `orchestrate` coroutine yourself and
