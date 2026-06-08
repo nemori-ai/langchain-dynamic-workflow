@@ -76,6 +76,23 @@ def test_collect_is_empty_when_nothing_changed(base_repo: str) -> None:
         provider.cleanup_all()
 
 
+def test_collect_fails_loud_on_a_deletion(base_repo: str) -> None:
+    # M1: a leaf that deletes a seeded base file cannot be represented by a
+    # dict[str, str] changeset (no tombstone in v1). Silently dropping the deletion
+    # is the exact incompleteness R5 forbids, so collect must fail loud, not return
+    # an authoritative diff that can't reproduce the deletion.
+    provider = GitWorktreeProvider(base_repo=base_repo)
+    try:
+        sb = provider.open_worktree("L1")
+        assert isinstance(sb, LocalSubprocessSandbox)
+        # The leaf really removes the seeded file on disk.
+        assert sb.execute("rm calc.py").exit_code == 0
+        with pytest.raises(GitWorktreeError, match="deletion"):
+            provider.collect("L1")
+    finally:
+        provider.cleanup_all()
+
+
 def test_open_worktree_is_idempotent_for_same_leaf_id(base_repo: str) -> None:
     # A crash after `git worktree add` but before journaling would leave a stale
     # worktree + branch under the same key; a resume re-opening the same leaf_id

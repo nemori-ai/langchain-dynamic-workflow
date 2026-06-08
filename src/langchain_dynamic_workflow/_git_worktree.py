@@ -292,8 +292,15 @@ class GitWorktreeProvider:
         via ``git diff --cached --name-status`` and reads each path's current
         content from the worktree. This is the AUTHORITATIVE changeset — the real
         on-disk truth, never a model self-report — mirroring M5's "gate on the real
-        exit code, not a model boolean". Deletions are omitted in v1 (the changeset
-        is the set of added/modified file contents the integration step folds).
+        exit code, not a model boolean".
+
+        v1 limitation (fail loud, not silent): a ``dict[str, str]`` changeset has no
+        way to represent a *deleted* file (no tombstone). Silently dropping a
+        deletion would make the "authoritative" diff unable to reproduce a leaf that
+        removed a base file — the exact incompleteness R5 forbids. So a deletion
+        (``D``; with rename detection off a rename's source side surfaces as a
+        deletion) raises rather than being omitted. A leaf that needs to remove
+        content should empty/replace the file or split the change.
 
         Args:
             leaf_id: The leaf whose worktree changeset is collected.
@@ -303,8 +310,8 @@ class GitWorktreeProvider:
             or modified relative to the base ref, in deterministic (sorted) order.
 
         Raises:
-            GitWorktreeError: If ``leaf_id`` has no live worktree, or a ``git``
-                command fails.
+            GitWorktreeError: If ``leaf_id`` has no live worktree, a ``git`` command
+                fails, or the leaf deleted a file (unrepresentable in v1).
         """
         path = self._worktrees.get(leaf_id)
         if path is None:
@@ -321,9 +328,15 @@ class GitWorktreeProvider:
             fields = line.split("\t")
             code = fields[0]
             # Added (A) and Modified (M) carry the path in field 1; a Rename (R...)
-            # carries the destination path in field 2. Deletions (D) are omitted.
+            # carries the destination path in field 2.
             if code.startswith("D"):
-                continue
+                # A deletion cannot be represented by a dict[str, str] changeset in
+                # v1; fail loud rather than drop it (R5: no silent incompleteness).
+                deleted = fields[-1]
+                raise GitWorktreeError(
+                    f"worktree leaf {leaf_id!r} deleted /{deleted}; deletion changesets are not "
+                    "represented in v1 — return a modified file or split the change"
+                )
             rel_path = fields[-1]
             file_path = "/" + rel_path
             content = (Path(path) / rel_path).read_text(encoding="utf-8", errors="replace")

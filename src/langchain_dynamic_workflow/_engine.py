@@ -8,6 +8,7 @@ completed leaves return cached results on resume.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -334,7 +335,12 @@ async def run_workflow(
                 else None
             )
             if git_provider is not None:
-                payload["state"][WORKTREE_CHANGESET_KEY] = git_provider.collect(leaf_id)
+                # collect() is a blocking git subprocess; thread-offload it so it
+                # never wedges the event loop (same defect class R8 fixed for the
+                # worktree add and H3 fixed for teardown).
+                payload["state"][WORKTREE_CHANGESET_KEY] = await asyncio.to_thread(
+                    git_provider.collect, leaf_id
+                )
             return payload
 
     async def leaf_runner(

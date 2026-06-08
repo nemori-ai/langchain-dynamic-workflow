@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -734,5 +735,76 @@ async def test_resume_hits_journal_with_zero_real_git_reruns(tmp_path: Path) -> 
         )
         assert merge_calls[0] == merges_after_first  # ZERO real merge re-runs
         assert second["integrated"] == first["integrated"]  # restored byte-for-byte
+    finally:
+        provider.cleanup_all()
+
+
+class _BlockingCollectProvider(GitWorktreeProvider):
+    """A GitWorktreeProvider whose ``collect`` blocks until a real event fires.
+
+    Stands in for a slow real ``git diff``: lets a test prove the engine offloads
+    ``collect`` off the event loop (FIX-2/M2) — if it ran on the loop, a concurrent
+    coroutine could not advance while collect blocks.
+    """
+
+    def __init__(self, *, base_repo: str, started: threading.Event, release: threading.Event):
+        super().__init__(base_repo=base_repo)
+        self._collect_started = started
+        self._collect_release = release
+
+    def collect(self, leaf_id: str) -> dict[str, str]:
+        self._collect_started.set()
+        self._collect_release.wait(timeout=10.0)
+        return super().collect(leaf_id)
+
+
+async def test_engine_collect_is_offloaded_off_the_event_loop(tmp_path: Path) -> None:
+    # M2: the engine's git_provider.collect(leaf_id) runs inside leaf_task after the
+    # leaf body; it is a blocking git subprocess and MUST be thread-offloaded so it
+    # does not wedge the event loop. A separate OS thread watches an async-incremented
+    # counter while collect blocks: if the counter advances, collect was offloaded.
+    started = threading.Event()
+    release = threading.Event()
+    offloaded = threading.Event()
+    progress = 0
+
+    base = _make_base_repo(tmp_path, {"calc.py": "def add(a, b):\n    return a - b\n"})
+    provider = _BlockingCollectProvider(base_repo=base, started=started, release=release)
+    manager = SandboxManager(git_worktree_provider=provider)
+    roster = Roster().register("fixer", builder=_lying_fixer_builder, needs_execution=True)
+
+    def _watch() -> None:
+        if not started.wait(timeout=10.0):
+            release.set()
+            return
+        before = progress
+        threading.Event().wait(0.2)
+        if progress > before:
+            offloaded.set()
+        release.set()
+
+    async def keep_advancing() -> None:
+        nonlocal progress
+        while not release.is_set():
+            progress += 1
+            await asyncio.sleep(0)
+
+    async def orchestrate(ctx: Ctx) -> _Patch:
+        return await ctx.agent("fix", agent_type="fixer", schema=_Patch, isolation="worktree")
+
+    watcher = threading.Thread(target=_watch, name="ldw-test-collect-watch", daemon=True)
+    watcher.start()
+    advancer = asyncio.create_task(keep_advancing())
+    try:
+        patch = await asyncio.wait_for(
+            run_workflow(
+                orchestrate, roster=roster, sandbox_manager=manager, thread_id="t-collect"
+            ),
+            timeout=15.0,
+        )
+        await asyncio.wait_for(advancer, timeout=10.0)
+        watcher.join(timeout=10.0)
+        assert patch.files == {"/calc.py": "def add(a, b):\n    return a + b\n"}
+        assert offloaded.is_set(), "event loop was wedged by a blocking collect on the loop"
     finally:
         provider.cleanup_all()
