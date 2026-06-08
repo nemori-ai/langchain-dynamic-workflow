@@ -18,7 +18,7 @@ import pytest
 from langchain_dynamic_workflow._git_worktree import (
     GitWorktreeError,
     GitWorktreeProvider,
-    _safe_dirname,
+    _safe_dirname,  # pyright: ignore[reportPrivateUsage] - internal helper under test
 )
 from langchain_dynamic_workflow._local_subprocess import LocalSubprocessSandbox
 

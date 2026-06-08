@@ -541,6 +541,7 @@ async def test_blocking_teardown_on_eviction_is_offloaded_off_the_event_loop() -
 
     async def lease_l2() -> str:
         async with manager.lease(leaf_id="L2", needs_execution=True) as backend:
+            assert isinstance(backend, SandboxBackendProtocol)
             return backend.id
 
     watcher = threading.Thread(target=_watch, name="ldw-test-watch", daemon=True)
