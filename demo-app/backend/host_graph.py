@@ -42,10 +42,13 @@ from langchain_dynamic_workflow import (
     BgRunManager,
     BgStatus,
     Ctx,
+    ExecPolicy,
     InMemoryJournalStore,
     JournalStore,
+    SandboxManager,
     WorkflowScriptError,
     compile_workflow_source,
+    local_subprocess_factory,
     run_workflow,
     run_workflow_from_source,
 )
@@ -64,6 +67,37 @@ HOST_INSTRUCTIONS = (
 # fan-out-heavy scenario than the hello smoke path, so the demo shows real
 # control-flow inversion out of the box.
 DEFAULT_LIVE_WORKFLOW = "deep_research"
+
+# Resilience bounds for the real execution sandbox the fix_loop's code_fixer leaf runs
+# its build/test commands in. A per-command timeout caps a runaway test; the output cap
+# bounds a chatty failure so the captured tail (and the on_command terminal card) stays
+# small. Generous enough for `bun test` on a tiny module, tight enough to fail fast.
+_EXEC_TIMEOUT_SECONDS = 60
+_EXEC_OUTPUT_CAP_BYTES = 64 * 1024
+
+
+def _make_sandbox_manager() -> SandboxManager:
+    """Build a per-run sandbox manager backing real execution leaves.
+
+    Returns a :class:`SandboxManager` whose factory produces real
+    ``LocalSubprocessSandbox`` backends under a bounded :class:`ExecPolicy` (a per-command
+    timeout and an output cap). A ``needs_execution`` leaf (the ``fix_loop`` preset's
+    ``code_fixer``) is leased one of these so its ``execute`` tool runs real shell
+    commands for a true exit code; a pure-reasoning leaf allocates none. The offline path
+    never reaches a real ``execute`` — its fake leaves return a structured result without
+    running a subprocess — so the manager is additive and offline runs are unaffected.
+
+    DANGEROUS OPT-IN: ``LocalSubprocessSandbox`` runs real shell commands on the host with
+    the calling user's permissions and is not a security sandbox.
+
+    Returns:
+        A fresh per-run :class:`SandboxManager` wired for real local-subprocess execution.
+    """
+    policy = ExecPolicy(
+        default_timeout=_EXEC_TIMEOUT_SECONDS,
+        output_cap_bytes=_EXEC_OUTPUT_CAP_BYTES,
+    )
+    return SandboxManager(sandbox_factory=local_subprocess_factory(policy))
 
 
 class _ResumeLane:
@@ -287,6 +321,8 @@ async def run_meta_script_live(*, submit_rejected: bool, adapter: UiAdapter, emi
         on_span_begin=adapter.on_span_begin,
         on_leaf_event=adapter.on_leaf_event,
         leaf_event_include_payloads=False,
+        on_command=adapter.on_command,
+        sandbox_manager=_make_sandbox_manager(),
     )
     return str(result)
 
@@ -392,6 +428,8 @@ async def run_workflow_live(
         on_span_begin=adapter.on_span_begin,
         on_leaf_event=adapter.on_leaf_event,
         leaf_event_include_payloads=False,
+        on_command=adapter.on_command,
+        sandbox_manager=_make_sandbox_manager(),
         workflows=workflows,
         **durable,
     )

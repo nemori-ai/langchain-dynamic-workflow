@@ -5,7 +5,7 @@ The demo states three sync invariants that an adversarial review found broken:
 * the README "Fixed models" table must name the SAME ids the code ships
   (:data:`HOST_MODEL` / :data:`LEAF_MODEL` in ``_models.py``) — the table had drifted
   to stale ids (``claude-3.5-sonnet`` / ``gpt-4o-mini``) the code does not use; and
-* the four preset-scenario messages in ``scenarios.json`` must match the frontend's
+* the preset-scenario messages in ``scenarios.json`` must match the frontend's
   ``ScenarioPanel`` inline copy byte-for-byte — the live #4 button had drifted into a
   self-contradicting "show me the progress as it goes" wording for a background run.
 
@@ -95,7 +95,7 @@ def test_readme_model_table_matches_code_constants() -> None:
 def test_scenario_panel_messages_match_scenarios_json() -> None:
     """The frontend ``ScenarioPanel`` and ``scenarios.json`` carry identical scenarios.
 
-    ``scenarios.json`` is the canonical wording; the frontend hardcodes the same four
+    ``scenarios.json`` is the canonical wording; the frontend hardcodes the same
     messages. This pins ``label`` / ``hint`` / ``message`` byte-for-byte across both so
     the drift the review found — the #4 button promising live progress while the JSON
     (and the actual background behavior) says "let me know once it's done" — fails here.
@@ -103,8 +103,8 @@ def test_scenario_panel_messages_match_scenarios_json() -> None:
     canonical = json.loads(_SCENARIOS_JSON.read_text(encoding="utf-8"))["scenarios"]
     frontend = _scenario_panel_messages()
 
-    assert len(frontend) == len(canonical) == 4, (
-        f"expected 4 scenarios on both sides, got json={len(canonical)} frontend={len(frontend)}"
+    assert len(frontend) == len(canonical) == 5, (
+        f"expected 5 scenarios on both sides, got json={len(canonical)} frontend={len(frontend)}"
     )
 
     for index, (json_scenario, (label, hint, message)) in enumerate(

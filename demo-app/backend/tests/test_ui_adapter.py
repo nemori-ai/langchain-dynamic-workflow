@@ -29,6 +29,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from ui_adapter import (
     _AGENT_SPAN,
+    _EXECUTION_COMMAND,
     _FANOUT_GRAPH,
     _JOURNAL_BADGE,
     _PHASE_TIMELINE,
@@ -36,6 +37,7 @@ from ui_adapter import (
 )
 
 from langchain_dynamic_workflow import (
+    CommandEvent,
     Ctx,
     InMemoryJournalStore,
     LeafEvent,
@@ -687,6 +689,229 @@ async def test_cached_leaf_emits_no_subtree_on_resume() -> None:
     assert not [p for c, p in second_sent if c == _AGENT_SPAN and "subtree" in p], (
         "a cached leaf must not carry a fabricated subtree"
     )
+
+
+# --- (2f) on_command: execution_command begin/end in-place flip --------------
+
+
+def _command_event(
+    *,
+    leaf_span_id: str = "leaf-1",
+    command_id: str = "cmd-1",
+    command: str = "bun test",
+    phase: str = "start",
+    exit_code: int | None = None,
+    output: str | None = None,
+    truncated: bool = False,
+    duration_s: float | None = None,
+    started_at: float = 1000.0,
+) -> CommandEvent:
+    """A real-execution :class:`CommandEvent` with the engine's actual field shape.
+
+    Defaults model a ``start`` edge (``exit_code``/``output``/``duration_s`` all
+    ``None``); a test flips ``phase="end"`` and supplies the run-variant fields to
+    model the reaped end edge that shares the same ``command_id``.
+
+    Args:
+        leaf_span_id: The owning leaf's span id (correlation key to its AgentSpan).
+        command_id: The engine-minted id shared by this command's start and end edges.
+        command: The shell command string.
+        phase: The lifecycle edge -- ``"start"`` or ``"end"``.
+        exit_code: ``None`` on start; the real subprocess exit code on end.
+        output: ``None`` on start; a bounded/truncated tail on end.
+        truncated: Whether ``output`` was clipped.
+        duration_s: ``None`` on start; wall-clock seconds on end.
+        started_at: Wall-clock epoch seconds at the command's start.
+    """
+    return CommandEvent(
+        leaf_span_id=leaf_span_id,
+        command_id=command_id,
+        command=command,
+        phase=phase,
+        exit_code=exit_code,
+        output=output,
+        truncated=truncated,
+        duration_s=duration_s,
+        started_at=started_at,
+    )
+
+
+def test_on_command_start_maps_to_running_execution_command() -> None:
+    """A start edge maps to an ``execution_command`` running card with a null exit code."""
+    sent, adapter = _collector()
+
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+
+    assert len(sent) == 1
+    component, props = sent[-1]
+    assert component == _EXECUTION_COMMAND
+    assert props["leaf_span_id"] == "leaf-1"
+    assert props["command"] == "bun test"
+    assert props["status"] == "running"
+    assert props["exit_code"] is None
+    assert props.get("event_id")
+    # A start edge is the create: it must NOT carry the merge transport flag.
+    assert "merge" not in props
+
+
+def test_on_command_end_passed_flips_in_place_with_same_event_id() -> None:
+    """An exit-0 end edge shares the start's event_id, merges, and flips to passed."""
+    sent, adapter = _collector()
+
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+    start_props = sent[-1][1]
+    adapter.on_command(
+        _command_event(
+            phase="end",
+            command="bun test",
+            exit_code=0,
+            output="2 pass · 0 fail",
+            truncated=False,
+            duration_s=0.38,
+        )
+    )
+
+    end_component, end_props = sent[-1]
+    assert end_component == _EXECUTION_COMMAND
+    # Same event_id -> the card flips in place (no second card).
+    assert end_props["event_id"] == start_props["event_id"]
+    assert end_props.get("merge") is True
+    assert end_props["status"] == "passed"
+    assert end_props["exit_code"] == 0
+    assert end_props["output"] == "2 pass · 0 fail"
+    assert end_props["duration_s"] == 0.38
+    assert end_props["truncated"] is False
+
+
+def test_on_command_end_nonzero_exit_flips_to_failed() -> None:
+    """A non-zero exit-code end edge flips the card to a failed status."""
+    sent, adapter = _collector()
+
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+    adapter.on_command(
+        _command_event(
+            phase="end",
+            command="bun test",
+            exit_code=1,
+            output="1 pass · 1 fail",
+            truncated=True,
+            duration_s=0.41,
+        )
+    )
+
+    _, end_props = sent[-1]
+    assert end_props["status"] == "failed"
+    assert end_props["exit_code"] == 1
+    assert end_props["truncated"] is True
+
+
+def test_on_command_stamps_the_latest_forwarded_phase_as_attempt() -> None:
+    """``attempt`` comes from the most recent phase marker the adapter forwarded.
+
+    ``on_command`` fires inside the leaf with no knowledge of the loop counter, so the
+    adapter derives ``attempt`` from the latest PHASE entry it forwarded via
+    ``on_progress`` and stamps it onto each ``execution_command`` -- no engine change.
+    """
+    sent, adapter = _collector()
+
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+    assert sent[-1][1]["attempt"] == "attempt 1"
+
+    # A new phase advances; subsequent commands stamp the newer attempt.
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 2"))
+    adapter.on_command(_command_event(phase="start", command="bun test", command_id="cmd-2"))
+    assert sent[-1][1]["attempt"] == "attempt 2"
+
+
+def test_on_command_attempt_is_not_advanced_by_a_log_line() -> None:
+    """Only PHASE markers (not LOG lines) set the ``attempt`` stamp."""
+    sent, adapter = _collector()
+
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.LOG, message="attempt 1 red"))
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+
+    assert sent[-1][1]["attempt"] == "attempt 1"
+
+
+def test_on_command_attempt_is_null_before_any_phase() -> None:
+    """With no phase forwarded yet, ``attempt`` is ``None`` (honest, not invented)."""
+    sent, adapter = _collector()
+
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+
+    assert sent[-1][1]["attempt"] is None
+
+
+def test_on_command_attempt_distinguishes_same_command_across_attempts() -> None:
+    """The same command across two attempts yields two distinct cards (attempt in key).
+
+    Without ``attempt`` in the dedupe key, the second attempt's ``bun test`` start edge
+    would collide with the first attempt's id and be swallowed by ``_seen``. The
+    ``attempt`` stamp keeps them distinct so each attempt renders its own card.
+    """
+    sent, adapter = _collector()
+
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+    adapter.on_command(_command_event(phase="start", command="bun test", command_id="a1"))
+    first_id = sent[-1][1]["event_id"]
+
+    adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 2"))
+    adapter.on_command(_command_event(phase="start", command="bun test", command_id="a2"))
+    second_id = sent[-1][1]["event_id"]
+
+    assert first_id != second_id
+
+
+def test_on_command_resume_reproduces_a_stable_event_id() -> None:
+    """A fresh adapter reproduces the exact same execution_command id sequence.
+
+    A real resume builds a fresh adapter (new host-tool invocation). Replaying the same
+    phase + command stream must reproduce the identical ``event_id`` so the frontend
+    dedupes the re-emit -- the resume-stable invariant the adapter exists to guarantee.
+    """
+
+    def run() -> list[str]:
+        sent: list[Event] = []
+        adapter = UiAdapter(emit=lambda comp, props: sent.append((comp, dict(props))))
+        adapter.on_progress(ProgressEntry(kind=ProgressKind.PHASE, message="attempt 1"))
+        adapter.on_command(_command_event(phase="start", command="bun build"))
+        adapter.on_command(_command_event(phase="start", command="bun test", command_id="t"))
+        return [p["event_id"] for c, p in sent if c == _EXECUTION_COMMAND]
+
+    fresh_ids = run()
+    resume_ids = run()
+    assert fresh_ids == resume_ids != []
+
+
+def test_on_command_end_is_not_swallowed_by_seen() -> None:
+    """The deliberate begin->end flip for one command_id must both deliver.
+
+    The end edge shares the begin's ``event_id``; without the begin/end merge exemption
+    ``_seen`` would drop the end as a duplicate and the card would never flip. The end
+    edge rides the same exemption the span begin/end pair uses.
+    """
+    sent, adapter = _collector()
+
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+    adapter.on_command(_command_event(phase="end", command="bun test", exit_code=0, duration_s=0.1))
+
+    cmd_emits = [(c, p) for c, p in sent if c == _EXECUTION_COMMAND]
+    assert len(cmd_emits) == 2, "both the start (create) and end (merge) edges must deliver"
+    assert cmd_emits[0][1]["status"] == "running"
+    assert cmd_emits[1][1]["status"] == "passed"
+
+
+def test_on_command_never_raises_on_a_failing_transport() -> None:
+    """A raising transport must not propagate out of ``on_command``."""
+
+    def boom(_component: str, _props: dict[str, Any]) -> None:
+        raise RuntimeError("ui down")
+
+    adapter = UiAdapter(emit=boom)
+    adapter.on_command(_command_event(phase="start", command="bun test"))
+    adapter.on_command(_command_event(phase="end", command="bun test", exit_code=0, duration_s=0.1))
 
 
 # --- (3) Stable-id dedupe ----------------------------------------------------

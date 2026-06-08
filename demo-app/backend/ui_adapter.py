@@ -57,7 +57,15 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from langchain_dynamic_workflow import LeafEvent, ProgressEntry, Span, SpanBegin, SpanKind
+from langchain_dynamic_workflow import (
+    CommandEvent,
+    LeafEvent,
+    ProgressEntry,
+    ProgressKind,
+    Span,
+    SpanBegin,
+    SpanKind,
+)
 
 UiEmit = Callable[[str, dict[str, Any]], None]
 """Transport callback: deliver one ``(component_name, props)`` Gen-UI event."""
@@ -68,6 +76,7 @@ _PHASE_TIMELINE = "phase_timeline"
 _FANOUT_GRAPH = "fanout_graph"
 _AGENT_SPAN = "agent_span"
 _JOURNAL_BADGE = "journal_badge"
+_EXECUTION_COMMAND = "execution_command"
 
 _FANOUT_KINDS: frozenset[SpanKind] = frozenset({SpanKind.PARALLEL, SpanKind.PIPELINE})
 
@@ -105,6 +114,17 @@ class UiAdapter:
         self._leaf_nodes: defaultdict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         # Leaves whose interior overflowed the node cap, so the re-emit can flag it.
         self._leaf_truncated: set[str] = set()
+        # The latest PHASE marker message the adapter forwarded (e.g. "attempt 2").
+        # on_command fires inside a leaf with no knowledge of the loop counter, so each
+        # execution_command is stamped with this attempt tag (§ risk #5). None until the
+        # script emits its first phase, so the attempt is honest rather than invented.
+        self._latest_phase: str | None = None
+        # Map an engine command_id (shared by a command's start and end edges) to the
+        # adapter-computed event_id minted on the start edge. The end edge reuses it so
+        # both edges share one id and the terminal card flips pass/fail in place, while
+        # the occurrence-ordinal is bumped exactly once per command (on start, the create
+        # edge) rather than diverging across the two edges.
+        self._command_event_ids: dict[str, str] = {}
 
     # --- public engine sinks -------------------------------------------------
 
@@ -118,6 +138,11 @@ class UiAdapter:
             "kind": entry.kind.value,
             "message": entry.message,
         }
+        # Track the latest PHASE marker so a subsequent execution_command can stamp its
+        # owning attempt (e.g. "attempt 2"). Only a PHASE advances the attempt — a LOG
+        # narration line is not a loop boundary and must not retag the next command.
+        if entry.kind is ProgressKind.PHASE:
+            self._latest_phase = entry.message
         # A progress line has no run-variant fields, so its full props ARE its stable
         # identity. The occurrence ordinal in _emit_event keeps two distinct lines that
         # render identical truncated text (a real-model verify-phase hazard) separate.
@@ -230,6 +255,86 @@ class UiAdapter:
             "truncated": leaf_id in self._leaf_truncated,
         }
         self._emit_event(_AGENT_SPAN, subtree_props, event_id=leaf_id, merge=True)
+
+    def on_command(self, event: CommandEvent) -> None:
+        """Map a real-execution command edge to an ``execution_command`` event (never raises).
+
+        Each real shell ``execute`` fires two edges that share one engine ``command_id``:
+        a ``"start"`` edge the instant before the subprocess spawns and an ``"end"`` edge
+        once it is reaped. The start edge **creates** a terminal card in the ``running``
+        state (``exit_code`` still ``None``); the end edge **patches it in place** (the
+        same ``event_id`` with ``merge=True``) flipping the card to ``passed`` (exit 0) or
+        ``failed`` (non-zero) and filling the exit code, output tail, truncation flag, and
+        duration — the same begin->end in-place flip the span running->complete chip uses.
+
+        The card is correlated to its owning leaf via ``leaf_span_id`` (so the frontend
+        nests it beneath that leaf's ``agent_span``) and tagged with the loop ``attempt``
+        the adapter most recently forwarded — ``on_command`` fires inside the leaf with no
+        knowledge of the loop counter, so the adapter stamps the latest phase marker it
+        saw. A replayed (cached) leaf never re-runs its subprocess and so fires no command
+        event; terminal cards are fresh-run only and never fabricated on resume.
+
+        Args:
+            event: One real-execution command lifecycle edge (``"start"`` then ``"end"``).
+        """
+        is_end = event.phase == "end"
+        if not is_end:
+            # Start edge: mint the adapter's resume-stable id (excluding run-variant
+            # fields) and remember it under the engine command_id so the end edge reuses
+            # it. The id carries attempt so the same command across two attempts stays
+            # distinct (else the second attempt's start would collide and be swallowed).
+            event_id = self._mint_command_event_id(event)
+            self._command_event_ids[event.command_id] = event_id
+            status = "running"
+        else:
+            # End edge: reuse the start's id so the card flips in place. If the start was
+            # never seen (an end with no paired begin), mint a fresh id so the card still
+            # renders something honest.
+            event_id = self._command_event_ids.get(event.command_id)
+            if event_id is None:
+                event_id = self._mint_command_event_id(event)
+            status = "passed" if event.exit_code == 0 else "failed"
+
+        props: dict[str, Any] = {
+            "leaf_span_id": event.leaf_span_id,
+            "command": event.command,
+            "attempt": self._latest_phase,
+            "status": status,
+            "exit_code": event.exit_code,
+            "output": event.output,
+            "truncated": event.truncated,
+            "duration_s": event.duration_s,
+        }
+        # The end edge patches the running card (same event_id), so it merges — and the
+        # merge path bypasses _seen, the same begin/end exemption the span pair uses.
+        self._emit_event(_EXECUTION_COMMAND, props, event_id=event_id, merge=is_end)
+
+    def _mint_command_event_id(self, event: CommandEvent) -> str:
+        """Mint a resume-stable ``execution_command`` id and bump its occurrence ordinal.
+
+        The id hashes the stable identity ``(leaf_span_id, command, attempt)`` — the
+        latest forwarded phase as ``attempt`` — and excludes every run-variant field
+        (``exit_code`` / ``output`` / ``duration_s`` / ``status``) so a command's start
+        and end edges share one id and the card flips in place. The per-key occurrence
+        ordinal (bumped once per command, on the create edge) keeps the same command
+        across two attempts on distinct cards while an honest resume — which re-emits the
+        same keys in the same source order — lands on the same ordinals and collapses.
+
+        Args:
+            event: The command edge whose stable identity seeds the id.
+
+        Returns:
+            The resume-stable ``event_id`` for this command's terminal card.
+        """
+        dedupe_key = {
+            "leaf_span_id": event.leaf_span_id,
+            "command": event.command,
+            "attempt": self._latest_phase,
+        }
+        stable = self._stable_id(_EXECUTION_COMMAND, dedupe_key)
+        ordinal = self._occurrences[stable]
+        self._occurrences[stable] = ordinal + 1
+        return f"{stable}-{ordinal}"
 
     # --- span mappers --------------------------------------------------------
 
