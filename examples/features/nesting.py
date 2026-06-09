@@ -1,13 +1,15 @@
-"""``ctx.workflow()`` named nesting — a parent inlines a registered child workflow.
+"""``workflow()`` named nesting — multiple levels deep, with a cycle guard.
 
-A parent orchestration resolves a named child workflow from the registry and runs
-it inline with ``ctx.workflow("gather", {...})``. The child fans out one research
-leaf per topic with ``ctx.parallel`` and synthesizes them; its result folds
-straight back into the parent, while sharing the parent's journal, budget, and
-concurrency gate. Named nesting is currently one level deep: a ``ctx.workflow()``
-call from inside an already-nested workflow fails loud with
-``WorkflowNestingError``, which this demo provokes on purpose. Runs fully offline
-with a deterministic fake.
+A parent orchestration calls a named child workflow via ``ctx.workflow()``, which
+in turn calls a grandchild workflow, which calls a leaf — three levels of nesting,
+well under the default cap of 8. The leaf result folds all the way back through
+every level so the parent sees it. Named workflows share the parent's journal,
+budget, and concurrency gate; each level is just function composition with no
+extra overhead.
+
+The demo also proves the cycle guard: a workflow that calls itself is refused with
+``WorkflowCycleError`` before any leaf runs. Runs fully offline with a
+deterministic fake.
 
     uv run python -m examples.features.nesting
 """
@@ -17,72 +19,113 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from deepagents import create_deep_agent
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig, RunnableLambda
 
-from examples._shared.offline_models import ScriptedModel
 from langchain_dynamic_workflow import (
     Ctx,
     Roster,
-    WorkflowNestingError,
+    WorkflowCycleError,
     WorkflowRegistry,
     run_workflow,
 )
 
-TOPICS = ["batteries", "solar", "wind"]
+# ── leaf (deterministic, offline fake) ───────────────────────────────────────
 
 
-async def gather(ctx: Ctx, args: dict[str, Any]) -> str:
-    """Child workflow: fan out a research leaf per topic and synthesize them."""
-    topics: list[str] = args["topics"]
-    findings = await ctx.parallel(
-        [lambda t=t: ctx.agent(f"Research {t}", agent_type="researcher") for t in topics]
-    )
-    surviving = [f for f in findings if f is not None]
-    return f"synthesis of {len(surviving)} findings: " + "; ".join(surviving)
+def _build_writer(*, response_format: Any = None) -> Any:
+    """A deterministic fake that echoes the prompt behind a 'leaf' prefix."""
+
+    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        prompt = str(inp["messages"][0].content) if inp["messages"] else ""
+        return {"messages": [*inp["messages"], AIMessage(content=f"leaf({prompt})")]}
+
+    return RunnableLambda(_leaf)
 
 
-async def nest_once(ctx: Ctx, args: dict[str, Any]) -> str:
-    """An already-nested child that tries to nest a second level — must fail loud."""
-    return await ctx.workflow("gather", {"topics": TOPICS})
+# ── three-level nesting chain ────────────────────────────────────────────────
+
+
+async def paragraph(ctx: Ctx, args: dict[str, Any]) -> str:
+    """Innermost (depth 3): calls a leaf and returns its result."""
+    topic: str = args.get("topic", "default")
+    return await ctx.agent(f"Write paragraph about {topic}", agent_type="writer")
+
+
+async def section(ctx: Ctx, args: dict[str, Any]) -> str:
+    """Mid level (depth 2): inlines paragraph and wraps the result."""
+    topic: str = args.get("topic", "default")
+    para = await ctx.workflow("paragraph", {"topic": topic})
+    return f"section[{para}]"
+
+
+async def chapter(ctx: Ctx, args: dict[str, Any]) -> str:
+    """Outer level (depth 1): inlines section and wraps the result."""
+    topic: str = args.get("topic", "default")
+    sec = await ctx.workflow("section", {"topic": topic})
+    return f"chapter[{sec}]"
+
+
+# ── cycle-guard demo ─────────────────────────────────────────────────────────
+
+
+async def self_referencing(ctx: Ctx, args: dict[str, Any]) -> str:
+    """A workflow that calls itself — the cycle guard must refuse it."""
+    return await ctx.workflow("self_referencing", args)
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
 
 
 async def main() -> None:
     roster = Roster().register(
-        "researcher",
-        create_deep_agent(model=ScriptedModel(prefix="research")),
-        description="Researches a single topic",
+        "writer",
+        builder=_build_writer,
+        description="Writes a short paragraph on a given topic",
     )
-    workflows = WorkflowRegistry().register("gather", gather).register("nest_once", nest_once)
+    workflows = (
+        WorkflowRegistry()
+        .register("paragraph", paragraph)
+        .register("section", section)
+        .register("chapter", chapter)
+        .register("self_referencing", self_referencing)
+    )
 
-    # The parent inlines the named child workflow and folds in its synthesized result.
+    # Three-level nesting: orchestrate -> chapter -> section -> paragraph -> leaf.
     async def orchestrate(ctx: Ctx) -> str:
-        inner = await ctx.workflow("gather", {"topics": TOPICS})
-        return f"parent folded child result -> {inner}"
+        result = await ctx.workflow("chapter", {"topic": "photosynthesis"})
+        return f"document[{result}]"
 
-    parent_result = await run_workflow(
+    document = await run_workflow(
         orchestrate,
         roster=roster,
         workflows=workflows,
-        thread_id="nesting",
-        max_concurrency=4,
+        thread_id="nesting-3-levels",
     )
-    print(f"one-level nesting:\n  {parent_result}")
-    assert parent_result.startswith("parent folded child result -> synthesis of 3 findings:")
+    print(f"three-level nesting:\n  {document}")
+    # The leaf result is wrapped by paragraph, section, chapter, and orchestrate in order:
+    # document[chapter[section[leaf(Write paragraph about photosynthesis)]]]
+    assert document.startswith("document[chapter[section[")
+    assert document.endswith(")]]]")
+    print("OK: ctx.workflow() inlined 3 levels of named nesting, result folded all the way back.")
 
-    # The one-level cap, made concrete: a second nesting level fails loud.
-    async def too_deep(ctx: Ctx) -> str:
-        return await ctx.workflow("nest_once", {})
+    # Cycle guard: a workflow that calls itself must be refused.
+    async def trigger_cycle(ctx: Ctx) -> str:
+        return await ctx.workflow("self_referencing", {})
 
-    nesting_error: WorkflowNestingError | None = None
+    cycle_error: WorkflowCycleError | None = None
     try:
         await run_workflow(
-            too_deep, roster=roster, workflows=workflows, thread_id="nesting-too-deep"
+            trigger_cycle,
+            roster=roster,
+            workflows=workflows,
+            thread_id="nesting-cycle",
         )
-    except WorkflowNestingError as exc:
-        nesting_error = exc
-    print(f"two-level nesting refused: {type(nesting_error).__name__}")
-    assert nesting_error is not None, "a second nesting level must raise WorkflowNestingError"
-    print("OK: ctx.workflow() inlined a named child one level deep; a second level was refused.")
+    except WorkflowCycleError as exc:
+        cycle_error = exc
+    print(f"cycle refused: {type(cycle_error).__name__}: {cycle_error}")
+    assert cycle_error is not None, "a self-referencing workflow must raise WorkflowCycleError"
+    print("OK: ctx.workflow() refused the self-cycle with WorkflowCycleError.")
 
 
 if __name__ == "__main__":

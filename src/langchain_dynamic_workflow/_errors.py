@@ -32,14 +32,20 @@ class WorkflowBudgetExceededError(RuntimeError):
 
 
 class WorkflowNestingError(RuntimeError):
-    """Raised when a workflow nests another workflow more than one level deep.
+    """Raised when a ``ctx.workflow`` call would exceed the configured nesting cap.
 
-    A workflow script may inline another workflow with ``ctx.workflow(name, args)``
-    exactly one level; the inner workflow runs in the same durable-execution scope
-    and shares the parent's journal, budget, and concurrency gate. Calling
-    ``ctx.workflow(...)`` again from inside an already-nested workflow would create
-    a second nesting level, which the engine refuses by raising this instead of
-    silently allowing unbounded recursion.
+    A workflow script may inline other workflows up to ``max_workflow_depth`` levels
+    (default 8). The cap is a runaway-recursion backstop: a legitimate composition
+    nests a handful of levels, while an unbounded recursion (a missing base case)
+    trips it and fails loud. The cycle guard (``WorkflowCycleError``) catches the
+    common recursive pattern earlier and more precisely; this error fires when
+    distinct workflow names are nested beyond the cap.
+
+    This is a control-flow signal: a depth-cap breach is a structural/runaway-recursion
+    error that must fail loud inside a fan-out frame (``parallel`` / ``pipeline`` /
+    ``race`` / ``dag``), not be masked as a ``None`` hole. It belongs in
+    ``WORKFLOW_CONTROL_FLOW_SIGNALS`` alongside ``WorkflowDagError`` and
+    ``WorkflowCycleError``.
     """
 
 
@@ -107,16 +113,45 @@ class WorkflowScriptError(RuntimeError):
     """
 
 
+class WorkflowDagError(RuntimeError):
+    """Raised when a ``ctx.dag`` call is structurally invalid before scheduling.
+
+    The DAG is validated eagerly at the top of ``ctx.dag`` — before any node runs —
+    so a duplicate node id, a dependency on an unknown id, a node depending on
+    itself, or a dependency cycle fails loud rather than scheduling a graph with no
+    topological order. It is a control-flow signal: raised from inside a
+    ``parallel`` / ``pipeline`` / ``race`` frame (a nested ``dag``) it must surface,
+    never be masked as a ``None`` hole, because it is an author bug, not a leaf
+    failure.
+    """
+
+
+class WorkflowCycleError(RuntimeError):
+    """Raised when ``ctx.workflow`` would re-enter a workflow already being inlined.
+
+    A workflow may inline other workflows up to ``max_workflow_depth`` levels, but a
+    name that is already on the inlining stack (a workflow calling itself directly,
+    or a mutual cycle such as A->B->A) has no engine-bounded base case and would
+    recurse to the depth cap on every run. The engine refuses the cycle the moment a
+    repeated name is seen, with a clearer diagnostic than the eventual depth-cap
+    breach. Like the other structural signals it fails loud inside a fan-out frame.
+    """
+
+
 WORKFLOW_CONTROL_FLOW_SIGNALS: tuple[type[Exception], ...] = (
     WorkflowBudgetExceededError,
     WorkflowDeterminismError,
     WorkflowCheckpointError,
+    WorkflowDagError,
+    WorkflowCycleError,
+    WorkflowNestingError,
 )
 """Engine signals that must fail loud inside a fan-out, never be masked as ``None``.
 
-``parallel`` / ``pipeline`` / ``race`` isolate an ordinary leaf failure as a quiet
-``None`` hole, but these signals indicate the run itself is no longer sound (an
-exhausted budget, a replay divergence, or a checkpoint reached from a fan-out
-frame). They are re-raised after the barrier/drain settles instead of being
-swallowed, so the breach surfaces rather than corrupting the result with a hole.
+``parallel`` / ``pipeline`` / ``race`` / ``dag`` isolate an ordinary leaf failure as
+a quiet ``None`` hole, but these signals indicate the run itself is no longer sound (an
+exhausted budget, a replay divergence, a checkpoint reached from a fan-out frame, a
+malformed dag graph, a workflow naming cycle, or a depth-cap breach). They are re-raised
+after the barrier/drain settles instead of being swallowed, so the breach surfaces rather
+than corrupting the result with a hole.
 """

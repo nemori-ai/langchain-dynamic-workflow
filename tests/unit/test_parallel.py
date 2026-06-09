@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
 from langchain_core.runnables import Runnable, RunnableLambda
 
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
 from langchain_dynamic_workflow._context import Ctx, LeafOutcome
+from langchain_dynamic_workflow._errors import WorkflowNestingError
 from langchain_dynamic_workflow._journal import InMemoryJournalStore
 from langchain_dynamic_workflow._roster import Roster
 
@@ -83,6 +85,19 @@ async def test_parallel_failed_thunk_becomes_none_and_does_not_raise() -> None:
 async def test_parallel_empty_returns_empty_list() -> None:
     ctx = _ctx()
     assert await ctx.parallel([]) == []
+
+
+async def test_parallel_reraises_nesting_error_loud() -> None:
+    # A WorkflowNestingError (a structural depth-cap breach) raised inside a thunk
+    # must fail loud through the barrier, not be masked as a None hole.
+    # This is the regression for the M7 Codex-review BLOCKER fix.
+    ctx = _ctx()
+
+    async def _breach() -> str:
+        raise WorkflowNestingError("too deep")
+
+    with pytest.raises(WorkflowNestingError):
+        await ctx.parallel([_breach])
 
 
 async def test_parallel_respects_concurrency_gate() -> None:

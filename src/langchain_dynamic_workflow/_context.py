@@ -22,10 +22,12 @@ from pydantic import BaseModel
 
 from ._budget import Budget
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
+from ._dag import DagNode, run_dag
 from ._determinism import CallSequenceGuard
 from ._errors import (
     WORKFLOW_CONTROL_FLOW_SIGNALS,
     WorkflowCheckpointError,
+    WorkflowCycleError,
     WorkflowNestingError,
     WorkflowSignoffRequired,
 )
@@ -183,14 +185,34 @@ _WORKFLOW_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
 )
 """How many ``ctx.workflow()`` frames are currently on the stack.
 
-The top-level orchestration script runs at depth ``0``. A ``ctx.workflow(name)``
-call enters depth ``1`` (one level of nesting); attempting another
-``ctx.workflow()`` from inside that frame would push depth ``2``, which the engine
-refuses. The inner workflow runs inline within the parent's entrypoint body and
-shares the parent context; its leaf ``agent()`` calls still execute as durable
-``@task`` invocations and journal normally, so resumability is unaffected. The
-variable is a :class:`~contextvars.ContextVar` so the depth is isolated per
-asyncio task and restored on frame exit.
+The top-level orchestration script runs at depth ``0``. Each ``ctx.workflow(name)``
+call increments this by one; the engine refuses a call that would push it past
+``max_workflow_depth`` (a runaway-recursion backstop). The inner workflow runs
+inline within the parent's entrypoint body and shares the parent context; its leaf
+``agent()`` calls still execute as durable ``@task`` invocations and journal
+normally, so resumability is unaffected. The variable is a
+:class:`~contextvars.ContextVar` so the depth is isolated per asyncio task and
+restored on frame exit.
+"""
+
+DEFAULT_MAX_WORKFLOW_DEPTH = 8
+"""Default cap on ``ctx.workflow()`` inline nesting depth.
+
+The cap is a runaway-recursion backstop, not a semantic limit: a legitimate
+composition nests a handful of levels, while an unbounded recursion (a missing base
+case) trips this and fails loud. The cycle guard catches the common case (a name
+re-entering itself) earlier and more precisely.
+"""
+
+_WORKFLOW_NAME_STACK: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "langchain_dynamic_workflow_workflow_name_stack", default=frozenset()
+)
+"""Names of the workflows currently inlined on the ``ctx.workflow`` call stack.
+
+A ``ctx.workflow(name)`` whose ``name`` is already in this set is a cycle (a workflow
+re-entering itself, directly or via a mutual A->B->A) and is refused. The variable is a
+:class:`~contextvars.ContextVar` so the stack is isolated per asyncio task and
+restored on frame exit, exactly like ``_WORKFLOW_DEPTH``.
 """
 
 
@@ -226,6 +248,8 @@ class Ctx:
         pending_signoff: Optional human value injected at the next un-decided
             ``ctx.checkpoint`` sign-off gate (an approve resume sets it). Omitted
             (the ``UNSET`` default) on a fresh run or a crash-resume replay.
+        max_workflow_depth: Cap on ``ctx.workflow`` inline nesting depth (a
+            runaway-recursion backstop); defaults to ``DEFAULT_MAX_WORKFLOW_DEPTH``.
     """
 
     def __init__(
@@ -241,6 +265,7 @@ class Ctx:
         workflows: WorkflowResolver | None = None,
         spans: SpanRecorder | None = None,
         pending_signoff: Any = UNSET,
+        max_workflow_depth: int = DEFAULT_MAX_WORKFLOW_DEPTH,
     ) -> None:
         self._roster = roster
         self._journal = journal
@@ -268,6 +293,7 @@ class Ctx:
         )
         self._workflows = workflows
         self._spans = spans if spans is not None else SpanRecorder()
+        self._max_workflow_depth = max_workflow_depth
 
     @property
     def observed_call_sequence(self) -> list[str]:
@@ -317,15 +343,16 @@ class Ctx:
         self._progress.emit(ProgressKind.LOG, message)
 
     async def workflow(self, name: str, args: dict[str, Any] | None = None) -> Any:
-        """Inline another workflow by name, exactly one level deep.
+        """Inline another workflow by name, up to ``max_workflow_depth`` levels deep.
 
         Resolves ``name`` against the workflow registry and runs its orchestration
         callable inline against *this* context, so the inner workflow shares the
         parent's journal, budget, concurrency gate, and progress log — its leaves
         are deduped and budgeted as if written inline, and each still executes as a
-        durable ``@task`` leaf so resumability is unaffected. Nesting is allowed
-        exactly one level; a ``workflow()`` call from inside an already-nested
-        workflow fails loud rather than recursing without bound.
+        durable ``@task`` leaf so resumability is unaffected. A cycle (a workflow
+        re-entering itself, directly or via a mutual A->B->A) is refused the moment
+        a repeated name is seen; nesting beyond ``max_workflow_depth`` levels fails
+        loud as a runaway-recursion backstop.
 
         Args:
             name: The workflow name to resolve in the registry.
@@ -338,26 +365,36 @@ class Ctx:
         Raises:
             LookupError: If no workflow registry is wired into this context.
             KeyError: If ``name`` is not registered.
-            WorkflowNestingError: If called from inside an already-nested workflow
-                (a second level of inlining).
+            WorkflowCycleError: If ``name`` is already on the inlining stack (a
+                workflow re-entering itself, directly or via a mutual cycle).
+            WorkflowNestingError: If nesting depth would exceed ``max_workflow_depth``
+                (a runaway-recursion backstop).
         """
         if self._workflows is None:
             raise LookupError(
                 f"cannot resolve workflow {name!r}: no workflow registry was wired "
                 "into this run (pass workflows=... to run_workflow)"
             )
-        if _WORKFLOW_DEPTH.get() >= 1:
+        stack = _WORKFLOW_NAME_STACK.get()
+        if name in stack:
+            raise WorkflowCycleError(
+                f"cannot inline workflow {name!r}: it is already on the inlining stack "
+                f"{sorted(stack)} — a workflow that re-enters itself (directly or via a "
+                "cycle) has no engine-bounded base case; refusing the cycle"
+            )
+        if _WORKFLOW_DEPTH.get() >= self._max_workflow_depth:
             raise WorkflowNestingError(
-                f"cannot nest workflow {name!r}: workflows may inline another workflow "
-                "exactly one level deep, and this call is already inside a nested "
-                "workflow (refusing a second nesting level)"
+                f"cannot inline workflow {name!r}: nesting depth would exceed "
+                f"max_workflow_depth={self._max_workflow_depth} (runaway-recursion backstop)"
             )
         workflow_fn = self._workflows.resolve(name)  # KeyError on unknown name
-        token = _WORKFLOW_DEPTH.set(_WORKFLOW_DEPTH.get() + 1)
+        depth_token = _WORKFLOW_DEPTH.set(_WORKFLOW_DEPTH.get() + 1)
+        stack_token = _WORKFLOW_NAME_STACK.set(stack | {name})
         try:
             return await workflow_fn(self, args or {})
         finally:
-            _WORKFLOW_DEPTH.reset(token)
+            _WORKFLOW_NAME_STACK.reset(stack_token)
+            _WORKFLOW_DEPTH.reset(depth_token)
 
     async def checkpoint(self, ask: Any, *, tag: str = "") -> Any:
         """Pause the run for a human sign-off and return the value they supply.
@@ -800,6 +837,99 @@ class Ctx:
                 _FANOUT_DEPTH.reset(token)
             span.set("surviving_count", sum(1 for r in results if r is not None))
             return results
+
+    async def dag(self, nodes: Sequence[DagNode]) -> dict[str, Any | None]:
+        """Run a dependency graph in topological order; a node runs after its deps.
+
+        Each :class:`~langchain_dynamic_workflow._dag.DagNode` declares an ``id``, its
+        ``deps`` (ids it depends on), and a ``run(deps)`` callable that receives a
+        ``{dep_id: result}`` mapping of its predecessors' results and typically calls
+        ``agent()``. Ready nodes (all deps settled) run concurrently; there is no
+        level barrier, so an independent branch races ahead of a slow one. A node
+        whose ``run`` raises lands as ``None`` and every node that depends on it
+        (transitively) is skipped to ``None``; a node that legitimately returns
+        ``None`` does not skip its dependents. Engine control-flow signals
+        (budget / determinism / a malformed graph) are re-raised loud after the
+        in-flight nodes drain, never masked as a ``None`` hole.
+
+        Concurrency is bounded at the leaf: the ``agent()`` calls inside a node's
+        ``run`` acquire the shared gate, while this fan-out layer holds no slot — so a
+        ``dag`` nested inside a node cannot starve the pool. Like ``parallel`` /
+        ``pipeline`` / ``race``, the leaves inside the nodes are excluded from the
+        determinism sequence guard (their completion order is wall-clock dependent);
+        the content-hash journal still guards each by its inputs, so a resume replays
+        completed nodes at zero model cost — the graph structure is script-defined and
+        therefore deterministic, needing no dag-level journal entry of its own.
+
+        Args:
+            nodes: The graph's nodes.
+
+        Returns:
+            A mapping ``{node_id: result}``; a failed or skipped node maps to ``None``.
+
+        Raises:
+            WorkflowDagError: If the graph is structurally invalid (duplicate id,
+                unknown / self dependency, or a cycle).
+        """
+        with self._spans.span(SpanKind.DAG, "dag") as span:
+            span.set("node_count", len(nodes))
+            if not nodes:
+                span.set("surviving_count", 0)
+                return {}
+            # Mark the fan-out frame so agent() calls inside the nodes skip the
+            # determinism backstop; set before run_dag spawns node tasks so each
+            # child task inherits the depth.
+            token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
+            try:
+                results = await run_dag(nodes)
+            finally:
+                _FANOUT_DEPTH.reset(token)
+            span.set("surviving_count", sum(1 for v in results.values() if v is not None))
+            return results
+
+    async def loop_until[T](
+        self,
+        body: Callable[[int, list[T]], Awaitable[T]],
+        *,
+        done: Callable[[list[T]], bool],
+        max_iters: int,
+    ) -> list[T]:
+        """Run ``body`` until ``done`` holds over the accumulated results, capped at ``max_iters``.
+
+        A measured-stop loop with the two author disciplines baked in: every loop has
+        a mandatory hard cap (``max_iters``), and the stop predicate is checked over
+        the FULL accumulated list (so dedup / convergence is against *everything* seen,
+        not just the last round). Each iteration calls ``body(iter_index, accumulated)``
+        — where ``accumulated`` is a copy of the results so far — appends its result,
+        then checks ``done(accumulated)``; the loop returns as soon as ``done`` holds.
+
+        This is a sequential (depth-0) primitive: ``body``'s direct ``agent()`` calls
+        record into the determinism guard, and the loop count derives from journaled
+        leaf results, so a resume reproduces the same number of iterations and replays
+        completed leaves at zero cost. If the cap is reached without ``done`` ever
+        holding, a (replay-idempotent) ``log`` line is emitted and the accumulated
+        results are returned — a graceful, non-silent stop rather than a raise.
+
+        Args:
+            body: ``(iter_index, accumulated_so_far) -> result`` for one iteration.
+            done: Stop predicate over the full accumulated result list.
+            max_iters: Mandatory hard cap on iterations (must be >= 1).
+
+        Returns:
+            The accumulated results, in iteration order.
+
+        Raises:
+            ValueError: If ``max_iters`` is less than 1.
+        """
+        if max_iters < 1:
+            raise ValueError(f"loop_until requires max_iters >= 1, got {max_iters}")
+        accumulated: list[T] = []
+        for iteration in range(max_iters):
+            accumulated.append(await body(iteration, list(accumulated)))
+            if done(accumulated):
+                return accumulated
+        self.log(f"loop_until reached max_iters={max_iters} without satisfying done()")
+        return accumulated
 
     async def _run_race_candidate(self, candidate: RaceCandidate) -> Any:
         """Dispatch one race candidate by reusing ``agent()`` verbatim.

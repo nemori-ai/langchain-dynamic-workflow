@@ -28,6 +28,7 @@ import inspect
 from typing import Any, cast
 
 from ._ast_gate import validate_workflow_source
+from ._dag import DagNode
 from ._engine import run_workflow
 from ._errors import WorkflowScriptError
 from ._race_types import RaceCandidate, RaceResult
@@ -105,6 +106,15 @@ _SCRIPT_RACE_API: dict[str, Any] = {
 ``RaceCandidate`` specs and reads ``RaceResult`` by name without an import (the AST
 gate forbids imports). ``ctx.race`` is a method, so it needs no injection."""
 
+_SCRIPT_DAG_API: dict[str, Any] = {
+    "DagNode": DagNode,
+}
+"""DAG value type injected as a script global so a host-authored script constructs
+``DagNode`` specs by name without an import (the AST gate forbids imports). ``ctx.dag``
+and ``ctx.loop_until`` are methods, so they need no injection — and unlike
+``ctx.checkpoint`` they are NOT on the AST gate's denylist (they are ordinary
+orchestration primitives, like ``parallel`` / ``pipeline`` / ``race``)."""
+
 
 def compile_workflow_source(source: str) -> WorkflowFn:
     """Validate, compile, and execute an untrusted script into an orchestration callable.
@@ -138,6 +148,7 @@ def compile_workflow_source(source: str) -> WorkflowFn:
         "__builtins__": _SAFE_BUILTINS,
         **_SCRIPT_REDUCE_API,
         **_SCRIPT_RACE_API,
+        **_SCRIPT_DAG_API,
     }
     exec(code, namespace)
 

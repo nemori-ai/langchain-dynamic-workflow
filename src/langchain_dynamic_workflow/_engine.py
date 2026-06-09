@@ -27,7 +27,14 @@ from ._concurrency import (
     resolve_max_concurrency,
     with_max_concurrency,
 )
-from ._context import UNSET, WORKTREE_CHANGESET_KEY, Ctx, LeafOutcome, WorkflowResolver
+from ._context import (
+    DEFAULT_MAX_WORKFLOW_DEPTH,
+    UNSET,
+    WORKTREE_CHANGESET_KEY,
+    Ctx,
+    LeafOutcome,
+    WorkflowResolver,
+)
 from ._determinism import CallSequenceGuard
 from ._errors import WorkflowCheckpointError, WorkflowSignoffRequired
 
@@ -79,6 +86,7 @@ async def run_workflow(
     command_include_payloads: bool = False,
     sandbox_manager: SandboxManager | None = None,
     workflows: WorkflowResolver | None = None,
+    max_workflow_depth: int = DEFAULT_MAX_WORKFLOW_DEPTH,
 ) -> Any:
     """Run an orchestration script to completion and return its final result.
 
@@ -180,9 +188,11 @@ async def run_workflow(
             throttles below the gate — setting both to the same value makes the two
             semaphores interleave and the effective cap fall one below the target.
         workflows: Optional named-workflow resolver enabling ``ctx.workflow(name,
-            args)`` one-level inline nesting. The inner workflow shares this run's
-            journal, budget, gate, and progress log. When omitted, any
-            ``ctx.workflow()`` call raises ``LookupError``.
+            args)`` inline nesting. The inner workflow shares this run's journal,
+            budget, gate, and progress log. When omitted, any ``ctx.workflow()``
+            call raises ``LookupError``.
+        max_workflow_depth: Cap on ``ctx.workflow`` inline nesting depth (a
+            runaway-recursion backstop); defaults to ``DEFAULT_MAX_WORKFLOW_DEPTH``.
 
     Returns:
         Whatever the orchestration callable returns.
@@ -401,6 +411,7 @@ async def run_workflow(
             workflows=workflows,
             spans=span_recorder,
             pending_signoff=resume,
+            max_workflow_depth=max_workflow_depth,
         )
         try:
             result = await orchestrate(ctx)

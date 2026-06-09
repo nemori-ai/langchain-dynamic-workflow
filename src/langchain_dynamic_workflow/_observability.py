@@ -44,12 +44,14 @@ class SpanKind(StrEnum):
         PARALLEL: A ``parallel()`` blocking-barrier fan-out.
         PIPELINE: A ``pipeline()`` no-barrier streaming fan-out.
         RACE: A ``race()`` best-of-N early-exit fan-out (or a journaled-decision replay).
+        DAG: A ``dag()`` topological-order dependency-graph fan-out.
     """
 
     AGENT = "agent"
     PARALLEL = "parallel"
     PIPELINE = "pipeline"
     RACE = "race"
+    DAG = "dag"
 
 
 @dataclass(slots=True)

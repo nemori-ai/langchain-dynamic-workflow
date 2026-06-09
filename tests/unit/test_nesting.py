@@ -1,10 +1,8 @@
-"""Unit tests for one-level ``ctx.workflow(name, args)`` nesting.
+"""Unit tests for ``ctx.workflow`` N-level nesting with a depth cap + cycle guard.
 
-A workflow may inline another workflow exactly one level deep; a second-level
-nest must fail loud. These tests drive ``Ctx.workflow`` directly with fake leaves
-(no host model): one level returns the inner result and shares the parent's
-journal/budget, while a nested ``workflow()`` inside an already-nested workflow
-raises ``WorkflowNestingError``.
+A workflow may inline other workflows up to ``max_workflow_depth`` levels; exceeding
+the cap raises ``WorkflowNestingError`` and re-entering a name already on the inlining
+stack (a cycle) raises ``WorkflowCycleError``.
 """
 
 from __future__ import annotations
@@ -16,36 +14,73 @@ import pytest
 from langchain_core.runnables import Runnable
 
 from langchain_dynamic_workflow import Ctx, Roster, run_workflow
-from langchain_dynamic_workflow._errors import WorkflowNestingError
+from langchain_dynamic_workflow._errors import WorkflowCycleError, WorkflowNestingError
 from langchain_dynamic_workflow._workflows import WorkflowRegistry
 
 FakeLeafFactory = Callable[..., tuple[Runnable[Any, Any], Any]]
 
 
-async def test_one_level_nesting_returns_inner_result(
-    make_fake_leaf: FakeLeafFactory,
-) -> None:
-    leaf, _state = make_fake_leaf("inner-finding")
+async def test_two_level_nesting_now_succeeds(make_fake_leaf: FakeLeafFactory) -> None:
+    leaf, _state = make_fake_leaf("deep-finding")
     roster = Roster().register("researcher", leaf)
 
     async def inner(ctx: Ctx, args: dict[str, Any]) -> str:
-        topic = args["topic"]
-        return await ctx.agent(f"Research {topic}", agent_type="researcher")
+        return await ctx.agent("leaf", agent_type="researcher")
 
-    workflows = WorkflowRegistry().register("inner", inner)
+    async def middle(ctx: Ctx, args: dict[str, Any]) -> str:
+        return await ctx.workflow("inner", {})
+
+    workflows = WorkflowRegistry().register("inner", inner).register("middle", middle)
 
     async def outer(ctx: Ctx) -> str:
-        return await ctx.workflow("inner", {"topic": "batteries"})
+        return await ctx.workflow("middle", {})  # depth 1 -> 2: previously refused
 
     result = await run_workflow(outer, roster=roster, workflows=workflows, thread_id="t1")
-    assert result == "inner-finding"
+    assert result == "deep-finding"
 
 
-async def test_one_level_nesting_shares_parent_budget(
+async def test_exceeding_max_workflow_depth_raises(make_fake_leaf: FakeLeafFactory) -> None:
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("researcher", leaf)
+
+    async def step(ctx: Ctx, args: dict[str, Any]) -> str:
+        # Each level inlines a DISTINCT next level so the cap (not the cycle guard)
+        # is what fires. With max_workflow_depth=2, depth 0 -> w1 -> w2 -> w3 breaches.
+        nxt = args["next"]
+        if nxt is None:
+            return await ctx.agent("leaf", agent_type="researcher")
+        return await ctx.workflow(nxt, {"next": args["then"], "then": None})
+
+    workflows = WorkflowRegistry().register("w1", step).register("w2", step).register("w3", step)
+
+    async def outer(ctx: Ctx) -> str:
+        return await ctx.workflow("w1", {"next": "w2", "then": "w3"})
+
+    with pytest.raises(WorkflowNestingError):
+        await run_workflow(
+            outer, roster=roster, workflows=workflows, thread_id="t1", max_workflow_depth=2
+        )
+
+
+async def test_name_cycle_raises_cycle_error(make_fake_leaf: FakeLeafFactory) -> None:
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("researcher", leaf)
+
+    async def selfish(ctx: Ctx, args: dict[str, Any]) -> str:
+        return await ctx.workflow("selfish", {})  # re-enters itself -> cycle
+
+    workflows = WorkflowRegistry().register("selfish", selfish)
+
+    async def outer(ctx: Ctx) -> str:
+        return await ctx.workflow("selfish", {})
+
+    with pytest.raises(WorkflowCycleError):
+        await run_workflow(outer, roster=roster, workflows=workflows, thread_id="t1")
+
+
+async def test_deep_nesting_shares_parent_budget(
     make_usage_leaf: Callable[..., tuple[Runnable[Any, Any], Any]],
 ) -> None:
-    # The inner workflow's leaf usage must count against the parent's shared
-    # budget — nesting must not open a fresh, separate pool.
     leaf, _model = make_usage_leaf("ok", tokens_per_call=10)
     roster = Roster().register("researcher", leaf)
     spent: dict[str, float] = {}
@@ -53,36 +88,18 @@ async def test_one_level_nesting_shares_parent_budget(
     async def inner(ctx: Ctx, args: dict[str, Any]) -> str:
         return await ctx.agent("Q", agent_type="researcher")
 
-    workflows = WorkflowRegistry().register("inner", inner)
+    async def middle(ctx: Ctx, args: dict[str, Any]) -> str:
+        return await ctx.workflow("inner", {})
+
+    workflows = WorkflowRegistry().register("inner", inner).register("middle", middle)
 
     async def outer(ctx: Ctx) -> str:
-        out = await ctx.workflow("inner", {})
+        out = await ctx.workflow("middle", {})
         spent["after"] = ctx.budget.spent()
         return out
 
     await run_workflow(outer, roster=roster, workflows=workflows, thread_id="t1", budget=1000)
-    # The inner leaf's 10 tokens are visible on the parent ctx budget.
-    assert spent["after"] == 10
-
-
-async def test_second_level_nesting_raises(make_fake_leaf: FakeLeafFactory) -> None:
-    leaf, _state = make_fake_leaf("x")
-    roster = Roster().register("researcher", leaf)
-
-    async def leaf_wf(ctx: Ctx, args: dict[str, Any]) -> str:
-        return await ctx.agent("Q", agent_type="researcher")
-
-    async def middle(ctx: Ctx, args: dict[str, Any]) -> str:
-        # Trying to nest a third level: workflow() inside an already-nested wf.
-        return await ctx.workflow("leaf_wf", {})
-
-    workflows = WorkflowRegistry().register("leaf_wf", leaf_wf).register("middle", middle)
-
-    async def outer(ctx: Ctx) -> str:
-        return await ctx.workflow("middle", {})
-
-    with pytest.raises(WorkflowNestingError):
-        await run_workflow(outer, roster=roster, workflows=workflows, thread_id="t1")
+    assert spent["after"] == 10  # inner leaf's tokens visible on the parent budget
 
 
 async def test_workflow_without_registry_raises_lookuperror(
@@ -94,6 +111,5 @@ async def test_workflow_without_registry_raises_lookuperror(
     async def outer(ctx: Ctx) -> str:
         return await ctx.workflow("missing", {})
 
-    # No workflow registry wired -> resolving any name is a loud lookup error.
     with pytest.raises(LookupError):
         await run_workflow(outer, roster=roster, thread_id="t1")

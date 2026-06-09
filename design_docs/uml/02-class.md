@@ -19,10 +19,14 @@ classDiagram
     +parallel(thunks) list
     +pipeline(items, *stages) list
     +race(candidates, *, win, win_tag) RaceResult
+    +dag(nodes) dict (DAG 拓扑序 fan-out; DagNode 依赖边; Kahn 调度; 独立失败跟踪)
+    +loop_until(body, *, done, max_iters) list (有终止保证的顺序循环; 全量 done 谓词)
+    +workflow(name, args) Any (内联嵌套, depth/cycle 守卫)
     +checkpoint(ask, *, tag) Any (HITL 签核门:journal 记决策/注入 pending/否则 raise WorkflowSignoffRequired;depth-0 守卫)
     +phase(title)
     +log(msg)
     +budget
+    +max_workflow_depth: int (默认 DEFAULT_MAX_WORKFLOW_DEPTH=8; run_workflow 线传)
   }
   class Roster {
     -_built: dict~tuple, Runnable~
@@ -244,9 +248,33 @@ classDiagram
     +winner_index: int or None
     +won: bool
   }
+  class DagNode {
+    <<_dag: pure value type, slots>>
+    +id: str (图内唯一名称; 结果 dict key)
+    +deps: Sequence~str~ (前置节点 id; 根节点传空列表)
+    +run: Callable~dict, Coroutine~ (接 {dep_id: result} 映射的异步工厂)
+  }
+  class WorkflowDagError {
+    <<_errors: control-flow signal — 入 WORKFLOW_CONTROL_FLOW_SIGNALS>>
+    graph structurally invalid before scheduling
+    (duplicate id / unknown dep / self-dep / cycle)
+  }
+  class WorkflowCycleError {
+    <<_errors: control-flow signal — 入 WORKFLOW_CONTROL_FLOW_SIGNALS>>
+    workflow name already on inlining stack
+    (direct recursion or mutual A→B→A)
+  }
   class Codegen {
     <<_codegen: L2 AST gate + exec>>
     +compile_workflow_source(source) Callable
+  }
+  class SpanKind {
+    <<_observability: StrEnum — span 类型>>
+    AGENT
+    PARALLEL
+    PIPELINE
+    RACE
+    DAG
   }
   class SpanRecorder {
     <<_observability: 开 span, 发 begin+end 两条带外边>>
@@ -350,9 +378,14 @@ classDiagram
   Codegen ..> Reduce : inject into run_script namespace
   Codegen ..> RaceCandidate : inject into run_script namespace
   Codegen ..> RaceResult : inject into run_script namespace
+  Codegen ..> DagNode : inject into run_script namespace (_SCRIPT_DAG_API)
   Ctx ..> RaceCandidate : race() candidate spec
   Ctx ..> RaceResult : race() return
   Ctx ..> Journal : race_key() journals the decision
+  Ctx ..> DagNode : dag() fan-out input
+  Ctx ..> WorkflowDagError : dag() 格式非法 re-raise
+  Ctx ..> WorkflowCycleError : workflow() 重入检测
+  SpanKind ..> SpanRecorder : span(kind, ...) 参数类型
   WorkflowEngine --> SpanRecorder : SpanRecorder(sink=on_span, begin_sink=on_span_begin)
   Ctx --> SpanRecorder : span() per primitive (mints span_id, threads into leaf_runner)
   SpanRecorder ..> SpanBegin : 打开即 emit (begin sink)
@@ -365,9 +398,9 @@ classDiagram
 
 ## 分层归属
 
-- **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`、`create_workflow_tool`(产 `WorkflowTool`)、`create_workflow_middleware`(产 `WorkflowMiddleware`)、`InMemoryWorktreeProvider`/`WorktreeProvider`(worktree 隔离 seam)、`read_only_leaf`/`read_only_builder`(只读裁判叶,deny-write permission,D-G4)、跨叶归约 helper `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`,`_reduce` 纯函数,F)、race 值类型 `RaceCandidate`/`RaceResult`(+ `race_key`,`_race_types` 纯类型,B,配 `ctx.race` 原语)、可观测性值类型与 sink 别名 `Span`/`SpanBegin`/`SpanKind`/`LeafEvent`/`CommandEvent`(+ `SpanSink`/`SpanBeginSink`/`LeafEventSink`/`CommandSink`,供宿主消费 `run_workflow` 的 `on_span`/`on_span_begin`/`on_leaf_event`/`on_command` 带外边——`CommandEvent`/`on_command` 是执行面同构 sink,在真 subprocess 边界发成对命令生命周期边)、**真执行 opt-in 面 `LocalSubprocessSandbox`/`SandboxFactory`/`local_subprocess_factory` + 策略值类型 `ExecPolicy`/`ExecRequest`/`ExecDecision`/`RLimitProfile`(M5,`_local_subprocess`/`_sandbox`,供宿主 `SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))` 注入真本地执行——危险 opt-in,非安全 sandbox)**。`LeafEventHandler` 是引擎内部(不导出)的回调 normalizer,一叶一实例、闭包持 `leaf_span_id` 关联(见 [01 §2b](../01-engine-mechanism.md))。
+- **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`、`create_workflow_tool`(产 `WorkflowTool`)、`create_workflow_middleware`(产 `WorkflowMiddleware`)、`InMemoryWorktreeProvider`/`WorktreeProvider`(worktree 隔离 seam)、`read_only_leaf`/`read_only_builder`(只读裁判叶,deny-write permission,D-G4)、跨叶归约 helper `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`,`_reduce` 纯函数,F)、race 值类型 `RaceCandidate`/`RaceResult`(+ `race_key`,`_race_types` 纯类型,B,配 `ctx.race` 原语)、**DAG 值类型 `DagNode`(`_dag`,M7,配 `ctx.dag` 原语;`_codegen` 注入 `run_script` 命名空间)** + **`WorkflowDagError`/`WorkflowCycleError`(M7,从包根导出,入 `WORKFLOW_CONTROL_FLOW_SIGNALS`)**、可观测性值类型与 sink 别名 `Span`/`SpanBegin`/`SpanKind`/`LeafEvent`/`CommandEvent`(+ `SpanSink`/`SpanBeginSink`/`LeafEventSink`/`CommandSink`,供宿主消费 `run_workflow` 的 `on_span`/`on_span_begin`/`on_leaf_event`/`on_command` 带外边——`CommandEvent`/`on_command` 是执行面同构 sink,在真 subprocess 边界发成对命令生命周期边;`SpanKind.DAG` 标注 dag fan-out span)、**真执行 opt-in 面 `LocalSubprocessSandbox`/`SandboxFactory`/`local_subprocess_factory` + 策略值类型 `ExecPolicy`/`ExecRequest`/`ExecDecision`/`RLimitProfile`(M5,`_local_subprocess`/`_sandbox`,供宿主 `SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))` 注入真本地执行——危险 opt-in,非安全 sandbox)**。`LeafEventHandler` 是引擎内部(不导出)的回调 normalizer,一叶一实例、闭包持 `leaf_span_id` 关联(见 [01 §2b](../01-engine-mechanism.md))。
 - **agent 面(运行时)**：`WorkflowTool`(多命令)。
 - **host 后台机制**：`WorkflowMiddleware` + `BgRunManager` + `BgRunSlot` + `ResultStore`。
 - **跨会话持久化(M3,Layer 2 host-wiring)**：`WorkflowRunStore`(协议)+ `RunSpec`(可 resume 的 launch 描述,携规范 `journal_run_id` 谱系)+ `InMemoryRunStore`(默认、零依赖)+ `SqliteWorkflowStore`(`[sqlite]` extra:统一 sqlite db 文件 + 两条连接——autocommit store 背 registry + `RunScopedJournal` per-run journal、第二连接背持久 `AsyncSqliteSaver` checkpointer)。`_persistence` / `_run_store` 只从 `._engine`(公共墙)import `JournalStore`/`JournalRecord`,故 import-linter Contract 1 把这两模块列入 `source_modules`。零成本重放由持久 journal 交付,checkpointer 是 durable add-on。
-- **引擎核心(不可见)**：`WorkflowEngine`、`Ctx`、`Journal`(+`JournalStore`)、`DeterminismGuard`、`PipelineScheduler`、`SandboxManager`、`SchemaConverter`(`_schema.to_pydantic_model`,把 JSON-schema dict 归一为 pydantic 模型)、`Codegen`(`_codegen`,L2 AST gate + 受限 `exec`,**依赖 `_reduce` 与 `_race_types`** 把归约 helper 与 race 值类型注入 `run_script` 命名空间——故 import-linter "L2 不得触 L0/L1 内部" 契约的 `forbidden_modules` 既不含 `_reduce` 也不含 `_race_types`)。`Roster` 经 `runnable_for(response_format)` 按 `(agent_type, schema)` 缓存绑定变体,builder 条目供 `agent(schema=)`。
+- **引擎核心(不可见)**：`WorkflowEngine`、`Ctx`、`Journal`(+`JournalStore`)、`DeterminismGuard`、`PipelineScheduler`、**`_dag.run_dag`(DagScheduler,M7:Kahn 入度调度 + 独立失败跟踪 + 控制流信号穿透)**、`SandboxManager`、`SchemaConverter`(`_schema.to_pydantic_model`,把 JSON-schema dict 归一为 pydantic 模型)、`Codegen`(`_codegen`,L2 AST gate + 受限 `exec`,**依赖 `_reduce` / `_race_types` / `_dag`** 把归约 helper / race 值类型 / `DagNode` 注入 `run_script` 命名空间——故 import-linter "L2 不得触 L0/L1 内部" 契约的 `forbidden_modules` 既不含 `_reduce` / `_race_types` 也不含 `_dag`)。`Roster` 经 `runnable_for(response_format)` 按 `(agent_type, schema)` 缓存绑定变体,builder 条目供 `agent(schema=)`。
 - **底座**：LangGraph `@entrypoint`/`@task`/checkpointer/`BaseStore`；deepagents `CompiledSubAgent`/`AgentMiddleware`/`SkillsMiddleware`/backend。
