@@ -171,14 +171,14 @@ A run executes in the background and a completion notice is injected before the 
 
 ## Examples
 
-The **17 feature demos** under [`examples/features/`](examples/features/) each isolate one mechanism and run **offline with no API key** (deterministic fake models). The two **flagships** under [`examples/flagship/`](examples/flagship/) carry the real end-to-end path: offline by default, they light up live OpenRouter leaves with native web search + prompt caching when you opt in. To drive the real path, install the demo extras with `uv sync --group example`, put `OPENROUTER_API_KEY` and the `LANGSMITH_*` settings in a local `.env`, then set `LDW_DEMO_REAL_MODEL` (defaults to `anthropic/claude-opus-4.8`; set it to any OpenRouter slug to override). The full taxonomy and the authoritative index of every demo live in **[`examples/AGENTS.md`](examples/AGENTS.md)**.
+The **18 feature demos** under [`examples/features/`](examples/features/) each isolate one mechanism and run **offline with no API key** (deterministic fake models). The two **flagships** under [`examples/flagship/`](examples/flagship/) carry the real end-to-end path: offline by default, they light up live OpenRouter leaves with native web search + prompt caching when you opt in. To drive the real path, install the demo extras with `uv sync --group example`, put `OPENROUTER_API_KEY` and the `LANGSMITH_*` settings in a local `.env`, then set `LDW_DEMO_REAL_MODEL` (defaults to `anthropic/claude-opus-4.8`; set it to any OpenRouter slug to override). The full taxonomy and the authoritative index of every demo live in **[`examples/AGENTS.md`](examples/AGENTS.md)**.
 
 | Demo | Shows |
 |---|---|
 | **[`flagship/deep_research_preset`](examples/flagship/deep_research_preset.py)** | Flagship (real model): a host drives the registered `deep_research` workflow — parallel search → extract → adversarial verify → synthesize, with native web search + prompt caching. |
 | **[`flagship/deep_research_authored`](examples/flagship/deep_research_authored.py)** | Flagship (real model): a host *authors* the deep-research script live and runs it via `run_script` (AST gate happy path), same web-search + caching leaf stack. |
 
-The 17 offline feature demos (one mechanism each, no API key) and the full taxonomy live in **[`examples/AGENTS.md`](examples/AGENTS.md)**.
+The 18 offline feature demos (one mechanism each, no API key) and the full taxonomy live in **[`examples/AGENTS.md`](examples/AGENTS.md)**.
 
 ```bash
 # any offline feature demo:

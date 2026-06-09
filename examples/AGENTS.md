@@ -22,7 +22,7 @@ The set has exactly two layers, with different rules:
   search → extract → adversarial verify → synthesize) on live models with native web
   search and prompt caching. A flagship is expensive to maintain and is **not added
   casually** — the bar is a genuinely new end-to-end story, not a new single feature.
-- **Feature demos** (`features/`, 17 demos): each demonstrates **exactly one**
+- **Feature demos** (`features/`, 18 demos): each demonstrates **exactly one**
   mechanism, runs **fully offline and deterministically**, and needs **no API key**.
   They use the shared scripted fakes in `_shared/offline_models.py`, so they are fast,
   reproducible, and safe to run in CI.
@@ -36,7 +36,7 @@ This table is the authoritative index of every demo. The two flagships:
 | `flagship/deep_research_preset` | Real-model host drives the **registered** `deep_research` workflow: parallel search → extract → adversarial verify → synthesize, with native web search + prompt caching; schema-as-handoff and reduce are embedded in the registered workflow. |
 | `flagship/deep_research_authored` | Real-model host **authors** the deep-research script live and submits it via `run_script` (AST-gate happy path), then runs it on the same web-search + caching leaf stack. |
 
-The 17 feature demos, one mechanism each:
+The 18 feature demos, one mechanism each:
 
 | Demo | Single mechanism |
 |---|---|
@@ -44,7 +44,8 @@ The 17 feature demos, one mechanism each:
 | `features/parallel` | `parallel()` barrier fan-out + filtering failed leaves (cross-reference pipeline). |
 | `features/pipeline` | `pipeline()` no-barrier staged flow (cross-reference parallel). |
 | `features/race` | `ctx.race` best-of-N early exit + in-flight cancel + journaled determinism (replay reproduces the winner and dispatches nothing new). |
-| `features/nesting` | `workflow()` named nesting (one level of nesting). |
+| `features/nesting` | `workflow()` named nesting — multiple levels deep + cycle guard. |
+| `features/dag` | `ctx.dag` dependency-order (topological) fan-out + transitive skip of a failed branch. |
 | `features/budget` | loop-until-budget / loop-until-dry via `ctx.budget.remaining()`. |
 | `features/observability` | `phase()` / `log()` narration + the full tap set — `on_progress` / `on_span` for the trace, `on_span_begin` for the running edge, `on_leaf_event` for a leaf's run-tree subtree (the same surfaces the demo app consumes). |
 | `features/reduce` | cross-leaf reduce family: gather → `dedup` → `corroborate` → `survives` (voting) → `reconcile` (double-blind reconciliation). |
@@ -63,11 +64,11 @@ The 17 feature demos, one mechanism each:
 Read in this order to build up from a single leaf to the full flagships:
 
 1. `agent_and_schema` — one leaf, structured handoff.
-2. `parallel` → `pipeline` — fan-out with a barrier vs. a staged flow without one.
+2. `parallel` → `pipeline` → `dag` — fan-out with a barrier, a staged flow without one, and dependency-order (topological) fan-out with transitive skip.
 3. `budget` → `observability` → `journal_resume` — loop control, narration, replay.
 4. `reduce` — synthesizing many leaf results into one.
 5. `race` — best-of-N early exit and journaled cancel.
-6. `nesting` — composing a named sub-workflow.
+6. `nesting` — composing named sub-workflows multiple levels deep, with a cycle guard.
 7. `host_integration` — wiring the runtime into a host and watching many runs.
 8. `sandbox` → `worktree` → `git_worktree` → `readonly_judge` — isolation
    (in-memory then real-`git`, with an authoritative diff + script-owned merge) and
