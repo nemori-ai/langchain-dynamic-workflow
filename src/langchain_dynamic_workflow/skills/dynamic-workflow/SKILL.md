@@ -8,7 +8,7 @@ description: >-
   intermediate results live in script variables and only the final conclusion
   reaches your context. Keywords: orchestrate, fan-out, parallel, pipeline,
   multi-agent, deterministic workflow, background run, author script,
-  run/run_script/status/resume/cancel.
+  run/run_script/status/resume/cancel, dag, topological, loop_until.
 ---
 
 # Dynamic Workflow orchestration
@@ -64,9 +64,25 @@ correct one yourself.
   over `parallel` when you only need the first good-enough answer and want to stop
   the rest (e.g. multi-hypothesis diagnosis). `win_tag` distinguishes the win
   criterion in the resume journal — see the footgun note in the race pattern below.
-- `await ctx.workflow(name, args)` — inline another registered workflow, exactly
-  one level deep. The inner workflow shares this run's journal and budget. A
-  second nesting level is refused.
+- `await ctx.dag(nodes)` — fan out a **dependency graph** in topological order: each
+  `DagNode(id, deps=[...], run=lambda d: ...)` runs only after every id in `deps` has
+  settled, and its `run` receives a `{dep_id: result}` mapping of those predecessors'
+  results. Ready nodes run concurrently with no level barrier (an independent branch
+  races ahead of a slow one). Returns a `{node_id: result}` dict. A node whose `run`
+  raises lands as `None` and every node that depends on it is **skipped** to `None`
+  (transitive); a node that legitimately returns `None` does NOT skip its dependents.
+  Use this over `parallel` when the work has a real dependency order (e.g. package →
+  module → symbol). Filter the `None` holes downstream, same as `parallel`/`pipeline`.
+- `await ctx.loop_until(body, *, done, max_iters)` — a measured-stop loop with the two
+  author disciplines built in. `body` is `(iter_index, accumulated_so_far) -> result`;
+  after each iteration the result is appended and `done(accumulated)` is checked over
+  the **full** accumulated list (dedup / convergence against *everything* seen, not just
+  the last round). `max_iters` is a **mandatory** hard cap — when it is reached without
+  `done` ever holding, a log line is emitted and the accumulated results are returned.
+  Returns the accumulated list.
+- `await ctx.workflow(name, args)` — inline another registered workflow, up to several
+  levels deep (a configurable cap guards runaway recursion). The inner workflow shares
+  this run's journal and budget. A workflow that re-enters itself (a cycle) is refused.
 - `ctx.phase(title)` / `ctx.log(message)` — narrate progress (grouping marker /
   free-form line). Display-only; safe to repeat in code.
 - `ctx.budget` — the shared token pool: `ctx.budget.total`, `ctx.budget.spent()`,
@@ -151,6 +167,66 @@ async def orchestrate(ctx, args):
     )
     return "rejected" if verdict.refuted else "stands"
 ```
+
+Dependency-order DAG (topological):
+
+```python
+async def orchestrate(ctx, args):
+    # Real dependency order: the package doc feeds each module doc, a module doc
+    # feeds its symbol docs. ctx.dag runs each node only after its deps settle and
+    # passes their results in as `d`.
+    results = await ctx.dag([
+        DagNode("pkg", deps=[], run=lambda d: ctx.agent("doc package", agent_type="doc")),
+        DagNode("mod", deps=["pkg"], run=lambda d: ctx.agent(f"doc module | {d['pkg']}", agent_type="doc")),
+        DagNode("sym", deps=["mod"], run=lambda d: ctx.agent(f"doc symbol | {d['mod']}", agent_type="doc")),
+    ])
+    return {k: v for k, v in results.items() if v is not None}  # drop skipped/failed holes
+```
+
+Measured-stop loop (`loop_until`):
+
+```python
+async def orchestrate(ctx, args):
+    # Keep finding until 10 DISTINCT findings, deduped against ALL seen — with a
+    # mandatory hard cap so a stubborn model can't loop forever.
+    def enough(found):
+        return len({f.lower() for f in found}) >= 10
+
+    async def round_(i, seen):
+        return await ctx.agent(f"Find an issue NOT already in: {sorted(set(seen))}", agent_type="finder")
+
+    found = await ctx.loop_until(round_, done=enough, max_iters=20)
+    return sorted(set(found))
+```
+
+Multi-phase: a prior phase's result drives the next phase's fan-out (scout-then-fan-out):
+
+```python
+async def orchestrate(ctx, args):
+    # Phase 1 (scout): one cheap leaf discovers the work-list at runtime.
+    plan = await ctx.agent(f"List the files to review for: {args['goal']}", agent_type="scout")
+    files = sorted(plan.splitlines())  # ordered -> deterministic
+    # Phase 2: fan out over the DISCOVERED list — the next phase's shape is decided by
+    # the previous phase's result, in plain deterministic code (control-flow inversion).
+    reviews = await ctx.parallel(
+        [lambda f=f: ctx.agent(f"Review {f}", agent_type="reviewer") for f in files]
+    )
+    return await ctx.agent("Synthesize:\n" + "\n".join(r for r in reviews if r), agent_type="writer")
+```
+
+### Author footguns
+
+- **Every loop needs a hard cap.** `ctx.loop_until` enforces `max_iters`; a hand-written
+  `while` loop must carry its own `MAX` so a stubborn model can't spin forever.
+- **Dedup / convergence against ALL seen, not just the last round.** Pass the full
+  accumulated set into each round (as `ctx.loop_until` does via its `accumulated` arg)
+  and compare against it — checking only the latest result silently re-discovers
+  duplicates and never converges.
+- **Build the next phase from the previous phase's result in plain code.** There is no
+  special multi-phase construct: `await` the prior phase into a variable, branch on it,
+  and build the next `parallel` / `pipeline` / `dag` work-list from it.
+- See **Determinism rules** above for the always-on disciplines (sorted iteration,
+  default-argument capture in `parallel`/`dag` lambdas) — they apply to every pattern here.
 
 ## Quality patterns
 
