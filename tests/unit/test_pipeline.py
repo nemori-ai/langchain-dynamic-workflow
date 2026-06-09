@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 
 import pytest
 
@@ -219,3 +220,88 @@ async def test_pipeline_is_faster_than_sequential() -> None:
     sequential = len(items) * 2 * per_stage
     # Overlap must beat naive sequential by a wide margin.
     assert elapsed < sequential * 0.6
+
+
+async def test_pipeline_accepts_sync_generator_without_len() -> None:
+    # A generator is Iterable but NOT Sized: it has no __len__. The generalized
+    # run_pipeline must stream it through without ever calling len(items) and
+    # collect results in the generator's yield order.
+    gate = ConcurrencyGate(limit=4)
+
+    def gen() -> Iterator[int]:  # generator: Iterable, not Sized
+        yield from (10, 20, 30, 40, 50)
+
+    async def stage(prev: int, item: int, index: int) -> int:
+        # Later items finish faster so completion order != input order.
+        await asyncio.sleep((50 - item) * 0.0001)
+        return item + index
+
+    results = await run_pipeline(gen(), [stage], gate=gate)
+    # index threads the yield position: 10+0, 20+1, 30+2, 40+3, 50+4.
+    assert results == [10, 21, 32, 43, 54]
+
+
+async def test_pipeline_accepts_async_iterable() -> None:
+    # An async source (paged API / streaming reader) is the point of streaming
+    # admission. The feeder must drive it via `async for` and preserve order.
+    gate = ConcurrencyGate(limit=4)
+
+    async def asource():
+        for value in range(6):
+            await asyncio.sleep(0.0005)
+            yield value
+
+    async def stage(prev: int, item: int, index: int) -> int:
+        await asyncio.sleep((6 - item) * 0.001)
+        return item * 100
+
+    results = await asyncio.wait_for(
+        run_pipeline(asource(), [stage], gate=gate),
+        timeout=3.0,
+    )
+    assert results == [0, 100, 200, 300, 400, 500]
+
+
+async def test_pipeline_empty_async_iterable_returns_empty() -> None:
+    # An empty AsyncIterable has no __len__ and no __bool__: the old
+    # `if not items: return []` early return would have crashed on it. The
+    # generalized run must drain zero items and return [] via poison-pill teardown.
+    gate = ConcurrencyGate(limit=2)
+
+    async def empty_asource():
+        return
+        yield  # pragma: no cover  -- makes this an async generator
+
+    async def stage(prev: int, item: int, index: int) -> int:  # pragma: no cover
+        raise AssertionError("stage must not run for an empty input")
+
+    results = await asyncio.wait_for(
+        run_pipeline(empty_asource(), [stage], gate=gate),
+        timeout=2.0,
+    )
+    assert results == []
+
+
+async def test_pipeline_async_iterable_preserves_order_under_backpressure() -> None:
+    # An AsyncIterable feeding more items than the queue capacity must apply
+    # backpressure (not deadlock) and still return results in input order, proving
+    # the dict-keyed collection reconstructs order without a pre-allocated length.
+    gate = ConcurrencyGate(limit=4)
+
+    async def asource():
+        for value in range(20):
+            yield value
+
+    async def stage_one(prev: int, item: int, index: int) -> int:
+        await asyncio.sleep(0.001)
+        return item + 1
+
+    async def stage_two(prev: int, item: int, index: int) -> int:
+        await asyncio.sleep(0.001)
+        return prev * 2
+
+    results = await asyncio.wait_for(
+        run_pipeline(asource(), [stage_one, stage_two], gate=gate, queue_maxsize=2),
+        timeout=3.0,
+    )
+    assert results == [(i + 1) * 2 for i in range(20)]
