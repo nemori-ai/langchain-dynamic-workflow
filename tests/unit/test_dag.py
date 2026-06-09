@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
-import pytest
+from typing import Any
 
+import pytest
+from langchain_core.messages import AIMessage
+
+from langchain_dynamic_workflow._concurrency import ConcurrencyGate
+from langchain_dynamic_workflow._context import Ctx, LeafOutcome
 from langchain_dynamic_workflow._dag import DagNode, _validate_dag, run_dag
 from langchain_dynamic_workflow._errors import WorkflowBudgetExceededError, WorkflowDagError
+from langchain_dynamic_workflow._journal import InMemoryJournalStore
+from langchain_dynamic_workflow._observability import Span, SpanKind, SpanRecorder
+from langchain_dynamic_workflow._roster import Roster
 
 
 def _node(node_id: str, deps: list[str]) -> DagNode:
@@ -111,3 +119,70 @@ async def test_run_dag_control_flow_signal_fails_loud_not_masked() -> None:
         await run_dag(
             [DagNode("a", deps=[], run=_budget_breach), DagNode("b", deps=[], run=_other)]
         )
+
+
+# ---------------------------------------------------------------------------
+# ctx.dag integration: fan-out frame + SpanKind.DAG
+# ---------------------------------------------------------------------------
+
+
+class _CountingLeaf:
+    """A lightweight leaf runner that records prompts and counts invocations."""
+
+    def __init__(self, *, prefix: str) -> None:
+        self.calls = 0
+        self.prefix = prefix
+
+    async def __call__(
+        self,
+        agent_type: str,
+        prompt: str,
+        model: str | None,
+        *,
+        leaf_id: str = "",
+        needs_execution: bool = False,
+        response_format: Any = None,
+        isolation: str = "shared",
+        leaf_span_id: str = "",
+    ) -> LeafOutcome:
+        self.calls += 1
+        return LeafOutcome(
+            state={"messages": [AIMessage(content=f"{self.prefix}:{prompt}")]}, usage=0
+        )
+
+
+def _dag_ctx(leaf: _CountingLeaf, journal: InMemoryJournalStore, collected: list[Span]) -> Ctx:
+    roster = Roster()
+    roster.register("worker", object())  # type: ignore[arg-type]
+    return Ctx(
+        roster=roster,
+        journal=journal,
+        leaf_runner=leaf,
+        gate=ConcurrencyGate(limit=8),
+        spans=SpanRecorder(sink=collected.append),
+    )
+
+
+async def test_ctx_dag_runs_topologically_and_emits_a_dag_span() -> None:
+    leaf = _CountingLeaf(prefix="R")
+    collected: list[Span] = []
+    ctx = _dag_ctx(leaf, InMemoryJournalStore(), collected)
+
+    results = await ctx.dag(
+        [
+            DagNode("pkg", deps=[], run=lambda d: ctx.agent("doc package", agent_type="worker")),
+            DagNode(
+                "modA",
+                deps=["pkg"],
+                run=lambda d: ctx.agent(f"doc A | {d['pkg']}", agent_type="worker"),
+            ),
+        ]
+    )
+    assert results["pkg"] == "R:doc package"
+    assert results["modA"] == "R:doc A | R:doc package"
+    assert leaf.calls == 2
+    # Verify a DAG span was emitted with the correct node/surviving counts.
+    dag_spans = [s for s in collected if s.kind is SpanKind.DAG]
+    assert len(dag_spans) == 1
+    assert dag_spans[0].attributes["node_count"] == 2
+    assert dag_spans[0].attributes["surviving_count"] == 2

@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from ._budget import Budget
 from ._concurrency import ConcurrencyGate, resolve_max_concurrency
+from ._dag import DagNode, run_dag
 from ._determinism import CallSequenceGuard
 from ._errors import (
     WORKFLOW_CONTROL_FLOW_SIGNALS,
@@ -799,6 +800,55 @@ class Ctx:
             finally:
                 _FANOUT_DEPTH.reset(token)
             span.set("surviving_count", sum(1 for r in results if r is not None))
+            return results
+
+    async def dag(self, nodes: Sequence[DagNode]) -> dict[str, Any | None]:
+        """Run a dependency graph in topological order; a node runs after its deps.
+
+        Each :class:`~langchain_dynamic_workflow._dag.DagNode` declares an ``id``, its
+        ``deps`` (ids it depends on), and a ``run(deps)`` callable that receives a
+        ``{dep_id: result}`` mapping of its predecessors' results and typically calls
+        ``agent()``. Ready nodes (all deps settled) run concurrently; there is no
+        level barrier, so an independent branch races ahead of a slow one. A node
+        whose ``run`` raises lands as ``None`` and every node that depends on it
+        (transitively) is skipped to ``None``; a node that legitimately returns
+        ``None`` does not skip its dependents. Engine control-flow signals
+        (budget / determinism / a malformed graph) are re-raised loud after the
+        in-flight nodes drain, never masked as a ``None`` hole.
+
+        Concurrency is bounded at the leaf: the ``agent()`` calls inside a node's
+        ``run`` acquire the shared gate, while this fan-out layer holds no slot — so a
+        ``dag`` nested inside a node cannot starve the pool. Like ``parallel`` /
+        ``pipeline`` / ``race``, the leaves inside the nodes are excluded from the
+        determinism sequence guard (their completion order is wall-clock dependent);
+        the content-hash journal still guards each by its inputs, so a resume replays
+        completed nodes at zero model cost — the graph structure is script-defined and
+        therefore deterministic, needing no dag-level journal entry of its own.
+
+        Args:
+            nodes: The graph's nodes.
+
+        Returns:
+            A mapping ``{node_id: result}``; a failed or skipped node maps to ``None``.
+
+        Raises:
+            WorkflowDagError: If the graph is structurally invalid (duplicate id,
+                unknown / self dependency, or a cycle).
+        """
+        with self._spans.span(SpanKind.DAG, "dag") as span:
+            span.set("node_count", len(nodes))
+            if not nodes:
+                span.set("surviving_count", 0)
+                return {}
+            # Mark the fan-out frame so agent() calls inside the nodes skip the
+            # determinism backstop; set before run_dag spawns node tasks so each
+            # child task inherits the depth.
+            token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
+            try:
+                results = await run_dag(nodes)
+            finally:
+                _FANOUT_DEPTH.reset(token)
+            span.set("surviving_count", sum(1 for v in results.values() if v is not None))
             return results
 
     async def _run_race_candidate(self, candidate: RaceCandidate) -> Any:
