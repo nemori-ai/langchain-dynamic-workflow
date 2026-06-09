@@ -40,6 +40,12 @@ class WorkflowNestingError(RuntimeError):
     trips it and fails loud. The cycle guard (``WorkflowCycleError``) catches the
     common recursive pattern earlier and more precisely; this error fires when
     distinct workflow names are nested beyond the cap.
+
+    This is a control-flow signal: a depth-cap breach is a structural/runaway-recursion
+    error that must fail loud inside a fan-out frame (``parallel`` / ``pipeline`` /
+    ``race`` / ``dag``), not be masked as a ``None`` hole. It belongs in
+    ``WORKFLOW_CONTROL_FLOW_SIGNALS`` alongside ``WorkflowDagError`` and
+    ``WorkflowCycleError``.
     """
 
 
@@ -138,12 +144,14 @@ WORKFLOW_CONTROL_FLOW_SIGNALS: tuple[type[Exception], ...] = (
     WorkflowCheckpointError,
     WorkflowDagError,
     WorkflowCycleError,
+    WorkflowNestingError,
 )
 """Engine signals that must fail loud inside a fan-out, never be masked as ``None``.
 
-``parallel`` / ``pipeline`` / ``race`` isolate an ordinary leaf failure as a quiet
-``None`` hole, but these signals indicate the run itself is no longer sound (an
-exhausted budget, a replay divergence, or a checkpoint reached from a fan-out
-frame). They are re-raised after the barrier/drain settles instead of being
-swallowed, so the breach surfaces rather than corrupting the result with a hole.
+``parallel`` / ``pipeline`` / ``race`` / ``dag`` isolate an ordinary leaf failure as
+a quiet ``None`` hole, but these signals indicate the run itself is no longer sound (an
+exhausted budget, a replay divergence, a checkpoint reached from a fan-out frame, a
+malformed dag graph, a workflow naming cycle, or a depth-cap breach). They are re-raised
+after the barrier/drain settles instead of being swallowed, so the breach surfaces rather
+than corrupting the result with a hole.
 """

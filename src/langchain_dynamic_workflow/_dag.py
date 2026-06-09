@@ -176,10 +176,14 @@ async def run_dag(nodes: Sequence[DagNode]) -> dict[str, Any | None]:
                     results[node_id] = task.result()
                 pending.extend(_release(node_id))
     finally:
-        # Defensive: never leak tasks if the loop unwinds unexpectedly.
+        # Defensive: if the loop unwinds unexpectedly (e.g. run_dag is cancelled
+        # externally), cancel any still-running node tasks AND await them so they are
+        # not left pending/unawaited. return_exceptions swallows their CancelledError.
         for task in running:
             if not task.done():
                 task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
 
     if aborted:
         raise aborted[0]

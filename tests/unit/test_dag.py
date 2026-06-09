@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -17,7 +18,11 @@ from langchain_dynamic_workflow._dag import (
     run_dag,
 )
 from langchain_dynamic_workflow._engine import run_workflow
-from langchain_dynamic_workflow._errors import WorkflowBudgetExceededError, WorkflowDagError
+from langchain_dynamic_workflow._errors import (
+    WorkflowBudgetExceededError,
+    WorkflowDagError,
+    WorkflowNestingError,
+)
 from langchain_dynamic_workflow._journal import InMemoryJournalStore
 from langchain_dynamic_workflow._observability import Span, SpanKind, SpanRecorder
 from langchain_dynamic_workflow._roster import Roster
@@ -131,6 +136,44 @@ async def test_run_dag_control_flow_signal_fails_loud_not_masked() -> None:
         await run_dag(
             [DagNode("a", deps=[], run=_budget_breach), DagNode("b", deps=[], run=_other)]
         )
+
+
+async def test_run_dag_cancellation_does_not_leak_tasks() -> None:
+    # When run_dag is cancelled externally while a node is in-flight, the finally
+    # block must cancel AND await the in-flight node tasks so none are left pending
+    # (the "Task was destroyed but it is pending!" asyncio warning must not fire).
+    started: list[str] = []
+
+    async def _slow(_d: dict[str, object]) -> str:
+        started.append("slow")
+        await asyncio.sleep(10)  # long enough that the outer cancel hits mid-flight
+        return "done"
+
+    task = asyncio.create_task(run_dag([DagNode("a", deps=[], run=_slow)]))
+    await asyncio.sleep(0.05)  # let the node start
+    assert started == ["slow"], "node should have started before we cancel"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Give the event loop one turn to settle any residual task teardown.
+    await asyncio.sleep(0)
+    leaked = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    assert leaked == [], f"leaked {len(leaked)} pending task(s) after run_dag cancellation"
+
+
+async def test_run_dag_nesting_error_fails_loud() -> None:
+    # A WorkflowNestingError (depth-cap breach) raised by a dag node must be
+    # re-raised after drain, not masked as a None hole. This is the regression
+    # for the M7 Codex-review BLOCKER fix: previously the error was absent from
+    # WORKFLOW_CONTROL_FLOW_SIGNALS and would have been silently swallowed.
+    async def _nest_breach(_d: dict[str, object]) -> object:
+        raise WorkflowNestingError("nesting too deep")
+
+    async def _other(_d: dict[str, object]) -> str:
+        return "ok"
+
+    with pytest.raises(WorkflowNestingError):
+        await run_dag([DagNode("a", deps=[], run=_nest_breach), DagNode("b", deps=[], run=_other)])
 
 
 # ---------------------------------------------------------------------------
