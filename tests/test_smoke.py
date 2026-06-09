@@ -57,6 +57,28 @@ def test_run_store_surface_exported_eagerly() -> None:
         assert hasattr(ldw, name), f"{name} not importable from the package root"
 
 
+def test_real_git_surface_exported_from_package_root() -> None:
+    """The real-git worktree + PR seam is exported eagerly with no NEW dependency.
+
+    ``GitWorktreeProvider`` / ``PullRequestProvider`` / ``PullRequestRef`` /
+    ``LocalPullRequestProvider`` add no dependency beyond the existing base/eager
+    stack the package already imports (``deepagents`` + the M5
+    ``LocalSubprocessSandbox`` the git provider roots its backends in); the new code
+    itself is plain ``subprocess`` + stdlib. So they are eagerly exported and
+    importable from the package root on a base install.
+    """
+    import langchain_dynamic_workflow as ldw
+
+    for name in (
+        "GitWorktreeProvider",
+        "PullRequestProvider",
+        "PullRequestRef",
+        "LocalPullRequestProvider",
+    ):
+        assert name in ldw.__all__, f"{name} missing from __all__"
+        assert hasattr(ldw, name), f"{name} not importable from the package root"
+
+
 def test_sqlite_store_is_lazily_resolved_not_eagerly_imported() -> None:
     """``SqliteWorkflowStore`` resolves only on access, via the package getattr.
 

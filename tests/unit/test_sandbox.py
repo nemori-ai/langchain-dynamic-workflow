@@ -11,6 +11,7 @@ traversal blocked.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 from deepagents.backends.protocol import SandboxBackendProtocol
@@ -468,3 +469,89 @@ def test_real_execution_public_surface_is_exported() -> None:
     ):
         assert hasattr(ldw, name), name
         assert name in ldw.__all__
+
+
+class _BlockingCloseSandbox(InMemorySandbox):
+    """An offline sandbox whose ``close`` blocks until a real threading event fires.
+
+    Stands in for a real-git worktree backend whose ``close`` (``on_close`` ->
+    ``GitWorktreeProvider.teardown``) runs blocking ``git`` subprocesses. It lets a
+    test prove the manager offloads teardown off the event loop: ``close`` blocks a
+    worker thread, not the loop.
+    """
+
+    def __init__(
+        self, *, identity: str, started: threading.Event, release: threading.Event
+    ) -> None:
+        super().__init__(identity=identity)
+        self._started = started
+        self._release = release
+
+    def close(self) -> None:
+        # Signal we entered close, then block on a real (cross-thread) event — only a
+        # to_thread offload can let the event loop keep running while this blocks.
+        self._started.set()
+        self._release.wait(timeout=10.0)
+
+
+async def test_blocking_teardown_on_eviction_is_offloaded_off_the_event_loop() -> None:
+    # FIX-2 (H3): a git-worktree backend's blocking teardown (close -> on_close ->
+    # git subprocesses) runs during reclaim/evict inside the async admit path. It
+    # MUST be thread-offloaded so the event loop keeps running; otherwise a single
+    # blocking teardown wedges every other coroutine. With max_active=1, leasing a
+    # second distinct leaf forces eviction of the first idle slot, whose close
+    # blocks — a concurrent coroutine must still advance while close is in flight.
+    #
+    # Detection is wedge-proof: a separate OS thread watches the async-incremented
+    # counter while close blocks. If the loop is offloaded, the counter advances
+    # during the watch window (-> offloaded flag set); if the loop is wedged in a
+    # synchronous close, the counter is frozen and the flag stays clear. The watcher
+    # always releases the block, so a wedged run fails fast (assert) rather than
+    # hanging on close's own timeout.
+    started = threading.Event()
+    release = threading.Event()
+    offloaded = threading.Event()
+    progress = 0
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        return _BlockingCloseSandbox(identity=leaf_id, started=started, release=release)
+
+    def _watch() -> None:
+        # Wait for the eviction close to begin blocking, sample the counter, then
+        # give the loop a window. If it advanced, teardown was offloaded.
+        if not started.wait(timeout=10.0):
+            release.set()
+            return
+        before = progress
+        threading.Event().wait(0.2)  # real sleep; independent of the event loop
+        if progress > before:
+            offloaded.set()
+        release.set()
+
+    manager = SandboxManager(max_active=1, sandbox_factory=factory)
+    # Lease + release L1 so it becomes an idle slot eligible for eviction.
+    async with manager.lease(leaf_id="L1", needs_execution=True):
+        pass
+
+    async def keep_advancing() -> None:
+        nonlocal progress
+        while not release.is_set():
+            progress += 1
+            await asyncio.sleep(0)
+
+    async def lease_l2() -> str:
+        async with manager.lease(leaf_id="L2", needs_execution=True) as backend:
+            assert isinstance(backend, SandboxBackendProtocol)
+            return backend.id
+
+    watcher = threading.Thread(target=_watch, name="ldw-test-watch", daemon=True)
+    watcher.start()
+    advancer = asyncio.create_task(keep_advancing())
+    leased_id = await asyncio.wait_for(lease_l2(), timeout=10.0)
+    await asyncio.wait_for(advancer, timeout=10.0)
+    watcher.join(timeout=10.0)
+    assert leased_id == "L2"
+    # The async counter advanced WHILE the eviction teardown was blocking in close
+    # => teardown was thread-offloaded, not run on (and wedging) the event loop.
+    assert offloaded.is_set(), "event loop was wedged by a blocking teardown under the slot lock"
+    await manager.stop("L2")

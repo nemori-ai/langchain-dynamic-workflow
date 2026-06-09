@@ -4,6 +4,78 @@ All notable changes to `langchain-dynamic-workflow` are documented here. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - Unreleased
+
+A use-case-driven batch that approaches — and selectively exceeds — Claude Code's
+Dynamic Workflows. Each milestone landed through full TDD, a real-model end-to-end
+acceptance run, and a two-round cross-model adversarial review. The public API stays
+backward-compatible — every addition is keyword-only or a new symbol. Version not yet
+released; per-milestone tracking lives in `design_docs/v0_3_0_plans/00-roadmap.md`.
+
+### Added
+
+- **Cross-leaf reduce helpers (M1 · F)** — `survives` (refute-by-default voting),
+  `dedup`, `reconcile` (double-blind reviewer reconciliation), and `corroborate`
+  (judge-panel aggregation), plus the `ReviewItem` / `Reconciled` / `Consensus` value
+  types: pure functions that fold `parallel` / `pipeline` result lists. Exported from
+  the package root and injected into the `run_script` namespace.
+- **`ctx.race` best-of-N early exit + cancel (M2 · B)** — runs candidates
+  concurrently; the first satisfying a `win` predicate wins, in-flight losers are
+  cancelled; the decision is content-hash-journaled (`race_key`) so resume reproduces
+  the winner and dispatches nothing new. Adds `RaceCandidate` / `RaceResult` and
+  `SpanKind.RACE`.
+- **Aggregate parallel-run observability (M3.5)** — a `runs` tool command +
+  `BgRunManager.list_runs` / `RunSnapshot` enumerate a host thread's in-flight /
+  finished runs; the `workflow_runs` state channel is rewritten to a terminal status
+  on settle; the `max_concurrent_runs` quota stays on `BgRunManager` (the middleware
+  fails loud on a conflicting double-source).
+- **Cross-session / cross-process persistence (M3 · D, superset of Claude Code)** —
+  a `WorkflowRunStore` protocol + `RunSpec` + `InMemoryRunStore` (default, zero-dep) +
+  `SqliteWorkflowStore` (the `[sqlite]` extra: one sqlite db, run_id-namespaced
+  journal + a persistent `AsyncSqliteSaver`). A fresh process pointed at the same db
+  resumes a run by `run_id` and replays completed leaves at zero model cost.
+- **Real local execution backend (M5 · A)** — `LocalSubprocessSandbox` (full
+  `SandboxBackendProtocol`, stdlib-only): real subprocess exec, POSIX rlimits via a
+  minimal `preexec_fn`, timeout → process-group kill (SIGTERM→grace→SIGKILL, exit
+  124), bounded output drain, exit-code gating. Pluggable via
+  `SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))`;
+  `before_execute` admission (allow / reject / tighten); command observability via the
+  `on_command` / `CommandEvent` out-of-band sink. DANGEROUS opt-in — not a security
+  sandbox; the offline `InMemorySandbox` stays the zero-dependency default.
+- **In-run human sign-off (M4 · C, superset of Claude Code)** — `ctx.checkpoint(ask,
+  *, tag)` pauses a run for a human decision and resumes with it via a journal-driven
+  gate (deliberately NOT LangGraph's native `interrupt`, whose index-based `@task`
+  cache misaligns with the content-hash journal on resume): it raises
+  `WorkflowSignoffRequired` when undecided, and `run_workflow(resume=...)` injects the
+  decision. Adds `BgStatus.AWAITING_SIGNOFF`, `BgRunManager.approve`, an `approve`
+  tool command, and `WorkflowCheckpointError`.
+- **Real git worktree + branch/PR (M6 · I, superset of Claude Code)** — each
+  file-mutating leaf runs in its own real `git worktree` / branch via
+  `GitWorktreeProvider` (`SandboxManager(git_worktree_provider=...)`); its authoritative
+  changeset is the real `git diff` collected inside the leaf task (a schema-less or
+  wrong-typed `files` field fails loud). `LocalSubprocessSandbox(root=, on_close=)`
+  roots a leaf sandbox in the real worktree. A `PullRequestProvider` protocol +
+  `PullRequestRef` + offline `LocalPullRequestProvider` finalize a PR into an
+  integration branch as host finalization, outside deterministic replay. DANGEROUS
+  opt-in — real `git` subprocess.
+- **Leaf-level live observability (Layer 1)** — `run_workflow` gains keyword-only,
+  default-no-op out-of-band sinks: `on_span_begin` (the running edge with a
+  resume-stable `span_id`), `on_leaf_event` (a leaf's callback subtree normalized to
+  `LeafEvent`), and `on_command` (real-subprocess `CommandEvent`s), with
+  `leaf_event_include_payloads` / `command_include_payloads`. All miss-only (a
+  journal-cached leaf emits none) and out-of-band (the host LLM context is unchanged).
+
+### Changed
+
+- **`isolation="worktree"` gains a real git backend (M6)** — beyond the in-memory
+  seeded copy (0.2.0 / G2), a configured `GitWorktreeProvider` roots the leaf in a real
+  `git worktree` on its own branch; teardown is bound to the backend's `close()`, and
+  blocking git is thread-offloaded out of the sandbox admission lock.
+- **The background run registry can persist (M3)** — the host `journals` / `run_specs`
+  registries move behind the `WorkflowRunStore` seam, so `resume` finds a run across
+  processes when a persistent store is wired (the defaults stay in-memory /
+  same-session).
+
 ## [0.2.0] - 2026-06-03
 
 Capability release: four use-case-driven gaps (G1–G4) closed against Claude Code's
@@ -108,5 +180,6 @@ is stable.
   ad-hoc script and submit it via `run_script`. All examples run offline on fake
   models; a real-leaf variant is env-gated behind `LDW_DEMO_REAL_MODEL`.
 
+[0.3.0]: https://github.com/nemori-ai/langchain-dynamic-workflow/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/nemori-ai/langchain-dynamic-workflow/releases/tag/v0.2.0
 [0.1.0]: https://github.com/nemori-ai/langchain-dynamic-workflow/releases/tag/v0.1.0

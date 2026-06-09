@@ -457,19 +457,33 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
     the network. See the module docstring and the project README for the full
     sharp-edge warning before enabling real execution.
 
-    Each instance owns a private temporary directory created at construction; the
-    command's working directory is that directory, and the file operations read
-    and write real files beneath it, so ``execute`` and the file tools share one
-    filesystem. Every :meth:`execute` call reaps its own child (and, on POSIX,
-    its process group on timeout) before it returns, so a completed call leaves
-    no live process behind; :meth:`close` therefore only removes the temporary
-    directory, and is idempotent.
+    By default each instance owns a private temporary directory created at
+    construction; the command's working directory is that directory, and the file
+    operations read and write real files beneath it, so ``execute`` and the file
+    tools share one filesystem. A host that already owns a directory (notably a
+    real ``git worktree`` a :class:`GitWorktreeProvider` created) passes it as
+    ``root``: the backend roots there instead of allocating a fresh temp dir, does
+    NOT remove it on close (the provider owns that directory's lifecycle via
+    ``git worktree remove``), and fires the supplied ``on_close`` hook exactly
+    once on the first close so the provider can tear the worktree down. Every
+    :meth:`execute` call reaps its own child (and, on POSIX, its process group on
+    timeout) before it returns, so a completed call leaves no live process behind;
+    :meth:`close` therefore only removes the temporary directory (when this
+    backend owns it) and runs the ``on_close`` hook, and is idempotent.
 
     Args:
         identity: The owning leaf identity, surfaced via :attr:`id`.
         policy: The resilience and admission policy for this backend.
         exec_gate: A shared bounded semaphore capping concurrent executions
             across every backend produced by one factory.
+        root: An existing directory to root this backend at instead of allocating
+            a fresh per-leaf temp dir. When supplied the backend does NOT remove
+            it on close — the caller owns the directory's lifecycle. ``None`` (the
+            default) allocates and owns a private temp dir, byte-unchanged.
+        on_close: A zero-argument hook invoked exactly once on the first
+            :meth:`close`, before any owned-directory cleanup. Used by a provider
+            to release the host resource backing ``root`` (for example
+            ``git worktree remove``). ``None`` (the default) runs no hook.
     """
 
     def __init__(
@@ -478,14 +492,23 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         identity: str,
         policy: ExecPolicy,
         exec_gate: threading.BoundedSemaphore,
+        root: str | None = None,
+        on_close: Callable[[], None] | None = None,
     ) -> None:
         self._identity = identity
         self._policy = policy
         self._exec_gate = exec_gate
         self._closed = False
-        # The private per-leaf working directory. Created eagerly so the file
-        # operations and execute share one real filesystem from the first call.
-        self._root = tempfile.mkdtemp(prefix=f"ldw-exec-{identity}-")
+        # The private per-leaf working directory. When a host supplies ``root`` the
+        # backend roots there and does NOT own the directory's lifecycle (the
+        # provider removes it); otherwise it allocates and owns a fresh temp dir,
+        # created eagerly so the file operations and execute share one real
+        # filesystem from the first call.
+        self._owns_root = root is None
+        self._root = root if root is not None else tempfile.mkdtemp(prefix=f"ldw-exec-{identity}-")
+        # The teardown hook (provider-owned-root only) fired once on first close.
+        self._on_close = on_close
+        self._on_close_fired = False
         # Command-event observability (M5 C1). Default no-op: a sandbox with no
         # wired sink fires nothing, so execute stays byte-for-byte the prior path.
         # set_command_sink threads in the owning leaf's span id + the sink the
@@ -1212,14 +1235,26 @@ class LocalSubprocessSandbox(SandboxBackendProtocol):
         return responses
 
     def close(self) -> None:
-        """Remove the per-leaf temp directory (idempotent).
+        """Run the teardown hook and (when owned) remove the temp directory.
 
-        Best-effort: a directory that is already gone is tolerated. No process
-        cleanup is needed here because every :meth:`execute` call reaps its own
+        Idempotent and best-effort. The ``on_close`` hook (when one was supplied)
+        fires exactly once, on the first close, before any directory cleanup — so
+        a provider can release the host resource backing the root (for example
+        ``git worktree remove``). The temp directory is removed only when this
+        backend owns it (no host-supplied ``root``); a host-supplied root is left
+        for its owner to remove, so ``close`` never destroys a directory the
+        provider still manages. A directory that is already gone is tolerated. No
+        process cleanup is needed because every :meth:`execute` call reaps its own
         child (and its process group on timeout) before returning, so a closed
         backend never had a live process to terminate.
         """
         if self._closed:
             return
         self._closed = True
-        shutil.rmtree(self._root, ignore_errors=True)
+        # Fire the teardown hook first (once), so a provider tears the worktree
+        # down before — and independently of — any owned-temp-dir cleanup.
+        if self._on_close is not None and not self._on_close_fired:
+            self._on_close_fired = True
+            self._on_close()
+        if self._owns_root:
+            shutil.rmtree(self._root, ignore_errors=True)

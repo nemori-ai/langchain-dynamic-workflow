@@ -30,6 +30,11 @@
       "label": "Sign off mid-run",
       "hint": "pause for human approval",
       "message": "Before you actually run the staging deployment, I want to sign off on the plan myself — walk me through the riskiest steps and pause for my approval before you proceed."
+    },
+    {
+      "label": "Refactor swarm",
+      "hint": "parallel fixes merged into a PR",
+      "message": "There are a few separate bugs in this little module I'd like fixed all at once. Please have several helpers each take a fix in parallel, review the patches, merge them together into one change — sorting out any conflicts — and open a pull request with the result."
     }
   ]
 }

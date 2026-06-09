@@ -56,8 +56,12 @@ classDiagram
     +acquire(leaf_id, isolation) Backend
     +lease(leaf_id, needs_execution, isolation) Backend
     +stop(id) (调 close)
+    +git_worktree_provider property
     -worktree_provider: WorktreeProvider?
+    -git_worktree_provider: GitWorktreeProvider? (M6, isolation=worktree 优先)
     -factory: SandboxFactory (默认 InMemorySandbox)
+    -_admit_slot(leaf_id, isolation) (M6/R8: 阻塞 git off-loop, 出 slot 锁)
+    -_pending: set (M6/R8: 并发同-leaf 去重 + 配额计 pending)
   }
   class WorktreeProvider {
     <<protocol>>
@@ -67,6 +71,27 @@ classDiagram
   class InMemoryWorktreeProvider {
     +seed(leaf_id) Mapping
     +collect(leaf_id, files) dict
+  }
+  class GitWorktreeProvider {
+    <<M6 真 git 服务: 装配期注入 — DANGEROUS OPT-IN 非安全 sandbox>>
+    +open_worktree(leaf_id) SandboxBackendProtocol (git worktree add -b leaf/<id>, 根植真目录 + on_close→teardown; 幂等 R4 + 异常安全 R3)
+    +collect(leaf_id) dict (真 git diff = 权威变更集; 删除 v1 fail-loud)
+    +teardown(leaf_id) (worktree remove --force + branch -D, best-effort 幂等)
+    +cleanup_all() (扫 workspace_root; host 须在 finally 调)
+    -base_repo / integration_branch / base_ref / workspace_root
+    -exec_gate: threading.BoundedSemaphore
+  }
+  class PullRequestProvider {
+    <<protocol, M6>>
+    +open(*, branch, title, body, integration_branch) PullRequestRef
+  }
+  class LocalPullRequestProvider {
+    <<M6 离线默认, 幂等 per branch — host finalization (R1, 移出确定性 replay)>>
+    +open(...) PullRequestRef
+  }
+  class PullRequestRef {
+    <<frozen>>
+    +number / branch / url / integration_branch / created
   }
   class SandboxBackendProtocol {
     <<deepagents protocol: 全文件操作 + id + execute>>
@@ -90,7 +115,8 @@ classDiagram
     +close() (删临时根, 幂等)
     -policy: ExecPolicy
     -exec_gate: threading.BoundedSemaphore (一工厂一闸)
-    -root: str (tempfile.mkdtemp)
+    -root: str (默认 tempfile.mkdtemp; M6 可传既有目录根植真 worktree, 不删)
+    -on_close: Callable? (M6 一次性回调; git provider 绑 worktree teardown)
     -_command_sink: CommandSink or None (默认 no-op)
   }
   class ExecPolicy {
@@ -290,8 +316,12 @@ classDiagram
   Roster *-- RosterEntry
   SandboxManager ..> Backend : deepagents backend 实例
   SandboxManager ..> SandboxFactory : _new_sandbox 经工厂构造 (默认 InMemorySandbox)
-  SandboxManager ..> WorktreeProvider : isolation=worktree 播种
+  SandboxManager ..> WorktreeProvider : isolation=worktree 内存播种
   WorktreeProvider <|.. InMemoryWorktreeProvider
+  SandboxManager ..> GitWorktreeProvider : isolation=worktree 优先 (M6 真 git)
+  GitWorktreeProvider ..> LocalSubprocessSandbox : open_worktree 返回 root= 的真后端 (on_close→teardown)
+  PullRequestProvider <|.. LocalPullRequestProvider
+  LocalPullRequestProvider ..> PullRequestRef : open 返回 (host finalization)
   SandboxBackendProtocol <|.. InMemorySandbox
   SandboxBackendProtocol <|.. LocalSubprocessSandbox
   SandboxFactory ..> LocalSubprocessSandbox : local_subprocess_factory 产 (共享 exec_gate)

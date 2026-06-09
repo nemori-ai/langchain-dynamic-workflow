@@ -39,6 +39,26 @@ from ._roster import Roster
 from ._sandbox import leaf_id_from_key
 from ._schema import to_pydantic_model
 
+WORKTREE_CHANGESET_KEY = "__ldw_worktree_changeset__"
+"""Reserved key under which the engine folds a worktree leaf's authoritative diff.
+
+For a real-git worktree execution leaf the engine collects the leaf's real
+``git diff`` while the lease is still held and stashes it in the leaf's output
+state under this key (so it rides into the content-hash journal). ``agent()`` then
+treats that on-disk truth as the authoritative changeset, overriding any file bytes
+the model self-reported in its schema. The double-underscore name keeps it from
+colliding with a real leaf-state key.
+"""
+
+_WORKTREE_FILES_FIELD = "files"
+"""Schema field whose value the authoritative worktree changeset overrides.
+
+A worktree fixer's structured schema reports its change under ``files``; when the
+engine folds in the real ``git diff``, ``agent()`` overrides exactly this field so
+the model-claimed bytes can never win over the on-disk truth. Other metadata
+fields (``summary`` and the like) are left untouched.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class LeafOutcome:
@@ -598,17 +618,53 @@ class Ctx:
                     leaf_span_id=span.span_id,
                 )
             )
+            # Authoritative changeset (R5): a real-git worktree execution leaf has its
+            # real `git diff` folded into the leaf state by the engine. When present
+            # it MUST be surfaced as the authoritative file source — the model's
+            # self-reported file bytes can never win over what the leaf actually wrote
+            # (mirroring M5's "gate on the real exit code, not the model's boolean").
+            # A schema-less worktree leaf would collect a diff it can never surface,
+            # so the boundary would be only half-closed; a worktree schema lacking the
+            # `files` field, or typing it as anything but dict[str, str], would either
+            # drop the diff or (under model_copy) journal a type-mismatched payload
+            # that crashes on a later resume. All three fail loud here, at fold time.
+            changeset = outcome.state.get(WORKTREE_CHANGESET_KEY)
             # With a schema, fold the validated structured object and journal its
             # canonical JSON; without one, fold the final text directly.
             folded_obj: str | BaseModel
             if structured_model is not None:
                 folded_obj = fold_structured(outcome.state, structured_model)
+                if changeset is not None:
+                    if _WORKTREE_FILES_FIELD not in type(folded_obj).model_fields:
+                        raise ValueError(
+                            f"a git-worktree execution leaf (agent_type {agent_type!r}) must "
+                            f"declare a schema with a {_WORKTREE_FILES_FIELD!r}: dict[str, str] "
+                            "field to carry its authoritative changeset; the bound schema "
+                            f"{structured_model.__name__!r} has no such field"
+                        )
+                    # Override `files` THROUGH validation (not model_copy, which
+                    # bypasses it): a wrong-typed `files` field then fails loud here on
+                    # the first run, never journaling a payload that would crash on a
+                    # resume's model_validate_json.
+                    folded_obj = type(folded_obj).model_validate(
+                        {
+                            **folded_obj.model_dump(by_alias=False),
+                            _WORKTREE_FILES_FIELD: changeset,
+                        }
+                    )
                 # Dump by alias with round-trip semantics so a schema with field
                 # aliases survives resume: model_validate_json (the replay path)
                 # validates by alias by default, so the stored JSON must use aliases
                 # too. For alias-free models this is identical to a plain dump.
                 result_str = folded_obj.model_dump_json(by_alias=True, round_trip=True)
             else:
+                if changeset is not None:
+                    raise ValueError(
+                        f"a git-worktree execution leaf (agent_type {agent_type!r}) must declare a "
+                        f"schema with a {_WORKTREE_FILES_FIELD!r}: dict[str, str] field to carry "
+                        "its authoritative changeset (schema-less worktree leaves are not "
+                        "supported)"
+                    )
                 folded_obj = fold_result(outcome.state)
                 result_str = folded_obj
             # success-only: unreachable if the leaf raised. Usage is journaled so

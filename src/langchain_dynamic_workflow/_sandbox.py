@@ -47,6 +47,7 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.state import StateBackend
 
+from ._git_worktree import GitWorktreeProvider
 from ._local_subprocess import ExecPolicy, LocalSubprocessSandbox
 from ._worktree import WorktreeProvider
 
@@ -519,6 +520,14 @@ class SandboxManager:
             seeding a fresh :class:`InMemorySandbox`; a host opts into real
             execution by passing a factory (for example the product of
             :func:`local_subprocess_factory`).
+        git_worktree_provider: When supplied, an ``isolation="worktree"`` leaf is
+            leased a backend rooted in a real ``git worktree`` (a real branch per
+            leaf) via :meth:`GitWorktreeProvider.open_worktree`, taking precedence
+            over the in-memory ``worktree_provider``. The provider's ``on_close``
+            hook teardown rides every existing ``_close_backend`` path (no extra
+            manager hook). The blocking ``git worktree add`` is thread-offloaded
+            outside the slot lock so it never wedges the event loop. ``None`` (the
+            default) keeps the in-memory worktree behavior.
     """
 
     def __init__(
@@ -529,6 +538,7 @@ class SandboxManager:
         hard_ttl: float | None = None,
         clock: Callable[[], float] = time.monotonic,
         worktree_provider: WorktreeProvider | None = None,
+        git_worktree_provider: GitWorktreeProvider | None = None,
         sandbox_factory: SandboxFactory | None = None,
     ) -> None:
         # Live execution sandboxes keyed by leaf identity. Reasoning leaves never
@@ -541,6 +551,10 @@ class SandboxManager:
         # Seeds + collects changesets for isolation="worktree" leaves; None keeps
         # worktree leaves as plain empty sandboxes (no seeding source).
         self._worktree_provider = worktree_provider
+        # Real-git worktree provider: when set, a worktree leaf is rooted in a real
+        # `git worktree add -b leaf/<id>` tree. Takes precedence over the in-memory
+        # worktree_provider for worktree leaves.
+        self._git_worktree_provider = git_worktree_provider
         # The seam that constructs a leaf's backend. The default reproduces the
         # prior behavior byte-for-byte (a fresh offline InMemorySandbox), so the
         # zero-dependency offline path is unchanged unless a host injects one.
@@ -550,25 +564,42 @@ class SandboxManager:
         # Signalled whenever a slot frees, so a lease parked under backpressure
         # can wake and re-check for room rather than busy-spinning.
         self._slot_freed = asyncio.Condition()
+        # Leaf ids whose backend is being constructed OUTSIDE the slot lock (R8:
+        # the blocking git worktree add is thread-offloaded). A second lease of the
+        # same leaf id parks on the condition until the in-flight build installs its
+        # slot, so concurrent same-leaf creation never builds two worktrees; the
+        # rare loser of a race closes its own freshly-built backend.
+        self._pending: set[str] = set()
 
     def _new_sandbox(self, leaf_id: str, isolation: str) -> SandboxBackendProtocol:
-        """Create a leaf's sandbox via the factory, seeding it when asked.
+        """Create a leaf's sandbox, rooting or seeding a worktree leaf when asked.
 
-        The configured factory builds the backend (the default produces a fresh
-        offline :class:`InMemorySandbox`). For ``isolation="worktree"`` with a
-        configured provider the new backend is then populated with an isolated
-        copy of the base snapshot before the leaf runs; otherwise it starts empty
-        (the prior per-leaf behavior). The worktree seeding uses ``upload_files``,
-        a :class:`SandboxBackendProtocol` method, so it applies to any backend the
-        factory returns.
+        For ``isolation="worktree"`` with a configured ``git_worktree_provider``
+        the backend is rooted in a real ``git worktree`` (a real branch per leaf)
+        returned already populated by :meth:`GitWorktreeProvider.open_worktree`;
+        its ``on_close`` hook tears the worktree down on close. Otherwise the
+        configured factory builds the backend (the default produces a fresh offline
+        :class:`InMemorySandbox`), and for a worktree leaf with an in-memory
+        ``worktree_provider`` the backend is populated with an isolated copy of the
+        base snapshot via ``upload_files``; a non-worktree leaf starts empty (the
+        prior per-leaf behavior).
+
+        This method may block (a git provider runs ``git worktree add``), so the
+        ``lease`` path always calls it via ``asyncio.to_thread`` OUTSIDE the slot
+        condition lock (R8) and never on the event loop directly.
 
         Args:
             leaf_id: The leaf's derived identity.
-            isolation: ``"worktree"`` to seed from the base snapshot, else ``"shared"``.
+            isolation: ``"worktree"`` to root/seed a worktree, else ``"shared"``.
 
         Returns:
             The new, possibly-seeded backend.
         """
+        if isolation == "worktree" and self._git_worktree_provider is not None:
+            # A real git worktree: open_worktree returns a backend already rooted in
+            # the leaf's worktree directory with an on_close -> teardown hook, so the
+            # existing _close_backend paths reclaim it with no extra manager hook.
+            return self._git_worktree_provider.open_worktree(leaf_id)
         sandbox = self._factory(leaf_id)
         if isolation == "worktree" and self._worktree_provider is not None:
             seed = self._worktree_provider.seed(leaf_id)
@@ -582,6 +613,16 @@ class SandboxManager:
     def active_count(self) -> int:
         """How many isolated execution sandboxes are currently live."""
         return len(self._slots)
+
+    @property
+    def git_worktree_provider(self) -> GitWorktreeProvider | None:
+        """The real-git worktree provider, or ``None`` when not configured.
+
+        Exposed so the engine can collect a worktree leaf's authoritative real
+        ``git diff`` while the lease is still held (before the worktree is torn
+        down on ``close``), without the engine reaching into a private field.
+        """
+        return self._git_worktree_provider
 
     def reclaim_idle(self) -> int:
         """Reclaim every idle sandbox whose idle or hard TTL has elapsed.
@@ -628,6 +669,13 @@ class SandboxManager:
         is genuinely in use and no idle sandbox can be reclaimed or evicted —
         :meth:`lease` is the path that waits instead. Use :meth:`lease` from the
         engine; ``acquire`` is exposed for direct, single-leaf use.
+
+        Sync escape hatch: unlike :meth:`lease` (which thread-offloads a victim's
+        blocking teardown off the event loop), this synchronous path runs
+        ``reclaim_idle`` / ``_evict_one_idle`` inline, so a reclaimed/evicted real
+        backend's ``close`` (which for a git-worktree backend runs blocking ``git``
+        subprocesses) blocks the caller. That is acceptable for direct single-leaf
+        use off the event loop; on the event loop, use :meth:`lease`.
 
         Args:
             leaf_id: The leaf's derived identity (see :func:`leaf_id_from_key`).
@@ -701,32 +749,7 @@ class SandboxManager:
         if not needs_execution:
             yield StateBackend()
             return
-        async with self._slot_freed:
-            # Wait for room at quota, in three escalating steps:
-            #   1. reclaim TTL-expired idle sandboxes (frees slots cleanly);
-            #   2. if still full, evict the least-recently-used *idle* sandbox to
-            #      admit this new leaf (a slot held only for find-or-create reuse
-            #      is yielded so distinct new work is not starved under a bounded
-            #      pool with no TTL — without this the pool deadlocks once every
-            #      slot holds an idle-but-alive sandbox);
-            #   3. only when every slot is genuinely in use, park until a release.
-            # A leaf reusing an already-live sandbox (same leaf_id) never waits and
-            # is never evicted — it is not new work, so its workspace stays intact.
-            while self._would_exceed_quota(leaf_id):
-                self.reclaim_idle()
-                if not self._would_exceed_quota(leaf_id):
-                    break
-                if self._evict_one_idle():
-                    break
-                # Every slot is in use: park until a lease releases one.
-                await self._slot_freed.wait()
-            slot = self._slots.get(leaf_id)
-            if slot is None:
-                now = self._clock()
-                sandbox = self._new_sandbox(leaf_id, isolation)
-                slot = _SandboxSlot(sandbox=sandbox, created_at=now, last_used_at=now)
-                self._slots[leaf_id] = slot
-            slot.in_use += 1
+        slot = await self._admit_slot(leaf_id, isolation)
         try:
             yield slot.sandbox
         finally:
@@ -736,15 +759,149 @@ class SandboxManager:
                 # Wake one parked lease so it can re-check for room.
                 self._slot_freed.notify()
 
+    async def _admit_slot(self, leaf_id: str, isolation: str) -> _SandboxSlot:
+        """Find-or-create the leaf's slot, building the backend OUTSIDE the lock.
+
+        Honors the same tiered admission as the prior inline body (reclaim idle ->
+        evict LRU idle -> park under backpressure), but with one change demanded by
+        R8: constructing the backend can block (a git provider runs
+        ``git worktree add``), so the construction is thread-offloaded via
+        ``asyncio.to_thread`` *outside* the ``self._slot_freed`` condition lock and
+        never on the event loop. A ``self._pending`` marker dedups concurrent
+        same-leaf creation: a second lease of the same leaf id parks until the
+        in-flight build installs its slot, so only one worktree is ever built per
+        leaf id; the rare loser of a race closes its own freshly-built backend.
+
+        The lock is held only for the fast decisions (quota wait, slot lookup,
+        marking pending, installing the finished slot, bumping ``in_use``). The slow
+        build runs unlocked, so a blocking git subprocess can never wedge the event
+        loop or stall an unrelated lease.
+
+        Args:
+            leaf_id: The leaf's derived identity.
+            isolation: ``"worktree"`` to root/seed a worktree, else ``"shared"``.
+
+        Returns:
+            The leaf's slot with ``in_use`` already incremented for the caller.
+        """
+        victims: list[SandboxBackendProtocol] = []
+        async with self._slot_freed:
+            while True:
+                # Reuse / park decisions come FIRST, before any eviction, so a leaf
+                # reusing its own already-live sandbox never evicts a sibling, and a
+                # second lease of a leaf already being built just parks.
+                existing = self._slots.get(leaf_id)
+                if existing is not None:
+                    # Find-or-create reuse: another lease (or a prior one) already
+                    # built this leaf's backend; reuse it without a second build.
+                    existing.in_use += 1
+                    return existing
+                if leaf_id in self._pending:
+                    # Another lease is building THIS leaf's backend outside the lock;
+                    # park until it installs the slot, then re-check from the top.
+                    await self._slot_freed.wait()
+                    continue
+                # Make room at quota, in three escalating steps:
+                #   1. reclaim TTL-expired idle sandboxes (frees slots cleanly);
+                #   2. if still full, evict the least-recently-used *idle* sandbox;
+                #   3. only when every slot is genuinely in use, park until a release.
+                # H3: a victim's teardown (close -> on_close -> git subprocesses) is
+                # blocking, so it must NOT run under the lock or on the event loop.
+                # Victims are POPPED from the pool here (freeing the quota) but their
+                # backends are CLOSED OFF-loop only AFTER this leaf claims the freed
+                # capacity via self._pending below — so the lock-release window of the
+                # off-loop close cannot let a concurrent lease over-allocate past the
+                # cap (the pending claim keeps the quota accounting honest).
+                if self._would_exceed_quota(leaf_id):
+                    victims.extend(self._pop_expired_idle())
+                    if self._would_exceed_quota(leaf_id):
+                        evicted = self._pop_one_idle()
+                        if evicted is not None:
+                            victims.append(evicted)
+                        elif not victims:
+                            # Every slot is genuinely in use: park until a release.
+                            await self._slot_freed.wait()
+                            continue
+                # Room exists (or was just freed). Claim it: mark this leaf pending so
+                # a concurrent lease counts it toward the quota and parks, then close
+                # the popped victims off-loop (lock released) before building.
+                self._pending.add(leaf_id)
+                break
+            if victims:
+                await self._close_backends_off_loop(victims)
+        # Build the backend OUTSIDE the lock (R8): a git provider's worktree add is
+        # blocking, so thread-offload it and never run it on the event loop.
+        try:
+            sandbox = await asyncio.to_thread(self._new_sandbox, leaf_id, isolation)
+        except BaseException:
+            # The build failed: release the pending claim and wake a parked lease so
+            # the failure does not strand the leaf id as permanently pending.
+            async with self._slot_freed:
+                self._pending.discard(leaf_id)
+                self._slot_freed.notify_all()
+            raise
+        async with self._slot_freed:
+            self._pending.discard(leaf_id)
+            installed = self._slots.get(leaf_id)
+            if installed is not None:
+                # Lost a race (a concurrent path installed the slot while we built);
+                # close our now-redundant backend and reuse the installed one so no
+                # worktree leaks.
+                _close_backend(sandbox)
+                installed.in_use += 1
+                self._slot_freed.notify_all()
+                return installed
+            now = self._clock()
+            slot = _SandboxSlot(sandbox=sandbox, created_at=now, last_used_at=now)
+            self._slots[leaf_id] = slot
+            slot.in_use += 1
+            # A build can free a parked same-leaf lease (now it finds the slot) and
+            # change the pending count other leases wait on, so wake them to re-check.
+            self._slot_freed.notify_all()
+            return slot
+
+    async def _close_backends_off_loop(self, backends: list[SandboxBackendProtocol]) -> None:
+        """Close popped victim backends OFF the event loop (H3).
+
+        The victim slots were already removed from the pool under the lock, so the
+        quota is free; this releases the ``self._slot_freed`` lock (held by the
+        caller), closes each backend on a worker thread via ``asyncio.to_thread``
+        (a real-git backend's ``close`` runs blocking ``git worktree remove`` /
+        ``git branch -D`` subprocesses), then re-acquires the lock and wakes parked
+        leases (the pool changed). Releasing the lock during the blocking teardown is
+        what keeps a single slow ``git`` teardown from wedging the event loop or
+        stalling an unrelated lease. Must be called while holding ``self._slot_freed``.
+
+        Args:
+            backends: The popped backends to close off-loop.
+        """
+        # Release the caller-held condition lock for the blocking teardown, then
+        # re-acquire it before returning so the caller's `async with` stays balanced.
+        self._slot_freed.release()
+        try:
+            for backend in backends:
+                await asyncio.to_thread(_close_backend, backend)
+        finally:
+            await self._slot_freed.acquire()
+        # The pool freed slots while unlocked; wake parked leases to re-check quota.
+        self._slot_freed.notify_all()
+
     def _would_exceed_quota(self, leaf_id: str) -> bool:
         """Whether admitting a *new* sandbox for ``leaf_id`` would breach the cap.
 
         Reusing an existing sandbox (``leaf_id`` already live) is always allowed —
-        it adds no new sandbox to the pool.
+        it adds no new sandbox to the pool. A backend currently being built outside
+        the lock (in ``_pending``) is counted as occupying a slot, so a concurrent
+        admission cannot over-allocate past the cap while a thread-offloaded
+        ``git worktree add`` is in flight (R8). ``_pending`` is only ever populated
+        by the async :meth:`lease` path; the sync :meth:`acquire` path leaves it
+        empty, so this term is a no-op there.
         """
         if self._max_active is None or leaf_id in self._slots:
             return False
-        return self.active_count >= self._max_active
+        # Count installed slots plus in-flight (pending) builds for OTHER leaves.
+        pending_others = len(self._pending - {leaf_id})
+        return self.active_count + pending_others >= self._max_active
 
     def _evict_one_idle(self) -> bool:
         """Evict the least-recently-used idle sandbox to make room at quota.
@@ -783,6 +940,49 @@ class SandboxManager:
         _close_backend(self._slots[lru_leaf_id].sandbox)
         del self._slots[lru_leaf_id]
         return True
+
+    def _pop_expired_idle(self) -> list[SandboxBackendProtocol]:
+        """Pop every TTL-expired idle slot, returning their backends UNCLOSED.
+
+        The deferred-close half of :meth:`reclaim_idle`, for the async admit path:
+        a slot is removed from the pool immediately (so the quota frees) but its
+        backend is NOT closed here — the caller closes the returned backends OFF the
+        event loop (a real-git backend's ``close`` runs blocking ``git`` subprocesses,
+        which must never run under the slot lock or on the loop, R8/H3). Must be
+        called while holding ``self._slot_freed``.
+
+        Returns:
+            The backends of the popped slots, for the caller to close off-loop.
+        """
+        now = self._clock()
+        expired = [
+            leaf_id
+            for leaf_id, slot in self._slots.items()
+            if slot.in_use == 0 and self._is_expired(slot, now)
+        ]
+        return [self._slots.pop(leaf_id).sandbox for leaf_id in expired]
+
+    def _pop_one_idle(self) -> SandboxBackendProtocol | None:
+        """Pop the LRU idle slot, returning its backend UNCLOSED (or ``None``).
+
+        The deferred-close half of :meth:`_evict_one_idle`, for the async admit
+        path: the LRU idle slot is removed from the pool immediately (freeing the
+        quota) but its backend is NOT closed here — the caller closes it OFF the
+        event loop. Must be called while holding ``self._slot_freed``.
+
+        Returns:
+            The popped backend, or ``None`` when every live slot is in use.
+        """
+        idle = [
+            (slot.last_used_at, leaf_id)
+            for leaf_id, slot in self._slots.items()
+            if slot.in_use == 0
+        ]
+        if not idle:
+            return None
+        idle.sort()
+        _, lru_leaf_id = idle[0]
+        return self._slots.pop(lru_leaf_id).sandbox
 
     async def stop(self, leaf_id: str) -> None:
         """Tear down and release the sandbox held by ``leaf_id`` (idempotent).

@@ -8,6 +8,12 @@ Two real dynamic workflows ship here, ported from the engine's runnable examples
   built-in deep-research dynamic workflow.
 * :func:`capstone` — research (parallel) -> refine (pipeline) -> adversarial verify
   (parallel majority vote) -> synthesize, the full primitive stack in one run.
+* :func:`refactor_swarm` — fix (parallel real-git worktree fixers, one per target
+  file, each on its own ``leaf/<id>`` branch) -> verify (a two-vote read-only judge
+  per patch) -> integrate (a script-owned scratch-repo ``git merge`` fold with a real
+  conflict -> resolver -> fold loop). It returns the integrated tree plus a PR intent;
+  the HOST opens the pull request after ``run_workflow`` returns (host finalization),
+  never from inside the orchestration script.
 
 The roster these drive is *real*: with a provider key present (``resolve_leaf_model``)
 each leaf is a ``create_deep_agent`` (the skeptic a read-only judge); with no key the
@@ -20,7 +26,11 @@ smoke path; it makes no leaf ``agent()`` calls.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import tempfile
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from _models import cache_middleware, resolve_leaf_model, resolve_openrouter_key
@@ -535,6 +545,594 @@ async def sign_off(ctx: Ctx, args: dict[str, Any]) -> str:
     return f"proceeded with {topic}: {report}"
 
 
+# ── refactor_swarm orchestration (real-git fix swarm + merge conflict loop, M6) ──
+
+# The buggy fixture the swarm refactors: a tiny module with a bug on ONE line of calc.py,
+# plus a small helper. TWO fixers target that SAME buggy line of calc.py with DIFFERENT
+# corrections, each in its OWN isolated worktree — so neither sees the other's edit, and
+# folding their two patches hits a REAL three-way git merge conflict (the SAME line changed
+# two ways), the headline path the integrate phase resolves. A third fixer edits a DIFFERENT
+# file (helper.py) so the swarm also shows a clean, non-conflicting fold. This mirrors the
+# engine integration test's conflict mechanic (two fixers, one overlapping line).
+SEED_CALC = "def combine(a, b):\n    return a - b\n"
+SEED_HELPER = "VALUE = 0\n"
+
+# The base tree the integration fold starts from (protocol-absolute paths, matching the
+# worktree provider's collect() keys), and the target files each parallel fixer owns.
+REFACTOR_BASE_TREE: dict[str, str] = {"/calc.py": SEED_CALC, "/helper.py": SEED_HELPER}
+
+
+class RefactorTarget(BaseModel):
+    """One file the swarm targets, with the bug to fix and the corrected line.
+
+    Drives both the real fixer prompt (online) and the deterministic fake fixer
+    (offline): the fake replaces ``old`` with ``new`` on the real worktree disk so its
+    authoritative ``git diff`` is exactly the edit, with no model involved.
+
+    Attributes:
+        path: The protocol-absolute file path the fixer edits (e.g. ``/calc.py``).
+        summary: A one-line description of the bug this target fixes.
+        old: The exact buggy line to replace.
+        new: The corrected line.
+    """
+
+    path: str
+    summary: str
+    old: str
+    new: str
+
+
+# The three fix targets. Targets 0 and 1 both rewrite the SAME line of /calc.py with
+# DIFFERENT corrections (in their OWN isolated worktrees), so folding their two patches
+# hits a REAL three-way git merge conflict on that line — the headline conflict path.
+# Target 2 edits /helper.py cleanly (a non-conflicting fold). Each `summary` is unique so
+# the offline fake fixer can tell which target a prompt names.
+REFACTOR_TARGETS: list[RefactorTarget] = [
+    RefactorTarget(
+        path="/calc.py",
+        summary="combine() should add its inputs",
+        old="    return a - b\n",
+        new="    return a + b\n",
+    ),
+    RefactorTarget(
+        path="/calc.py",
+        summary="combine() should sum the magnitudes",
+        old="    return a - b\n",
+        new="    return abs(a) + abs(b)\n",
+    ),
+    RefactorTarget(
+        path="/helper.py",
+        summary="VALUE constant is wrong",
+        old="VALUE = 0\n",
+        new="VALUE = 42\n",
+    ),
+]
+
+# The PR intent the workflow returns for the host to materialize after the run.
+REFACTOR_PR_BRANCH = "ldw/refactor-swarm"
+REFACTOR_PR_TITLE = "Refactor swarm: fix calc + helper bugs"
+
+
+class GitPatch(BaseModel):
+    """A single git-worktree fixer's authoritative changeset (engine-folded).
+
+    The engine folds the real ``git diff`` of the fixer's worktree into :attr:`files`
+    as the AUTHORITATIVE changeset — a model self-report can never override the on-disk
+    truth — so a git-worktree execution leaf's schema MUST declare a ``files: dict[str,
+    str]`` field or the fold fails loud. The fixer self-reports a :attr:`summary`; the
+    changeset itself is the real diff, not the model's word.
+
+    Attributes:
+        summary: The fixer's one-line description of what it changed.
+        files: The authoritative changeset (``path -> new content``), folded in by the
+            engine from the real ``git diff`` of the leaf's worktree.
+    """
+
+    summary: str
+    files: dict[str, str]
+
+
+class MergeResult(BaseModel):
+    """The outcome of one scratch-repo three-way ``git merge`` (mirrors the engine test).
+
+    Attributes:
+        clean: ``True`` when the merge applied with no conflict.
+        files: The merged tree on a clean merge; on a conflict, the working tree
+            carrying the real ``<<<<<<<`` markers.
+        conflicts: ``path -> conflicted content`` for each file git could not
+            auto-merge (empty on a clean merge).
+    """
+
+    clean: bool
+    files: dict[str, str]
+    conflicts: dict[str, str]
+
+
+class Resolution(BaseModel):
+    """A conflict resolver leaf's flattened, marker-free resolution of conflicted files.
+
+    Attributes:
+        files: ``path -> resolved content`` for each conflicted file, with every git
+            conflict hunk flattened so no ``<<<<<<<`` / ``>>>>>>>`` markers remain.
+    """
+
+    files: dict[str, str]
+
+
+class PrIntent(BaseModel):
+    """The pull-request intent a workflow returns for the HOST to materialize (R1).
+
+    Opening a PR is a networked side effect that must NOT live inside the deterministic
+    replay (a journaled leaf short-circuits on resume), so the workflow returns this
+    pure intent and the host opens the PR once, after ``run_workflow`` returns.
+
+    Attributes:
+        branch: The source branch the PR should be opened from.
+        title: The PR title.
+        body: The PR description body.
+    """
+
+    branch: str
+    title: str
+    body: str
+
+
+class RefactorResult(BaseModel):
+    """The pure, journaled result the ``refactor_swarm`` workflow returns.
+
+    Attributes:
+        integrated_tree: The integrated source tree after every approved patch folded in
+            (``path -> content``), conflicts resolved — no merge markers remain.
+        conflict_resolved: ``True`` when the integrate fold actually hit (and resolved) a
+            real ``git merge`` conflict, ``False`` when every fold was clean.
+        approved: The summaries of the patches the two-vote judge approved (one per
+            integrated patch).
+        rejected: The summaries of the patches the judge rejected (folded into nothing).
+        pr: The PR intent for the host to materialize after the run (host finalization).
+    """
+
+    integrated_tree: dict[str, str]
+    conflict_resolved: bool
+    approved: list[str]
+    rejected: list[str]
+    pr: PrIntent
+
+
+def _scratch_merge(
+    base: dict[str, str], ours: dict[str, str], theirs: dict[str, str]
+) -> MergeResult:
+    """Run a real three-way ``git merge`` in a throwaway repo (pure, resume-safe).
+
+    Mirrors the engine integration test's ``scratch_merge``: builds a disposable git
+    repo from the inputs alone — commit ``base``, branch ``ours`` off the base SHA,
+    branch ``theirs`` off the base SHA — then runs a real ``git merge ours <- theirs``.
+    A clean merge returns the merged tree; a real conflict returns the working tree
+    carrying git's real ``<<<<<<<`` markers plus a per-file conflict map. The function is
+    a pure rebuild from its inputs (no persisted state across calls), so a merge leaf
+    that calls it is resume-safe: every replay reconstructs the identical scratch repo and
+    the identical result.
+
+    Args:
+        base: The common ancestor tree (``path -> content``).
+        ours: The integrated-so-far tree to merge into.
+        theirs: The incoming patch tree to merge in.
+
+    Returns:
+        A :class:`MergeResult` capturing whether the merge was clean and the resulting
+        (merged or conflicted) tree.
+    """
+    with tempfile.TemporaryDirectory(prefix="ldw-demo-scratch-merge-") as repo:
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.email", "t@t")
+        _git(repo, "config", "user.name", "t")
+
+        def _write_tree(tree: dict[str, str], message: str) -> None:
+            # Replace the whole tree deterministically so a removed path is honored.
+            for existing in Path(repo).iterdir():
+                if existing.name == ".git":
+                    continue
+                existing.unlink()
+            for rel, content in tree.items():
+                (Path(repo) / rel.lstrip("/")).write_text(content)
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-qm", message, "--allow-empty")
+
+        # Branch ours/theirs EXPLICITLY off the base commit SHA so the merge is a genuine
+        # three-way merge independent of the init default branch name (main vs master).
+        _write_tree(base, "base")
+        base_sha = _git_out(repo, "rev-parse", "HEAD").strip()
+        _git(repo, "checkout", "-qb", "ours", base_sha)
+        _write_tree(ours, "ours")
+        _git(repo, "checkout", "-qb", "theirs", base_sha)
+        _write_tree(theirs, "theirs")
+        _git(repo, "checkout", "-q", "ours")
+        merge = subprocess.run(
+            ["git", "-C", repo, "merge", "--no-edit", "theirs"],
+            capture_output=True,
+            text=True,
+        )
+        files: dict[str, str] = {}
+        for path in sorted(Path(repo).rglob("*")):
+            if ".git" in path.parts or not path.is_file():
+                continue
+            rel = "/" + str(path.relative_to(repo))
+            files[rel] = path.read_text(encoding="utf-8", errors="replace")
+        if merge.returncode == 0:
+            return MergeResult(clean=True, files=files, conflicts={})
+        # Real conflict: enumerate the unmerged paths git reports.
+        unmerged = _git_out(repo, "diff", "--name-only", "--diff-filter=U")
+        conflicts = {"/" + rel: files["/" + rel] for rel in unmerged.splitlines() if rel.strip()}
+        return MergeResult(clean=False, files=files, conflicts=conflicts)
+
+
+def _git(cwd: str, *args: str) -> None:
+    """Run a ``git`` command in ``cwd``, raising on failure (used by ``_scratch_merge``)."""
+    subprocess.run(["git", "-C", cwd, *args], check=True, capture_output=True)
+
+
+def _git_out(cwd: str, *args: str) -> str:
+    """Run a ``git`` command in ``cwd`` and return its stdout (used by ``_scratch_merge``)."""
+    return subprocess.run(
+        ["git", "-C", cwd, *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _flatten_conflict_markers(conflicted: str) -> str:
+    """Deterministically flatten git conflict hunks, keeping BOTH sides' contributions.
+
+    A real ``git`` conflict hunk looks like::
+
+        <<<<<<< ours
+        <ours lines>
+        =======
+        <theirs lines>
+        >>>>>>> theirs
+
+    A deterministic resolver (standing in for an LLM resolver leaf offline) drops the
+    marker lines and keeps both bodies concatenated, so the resolution is reproducible
+    and contains both contributions. The resolved content IS the merge resolution — it is
+    folded directly into the integrated tree (no second merge pass).
+
+    Args:
+        conflicted: File content carrying one or more conflict hunks.
+
+    Returns:
+        The resolved content with every conflict hunk flattened.
+    """
+    out: list[str] = []
+    for line in conflicted.splitlines(keepends=True):
+        stripped = line.rstrip("\n")
+        if stripped.startswith(("<<<<<<<", "=======", ">>>>>>>")):
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+# Git conflict-hunk marker prefixes. A resolved file that still carries ANY of these is a
+# broken (un-resolved) merge and must never be folded into the integrated tree or a PR.
+_CONFLICT_MARKERS: tuple[str, ...] = ("<<<<<<<", "=======", ">>>>>>>")
+
+# How many times the conflict resolver leaf is retried before the fold FAILS LOUD. The fold
+# gates on the real artifact (no markers, every conflicted file present), not the model's
+# word — a small bounded retry tolerates a botched first try without looping forever.
+_MAX_RESOLVE_ATTEMPTS = 2
+
+
+def _has_conflict_markers(text: str) -> bool:
+    """Return ``True`` if any line of ``text`` begins with a git conflict marker."""
+    return any(
+        line.startswith(_CONFLICT_MARKERS) for line in (ln.rstrip("\n") for ln in text.splitlines())
+    )
+
+
+def _invalid_resolution_files(
+    conflicts: dict[str, str], resolved: dict[str, str]
+) -> dict[str, str]:
+    """Return the conflicted files a resolution failed to resolve (missing or marker-laden).
+
+    A resolution is valid only when every conflicted path is present AND carries no remaining
+    conflict markers. This returns the offending subset — keyed by path — so a retry can feed
+    back exactly which files still need resolving (missing files map to their original
+    conflicted content so the retry sees the markers it must remove).
+
+    Args:
+        conflicts: The merge's conflicted files (``path -> conflicted content``).
+        resolved: The resolver's returned files (``path -> resolved content``).
+
+    Returns:
+        A ``path -> content`` map of the still-invalid files (empty when the resolution is
+        valid). A missing path maps to its original conflicted content; a present-but-dirty
+        path maps to the resolver's still-markered content.
+    """
+    invalid: dict[str, str] = {}
+    for path, conflicted in conflicts.items():
+        if path not in resolved:
+            invalid[path] = conflicted
+        elif _has_conflict_markers(resolved[path]):
+            invalid[path] = resolved[path]
+    return invalid
+
+
+# Sentinel delimiting the machine-readable conflicts JSON block in the resolver prompt. The
+# real model reads the prose instructions; an offline fake extracts the JSON between these
+# markers (see _parse_conflicts_from_prompt) — so one prompt serves both paths.
+_CONFLICTS_JSON_BEGIN = "<<<CONFLICTS_JSON>>>"
+_CONFLICTS_JSON_END = "<<<END_CONFLICTS_JSON>>>"
+
+
+def _resolve_conflict_prompt(conflicts: dict[str, str], *, attempt: int, retry_files: str) -> str:
+    """Build the prescriptive conflict-resolver prompt for one attempt.
+
+    The prompt is content-distinct per attempt (it carries the attempt number and, on a
+    retry, the files still carrying markers), so the engine's content-hash journal does NOT
+    short-circuit a retry to the prior attempt's result. It carries prose instructions for a
+    real model AND a machine-readable conflicts JSON block (between
+    :data:`_CONFLICTS_JSON_BEGIN` / :data:`_CONFLICTS_JSON_END`) an offline fake parses, so
+    one prompt serves both the real and offline paths.
+
+    Args:
+        conflicts: The merge's conflicted files (``path -> conflicted content with markers``).
+        attempt: The 1-based resolver attempt number.
+        retry_files: On a retry, a rendered list of the files that still had markers / were
+            missing on the prior attempt; empty on the first attempt.
+
+    Returns:
+        The resolver leaf prompt for this attempt.
+    """
+    retry = (
+        ""
+        if not retry_files
+        else (
+            "Your previous attempt did NOT fully resolve these files — they still carry "
+            f"conflict markers or were missing:\n{retry_files}\n\n"
+        )
+    )
+    rendered = "\n".join(
+        f"--- {path} ---\n{content}" for path, content in sorted(conflicts.items())
+    )
+    conflicts_json = json.dumps(conflicts, sort_keys=True)
+    return (
+        "You are resolving git merge conflicts. For EACH conflicted file below, return its "
+        "fully-merged content in `files` keyed by the same path. Remove EVERY "
+        "`<<<<<<<` / `=======` / `>>>>>>>` conflict marker line and keep the correct merged "
+        "content from both sides — no marker may remain in any returned file, and every "
+        f"conflicted path MUST be present in your `files`.\n\n{retry}"
+        f"Attempt {attempt}.\nConflicted files:\n{rendered}\n\n"
+        f"{_CONFLICTS_JSON_BEGIN}\n{conflicts_json}\n{_CONFLICTS_JSON_END}"
+    )
+
+
+def _parse_conflicts_from_prompt(prompt: str) -> dict[str, str]:
+    """Extract the conflicts JSON block an offline resolver fake resolves.
+
+    Reads the JSON object between :data:`_CONFLICTS_JSON_BEGIN` / :data:`_CONFLICTS_JSON_END`
+    in a resolver prompt built by :func:`_resolve_conflict_prompt`. Falls back to parsing the
+    whole prompt as JSON (so a caller that passes raw JSON still works) and to an empty map
+    when neither yields an object.
+
+    Args:
+        prompt: The resolver leaf's prompt text.
+
+    Returns:
+        The conflicted files (``path -> conflicted content``), or an empty map when absent.
+    """
+    begin = prompt.find(_CONFLICTS_JSON_BEGIN)
+    end = prompt.find(_CONFLICTS_JSON_END)
+    if begin != -1 and end != -1 and end > begin:
+        block = prompt[begin + len(_CONFLICTS_JSON_BEGIN) : end].strip()
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError:
+            parsed = {}
+    else:
+        try:
+            parsed = json.loads(prompt)
+        except json.JSONDecodeError:
+            parsed = {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _refactor_fix_prompt(target: RefactorTarget) -> str:
+    """Build the git fixer prompt for one target file (real-model path)."""
+    return (
+        "You are fixing a bug in a small Python module that lives in your git worktree.\n\n"
+        f"File to fix: {target.path}\n"
+        f"Bug: {target.summary}\n"
+        f"Replace this exact line:\n{target.old}\n"
+        f"with:\n{target.new}\n\n"
+        "Use your edit tool to make exactly that change on disk in your worktree, then "
+        "give a one-line `summary` of what you changed. The engine will collect the real "
+        "git diff of your worktree as the authoritative changeset — make the edit on disk, "
+        "do not just describe it."
+    )
+
+
+def _refactor_verify_prompt(summary: str, files: dict[str, str], voter: int) -> str:
+    """Build the read-only judge prompt for one patch (one of two voters)."""
+    rendered = "\n".join(f"--- {path} ---\n{content}" for path, content in sorted(files.items()))
+    return (
+        f"You are reviewer #{voter + 1} judging a code patch. Decide whether it is a "
+        "sound, safe change. Set `refuted` to true ONLY if the patch is clearly wrong, "
+        "unsafe, or introduces a regression; otherwise set it to false. Give one sentence "
+        f"of `reason`.\nPatch summary: {summary}\nPatched files:\n{rendered}"
+    )
+
+
+async def _resolve_conflict(ctx: Ctx, conflicts: dict[str, str]) -> dict[str, str]:
+    """Drive the conflict resolver leaf, VALIDATING its output, retrying, then failing loud.
+
+    A real resolver can omit a conflicted file or leave ``<<<<<<<`` / ``=======`` /
+    ``>>>>>>>`` markers behind. Folding such output would integrate a broken merge and open a
+    PR over it, so this gates on the real artifact: after each resolver attempt it checks
+    every conflicted path is present and marker-free, and on failure RETRIES the resolver
+    (feeding back exactly which files still need work) up to :data:`_MAX_RESOLVE_ATTEMPTS`.
+    If no attempt lands a clean resolution, it FAILS LOUD rather than folding markers — the
+    same "don't trust the model; verify the artifact" discipline the M5 fix loop uses.
+
+    Each attempt's prompt is content-distinct (it carries the attempt number and the retry
+    feedback), so the engine's content-hash journal does not short-circuit a retry to the
+    prior attempt's cached result.
+
+    Args:
+        ctx: The orchestration context (for the resolver ``ctx.agent`` calls + logging).
+        conflicts: The merge's conflicted files (``path -> conflicted content with markers``).
+
+    Returns:
+        The validated, marker-free resolution (``path -> resolved content``) for every
+        conflicted file.
+
+    Raises:
+        ValueError: If the resolver never produces a valid (complete, marker-free)
+            resolution within :data:`_MAX_RESOLVE_ATTEMPTS` attempts.
+    """
+    retry_files = ""
+    invalid: dict[str, str] = {}
+    for attempt in range(1, _MAX_RESOLVE_ATTEMPTS + 1):
+        resolution = await ctx.agent(
+            _resolve_conflict_prompt(conflicts, attempt=attempt, retry_files=retry_files),
+            agent_type="conflict_resolver",
+            schema=Resolution,
+        )
+        invalid = _invalid_resolution_files(conflicts, resolution.files)
+        if not invalid:
+            return {path: resolution.files[path] for path in conflicts}
+        # Still invalid: feed back which files are unresolved so the retry's prompt is both
+        # actionable and content-distinct (so the journal does not replay attempt N's result).
+        retry_files = "\n".join(
+            f"--- {path} ---\n{content}" for path, content in sorted(invalid.items())
+        )
+        ctx.log(f"resolver attempt {attempt} left {len(invalid)} file(s) unresolved; retrying")
+    raise ValueError(
+        "conflict resolution failed: the resolver left "
+        f"{len(invalid)} file(s) with conflict markers or missing after "
+        f"{_MAX_RESOLVE_ATTEMPTS} attempts ({sorted(invalid)}); refusing to fold a broken "
+        "merge or open a PR over it"
+    )
+
+
+async def refactor_swarm(ctx: Ctx, args: dict[str, Any]) -> RefactorResult:
+    """Real-git fix swarm -> two-vote judge -> script-owned merge-conflict fold + PR intent.
+
+    The M6 dual-track thesis made concrete, end to end:
+
+    * **fix** — a ``ctx.parallel`` fan-out of git fixers, each ``isolation="worktree"`` so
+      it runs in its OWN real ``git worktree`` on its own ``leaf/<id>`` branch, fully
+      isolated from its siblings. Each fixer edits one target file on its worktree disk;
+      the engine folds the real ``git diff`` into the leaf's :class:`GitPatch` ``files``
+      as the AUTHORITATIVE changeset (a model self-report cannot override on-disk truth).
+    * **verify** — a two-vote read-only judge per patch. A patch is approved unless a
+      voter refutes it; a refuted patch is dropped from the fold (never integrated).
+    * **integrate** — a SCRIPT-OWNED fold: cross-leaf state lives in the script variable
+      ``integrated`` (seeded from the base tree), and each approved patch is folded by a
+      journaled merge leaf running a real scratch-repo ``git merge`` (:func:`_scratch_merge`).
+      A clean merge folds its merged tree directly; a real conflict routes through a
+      resolver leaf whose flattened resolution is folded straight into the merged working
+      tree (completing the merge, no second pass). The script — not the model — owns the
+      loop: the control-flow inversion at the heart of the engine.
+
+    The fixture is designed so two fixers edit the SAME overlapping region of ``/calc.py``,
+    so the integrate fold ACTUALLY hits (and resolves) a real ``git merge`` conflict — the
+    headline conflict path — while a third fixer edits ``/helper.py`` cleanly.
+
+    Host-finalization boundary (R1): opening a PR is a networked side effect that must not
+    live in the deterministic replay, so this workflow RETURNS a pure :class:`RefactorResult`
+    carrying the integrated tree plus a :class:`PrIntent`; the HOST opens the PR once, after
+    ``run_workflow`` returns, never from inside this script.
+
+    Args:
+        ctx: The orchestration context supplied by ``run_workflow``.
+        args: Workflow arguments; unused today (the fixture is fixed for a deterministic
+            demo), accepted for signature parity with the other presets.
+
+    Returns:
+        A :class:`RefactorResult` with the integrated tree, whether a conflict was
+        resolved, the approved/rejected patch summaries, and the PR intent.
+    """
+    _ = args  # the fixture is fixed; args is accepted for preset-signature parity
+    base_tree = dict(REFACTOR_BASE_TREE)
+
+    ctx.phase("fix")
+    # Each fixer runs in its OWN real git worktree (isolation="worktree"), so two fixers
+    # editing the same file never see each other's edit — the isolation the conflict relies on.
+    patches = await ctx.parallel(
+        [
+            lambda t=target, i=index: ctx.agent(
+                _refactor_fix_prompt(t),
+                agent_type="git_fixer",
+                schema=GitPatch,
+                isolation="worktree",
+            )
+            for index, target in enumerate(REFACTOR_TARGETS)
+        ]
+    )
+    fixed = [p for p in patches if p is not None]
+    ctx.log(f"fixed {len(fixed)}/{len(REFACTOR_TARGETS)} target files")
+
+    ctx.phase("verify")
+    approved: list[GitPatch] = []
+    rejected: list[str] = []
+    for patch in fixed:
+        verdicts = await ctx.parallel(
+            [
+                lambda s=patch.summary, f=patch.files, v=v: ctx.agent(
+                    _refactor_verify_prompt(s, f, v), agent_type="patch_judge", schema=Verdict
+                )
+                for v in range(2)
+            ]
+        )
+        # A patch is approved unless ANY voter refutes it (a strict two-vote gate over typed
+        # Verdicts) — the script branches on the typed ruling, never on leaf prose.
+        survived = survives(verdicts, against=lambda v: v.refuted, kill_at=1)
+        if survived:
+            approved.append(patch)
+            ctx.log(f"patch approved: {patch.summary.strip()[:50]}")
+        else:
+            rejected.append(patch.summary)
+            ctx.log(f"patch rejected: {patch.summary.strip()[:50]}")
+
+    ctx.phase("integrate")
+    # Cross-leaf state lives in THIS script variable, seeded from the base tree and folded
+    # forward by a journaled merge leaf — deterministic control-flow inversion.
+    integrated = dict(base_tree)
+    any_conflict = False
+    for patch in approved:
+        # "theirs" is a real branch: the base tree with this patch's files applied, so a
+        # patch touching only some files does not appear to delete the rest.
+        theirs = {**base_tree, **patch.files}
+        merged = await ctx.agent(
+            json.dumps({"base": base_tree, "ours": integrated, "theirs": theirs}, sort_keys=True),
+            agent_type="merge",
+            schema=MergeResult,
+        )
+        if merged.clean:
+            integrated = merged.files
+            continue
+        any_conflict = True
+        # Real conflict: a resolver leaf flattens git's markers. DON'T trust it blindly —
+        # validate the resolution carries no remaining markers and resolves every conflicted
+        # file, retrying with feedback up to a bound, and FAIL LOUD if it never lands a clean
+        # tree (mirroring M5's "gate on the real artifact, not the model's word"). Only a
+        # validated, marker-free resolution is folded into the merged working tree.
+        resolved_files = await _resolve_conflict(ctx, merged.conflicts)
+        integrated = dict(merged.files)
+        integrated.update(resolved_files)
+    ctx.log(f"integrated {len(approved)} patches (conflict resolved: {any_conflict})")
+
+    body = (
+        "Automated refactor swarm.\n\n"
+        + "Approved patches:\n"
+        + "\n".join(f"- {s}" for s in (p.summary for p in approved))
+        + (f"\n\nResolved {1 if any_conflict else 0} merge conflict." if any_conflict else "")
+    )
+    return RefactorResult(
+        integrated_tree=integrated,
+        conflict_resolved=any_conflict,
+        approved=[p.summary for p in approved],
+        rejected=rejected,
+        pr=PrIntent(branch=REFACTOR_PR_BRANCH, title=REFACTOR_PR_TITLE, body=body),
+    )
+
+
 # ── leaves (real deepagents when a key is present, deterministic fakes offline) ──
 
 
@@ -771,6 +1369,157 @@ def _build_code_fixer(*, response_format: Any = None, api_key: str | None = None
     return RunnableLambda(_leaf)
 
 
+def _build_git_fixer(*, response_format: Any = None, api_key: str | None = None) -> Any:
+    """Build the ``git_fixer`` execution leaf, forwarding ``response_format`` (GitPatch).
+
+    The real path is a ``create_deep_agent`` wired with a ``backend`` factory that reads
+    the engine-leased per-leaf real GIT WORKTREE backend from the run config at call time
+    (``configurable['sandbox_backend']``), so the leaf's edit/write tools mutate a real
+    ``git worktree`` on its own ``leaf/<id>`` branch. The engine collects the worktree's
+    real ``git diff`` and folds it into :class:`GitPatch` ``files`` as the authoritative
+    changeset — so a git-worktree leaf MUST carry a ``files: dict[str, str]`` schema field
+    (which :class:`GitPatch` declares) or the fold fails loud.
+
+    The offline path is a deterministic fake that, with no model and no real worktree,
+    EDITS the target file on the leased worktree disk itself (so the engine's real
+    ``git diff`` collect still yields the authoritative changeset, exactly as a real fixer
+    would). It reads the target from its prompt: the prompt names exactly one
+    :class:`RefactorTarget`'s ``old`` / ``new`` / ``path``, so the fake replaces ``old``
+    with ``new`` on disk and self-reports a ``files={}`` (the engine overrides it with the
+    real diff). This exercises the genuine isolation + authoritative-collect + conflict
+    path offline, with the real worktree provider driving the diff, not the fake.
+
+    Args:
+        response_format: The structured schema (``GitPatch``) the real leaf returns.
+        api_key: The per-run OpenRouter key captured at roster-build time (or ``None``).
+
+    Returns:
+        A real execution deepagent when a key is in force, else the deterministic fake.
+    """
+    model = resolve_leaf_model(api_key=api_key)
+    if model is not None:
+
+        def _backend_factory(_runtime: Any) -> Any:
+            # The engine leases a per-leaf real git-worktree backend (needs_execution=True,
+            # isolation="worktree") and threads it into the run-config contextvar; read it
+            # here at call time via get_config (the canonical engine pattern).
+            configurable = (get_config() or {}).get("configurable") or {}
+            return configurable["sandbox_backend"]
+
+        return create_deep_agent(
+            model=model,
+            backend=_backend_factory,
+            response_format=response_format,
+            middleware=cache_middleware(),
+        )
+
+    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        prompt = inp["messages"][-1].text if inp["messages"] else ""
+        # The leased real worktree backend is on the run config under 'sandbox_backend';
+        # the fake makes the REAL edit on disk so the engine's git diff is authoritative.
+        backend = (config or {}).get("configurable", {}).get("sandbox_backend")
+        # Identify exactly which target this prompt names. Two targets share a file
+        # (/calc.py) AND overlap textually (that overlap is what makes them conflict), so
+        # the path or the edited lines are ambiguous; match on the unique per-target
+        # `summary` (rendered verbatim as `Bug: ...`) so each fixer makes ITS OWN edit.
+        target = next((t for t in REFACTOR_TARGETS if f"Bug: {t.summary}" in prompt), None)
+        if backend is not None and target is not None:
+            # protocol-absolute path (e.g. "/calc.py") is what the backend edit tool expects.
+            await backend.aedit(target.path, target.old, target.new)
+        summary = target.summary if target is not None else "edited the target file"
+        return {
+            "messages": [*inp["messages"], AIMessage(content="edited the worktree file")],
+            # files={} — the engine folds the real git diff in as the authoritative changeset.
+            "structured_response": GitPatch(summary=summary, files={}),
+        }
+
+    return RunnableLambda(_leaf)
+
+
+def _build_patch_judge(*, response_format: Any = None, api_key: str | None = None) -> Any:
+    """Build the ``patch_judge`` read-only judge leaf, forwarding ``response_format`` (Verdict).
+
+    A two-vote reviewer over a patch: it should only judge, never mutate. The real path is
+    a ``read_only_leaf`` (a deny-write permission) so even a hallucinated "fix" is refused
+    at the tool boundary. Offline it never refutes, so every patch is approved — a
+    deterministic, readable demo (the conflict/fold narrative, not the vote split, is the
+    headline; the vote split is exercised in ``capstone``).
+
+    Args:
+        response_format: The structured schema (``Verdict``) the real leaf returns.
+        api_key: The per-run OpenRouter key captured at roster-build time (or ``None``).
+    """
+    model = resolve_leaf_model(api_key=api_key)
+    if model is not None:
+        return read_only_leaf(model, response_format=response_format, middleware=cache_middleware())
+    return _fake_structured_leaf(
+        Verdict(refuted=False, reason="the patch is a sound, targeted fix"),
+        reply="reviewed the patch",
+    )
+
+
+def _build_merge_leaf(*, response_format: Any = None, api_key: str | None = None) -> Any:
+    """Build the ``merge`` leaf: it runs a real scratch-repo three-way ``git merge``.
+
+    Always deterministic — on BOTH the online and offline paths — because merging is an
+    exact git operation, not a reasoning task: the leaf reads ``{base, ours, theirs}`` from
+    its (journal-keyed) prompt JSON and runs :func:`_scratch_merge`, returning a typed
+    :class:`MergeResult`. The model is irrelevant to a deterministic git merge, so this
+    leaf never builds a deepagent; the conflict outcome is the real git result, not a model
+    guess. ``response_format`` / ``api_key`` are accepted for builder-signature parity.
+
+    Args:
+        response_format: Unused (the leaf returns a fixed :class:`MergeResult` schema).
+        api_key: Unused (the merge is deterministic, model-free).
+    """
+    _ = (response_format, api_key)
+
+    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        payload = json.loads(inp["messages"][-1].text if inp["messages"] else "{}")
+        result = _scratch_merge(payload["base"], payload["ours"], payload["theirs"])
+        return {
+            "messages": [*inp["messages"], AIMessage(content="merged")],
+            "structured_response": result,
+        }
+
+    return RunnableLambda(_leaf)
+
+
+def _build_conflict_resolver(*, response_format: Any = None, api_key: str | None = None) -> Any:
+    """Build the ``conflict_resolver`` reasoning leaf, forwarding ``response_format`` (Resolution).
+
+    Resolves git conflict markers into clean, marker-free content. The real path is a
+    ``create_deep_agent`` (a reasoning leaf — it merges intent, it does not execute), driven
+    by the prescriptive :func:`_resolve_conflict_prompt` to return a :class:`Resolution` with
+    every conflicted file present and every marker removed. The script does not trust the
+    result blindly — :func:`_resolve_conflict` validates it (no markers, all files present),
+    retries with feedback, and fails loud otherwise. The offline path deterministically
+    flattens the conflict hunks (:func:`_flatten_conflict_markers`) parsed from the prompt's
+    machine-readable conflicts block, keeping BOTH sides' contributions so the resolution is
+    reproducible — the same mechanic the engine integration test mirrors.
+
+    Args:
+        response_format: The structured schema (``Resolution``) the real leaf returns.
+        api_key: The per-run OpenRouter key captured at roster-build time (or ``None``).
+    """
+    model = resolve_leaf_model(api_key=api_key)
+    if model is not None:
+        return create_deep_agent(
+            model=model, response_format=response_format, middleware=cache_middleware()
+        )
+
+    async def _leaf(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        prompt = inp["messages"][-1].text if inp["messages"] else ""
+        conflicts = _parse_conflicts_from_prompt(prompt)
+        resolved = {path: _flatten_conflict_markers(text) for path, text in conflicts.items()}
+        return {
+            "messages": [*inp["messages"], AIMessage(content="resolved the conflict")],
+            "structured_response": Resolution(files=resolved),
+        }
+
+    return RunnableLambda(_leaf)
+
+
 # ── roster + registry ─────────────────────────────────────────────────────────
 
 
@@ -826,18 +1575,70 @@ def _register_reasoning_roles(roster: Roster, *, api_key: str | None) -> Roster:
     )
 
 
+def _register_refactor_roles(roster: Roster, *, api_key: str | None) -> Roster:
+    """Register the ``refactor_swarm`` roles onto ``roster`` (HOST-TRUSTED path only).
+
+    Adds the four leaves the ``refactor_swarm`` preset drives: ``git_fixer`` (an EXECUTION
+    leaf, ``needs_execution=True``, that edits a real ``git worktree`` so its diff is the
+    authoritative changeset), ``patch_judge`` (a read-only two-vote reviewer), ``merge`` (a
+    deterministic real scratch-repo ``git merge`` leaf), and ``conflict_resolver`` (a
+    reasoning leaf that flattens conflict markers).
+
+    Trust boundary (R6): ``git_fixer`` is ``needs_execution``, so it can lease a real
+    git-worktree backend — exactly what an untrusted authored script must NOT reach. This
+    helper is therefore called ONLY from :func:`make_roster` (the trusted preset path),
+    never from :func:`make_reasoning_roster`. None of these roles is registered on the
+    reasoning roster, so an AST-gated authored script has no ``git_fixer`` to reach no
+    matter what ``agent_type`` it asks for.
+
+    Args:
+        roster: The roster to register the refactor roles onto (mutated and returned).
+        api_key: The per-run OpenRouter key captured in the host node context, threaded
+            into every leaf builder (or ``None`` to fall back to the env key).
+
+    Returns:
+        The same ``roster``, with every refactor role registered, for fluent chaining.
+    """
+    return (
+        roster.register(
+            "git_fixer",
+            builder=partial(_build_git_fixer, api_key=api_key),
+            description="Fixes one file in a real git worktree (execution leaf).",
+            needs_execution=True,
+        )
+        .register(
+            "patch_judge",
+            builder=partial(_build_patch_judge, api_key=api_key),
+            description="Reviews a code patch read-only (two-vote gate).",
+        )
+        .register(
+            "merge",
+            builder=partial(_build_merge_leaf, api_key=api_key),
+            description="Runs a real scratch-repo three-way git merge (deterministic).",
+        )
+        .register(
+            "conflict_resolver",
+            builder=partial(_build_conflict_resolver, api_key=api_key),
+            description="Resolves git merge conflict markers (reasoning leaf).",
+        )
+    )
+
+
 def make_roster() -> Roster:
     """Build the demo leaf roster shared by both preset workflows.
 
     Registers the reasoning roles (``researcher``, ``writer``, ``refiner``, ``extractor``,
-    ``skeptic``, ``capstone_skeptic``, ``echo``) plus ``code_fixer`` (an EXECUTION leaf,
-    ``needs_execution=True``, that edits code and runs the real build/test until green —
-    the ``fix_loop`` preset's leaf). With an OpenRouter key in force each leaf is a real
-    ``create_deep_agent``; with no key the roster serves deterministic fake leaves so an
-    offline run is fully reproducible.
+    ``skeptic``, ``capstone_skeptic``, ``echo``) plus ``code_fixer`` (the ``fix_loop``
+    preset's EXECUTION leaf) and the ``refactor_swarm`` roles — ``git_fixer`` (an EXECUTION
+    leaf that edits a real ``git worktree``), ``patch_judge``, ``merge``, and
+    ``conflict_resolver``. With an OpenRouter key in force each leaf is a real
+    ``create_deep_agent`` (the merge leaf stays deterministic — git merging is exact, not
+    reasoning); with no key the roster serves deterministic fake leaves so an offline run is
+    fully reproducible.
 
     Trust boundary: this FULL roster — which can reach the real ``LocalSubprocessSandbox``
-    via ``code_fixer`` — is for the TRUSTED preset path only (``run_workflow_live``, whose
+    via ``code_fixer`` and a real ``git worktree`` via ``git_fixer`` — is for the TRUSTED
+    preset path only (``run_workflow_live``, whose
     ``agent()`` calls are fixed in code). The meta layer, which runs an LLM-authored script
     whose ``agent_type`` choices the AST gate does not constrain, must instead use
     :func:`make_reasoning_roster` so an authored script cannot reach real execution.
@@ -862,12 +1663,15 @@ def make_roster() -> Roster:
     # engine substrate where the per-run config is not visible.
     api_key = resolve_openrouter_key()
     roster = _register_reasoning_roles(Roster(), api_key=api_key)
-    return roster.register(
+    roster = roster.register(
         "code_fixer",
         builder=partial(_build_code_fixer, api_key=api_key),
         description="Edits code and runs the real build/test until green (execution leaf).",
         needs_execution=True,
     )
+    # The refactor_swarm roles — including the needs_execution git_fixer — are registered
+    # ONLY here, on the trusted preset roster, never on make_reasoning_roster (R6 boundary).
+    return _register_refactor_roles(roster, api_key=api_key)
 
 
 def make_reasoning_roster() -> Roster:
@@ -894,7 +1698,7 @@ def make_workflows() -> WorkflowRegistry:
 
     Returns:
         A :class:`~langchain_dynamic_workflow.WorkflowRegistry` with ``deep_research``,
-        ``capstone``, ``fix_loop``, and ``sign_off``.
+        ``capstone``, ``fix_loop``, ``sign_off``, and ``refactor_swarm``.
     """
     return (
         WorkflowRegistry()
@@ -902,6 +1706,7 @@ def make_workflows() -> WorkflowRegistry:
         .register("capstone", capstone)
         .register("fix_loop", fix_loop)
         .register("sign_off", sign_off)
+        .register("refactor_swarm", refactor_swarm)
     )
 
 
@@ -929,9 +1734,18 @@ async def hello_workflow(ctx: Ctx) -> str:
 
 
 __all__: list[str] = [
+    "REFACTOR_BASE_TREE",
+    "REFACTOR_PR_BRANCH",
+    "REFACTOR_TARGETS",
     "Claim",
     "EditedFile",
     "FixResult",
+    "GitPatch",
+    "MergeResult",
+    "PrIntent",
+    "RefactorResult",
+    "RefactorTarget",
+    "Resolution",
     "Verdict",
     "capstone",
     "deep_research",
@@ -940,4 +1754,6 @@ __all__: list[str] = [
     "make_reasoning_roster",
     "make_roster",
     "make_workflows",
+    "refactor_swarm",
+    "sign_off",
 ]

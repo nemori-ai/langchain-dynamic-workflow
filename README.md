@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 ![Types: pyright strict](https://img.shields.io/badge/types-pyright%20strict-blue.svg)
-![Status: alpha 0.2.0](https://img.shields.io/badge/status-alpha%200.2.0-orange.svg)
+![Status: alpha 0.3.0-dev](https://img.shields.io/badge/status-alpha%200.3.0--dev-orange.svg)
 
 **English** | [中文](README_zh.md)
 
@@ -45,11 +45,15 @@ Reach for it when a task is **fan-out heavy** (research N angles, grade M candid
 - **Deterministic control flow** — loops, branching, and fan-out live in code, not in the model's head.
 - **Context quarantine** — each leaf runs in a fresh, discarded deepagents context; only its folded result returns.
 - **Parallel, pipeline, and race fan-out** — `parallel()` (blocking barrier), `pipeline()` (no-barrier streaming), and `race()` (best-of-N early exit: the first result satisfying `win` wins, in-flight losers are cancelled, the decision is journaled so resume reproduces the winner) over a shared concurrency gate.
+- **Cross-leaf reduce** — first-class helpers fold many leaf results: `survives` (refute-by-default voting), `dedup`, `reconcile` (double-blind reviewer reconciliation), and `corroborate` (judge-panel aggregation).
 - **Resumable by content hash** — a success-only journal replays completed leaves on resume at zero model cost.
+- **Cross-session persistence** — wire the optional `[sqlite]` store and a fresh process resumes a run by `run_id`, replaying completed leaves at zero model cost (a superset of Claude Code's same-session-only resume).
 - **Fail-loud determinism guard** — a replay whose `agent()` call sequence diverges raises rather than serving a positionally misaligned cache entry.
 - **Shared token budget** — one ceiling across every leaf, with a `loop-until-budget` idiom.
 - **Observability by default** — every `agent` / `parallel` / `pipeline` / `race` call emits a span to an opt-in sink (zero cost when unset).
-- **Per-leaf sandbox isolation** — execution leaves lease isolated backends; a `/shared/` route enables explicit producer→consumer hand-off.
+- **Per-leaf sandbox isolation + real execution** — execution leaves lease isolated backends (a `/shared/` route enables explicit producer→consumer hand-off); opt into `LocalSubprocessSandbox` for real subprocess build/test with exit-code gating, resource limits, and admission control.
+- **Real git worktree + branch/PR** — opt into `GitWorktreeProvider` and each file-mutating leaf runs in its own real `git worktree` / branch (its authoritative change is the real `git diff`), folded into an integration branch via real `git merge` and finalized as a PR.
+- **In-run human sign-off** — `ctx.checkpoint` pauses a run for a human decision and resumes with it via a journal-driven gate (a superset of Claude Code, which accepts no input mid-run).
 - **Meta layer** — a host agent authors an orchestration script at runtime; an AST gate validates it before a single restricted `exec`.
 - **Strict engineering** — Python 3.12, async-first, pyright `strict`, and Layer 0/1/2 boundaries enforced by import-linter.
 
@@ -167,14 +171,14 @@ A run executes in the background and a completion notice is injected before the 
 
 ## Examples
 
-The **15 feature demos** under [`examples/features/`](examples/features/) each isolate one mechanism and run **offline with no API key** (deterministic fake models). The two **flagships** under [`examples/flagship/`](examples/flagship/) carry the real end-to-end path: offline by default, they light up live OpenRouter leaves with native web search + prompt caching when you opt in. To drive the real path, install the demo extras with `uv sync --group example`, put `OPENROUTER_API_KEY` and the `LANGSMITH_*` settings in a local `.env`, then set `LDW_DEMO_REAL_MODEL` (defaults to `anthropic/claude-opus-4.8`; set it to any OpenRouter slug to override). The full taxonomy and the authoritative index of every demo live in **[`examples/AGENTS.md`](examples/AGENTS.md)**.
+The **17 feature demos** under [`examples/features/`](examples/features/) each isolate one mechanism and run **offline with no API key** (deterministic fake models). The two **flagships** under [`examples/flagship/`](examples/flagship/) carry the real end-to-end path: offline by default, they light up live OpenRouter leaves with native web search + prompt caching when you opt in. To drive the real path, install the demo extras with `uv sync --group example`, put `OPENROUTER_API_KEY` and the `LANGSMITH_*` settings in a local `.env`, then set `LDW_DEMO_REAL_MODEL` (defaults to `anthropic/claude-opus-4.8`; set it to any OpenRouter slug to override). The full taxonomy and the authoritative index of every demo live in **[`examples/AGENTS.md`](examples/AGENTS.md)**.
 
 | Demo | Shows |
 |---|---|
 | **[`flagship/deep_research_preset`](examples/flagship/deep_research_preset.py)** | Flagship (real model): a host drives the registered `deep_research` workflow — parallel search → extract → adversarial verify → synthesize, with native web search + prompt caching. |
 | **[`flagship/deep_research_authored`](examples/flagship/deep_research_authored.py)** | Flagship (real model): a host *authors* the deep-research script live and runs it via `run_script` (AST gate happy path), same web-search + caching leaf stack. |
 
-The 15 offline feature demos (one mechanism each, no API key) and the full taxonomy live in **[`examples/AGENTS.md`](examples/AGENTS.md)**.
+The 17 offline feature demos (one mechanism each, no API key) and the full taxonomy live in **[`examples/AGENTS.md`](examples/AGENTS.md)**.
 
 ```bash
 # any offline feature demo:
@@ -195,10 +199,13 @@ The stable, public surface is exported from the package root and follows semanti
 - **Meta layer** — `compile_workflow_source` / `run_workflow_from_source` / `extract_meta`: compile and run an LLM-authored source string through the AST gate.
 - **Registries** — `Roster` / `RosterEntry`, `WorkflowRegistry`.
 - **Host-facing** — `create_workflow_tool`, `create_workflow_middleware`, `skills_path` / `skill_files`.
-- **Primitives** — exposed on the `Ctx` handed to your script: `agent` / `parallel` / `pipeline` / `race` / `phase` / `log` / `budget` / `workflow`. `ctx.race(candidates, *, win, win_tag="")` runs `RaceCandidate` specs concurrently and returns a `RaceResult` for the first whose result satisfies `win`, cancelling the rest; the decision is journaled (content-hash, `win_tag`-keyed) so resume reproduces the winner and dispatches nothing.
+- **Primitives** — exposed on the `Ctx` handed to your script: `agent` / `parallel` / `pipeline` / `race` / `phase` / `log` / `budget` / `workflow` / `checkpoint`. `ctx.race(candidates, *, win, win_tag="")` runs `RaceCandidate` specs concurrently and returns a `RaceResult` for the first whose result satisfies `win`, cancelling the rest; the decision is journaled (content-hash, `win_tag`-keyed) so resume reproduces the winner and dispatches nothing. `ctx.checkpoint(ask, *, tag="")` pauses the run for a human sign-off — a journal-driven gate that raises `WorkflowSignoffRequired`; the host resumes with the decision via `run_workflow(resume=...)` (the `approve` tool command on the host surface).
 - **Cross-leaf reduce** — pure helpers that fold the result lists `parallel` / `pipeline` hand back: `survives` (refute-by-default vote), `dedup`, `reconcile` (dual-blind reviewer reconciliation), `corroborate` (cross-leaf corroboration), plus the `ReviewItem` / `Reconciled` / `Consensus` result types. Also injected into the `run_script` namespace, so a host-authored script calls them by name without an import.
 - **Race value types** — `RaceCandidate` (one content-hashable agent-call spec, mirroring an `agent()` call) and `RaceResult` (the winner, its index, and `.won`). Both are injected into the `run_script` namespace, so a host-authored script constructs and reads them by name without an import.
-- **Types and errors** — `Budget`, `JournalStore` / `InMemoryJournalStore` / `JournalRecord` / `race_key`, `SandboxManager`, `Span` / `SpanKind` / `SpanSink`, the `BgRunManager` family, and the `Workflow*Error` exceptions (including `WorkflowScriptError`).
+- **Execution & isolation backends** — `SandboxManager` plus the pluggable seams a host opts into: `LocalSubprocessSandbox` / `local_subprocess_factory` / `ExecPolicy` for real subprocess execution; `WorktreeProvider` / `InMemoryWorktreeProvider` and the real-git `GitWorktreeProvider` for per-leaf worktree isolation; and `PullRequestProvider` / `PullRequestRef` / `LocalPullRequestProvider` for PR finalization. The real backends are DANGEROUS opt-ins (real subprocess / `git`), not security sandboxes.
+- **Persistence** — `WorkflowRunStore` / `RunSpec` / `InMemoryRunStore` (default, zero-dep) and `SqliteWorkflowStore` (the optional `[sqlite]` extra), so a run resumes across processes.
+- **Live observability sinks** — `run_workflow`'s keyword-only `on_span` / `on_span_begin` / `on_leaf_event` / `on_command` (all default no-op, out-of-band) plus the value types `Span` / `SpanBegin` / `SpanKind` / `LeafEvent` / `CommandEvent` and their `*Sink` aliases.
+- **Types and errors** — `Budget`, `JournalStore` / `InMemoryJournalStore` / `JournalRecord` / `race_key`, the `BgRunManager` family, and the `Workflow*Error` exceptions (`WorkflowScriptError`, `WorkflowSignoffRequired`, `WorkflowCheckpointError`, and the rest).
 
 Public signatures are stable; new parameters are added keyword-only with defaults. Names prefixed with `_` (modules and members) are internal and may change without notice.
 
@@ -215,7 +222,7 @@ uv run lint-imports     # verify the Layer 0/1/2 architecture boundaries
 
 ## Status
 
-**0.1.0 — architecture locked, public API stable, not yet published to PyPI.** All three layers are implemented, including the Layer 2 meta layer. See [`CHANGELOG.md`](CHANGELOG.md) for the release log.
+**0.2.0 released; 0.3.0 in progress — not yet published to PyPI.** All three layers are implemented and the public API is stable. The v0.3.0 line has landed cross-leaf reduce (M1), race (M2), parallel-run observability (M3.5), cross-session persistence (M3), real local execution (M5), in-run human sign-off (M4), and real git worktree + branch/PR (M6); topological/DAG fan-out + deep nesting (M7) remains. See [`CHANGELOG.md`](CHANGELOG.md) for the full log.
 
 ## License
 
