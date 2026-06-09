@@ -27,6 +27,7 @@ from ._determinism import CallSequenceGuard
 from ._errors import (
     WORKFLOW_CONTROL_FLOW_SIGNALS,
     WorkflowCheckpointError,
+    WorkflowCycleError,
     WorkflowNestingError,
     WorkflowSignoffRequired,
 )
@@ -184,14 +185,34 @@ _WORKFLOW_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
 )
 """How many ``ctx.workflow()`` frames are currently on the stack.
 
-The top-level orchestration script runs at depth ``0``. A ``ctx.workflow(name)``
-call enters depth ``1`` (one level of nesting); attempting another
-``ctx.workflow()`` from inside that frame would push depth ``2``, which the engine
-refuses. The inner workflow runs inline within the parent's entrypoint body and
-shares the parent context; its leaf ``agent()`` calls still execute as durable
-``@task`` invocations and journal normally, so resumability is unaffected. The
-variable is a :class:`~contextvars.ContextVar` so the depth is isolated per
-asyncio task and restored on frame exit.
+The top-level orchestration script runs at depth ``0``. Each ``ctx.workflow(name)``
+call increments this by one; the engine refuses a call that would push it past
+``max_workflow_depth`` (a runaway-recursion backstop). The inner workflow runs
+inline within the parent's entrypoint body and shares the parent context; its leaf
+``agent()`` calls still execute as durable ``@task`` invocations and journal
+normally, so resumability is unaffected. The variable is a
+:class:`~contextvars.ContextVar` so the depth is isolated per asyncio task and
+restored on frame exit.
+"""
+
+DEFAULT_MAX_WORKFLOW_DEPTH = 8
+"""Default cap on ``ctx.workflow()`` inline nesting depth.
+
+The cap is a runaway-recursion backstop, not a semantic limit: a legitimate
+composition nests a handful of levels, while an unbounded recursion (a missing base
+case) trips this and fails loud. The cycle guard catches the common case (a name
+re-entering itself) earlier and more precisely.
+"""
+
+_WORKFLOW_NAME_STACK: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "langchain_dynamic_workflow_workflow_name_stack", default=frozenset()
+)
+"""Names of the workflows currently inlined on the ``ctx.workflow`` call stack.
+
+A ``ctx.workflow(name)`` whose ``name`` is already in this set is a cycle (a workflow
+re-entering itself, directly or via a mutual A->B->A) and is refused. The variable is a
+:class:`~contextvars.ContextVar` so the stack is isolated per asyncio task and
+restored on frame exit, exactly like ``_WORKFLOW_DEPTH``.
 """
 
 
@@ -227,6 +248,8 @@ class Ctx:
         pending_signoff: Optional human value injected at the next un-decided
             ``ctx.checkpoint`` sign-off gate (an approve resume sets it). Omitted
             (the ``UNSET`` default) on a fresh run or a crash-resume replay.
+        max_workflow_depth: Cap on ``ctx.workflow`` inline nesting depth (a
+            runaway-recursion backstop); defaults to ``DEFAULT_MAX_WORKFLOW_DEPTH``.
     """
 
     def __init__(
@@ -242,6 +265,7 @@ class Ctx:
         workflows: WorkflowResolver | None = None,
         spans: SpanRecorder | None = None,
         pending_signoff: Any = UNSET,
+        max_workflow_depth: int = DEFAULT_MAX_WORKFLOW_DEPTH,
     ) -> None:
         self._roster = roster
         self._journal = journal
@@ -269,6 +293,7 @@ class Ctx:
         )
         self._workflows = workflows
         self._spans = spans if spans is not None else SpanRecorder()
+        self._max_workflow_depth = max_workflow_depth
 
     @property
     def observed_call_sequence(self) -> list[str]:
@@ -318,15 +343,16 @@ class Ctx:
         self._progress.emit(ProgressKind.LOG, message)
 
     async def workflow(self, name: str, args: dict[str, Any] | None = None) -> Any:
-        """Inline another workflow by name, exactly one level deep.
+        """Inline another workflow by name, up to ``max_workflow_depth`` levels deep.
 
         Resolves ``name`` against the workflow registry and runs its orchestration
         callable inline against *this* context, so the inner workflow shares the
         parent's journal, budget, concurrency gate, and progress log — its leaves
         are deduped and budgeted as if written inline, and each still executes as a
-        durable ``@task`` leaf so resumability is unaffected. Nesting is allowed
-        exactly one level; a ``workflow()`` call from inside an already-nested
-        workflow fails loud rather than recursing without bound.
+        durable ``@task`` leaf so resumability is unaffected. A cycle (a workflow
+        re-entering itself, directly or via a mutual A->B->A) is refused the moment
+        a repeated name is seen; nesting beyond ``max_workflow_depth`` levels fails
+        loud as a runaway-recursion backstop.
 
         Args:
             name: The workflow name to resolve in the registry.
@@ -339,26 +365,36 @@ class Ctx:
         Raises:
             LookupError: If no workflow registry is wired into this context.
             KeyError: If ``name`` is not registered.
-            WorkflowNestingError: If called from inside an already-nested workflow
-                (a second level of inlining).
+            WorkflowCycleError: If ``name`` is already on the inlining stack (a
+                workflow re-entering itself, directly or via a mutual cycle).
+            WorkflowNestingError: If nesting depth would exceed ``max_workflow_depth``
+                (a runaway-recursion backstop).
         """
         if self._workflows is None:
             raise LookupError(
                 f"cannot resolve workflow {name!r}: no workflow registry was wired "
                 "into this run (pass workflows=... to run_workflow)"
             )
-        if _WORKFLOW_DEPTH.get() >= 1:
+        stack = _WORKFLOW_NAME_STACK.get()
+        if name in stack:
+            raise WorkflowCycleError(
+                f"cannot inline workflow {name!r}: it is already on the inlining stack "
+                f"{sorted(stack)} — a workflow that re-enters itself (directly or via a "
+                "cycle) has no engine-bounded base case; refusing the cycle"
+            )
+        if _WORKFLOW_DEPTH.get() >= self._max_workflow_depth:
             raise WorkflowNestingError(
-                f"cannot nest workflow {name!r}: workflows may inline another workflow "
-                "exactly one level deep, and this call is already inside a nested "
-                "workflow (refusing a second nesting level)"
+                f"cannot inline workflow {name!r}: nesting depth would exceed "
+                f"max_workflow_depth={self._max_workflow_depth} (runaway-recursion backstop)"
             )
         workflow_fn = self._workflows.resolve(name)  # KeyError on unknown name
-        token = _WORKFLOW_DEPTH.set(_WORKFLOW_DEPTH.get() + 1)
+        depth_token = _WORKFLOW_DEPTH.set(_WORKFLOW_DEPTH.get() + 1)
+        stack_token = _WORKFLOW_NAME_STACK.set(stack | {name})
         try:
             return await workflow_fn(self, args or {})
         finally:
-            _WORKFLOW_DEPTH.reset(token)
+            _WORKFLOW_NAME_STACK.reset(stack_token)
+            _WORKFLOW_DEPTH.reset(depth_token)
 
     async def checkpoint(self, ask: Any, *, tag: str = "") -> Any:
         """Pause the run for a human sign-off and return the value they supply.

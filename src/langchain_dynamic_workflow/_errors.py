@@ -32,14 +32,14 @@ class WorkflowBudgetExceededError(RuntimeError):
 
 
 class WorkflowNestingError(RuntimeError):
-    """Raised when a workflow nests another workflow more than one level deep.
+    """Raised when a ``ctx.workflow`` call would exceed the configured nesting cap.
 
-    A workflow script may inline another workflow with ``ctx.workflow(name, args)``
-    exactly one level; the inner workflow runs in the same durable-execution scope
-    and shares the parent's journal, budget, and concurrency gate. Calling
-    ``ctx.workflow(...)`` again from inside an already-nested workflow would create
-    a second nesting level, which the engine refuses by raising this instead of
-    silently allowing unbounded recursion.
+    A workflow script may inline other workflows up to ``max_workflow_depth`` levels
+    (default 8). The cap is a runaway-recursion backstop: a legitimate composition
+    nests a handful of levels, while an unbounded recursion (a missing base case)
+    trips it and fails loud. The cycle guard (``WorkflowCycleError``) catches the
+    common recursive pattern earlier and more precisely; this error fires when
+    distinct workflow names are nested beyond the cap.
     """
 
 
