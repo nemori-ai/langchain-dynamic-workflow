@@ -34,14 +34,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterable,
-    AsyncIterator,
     Awaitable,
     Callable,
     Iterable,
     Sequence,
     Sized,
 )
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,7 +75,9 @@ class _Envelope:
 _POISON = object()
 
 
-async def _drain(items: Iterable[Any] | AsyncIterable[Any]) -> AsyncIterator[tuple[int, Any]]:
+async def _drain(
+    items: Iterable[Any] | AsyncIterable[Any],
+) -> AsyncGenerator[tuple[int, Any], None]:
     """Yield ``(index, item)`` from either a sync or an async input source.
 
     The ``AsyncIterable`` check comes first: a ``list`` is ``Iterable`` but not
@@ -211,8 +214,18 @@ async def run_pipeline(
 
     async def feeder() -> None:
         """Inject every item into stage 0, then propagate poison pills downstream."""
-        async for index, item in _drain(items):
-            await queues[0].put(_Envelope(index=index, original=item, payload=item))
+        # aclosing closes the (possibly unbounded / paged) async source even when we break
+        # out early on a control-flow abort, releasing its resources.
+        async with aclosing(_drain(items)) as stream:
+            async for index, item in stream:
+                # A stage tripped a fail-loud control-flow signal: stop pulling the source.
+                # Envelopes already queued are still drained + task_done by the workers
+                # (which drop them under ``aborted``), so the join() and poison-pill teardown
+                # below still complete; we only stop admitting new items, so an unbounded
+                # source cannot keep paging after the abort.
+                if aborted:
+                    break
+                await queues[0].put(_Envelope(index=index, original=item, payload=item))
         # Retire each stage's workers in order. Each stage drains fully (every
         # live envelope already forwarded) before its poison pills are consumed,
         # because a worker only pulls a pill after all real envelopes ahead of it.

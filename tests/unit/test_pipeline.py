@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 
 import pytest
 
@@ -368,3 +368,32 @@ async def test_pipeline_streaming_admission_bounds_source_pulls_below_n() -> Non
         f"pulled {pulled_at_barrier} reached N={n} — source fully drained, "
         "admission not decoupled from total (eager materialization)"
     )
+
+
+async def test_pipeline_stops_pulling_source_after_control_flow_abort() -> None:
+    # #1: when a stage trips a fail-loud control-flow signal, the feeder must STOP
+    # pulling from the source. Otherwise an unbounded / paged AsyncIterable keeps
+    # paging (or hangs) after the abort. Use a large bounded source and assert it is
+    # NOT fully drained. asyncio.wait_for guards against a hang.
+    n = 500
+    window = 4
+    gate = ConcurrencyGate(limit=8)
+    pulled = 0
+
+    async def asource() -> AsyncIterator[int]:
+        nonlocal pulled
+        for v in range(n):
+            pulled += 1
+            yield v
+
+    async def stage(prev: int, item: int, index: int) -> int:
+        raise WorkflowBudgetExceededError("boom")  # first item trips the fail-loud signal
+
+    with pytest.raises(WorkflowBudgetExceededError):
+        await asyncio.wait_for(
+            run_pipeline(asource(), [stage], gate=gate, queue_maxsize=window),
+            timeout=5.0,
+        )
+    # Bug: feeder drains all N before poison pills -> pulled == n.
+    # Fixed: feeder breaks shortly after the abort -> pulled << n.
+    assert pulled < n, f"feeder pulled all {n} items after abort (pulled={pulled}) - #1 not fixed"
