@@ -6,10 +6,13 @@ from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 
+from langchain_dynamic_workflow._codegen import compile_workflow_source
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
 from langchain_dynamic_workflow._context import Ctx, LeafOutcome
 from langchain_dynamic_workflow._dag import DagNode, _validate_dag, run_dag
+from langchain_dynamic_workflow._engine import run_workflow
 from langchain_dynamic_workflow._errors import WorkflowBudgetExceededError, WorkflowDagError
 from langchain_dynamic_workflow._journal import InMemoryJournalStore
 from langchain_dynamic_workflow._observability import Span, SpanKind, SpanRecorder
@@ -186,3 +189,27 @@ async def test_ctx_dag_runs_topologically_and_emits_a_dag_span() -> None:
     assert len(dag_spans) == 1
     assert dag_spans[0].attributes["node_count"] == 2
     assert dag_spans[0].attributes["surviving_count"] == 2
+
+
+async def test_authored_script_dagnode_resolves_at_runtime() -> None:
+    # A genuine red→green test of the run_script namespace injection: the compiled
+    # script names `DagNode` (no import) and is actually EXECUTED, so a missing
+    # injection surfaces as a NameError through run_workflow rather than passing
+    # silently.
+    source = (
+        "async def orchestrate(ctx, args):\n"
+        "    nodes = [DagNode('a', deps=[], run=lambda d: ctx.agent('q', agent_type='w'))]\n"
+        "    return await ctx.dag(nodes)\n"
+    )
+    orchestrate = compile_workflow_source(source)
+
+    async def leaf(inp: dict[str, Any], config: Any = None) -> dict[str, Any]:
+        return {"messages": [*inp["messages"], AIMessage(content="DOC")]}
+
+    roster = Roster().register("w", RunnableLambda(leaf))
+
+    async def top(ctx: Ctx) -> Any:
+        return await orchestrate(ctx, {})
+
+    result = await run_workflow(top, roster=roster, thread_id="t-inject")
+    assert result == {"a": "DOC"}

@@ -19,10 +19,13 @@ from ._background import (
 from ._budget import Budget
 from ._codegen import compile_workflow_source, extract_meta, run_workflow_from_source
 from ._context import Ctx
+from ._dag import DagNode
 from ._engine import Orchestrator, run_workflow
 from ._errors import (
     WorkflowBudgetExceededError,
     WorkflowCheckpointError,
+    WorkflowCycleError,
+    WorkflowDagError,
     WorkflowDeterminismError,
     WorkflowNestingError,
     WorkflowScriptError,
@@ -116,6 +119,7 @@ __all__ = [
     "CommandSink",
     "Consensus",
     "Ctx",
+    "DagNode",
     "ExecDecision",
     "ExecPolicy",
     "ExecRequest",
@@ -154,6 +158,8 @@ __all__ = [
     "SpanSink",
     "WorkflowBudgetExceededError",
     "WorkflowCheckpointError",
+    "WorkflowCycleError",
+    "WorkflowDagError",
     "WorkflowDeterminismError",
     "WorkflowNestingError",
     "WorkflowRegistry",
