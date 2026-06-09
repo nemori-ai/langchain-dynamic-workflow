@@ -1233,7 +1233,13 @@ class Ctx:
         Returns:
             A list aligned to ``items`` input order; each entry is ``fn``'s result,
             or ``None`` if ``fn`` raised for that item.
+
+        Raises:
+            ValueError: If ``max_in_flight`` is supplied and is less than 1.
         """
+        # Fail fast on a meaningless window before opening a span or admitting work.
+        if max_in_flight is not None and max_in_flight < 1:
+            raise ValueError(f"batch_map requires max_in_flight >= 1, got {max_in_flight}")
         with self._spans.span(SpanKind.BATCH, label) as span:
             # A Sized input knows its length for free; a non-Sized source falls
             # back to the caller's total hint (which may be None -> no ETA).

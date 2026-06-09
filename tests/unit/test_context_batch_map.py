@@ -13,6 +13,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage
 
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
@@ -267,3 +268,18 @@ async def test_batch_map_respects_max_in_flight_window() -> None:
     assert len(results) == 6
     assert all(r is not None for r in results)
     assert leaf.peak <= 2, f"window breached: peak {leaf.peak} > 2"
+
+
+async def test_batch_map_rejects_non_positive_max_in_flight() -> None:
+    # A non-positive admission window is meaningless; batch_map fails fast before
+    # opening a span or admitting any work — the guard fires before fn ever runs.
+    leaf = _CountingLeaf(prefix="R")
+    ctx = _batch_ctx(leaf, InMemoryJournalStore())
+    for bad_window in (0, -3):
+        with pytest.raises(ValueError, match="max_in_flight"):
+            await ctx.batch_map(
+                ["a", "b"],
+                lambda item: ctx.agent(f"audit {item}", agent_type="worker"),
+                max_in_flight=bad_window,
+            )
+    assert leaf.calls == 0  # the guard fired before any fn / leaf ran
