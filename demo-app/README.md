@@ -140,10 +140,10 @@ online-path only; the offline scripted path stays deterministic and credential-f
 
 ---
 
-## The seven scenarios
+## The eight scenarios
 
-The chat ships seven preset buttons. Their canonical wording lives in
-`scenarios.json`; the frontend's `ScenarioPanel` carries the same seven messages, and
+The chat ships eight preset buttons. Their canonical wording lives in
+`scenarios.json`; the frontend's `ScenarioPanel` carries the same eight messages, and
 a backend doc-sync test pins the two copies byte-for-byte (and pins the README's
 scenario count to the same source) so they cannot drift. Each is phrased as a real
 user's request, not a tool instruction — click one, or type your own. Here is what each
@@ -257,6 +257,24 @@ ref. (Offline-fake caveat: with no key the fixers are deterministic fakes that s
 edit a real worktree on disk — so the isolation, the authoritative git-diff collect, and
 the real scratch-repo merge conflict are all genuinely exercised — but no real model
 authors the fixes; add a key to see a real model drive each fix.)
+
+### 8. A few at once — kick off several jobs in parallel
+> *"I've got a few separate things I want looked into at the same time — the
+> trade-offs of retrieval-augmented generation, the state of long-context models,
+> and how agent frameworks compare. Start all three off together and keep me posted
+> on how each one's going; I don't want to wait on them one at a time."*
+
+**Several independent runs, watched side by side.** The user names three independent
+investigations and asks to run them *together*. The host fans them out as three separate
+**background runs** — the same deep-research preset over three distinct questions — and
+renders one **RunBoard** card: a row per run, each flipping `pending → running → done`
+in place as it settles (the board re-emits under a fixed id, so it is one card whose rows
+update, not a new card per tick). A header counter reads "2 running · 1 done · 3 total"
+and updates live; a settled row shows its capped outcome summary. Background runs are
+**UI-dark** (a detached task cannot push interior fan-out to the chat), so the board
+honestly shows each run's *aggregate* status and summary — not its per-leaf stream.
+(Offline-fake caveat: with no key the three runs execute with the deterministic offline
+roster, so the board is honest in both modes — the offline banner still shows above it.)
 
 ---
 

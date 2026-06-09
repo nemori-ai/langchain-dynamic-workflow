@@ -240,6 +240,56 @@ async def orchestrate(ctx, args):
     return await ctx.agent("Synthesize these findings:\n" + "\n".join(kept), agent_type="writer")
 ```
 
+**Let an earlier stage shape the next (scout, then fan out).** The fan-outs above
+all knew their work-list up front. The deeper power of control-flow inversion is a
+**multi-stage** script where an earlier stage's *result* — held in a script
+variable — decides the **shape** of the next stage: how many leaves, and over
+what. Run a cheap "scout" leaf to map the territory, branch on what it found, then
+fan out the real work over a work-list built at runtime. Each stage is just
+`await`-then-branch in plain Python, and the whole thing still replays from the
+journal.
+
+```python
+async def orchestrate(ctx, args):
+    # Stage 1 — scout: one cheap leaf maps the work-list. Nothing downstream knows
+    # its length or contents until this lands.
+    ctx.phase("scout")
+    survey = await ctx.agent(
+        f"List the distinct areas that {args['task']} must cover — one per line.",
+        agent_type="scout",
+        model="haiku",
+        schema={
+            "type": "object",
+            "properties": {"areas": {"type": "array", "items": {"type": "string"}}},
+            "required": ["areas"],
+            "additionalProperties": False,
+        },
+    )
+    areas = sorted({a.strip() for a in survey.areas if a.strip()})
+    if not areas:  # the script — not a model mid-turn — decides there's nothing to fan out
+        return "scout found nothing to do"
+
+    # Stage 2 — fan out the REAL work over what stage 1 discovered (runtime work-list).
+    ctx.phase("deep-dive")
+    drafts = await ctx.parallel(
+        [lambda a=a: ctx.agent(f"Write the section on {a}.", agent_type="writer") for a in areas]
+    )
+
+    # Stage 3 — synthesize. Each stage fed the next through a script variable, never
+    # a model's context window.
+    ctx.phase("synthesize")
+    kept = [d for d in drafts if d]
+    return await ctx.agent(
+        "Stitch these sections into one document:\n\n" + "\n\n".join(kept), agent_type="editor"
+    )
+```
+
+The runtime-built `areas` work-list and the branch after the scout
+(`if not areas`) are the whole point: the script decides what the next phase fans
+out over, at the moment it has the scout's result — not a model improvising turn by
+turn. Keep the scout cheap (`model="haiku"`) and the iron law still holds —
+`sorted({...})` fixes the work-list order, so resume replays the same fan-out.
+
 **Loop until dry, with a hard `MAX_ROUNDS` and a budget guard.** Keep hunting until
 two dry rounds in a row, but always cap the rounds so a model that keeps
 "discovering" can't loop forever. Guard the budget check with `ctx.budget.total`:
@@ -545,3 +595,16 @@ The script is launched **in the background**, so your turn is not blocked:
 4. `workflow(command="resume", run_id="<id>")` — re-run against the journal so
    completed steps replay at zero cost (use after an interruption).
 5. `workflow(command="cancel", run_id="<id>")` — stop an in-flight run.
+
+### Running several at once
+
+Because every launch returns a `run_id` immediately and runs in the background,
+you can start **several runs at once** and react to each as it lands rather than
+waiting on them one at a time. Launch them back to back, keep working, and when a
+run finishes its `run_id` arrives in the next `<workflow_notification>`; fetch that
+one's result with `status` and respond to it then. Each run is fully isolated — its
+own journal, its own budget, its own resume / cancel — so one finishing, failing,
+or being cancelled never touches the others. Reach for this when a request implies
+several independent heavy jobs ("look into A, B, and C and keep me posted"): fan
+them out as separate runs and report each as it settles, instead of serializing
+them into one long wait.

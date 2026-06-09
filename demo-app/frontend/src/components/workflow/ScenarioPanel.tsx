@@ -80,6 +80,16 @@ const SCENARIOS: readonly Scenario[] = [
       "patches, merge them together into one change — sorting out any conflicts — " +
       "and open a pull request with the result.",
   },
+  {
+    label: "A few at once",
+    hint: "kick off several jobs in parallel",
+    message:
+      "I've got a few separate things I want looked into at the same time — the " +
+      "trade-offs of retrieval-augmented generation, the state of long-context " +
+      "models, and how agent frameworks compare. Start all three off together and " +
+      "keep me posted on how each one's going; I don't want to wait on them one at " +
+      "a time.",
+  },
 ];
 
 export function ScenarioPanel({

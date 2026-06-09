@@ -1,6 +1,6 @@
 # v0.4.0 路线图（Roadmap）— 引擎可观测性 + 交互式体验
 
-> **For agentic workers:** 本文件是 v0.4.0 的**批次总线**。延续 v0.2.0/v0.3.0 的方法：每个目标对应一份独立设计/计划文档（`design_docs/v0_4_0_plans/0N-*.md`，**逐目标增补**，不一次写完）。本批次为**开放状态**——下列为已确认目标之一；v0.3.0 未尽里程碑（M2–M7）与新候选随推进纳入。
+> **For agentic workers:** 本文件是 v0.4.0 的**批次总线**。延续 v0.2.0/v0.3.0 的方法：每个目标对应一份独立设计/计划文档（`design_docs/v0_4_0_plans/0N-*.md`，**逐目标增补**，不一次写完）。本批次为**开放状态**——M1 已落地；M2/M3 为 2026-06-09 用户登记的新需求（详细设计待本批次正式启动时展开）；v0.3.0 未尽里程碑（M7、E）与新候选随推进纳入。
 
 ## 已确认目标
 
@@ -22,7 +22,33 @@
 
 完整设计见 [`01-leaf-live-observability.md`](01-leaf-live-observability.md)。
 
+## 已登记需求（2026-06-09 用户提；详细设计待本批次正式启动展开）
+
+> 下面两块为**需求登记**，不是定稿设计——记录目标、现状缺口与一个已识别的承重架构约束（二者共享 **context-independent transport** 底座），以免 v0.4.0 启动时重新发现。视图复用、渲染技术、回传粒度等细化设计**刻意留空**，待正式启动时讨论。
+
+### M2 · 持久侧边栏 — 多-workflow 实时流程图视图
+
+**目标：** 一个**侧边栏性质的嵌套视图**，实时动态渲染、持续更新**每一条** workflow 的流程图（phase / fan-out / DAG）与各 leaf agent 的实时状态（running / done / error）。从 inline chat 里一次性的卡，升级为常驻、可同时看多条 workflow 的实时总览。
+
+**与既有的关系：** 复用 M1 的事件底座（`on_span_begin` / `on_leaf_event` / 稳定 `span_id`）——M1 已让 inline leaf 实时可观测，本目标把同一事件流升级成**侧边栏 + 图形化流程图 + 多 workflow 并列**的渲染形态。流程图渲染与 v0.3.0 **M7 `DagGraph`**（拓扑序 DAG）天然相邻（M7 是 inline DAG 卡，本目标是侧边栏实时 DAG）。
+
+**关键架构依赖（与 M3 共享）：** 要在侧边栏渲染 **background / detached run**（board 启的那些）的实时流程图，需要 **context-independent transport**（见 M3）——当前 detached asyncio task 不携带 host node context、事件推不出（UI-dark）；inline run 不需要它（M1 已覆盖），background run 需要。
+
+### M3 · run board 下钻 + 背景 run 结果回传 host
+
+**目标：** ① board 行可**下钻**到该 background run 的实时内部（流程图 + leaf 状态）；② 每个 background job **运行完把报告（结果）回传给调用 `run_runs_board` 的 host agent**，让 host 能据此向用户**汇报情况和结果**——不只是"3 个完成了"，而是"RAG vs long-context 的结论是 X……"。
+
+**现状缺口（精确）：**
+- ① 下钻：board 行当前只有聚合状态（`RunSnapshot.status` + 80-char `summary`），**无下钻**——background run 是 detached task、UI-dark（`RunBoard.tsx` 注释已钉死）。
+- ② 回传：`run_runs_board_live` 当前只返回一句聚合 summary（"Ran 3 of 3: 3 finished"），**没把每个 run 的实际 result 喂回 host 上下文**，host 因此无内容可汇报。
+
+**拆解（两半依赖不同，承重在 ①）：**
+- ① 下钻 = **context-independent transport**（核心基建）：让 detached background run 的 leaf 事件靠 run-tree `run_id`/`parent_run_id` **定向**流回发起它的 host run + UI surface。这与 M2 渲染 background run 是**同一块底座**——v0.4.0 最重一块，比 M1 重（要解开"detached task 怎么找回正确的 UI / host 流"）。
+- ② 回传 = 相对独立、**不依赖 transport**：run 完成后结果已在 `ResultStore`；`run_runs_board` 收尾时 fetch 每个 run 的结果作为 tool 返回值喂回 host。设计点：守**控制流反转**（host 上下文只收**精炼** report、非 3 份全文）——回传粒度（精炼摘要 / 按需 fetch handle）留待设计定。
+
 ## 状态
 
-- **M1 叶子级实时可观测**：✅ 设计已定稿（spec 交接引擎-core session）；⏳ 实现待启（引擎 hook 先行，demo 消费侧随后）。
-- **其余 v0.4.0 目标**：批次开放，逐项增补（候选：v0.3.0 未尽里程碑 M2–M7、面向社区的交互式 demo-app 等）。
+- **M1 叶子级实时可观测**：✅ 已落地（引擎 hook PR #12 + demo 消费 PR #13）——inline leaf 实时 status + 计时器 + drill-in。
+- **M2 持久侧边栏多-workflow 实时视图**：📝 需求已登记（2026-06-09）；详细设计待 v0.4.0 正式启动。
+- **M3 run board 下钻 + 背景 run 结果回传 host**：📝 需求已登记（2026-06-09）；① context-independent transport 是 M2 + M3① 的**共享承重基建**（v0.4.0 核心攻坚），② 结果回传相对独立、不依赖 transport；详细设计待启动。
+- **其余 v0.4.0 目标**：批次开放，逐项增补（候选：v0.3.0 未尽 M7/E、面向社区的交互式 demo-app 等）。

@@ -103,8 +103,8 @@ def test_scenario_panel_messages_match_scenarios_json() -> None:
     canonical = json.loads(_SCENARIOS_JSON.read_text(encoding="utf-8"))["scenarios"]
     frontend = _scenario_panel_messages()
 
-    assert len(frontend) == len(canonical) == 7, (
-        f"expected 7 scenarios on both sides, got json={len(canonical)} frontend={len(frontend)}"
+    assert len(frontend) == len(canonical) == 8, (
+        f"expected 8 scenarios on both sides, got json={len(canonical)} frontend={len(frontend)}"
     )
 
     for index, (json_scenario, (label, hint, message)) in enumerate(
@@ -149,6 +149,7 @@ def test_readme_scenario_count_matches_scenarios_json() -> None:
     stale_counts = {
         4: ("four scenarios", "four preset buttons", "the same four"),
         6: ("six scenarios", "six preset buttons", "the same six"),
+        7: ("seven scenarios", "seven preset buttons", "the same seven"),
     }
     forbidden = stale_counts.get(len(canonical) - 1, ())
     for phrase in forbidden:

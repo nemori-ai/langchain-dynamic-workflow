@@ -21,6 +21,7 @@ tested without a node context.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import re
@@ -28,6 +29,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -54,6 +56,7 @@ from workflows import (
 
 from langchain_dynamic_workflow import (
     BgRunManager,
+    BgRunQuotaExceededError,
     BgStatus,
     Ctx,
     ExecDecision,
@@ -64,6 +67,7 @@ from langchain_dynamic_workflow import (
     JournalStore,
     LocalPullRequestProvider,
     PullRequestProvider,
+    RunSnapshot,
     SandboxManager,
     WorkflowScriptError,
     WorkflowSignoffRequired,
@@ -78,7 +82,10 @@ HOST_INSTRUCTIONS = (
     "task is best tackled by decomposing it into independent sub-work, investigating "
     "those parts in parallel, cross-checking the findings before committing to them, "
     "and only then synthesizing a clear answer — and that heavier orchestration runs "
-    "as a workflow rather than being crammed into a single pass. When the user wants "
+    "as a workflow rather than being crammed into a single pass. When several "
+    "independent jobs can each run on their own and the user wants to be kept posted "
+    "on all of them, kick them off together and watch them progress side by side as "
+    "each settles, rather than working through them one at a time. When the user wants "
     "to drive a preset scenario live, run it through the live workflow tool and let "
     "its progress stream into the panel. Otherwise answer directly and concisely."
 )
@@ -1021,7 +1028,12 @@ DEFAULT_BACKGROUND_WORKFLOW = "deep_research"
 
 
 def launch_background_run(
-    manager: BgRunManager, *, thread_id: str, workflow: str = DEFAULT_BACKGROUND_WORKFLOW
+    manager: BgRunManager,
+    *,
+    thread_id: str,
+    workflow: str = DEFAULT_BACKGROUND_WORKFLOW,
+    label: str | None = None,
+    workflow_args: dict[str, Any] | None = None,
 ) -> str:
     """Launch a preset workflow in the background and return its run id immediately.
 
@@ -1042,21 +1054,27 @@ def launch_background_run(
         thread_id: The host thread id; the manager keys run slots on ``(thread_id,
             run_id)`` so concurrent host threads stay isolated.
         workflow: The preset workflow name to run; defaults to ``deep_research``.
+        label: Optional display label recorded on the run slot so an aggregate
+            listing (the run board) can name the row; ``None`` leaves it unlabeled.
+        workflow_args: Optional arguments forwarded to the preset (e.g. a distinct
+            ``question`` per run so several runs of one preset cover different topics);
+            ``None`` runs the preset with its defaults.
 
     Returns:
         The launched run's id, usable with ``manager.poll`` / ``manager.get_result``.
     """
     workflows = make_workflows()
     workflow_fn = workflows.resolve(workflow)  # fail-loud on an unknown name
+    resolved_args = workflow_args if workflow_args is not None else {}
 
     async def _run() -> str:
         async def _orchestrate(ctx: Ctx) -> Any:
-            return await workflow_fn(ctx, {})
+            return await workflow_fn(ctx, resolved_args)
 
         result = await run_workflow(_orchestrate, roster=make_roster(), workflows=workflows)
         return str(result)
 
-    slot = manager.start(_run(), thread_id=thread_id)
+    slot = manager.start(_run(), thread_id=thread_id, label=label)
     return slot.run_id
 
 
@@ -1122,6 +1140,176 @@ async def run_background(state: Annotated[dict[str, Any], InjectedState]) -> str
     return await run_background_live(_BG_MANAGER, thread_id=_host_thread_id())
 
 
+# ---------------------------------------------------------------------------
+# M3.5 — aggregate run board: several background runs watched side by side.
+# ---------------------------------------------------------------------------
+
+# Component name for the host-emitted aggregate run board. One card lists every run on the
+# thread, one row per run, re-emitted in place each poll under a FIXED event_id so the SDK
+# upserts the single card rather than stacking a new one per tick.
+_RUN_BOARD = "run_board"
+_BOARD_EVENT_ID = "run-board-1"
+
+# A run is "settled" for the board once it reaches one of these statuses. AWAITING_SIGNOFF
+# and UNKNOWN are deliberately NOT terminal (a parked run is still live); the board's
+# presets never park, but the set stays honest.
+_BOARD_TERMINAL: frozenset[BgStatus] = frozenset(
+    {BgStatus.DONE, BgStatus.FAILED, BgStatus.CANCELLED}
+)
+# Poll cadence + a defended upper bound so a run that never settles cannot loop forever.
+# The cadence (0.3s) keeps the ui channel from flooding; the bound (~7.5 min) is generous
+# enough for several REAL-model runs to finish — three concurrent deep_research runs take
+# minutes, far longer than offline fakes — yet still caps a genuinely stuck run.
+_BOARD_POLL_INTERVAL_S = 0.3
+_BOARD_MAX_POLLS = 1500  # ~7.5 min at the cadence above
+
+# The three independent investigations the "A few at once" scenario implies: the same
+# deep_research preset over a DISTINCT question each, with a topic label so the board names
+# the rows meaningfully (genuinely independent runs — list_runs keys per run_id).
+_RUNS_BOARD_JOBS: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("RAG vs long-context", {"question": "Trade-offs between RAG and long-context LLMs?"}),
+    ("Long-context models", {"question": "The current state of long-context LLMs?"}),
+    ("Agent frameworks", {"question": "How do agent frameworks compare on durable execution?"}),
+)
+
+
+def _snapshot_to_props(snapshot: RunSnapshot) -> dict[str, Any]:
+    """Map a :class:`RunSnapshot` 1:1 onto the ``run_board`` row props the frontend reads."""
+    return {
+        "run_id": snapshot.run_id,
+        "label": snapshot.label,
+        "status": snapshot.status.value,
+        "summary": snapshot.summary,
+    }
+
+
+def _emit_run_board(emit: UiEmit, snapshots: Sequence[RunSnapshot]) -> None:
+    """Emit the aggregate ``run_board`` card under the fixed id (in-place upsert per poll).
+
+    Args:
+        emit: The host-bound, non-blocking UI emit (rebinds the host node context).
+        snapshots: The current per-run snapshots from ``BgRunManager.list_runs``.
+    """
+    emit(
+        _RUN_BOARD,
+        {"runs": [_snapshot_to_props(s) for s in snapshots], "event_id": _BOARD_EVENT_ID},
+    )
+
+
+def _summarize_board(snapshots: Sequence[RunSnapshot], *, launched: int, requested: int) -> str:
+    """Summarize the settled board for the host's text reply.
+
+    Names how many jobs actually launched (vs requested, so a quota cap surfaces honestly)
+    and how many finished versus did not complete.
+    """
+    done = sum(1 for s in snapshots if s.status is BgStatus.DONE)
+    failed = sum(1 for s in snapshots if s.status in {BgStatus.FAILED, BgStatus.CANCELLED})
+    in_flight = sum(1 for s in snapshots if s.status not in _BOARD_TERMINAL)
+    head = f"Ran {launched} of {requested} jobs together"
+    if launched < requested:
+        head += " (a concurrency quota capped the rest)"
+    parts = [f"{done} finished"]
+    if failed:
+        parts.append(f"{failed} did not complete")
+    if in_flight:
+        # The poll cap expired with runs still in flight — say so, never imply they finished.
+        parts.append(f"{in_flight} still running")
+    return f"{head}: {', '.join(parts)}."
+
+
+async def run_runs_board_live(
+    manager: BgRunManager,
+    emit: UiEmit,
+    *,
+    thread_id: str,
+    jobs: Sequence[tuple[str, dict[str, Any]]],
+    workflow: str = DEFAULT_BACKGROUND_WORKFLOW,
+) -> str:
+    """Fan out several background runs and stream an aggregate board until all settle.
+
+    The engine-facing core of the :func:`run_runs_board` host tool, kept free of the
+    node-context machinery so it can be exercised directly in tests. It launches one
+    background run per job (labelled, over the job's args), then poll-emits a single
+    ``run_board`` card — re-emitted in place each tick under a fixed id — until every run
+    reaches a terminal status, and returns a short text summary.
+
+    A run refused by the manager's concurrency quota stops further launches (the board
+    surfaces "launched X of N" honestly rather than silently dropping a job). Background
+    runs stay UI-dark: the board shows aggregate status + capped summary only, never a
+    detached run's interior fan-out.
+
+    Args:
+        manager: The shared :class:`~langchain_dynamic_workflow.BgRunManager`.
+        emit: The host-bound, non-blocking UI emit.
+        thread_id: The host thread id keying the run slots.
+        jobs: One ``(label, workflow_args)`` pair per run to launch.
+        workflow: The preset each job runs; defaults to ``deep_research``.
+
+    Returns:
+        A short summary naming how many jobs ran and how many finished.
+    """
+    requested = len(jobs)
+    launched_ids: list[str] = []
+    for label, workflow_args in jobs:
+        try:
+            run_id = launch_background_run(
+                manager,
+                thread_id=thread_id,
+                workflow=workflow,
+                label=label,
+                workflow_args=workflow_args,
+            )
+        except BgRunQuotaExceededError:
+            break  # honest: surface the cap, do not silently drop the remaining jobs
+        launched_ids.append(run_id)
+
+    launched = len(launched_ids)
+    launched_set = set(launched_ids)
+
+    def _board_snapshots() -> list[RunSnapshot]:
+        # Scope to the runs THIS call launched — never other (prior/stale) runs on the
+        # thread. A pre-existing run would otherwise pollute the board and the summary, and
+        # a still-running one would hold this loop open until the poll cap.
+        return [s for s in manager.list_runs(thread_id) if s.run_id in launched_set]
+
+    snapshots = _board_snapshots()
+    for _poll in range(_BOARD_MAX_POLLS):
+        snapshots = _board_snapshots()
+        _emit_run_board(emit, snapshots)
+        if not snapshots or all(s.status in _BOARD_TERMINAL for s in snapshots):
+            break
+        await asyncio.sleep(_BOARD_POLL_INTERVAL_S)
+
+    return _summarize_board(snapshots, launched=launched, requested=requested)
+
+
+@tool
+async def run_runs_board(state: Annotated[dict[str, Any], InjectedState]) -> str:
+    """Kick off several independent jobs at once and report them on one live board.
+
+    For a request that implies several independent heavy jobs ("look into A, B, and C and
+    keep me posted"), this fans them out as separate background runs and surfaces their
+    aggregate status as a single board card that updates in place as each run settles —
+    rather than serializing the jobs into one long wait.
+
+    Honest limitation: background runs are UI-dark (a detached task does not carry the host
+    node context), so the board shows each run's aggregate status and a capped outcome
+    summary, not its interior per-leaf fan-out.
+
+    Args:
+        state: Injected graph state (used to anchor UI events to the host turn).
+
+    Returns:
+        A short summary naming how many jobs ran and how many finished.
+    """
+    anchor = _anchor_message(state.get("messages", []))
+    emit = make_host_ui_emit(anchor=anchor)
+    _emit_run_status(emit)
+    return await run_runs_board_live(
+        _BG_MANAGER, emit, thread_id=_host_thread_id(), jobs=_RUNS_BOARD_JOBS
+    )
+
+
 def _build_host_graph(*, checkpointer: BaseCheckpointSaver[Any] | None = None) -> Any:
     """Build the host deepagent graph, optionally with an explicit checkpointer.
 
@@ -1155,7 +1343,7 @@ def _build_host_graph(*, checkpointer: BaseCheckpointSaver[Any] | None = None) -
     return create_deep_agent(
         model=resolve_host_model(),
         system_prompt=HOST_INSTRUCTIONS,
-        tools=[run_hello_demo, run_live, run_meta_script, run_background],
+        tools=[run_hello_demo, run_live, run_meta_script, run_background, run_runs_board],
         state_schema=HostState,
         middleware=cache_middleware(),
         **extra,

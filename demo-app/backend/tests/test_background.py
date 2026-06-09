@@ -137,3 +137,34 @@ def test_offline_host_routes_delegate_message_to_run_background() -> None:
         "whole workflow in the background end to end."
     )
     assert name == "run_background", name
+
+
+async def test_launch_background_run_threads_label_and_args() -> None:
+    """``launch_background_run`` records a display label and forwards workflow args.
+
+    The aggregate run board (M3.5) names each row by the label set at launch and runs
+    the same preset over distinct questions, so the launcher must thread ``label`` onto
+    the manager slot (surfaced by ``list_runs``) and ``workflow_args`` into the preset —
+    rather than dropping both as the single-run background path did.
+    """
+    from host_graph import launch_background_run
+
+    from langchain_dynamic_workflow import BgRunManager, BgStatus
+
+    manager = BgRunManager()
+    run_id = launch_background_run(
+        manager,
+        thread_id="board-test",
+        workflow="deep_research",
+        label="Agent frameworks",
+        workflow_args={"question": "How do agent frameworks compare on durable execution?"},
+    )
+
+    snapshots = manager.list_runs("board-test")
+    assert len(snapshots) == 1, snapshots
+    assert snapshots[0].run_id == run_id
+    assert snapshots[0].label == "Agent frameworks", "the launch label must reach the snapshot"
+
+    # The forwarded args must not break the run (deep_research reads args['question']).
+    await manager.wait(run_id, thread_id="board-test")
+    assert manager.poll(run_id, thread_id="board-test") is BgStatus.DONE
