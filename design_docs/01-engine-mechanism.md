@@ -25,15 +25,74 @@
 | `parallel(thunks)` | 并发 + **阻塞 barrier**;thunk 抛错 → 该位 `null`,整体**永不 reject**(用前 `.filter`) |
 | `pipeline(items, *stages)` | 多 stage **无 barrier** 流水线;stage 签名 `(prev_result, original_item, index)`;抛错 → 该 item `null` 跳后续 |
 | `race(candidates, *, win, win_tag="")` | **best-of-N 早退**:N 个 `RaceCandidate`(镜像 `agent()` 入参)经 `agent()` 并发,第一个令 `win(result)` 为真者胜,在飞 loser 全数 cancel;决策**内容哈希 journal**(`win_tag` 折进 key)——resume 复现胜者、**零派发**;无胜者**不** journal(resume 可重试)。返回 `RaceResult`(`won`/`winner`/`winner_index`);候选须同构(全无 schema 或全同一 schema)。靠两补丁:race-key 用 content-hash journal、确定性 guard 只在深度 0 observe race-key(候选 `agent()` 在深度 > 0、不入序列,同 `parallel`/`pipeline` 叶) |
+| `dag(nodes)` | **依赖序（拓扑序）fan-out**——第四种扇出帧:见 §2c |
+| `loop_until(body, *, done, max_iters)` | **有终止保证的顺序循环**:见 §2d |
 | `phase(title)` / `log(msg)` | 进度分组 / 叙事日志 |
 | `budget` | `{total, spent(), remaining()}`,**共享池**,到顶 `agent()` 抛 |
-| `workflow(name, args)` | 内联调另一 workflow,**仅一层嵌套**(内层 = `@task`) |
+| `workflow(name, args)` | 内联调另一 workflow,深度上限可配置(默认 8 层,含循环检测);见 §2e |
 
 失败语义照搬 Claude Code:`parallel` 永不 reject、`pipeline` 抛错落 `null`;`race` 单个候选叶失败仅淘汰该候选、其余继续,引擎控制流信号(budget/确定性)或 `win` 谓词抛错则在拆除 loser 后**失声而抛**(fail-loud)。
 
 **跨叶归约 helper(`_reduce`,纯函数,F)**:折叠 `parallel` / `pipeline` 交回的结果列表(失败叶=`None`)的一等公民——`survives`(refute-by-default 投票,`None` 恒计反对的 fail-safe,覆盖 adversarial-verify 与 judge-panel)、`dedup`(丢 `None` + 按 key 去重,保首见序)、`reconcile`(双盲复核分桶 included/excluded/conflicts,`None`/空裁决恒落 conflict)、`corroborate`(按 key 分组、≥`min_support` 才留的跨叶相互印证),配 `ReviewItem` / `Reconciled` / `Consensus` 三个 frozen dataclass。它们**无 `agent()` 调用、无引擎状态**,故天然 replay-safe、不碰 journal/确定性 guard;由包根导出供开发者 workflow `import`,并由 `_codegen` 注入 `run_script` 命名空间(L2 脚本禁 import,故按名直调)。
 
 **race 公共面(`_race_types`,纯值类型 + `race_key`,B)**:`ctx.race`(原语)的开发者面是两个 frozen dataclass——`RaceCandidate`(`prompt`/`agent_type`/`schema`/`model`/`isolation`,镜像 `agent()` 入参,故候选 journal-key 与直接 `agent()` 同源)与 `RaceResult[T]`(`winner`/`winner_index` + `.won` 属性),配 `_journal` 内的 `race_key`(对候选叶 key 序列 + `win_tag` 取 SHA-256、`"race"` 命名空间隔离,绝不与叶 key 撞)。两个值类型**无 `agent()` 调用、无引擎状态**,与 `_reduce` 同级:由包根导出供开发者 workflow `import`,并由 `_codegen` 注入 `run_script` 命名空间(L2 脚本禁 import,故按名直调);`race_key` 仅导出(脚本走 `ctx.race`、不直接碰 key)。`SpanKind.RACE` 标注 race 扇出 / journaled-decision replay 的 span。
+
+## 2c. DAG / 依赖序（拓扑序）fan-out（第四种扇出帧）
+
+`ctx.dag(nodes)` 是继 `parallel`/`pipeline`/`race` 之后的**第四种扇出帧**:给每个节点声明前置依赖,调度器确保节点只在全部前置节点都完成后才启动;有依赖关系的节点可任意拓扑深度、独立分支照常并发。
+
+### 值类型:`DagNode`
+
+```
+DagNode(id: str, deps: Sequence[str], run: Callable[[dict], Coroutine])
+```
+
+- `id`:节点在图内的唯一名称;结果 dict 以此为 key 返回。
+- `deps`:此节点依赖的其它节点 id 列表;根节点传空列表(`deps=[]`)。
+- `run`:接收 `{dep_id: result}` 映射的异步工厂,通常是一个闭包内调 `agent()`。
+
+`DagNode` 是一个纯值类型(`@dataclass(slots=True)`)——无引擎状态、无 `agent()` 调用——由 `_codegen` 注入 `run_script` 命名空间(L2 脚本禁 import,按名直构造)。
+
+### 调度器(`_dag.run_dag`)
+
+1. **急切合法性校验**:在任何节点开始运行之前一次性验证——重复 id、依赖未知 id、自依赖、依赖环——均 fail-loud 抛 `WorkflowDagError`。宁在 O(N) 校验时炸,不在调度过程中死锁。
+2. **Kahn 入度调度**:维护每个节点的剩余前置数;某节点最后一个前置节点一完成,该节点**立即**启动——无层级 barrier,快分支超前于慢分支(同 `pipeline` 的 no-barrier 精神)。
+3. **失败与跳过的区分**:一个节点的 `run` 抛出普通异常 → 该节点 `failed`,结果置 `None`;所有**传递依赖**于它的节点均被 **skip** 至 `None`(不会启动)。但节点**合法返回 `None`** 不会触发 skip——失败状态和 `None` 返回值用**独立的 `failed: set`** 跟踪。
+4. **控制流信号穿透**:budget / determinism / 格式非法的嵌套 dag(`WorkflowDagError`/`WorkflowCycleError`)属于 `WORKFLOW_CONTROL_FLOW_SIGNALS`;任一节点抛出时,记录信号、停止发射新节点、等在飞节点排空(drain),然后**原样重新抛出**——绝不被 mask 为 `None` 空洞。
+5. **并发闸归属于叶子**:调度器本身不持有任何并发 gate slot;`run` 函数内的 `agent()` 调用才获取共享闸——故一个 `dag` 嵌套在另一 `dag` 节点的 `run` 内不会死锁池。
+
+### 确定性与 resume 安全
+
+`ctx.dag` 是扇出帧(递增 `_FANOUT_DEPTH`),其内部节点的 `agent()` 调用不记入顺序序列 guard(完成顺序随墙钟变化)。每个叶子仍由内容哈希 journal 守护——resume 时完成节点零模型成本重放。DAG 图的拓扑结构由脚本代码定义(确定性),故**无需 dag 级 journal 条目**;resume 重新执行调度器,命中的叶子直接短路,未命中的继续运行。
+
+## 2d. `loop_until` — 有终止保证的顺序循环
+
+`ctx.loop_until(body, *, done, max_iters)` 是一个把两条作者纪律固化进 API 的**顺序(深度-0)循环 helper**:
+
+- **停止谓词覆盖全部累积结果**:`done(accumulated)` 每次迭代后以**完整列表**调用,而非仅看最新一轮——保证 dedup / 收敛判断针对所有轮次的见过的内容。
+- **强制 `max_iters` 硬上限**:必须传入正整数;到达上限不抛异常——改发一条 replay 幂等的 `log(...)` 行后返回已积累的列表(graceful、非 silent)。
+
+签名:`body(iter_index, accumulated_so_far) -> result`;每轮调用一次,结果 append 进 `accumulated`,然后检查 `done(accumulated)`,满足即提前返回。
+
+顺序运行意味着 `body` 内的直接 `agent()` 调用记入确定性序列;resume 时循环次数由 journal 结果自然恢复(相同的 `done` 条件在相同的累积结果下产生相同的停止轮次),完成叶零成本重放。
+
+## 2e. 命名工作流嵌套:深度上限 + 循环检测
+
+`ctx.workflow(name, args)` 可内联另一注册工作流,V0.3.0 M7 将 1 层硬限**放开为可配置深度上限**(`DEFAULT_MAX_WORKFLOW_DEPTH = 8`),并加上独立的**循环检测**。
+
+### 深度上限
+
+- 每次 `ctx.workflow()` 进入时递增 `_WORKFLOW_DEPTH` contextvar;退出时在 `finally` 重置。
+- 若即将超过 `max_workflow_depth`(默认 8)时抛 `WorkflowNestingError`——是"跑飞的递归"的最后防线,**不**并入 `WORKFLOW_CONTROL_FLOW_SIGNALS`(命名限制是作者边界,不是引擎内部信号;越界失败属于合理的有界行为,不需要 fan-out 帧中穿透 mask)。
+
+### 循环检测
+
+- `_WORKFLOW_NAME_STACK` contextvar 记录当前正在内联的工作流名集合(`frozenset`)。
+- 若目标名已在集合中(直接递归 `A→A` 或相互 `A→B→A`)立即抛 `WorkflowCycleError`——比等到深度上限触发给出更精确的诊断。`WorkflowCycleError` **并入** `WORKFLOW_CONTROL_FLOW_SIGNALS`(结构错误,同 `WorkflowDagError`),在 fan-out 帧内 fail-loud。
+
+### 确定性与 resume 安全
+
+内层工作流的 `orchestrate` 以 `inline` 方式在父 `@entrypoint` body 内运行,共享同一 journal / budget / concurrency gate / progress log——叶子 call-key 和结果由内容哈希守护,resume 同样零成本重放。嵌套结构由脚本代码定义(确定性),故不需要嵌套层本身的 journal 条目。
 
 这些是"能写什么"；用好它们的**作者模式库**（adversarial-verify、pipeline-by-default、loop-until-dry + 硬 MAX_ROUNDS、judge-panel、model-routing…）及其确定性适配见 [03-authoring-patterns.md](03-authoring-patterns.md)，可运行投影在 `skills/dynamic-workflow/SKILL.md`。
 
@@ -225,6 +284,11 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | D21 | 跨会话持久化形态(M3) | **一个统一 sqlite db 文件**,run_id 命名空间化四表(registry + journal),**两条连接**(autocommit store + explicit-commit `AsyncSqliteSaver`,皆 WAL)。否决"分文件 / 复用单连接":隔离 regime 不兼容须分连接、同文件保单一持久单元。**journal(非 checkpointer)交付零成本重放**,checkpointer 是 durable add-on。`[sqlite]` 可选 extra 把守,base 安装零依赖。per-run 规范 id(`journal_run_id`)同 key journal 谱系与 checkpoint thread;host thread 仅 key manager slot。schema-version guard(`PRAGMA user_version`)fail-loud。详见 §13b |
 | D22 | 逐叶 live 可观测性 tap 形态(M1) | **选 callback-handler tap**(把 `BaseCallbackHandler` 挂上叶子既有 `leaf_config["callbacks"]`),否决 `astream_events`:叶 `ainvoke` 调用路径不变(folding / 结构化输出 / usage 计量逐字节不动),复用 budget 已走的同一条 callbacks 转发路径。**`metadata` 关联法被否**——deepagents subagent 边界丢弃 `metadata`(只转发 `callbacks`/`tags`/`configurable`),故 `leaf_span_id` 关联改由 per-leaf handler 实例在构造时**闭包**承担(一叶一 handler,它见的每条边按构造即属本叶子)。`SpanBegin` 立为**独立值类型**(非把 begin 字段塞进统一 event),与完成 `Span` 共享 `span_id`。`detail` opt-in 取**单一 bool**(`leaf_event_include_payloads`),不引入更重的 sink-config 对象。replay 策略**随控制流自落**:begin 发于 span 打开、早于 journal 查询故 cached 叶照常重发(配 cached 完成);`on_leaf_event` 只在 miss 路挂 handler,故 journal 命中**零** interior 事件——无需额外开关 |
 | D-M5 | 真本地执行后端形态(M5) | **可插拔 sandbox 工厂 + `LocalSubprocessSandbox`(stdlib-only 全协议后端,per-leaf 临时根)**,默认仍 `InMemorySandbox`(零依赖、离线默认逐字节不变),宿主经 `SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))` 危险 opt-in。选 `Popen`(非 `subprocess.run`)以做进程树清理 + 有界流式抽干(过 cap 标 `truncated` 不无界缓冲、续读到 EOF 防满管道死锁);超时杀**进程组**(`start_new_session` + `os.killpg` SIGTERM→grace→SIGKILL,码 124),准入拒绝码 126。`ExecGate`(`threading.BoundedSemaphore`)与叶级 `ConcurrencyGate`(asyncio)**正交**——`execute` 在 `aexecute→to_thread` worker 上跑,须跨线程闸、一工厂一闸。`before_execute(request)->decision` 为**准入控制非 sink**(allow/reject/缩超时/降 cap/选 profile)。命令可观测性走**专门的带外 sink `on_command`**——execute 体内在 spawn 前后发成对 `CommandEvent`(`"start"`/`"end"`,共享 resume 稳定 `command_id`、携 `leaf_span_id`),是 `on_leaf_event` 在执行面的同构 sink:keyword-only、默认 no-op、不入 journal、miss-only(journal 命中叶不 lease 不跑 subprocess 故零 command 事件)、`output` 默认截尾、`command_include_payloads` 才带全量;引擎经 `set_command_sink` 仅在 lease 真后端时接上(`InMemorySandbox` 无真 execute 边界不发)。rlimit 走**最小化 `preexec_fn`**(父进程预算 soft/hard、子侧只 `setrlimit` 不分配/不 import/不取锁,故 fork-then-exec 窗口内安全;不另起 `python -c` wrapper 省每命令一次解释器启动),默认 generous-but-bounded profile ON(CPU 60s / AS 2 GiB / FSIZE 256 MiB / NOFILE 1024;NPROC 默认 unset——per-user 计数使固定 cap 不可靠)。`ExecDecision.rlimits` 内联 `RLimitProfile` 覆写即"选 profile",否决命名 profile 注册表(v1 过度抽象)。per-leaf 临时根保持**私有**(`/shared/` hand-off 仍走内存 `SharedArtifactStore` 复合,不耦合真 FS 到内存 store)、`close()` 删根幂等(子进程已在每次 `execute` reap)。否决 `run_workflow` 级 `execution=` 旋钮(危险 opt-in 该是审慎的 manager 构造期决定)。诚实非目标明列为 sharp edge:非安全 sandbox、不封闭 FS/网络/cgroup、Windows best-effort。container 后端是同接缝后延后 opt-in extra(仿 `[sqlite]`),M5 不交付。详见 §8b |
+| D-M7a | DAG 调度失败语义 | **独立 `failed: set` + 传递 skip**:节点 `run` 抛 → 该节点 failed、结果 `None`、传递依赖全 skip 到 `None`;合法 `return None` **不触发** skip——二者须可区分,否则"无结论"与"失败"语义混淆。控制流信号穿透:drain 后原样重抛,从不 mask 为 `None` 空洞。 |
+| D-M7b | `WorkflowDagError` / `WorkflowCycleError` 入信号元组 | 两者均**并入 `WORKFLOW_CONTROL_FLOW_SIGNALS`**——dag 格式非法或命名循环是作者 bug、非叶子失败;fan-out 帧内 fail-loud 而非被 mask。`WorkflowNestingError`(深度上限)有意**不**入信号元组:它是由宿主配置的边界行为,越界失败合理,不需穿透 fan-out。 |
+| D-M7c | DAG scheduler 不持 gate slot | 调度器不持有并发 gate;`run` 函数内的 `agent()` 才获取。故 dag 嵌套在 dag 节点的 `run` 里不会 deadlock 池,且并发界仍全局有效。 |
+| D-M7d | dag 无需 journal 条目 | DAG 结构由确定性脚本定义;resume 重跑调度器、已完成叶走 journal 短路。无需 dag 级 journal 条目;与 `parallel`/`pipeline`/`race` 的统一处理:结构元数据不入 journal,只有叶子结果入。 |
+| D-M7e | `workflow()` 嵌套:循环检测先于深度检测 | `WorkflowCycleError`(名字已在栈上)优先于 `WorkflowNestingError`(深度超限):循环检测代价低、诊断更精确;深度上限是兜底防线。两个 contextvar(`_WORKFLOW_DEPTH` + `_WORKFLOW_NAME_STACK`)在 `finally` 中各自独立 reset——栈和深度各自恢复,避免其中一个失败导致另一个泄漏。 |
 | D-M6 | 真 git worktree + 分支/PR 形态(M6) | **方案 1**(经 Codex + in-house 跨模型评审拍板,折入 R1–R10):**git provider 拥有 worktree-rooted 后端 + merge/冲突循环走 journaled 叶 + 脚本变量 fold + PR 作 host finalization**。`LocalSubprocessSandbox(root=, on_close=)` 让叶沙箱根植真 worktree(默认逐字节不变);`GitWorktreeProvider`(`git worktree add -b leaf/<id>`、真 `git diff` 作 collect、幂等 R4 + 异常安全 R3、teardown 绑 `on_close`、`cleanup_all` 由 host 在 `finally` 调 R-host-contract);`SandboxManager(git_worktree_provider=)` 两契约各一分支、离线默认零改动。**三处承重决策**:① **PR/integration 物化移出确定性 replay 作幂等 host finalization**(R1——副作用须在叶边界或 replay 之外,否则 resume 重开);② **worktree 叶权威变更集 = leaf task 内真 `git diff`**(R5,经 `model_validate` 覆写 schema `files`、schema-less/缺字段/错类型皆 fold 期 fail-loud,非模型自报);③ **整合用 merge 叶内一次性 scratch-repo 真 `git merge`**(R7,比 merge-file 忠于 branch 语义且自给自足 resume-safe)。R8:阻塞 git(add + teardown)thread-offload 出 slot 锁(`_admit_slot` 锁内 POP 牺牲 slot + `_pending` 占位、off-loop 关/建)。R6 安全:真 git 执行叶只在 host-trusted roster,untrusted authored-script 走 reasoning-only roster(`make_reasoning_roster`)+ ExecPolicy admission,撤"脚本够不到 git"错误论据。collect 删除 v1 fail-loud(无 tombstone)。真 `gh` provider 降级为示例(R9)。否决方案 2(统一 open/collect/close 生命周期契约——改稳定 seam、共享 integration 工作区与 per-leaf 隔离 + resume 冲突)、方案 3(冲突在单叶内解决——放弃"脚本拥有循环"命门)。详见 §8c |
 
 ## 13. 实现待核实清单（开工前/中逐条钉测试）

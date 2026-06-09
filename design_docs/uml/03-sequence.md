@@ -300,6 +300,63 @@ sequenceDiagram
 
 **要点**:签核门**走 journal,不用 LangGraph 原生 `interrupt`**(C8 spike 否决:checkpointer 的 `@task` index 缓存与 content-hash journal 短路在 resume 时错位,实测叶 B 拿到叶 A 缓存)。park 与 approve 是**两次独立 `run_workflow` 调用**,各持自己的 per-call `InMemorySaver`,journal 是唯一跨调用缓存 ⇒ 无 `@task` index 错位、`checkpointer=None` 即可、跨进程骑持久 journal。门按 `signoff_key(position, tag)` 取键(序号 = 本 run 第几个 checkpoint 调用),故 `ctx.checkpoint` 是 **depth-0 原语**(fan-out 内序号竞争 → 抛 `WorkflowCheckpointError`,已并入 `WORKFLOW_CONTROL_FLOW_SIGNALS` fail-loud)。`AWAITING_SIGNOFF` 非终态、计入 `active_run_count`(abandoned park 由 `sweep` 经 `park_ttl_seconds` 过期回收)。`approve` **只批准本进程在活的 parked run**:`BgRunManager.approve` 先同步翻 `RUNNING` 再排续跑(杜绝双批竞争出孤儿续跑),就地复用 parked slot(**同 run_id**,卡片据 id 跨暂停原地更新);UNKNOWN(swept/跨进程)拒批——parked 态未持久化,无法核实确在门上(评审 M1)。`approve`(注入人工值)与 `resume`(崩溃重放、无值注入)是不同动词。脚本体在 approve 时从头重执行 ⇒ 门前叶决策走 journal 重放免费,但非幂等脚本副作用重复(D4 边界);**进度叙述不再重发**(park 时持久 progress_count)。安全:门入确定性序列(漂移 fail-loud)、决策须 JSON-可序列化(消费前序列化)、注入决策无门消费 → fail-loud、authored 脚本经 AST gate 禁 `ctx.checkpoint`。机制见 [01 §14](../01-engine-mechanism.md),host 接线见 [02 §11](../02-architecture.md)。
 
+## I — DAG 拓扑序调度（M7:依赖序 fan-out + 独立失败跟踪 + 控制流信号穿透）
+
+```mermaid
+sequenceDiagram
+  participant C as Ctx.dag
+  participant V as run_dag (_dag)
+  participant G as DeterminismGuard
+  participant J as Journal
+  participant Ni as node i (run=lambda deps: agent(...))
+  participant Nj as node j (deps=[i])
+
+  Note over C,V: ctx.dag(nodes) 入口
+  C->>C: _FANOUT_DEPTH += 1 (contextvar; 子 task 继承; agent() 不入序列 guard)
+  C->>V: run_dag(nodes)
+
+  Note over V: 1. 急切结构校验 (任何 node 运行之前)
+  V->>V: _validate_dag: 检重 id / 未知 dep / 自依赖 / 依赖环
+  alt 结构非法
+    V-->>C: raise WorkflowDagError (控制流信号, 穿透 fan-out)
+  end
+
+  Note over V: 2. Kahn 入度调度
+  V->>V: 计算 indegree + dependents 映射; 入度 0 的根节点入 pending
+  loop 每一批 ready nodes
+    V->>Ni: asyncio.create_task(node_i.run(deps_view)) — 无 barrier, 立即发出
+    Note over V,Ni: 快分支可超前于慢分支 (no-level-barrier 精神同 pipeline)
+    V->>V: asyncio.wait(running, FIRST_COMPLETED)
+    Ni-->>V: 完成 (result or exception)
+    alt 控制流信号 (WorkflowBudgetExceededError / WorkflowDeterminismError / WorkflowDagError / WorkflowCycleError)
+      V->>V: 记录 aborted[0]; 停止发射新节点
+      Note over V: 继续 drain 在飞节点 (结果抛弃), 最终 re-raise
+    else 普通异常
+      V->>V: failed.add(node_i.id); results[node_i.id] = None
+    else 成功
+      V->>V: results[node_i.id] = result
+    end
+    V->>V: _release(node_i.id) → 递减 j 的 indegree; 若 j 入度降为 0 → j 入 pending
+  end
+
+  Note over V,Nj: node j 依赖 node i: 等到 i 完成才入 pending
+  alt node i 成功
+    V->>Nj: create_task(node_j.run({i: results[i]}))
+    Nj->>J: agent() → journal 查 content-hash
+    J-->>Nj: hit → 零成本重放 / miss → 真执行
+    Nj-->>V: 结果
+  else node i failed 或 skip
+    V->>V: j 的任一 dep 在 failed → j 也 failed; _release(j) 向下传递 skip
+    Note over V,Nj: node j 永不启动; results[j] = None (skip, 非合法 None 返回)
+  end
+
+  V-->>C: {node_id: result} — failed/skipped 节点映射 None
+  C->>C: _FANOUT_DEPTH -= 1 (reset contextvar)
+  C-->>C: 返回结果 dict; SpanKind.DAG span 关闭 emit surviving_count
+```
+
+**要点**:`ctx.dag` 是第四扇出帧——对 `agent()` 序列 guard 的影响与 `parallel`/`pipeline`/`race` 相同(内部调用不入序列,每叶仍由内容哈希 journal 守护)。调度核心的两个关键不变量:① **`failed: set` 独立于 `results`** ——合法 `return None` 不 skip 下游;② **控制流信号在 drain 后穿透重抛**——budget / determinism / 格式非法 dag 从不被 mask 为 `None` 空洞。DAG 结构由脚本定义(确定性),resume 重新调度:journal 命中的叶子短路 → 对应节点直接返回缓存结果,未命中的继续真执行。
+
 ## H — 真 git worktree refactor-swarm（M6:每叶真分支 → 真改+权威 collect → scratch-repo 真 merge 冲突循环 → PR host finalization）
 
 ```mermaid
