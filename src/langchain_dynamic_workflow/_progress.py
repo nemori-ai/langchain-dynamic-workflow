@@ -110,3 +110,20 @@ class ProgressLog:
         self._entries.append(entry)
         if position >= self._delivered_count:
             self._sink(entry)
+
+    def emit_transient(self, message: str, *, metrics: BatchMetrics) -> None:
+        """Deliver a transient ``BATCH`` refresh to the sink without recording it.
+
+        Unlike :meth:`emit`, this is a fire-and-forget live view: the entry flows
+        straight to the sink and is never appended to the recorded sequence nor
+        counted against ``delivered_count``. It therefore never reaches the
+        journal, the determinism guard, or the replay result — the non-deterministic
+        timestamps it carries must never key a journal entry — and it is always
+        delivered, never suppressed on replay (the consumer overwrites the previous
+        refresh, like a progress bar).
+
+        Args:
+            message: A human-readable progress line (e.g. ``"batch: 340/1000"``).
+            metrics: The count/ETA snapshot for this refresh.
+        """
+        self._sink(ProgressEntry(kind=ProgressKind.BATCH, message=message, metrics=metrics))

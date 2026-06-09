@@ -114,3 +114,59 @@ def test_phase_and_log_entries_have_no_metrics() -> None:
     log = ProgressEntry(kind=ProgressKind.LOG, message="found 3 sources")
     assert phase.metrics is None
     assert log.metrics is None
+
+
+def test_emit_transient_delivers_a_batch_entry_to_the_sink() -> None:
+    # A transient BATCH refresh is delivered to the sink (the live progress bar)
+    # carrying its metrics, exactly like a normal emit reaches the consumer.
+    delivered: list[ProgressEntry] = []
+    log = ProgressLog(delivered_count=0, sink=delivered.append)
+    metrics = BatchMetrics(completed=10, elapsed_seconds=1.0, rate=10.0, total=100, eta_seconds=9.0)
+
+    log.emit_transient("batch: 10/100 (~9s left)", metrics=metrics)
+
+    assert len(delivered) == 1
+    assert delivered[0].kind == ProgressKind.BATCH
+    assert delivered[0].message == "batch: 10/100 (~9s left)"
+    assert delivered[0].metrics is metrics
+
+
+def test_emit_transient_never_records_into_entries() -> None:
+    # The transient entry is out-of-band: it must NOT enter the append-only log,
+    # so it never reaches the journal / determinism guard / replay result, and a
+    # following recorded emit() still lands at position 0 (the transient did not
+    # advance the recorded sequence).
+    delivered: list[ProgressEntry] = []
+    log = ProgressLog(delivered_count=0, sink=delivered.append)
+    metrics = BatchMetrics(completed=10, elapsed_seconds=1.0, rate=10.0)
+
+    log.emit_transient("batch: 10/?", metrics=metrics)
+    log.emit_transient("batch: 20/?", metrics=metrics)
+
+    # Two transients delivered, but the recorded log did not grow.
+    assert len(delivered) == 2
+    assert log.entries == []
+
+    # A subsequent recorded emit() is unaffected — it records at position 0.
+    log.emit(ProgressKind.PHASE, "research")
+    assert [e.kind for e in log.entries] == [ProgressKind.PHASE]
+    assert delivered[-1].kind == ProgressKind.PHASE
+
+
+def test_emit_transient_is_delivered_even_on_replay() -> None:
+    # On resume (delivered_count > 0) recorded PHASE/LOG entries are suppressed by
+    # position, but a transient BATCH refresh is never suppressed — live progress
+    # is a view, not history, so it always reaches the sink.
+    delivered: list[ProgressEntry] = []
+    log = ProgressLog(delivered_count=5, sink=delivered.append)
+    metrics = BatchMetrics(
+        completed=42, elapsed_seconds=2.0, rate=21.0, total=100, eta_seconds=2.76
+    )
+
+    log.emit_transient("batch: 42/100 (~3s left)", metrics=metrics)
+
+    assert len(delivered) == 1
+    assert delivered[0].kind == ProgressKind.BATCH
+    assert delivered[0].metrics is metrics
+    # The transient never touched the recorded sequence on replay either.
+    assert log.entries == []
