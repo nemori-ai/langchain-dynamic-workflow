@@ -11,6 +11,7 @@ bounds the number of in-flight leaves across every fan-out path.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import time
@@ -1302,11 +1303,22 @@ class Ctx:
                 # advances whether fn succeeds or raises (a raise drops the item to
                 # None in run_pipeline, but it still settled), so progress tracks
                 # settled work, not just successes.
+                fn_raised = True
                 try:
-                    return await fn(item)
+                    result = await fn(item)
+                    fn_raised = False
+                    return result
                 finally:
                     completed_count[0] += 1
-                    _emit_progress(completed_count[0])
+                    if fn_raised:
+                        # fn raised (esp. a control-flow signal: budget/determinism/
+                        # checkpoint). A progress-sink failure here must NOT mask fn's
+                        # exception, so swallow it — fn's exception takes priority.
+                        with contextlib.suppress(Exception):
+                            _emit_progress(completed_count[0])
+                    else:
+                        # fn succeeded: a progress-sink failure propagates loud.
+                        _emit_progress(completed_count[0])
 
             # Mark the fan-out frame BEFORE the engine spawns its workers so each
             # worker task inherits the depth and its agent() calls skip the

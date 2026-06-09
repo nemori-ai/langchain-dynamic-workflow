@@ -22,6 +22,7 @@ from langchain_dynamic_workflow._context import (
     Ctx,
     LeafOutcome,
 )
+from langchain_dynamic_workflow._errors import WorkflowBudgetExceededError
 from langchain_dynamic_workflow._journal import InMemoryJournalStore
 from langchain_dynamic_workflow._observability import Span, SpanKind, SpanRecorder
 from langchain_dynamic_workflow._progress import (
@@ -283,3 +284,42 @@ async def test_batch_map_rejects_non_positive_max_in_flight() -> None:
                 max_in_flight=bad_window,
             )
     assert leaf.calls == 0  # the guard fired before any fn / leaf ran
+
+
+async def test_batch_map_progress_sink_failure_is_loud_not_swallowed() -> None:
+    # #2(a): an on_progress sink that raises while emitting a BATCH update must NOT be
+    # swallowed into per-item None holes (corrupting a successful fn result). It should
+    # fail loud, like ctx.phase / log sink failures do.
+    leaf = _CountingLeaf(prefix="R")
+
+    def exploding_sink(entry: ProgressEntry) -> None:
+        if entry.kind is ProgressKind.BATCH:
+            raise RuntimeError("sink boom")
+
+    progress = ProgressLog(delivered_count=0, sink=exploding_sink)
+    ctx = _batch_ctx(leaf, InMemoryJournalStore(), progress=progress)
+    with pytest.raises(RuntimeError, match="sink boom"):
+        await ctx.batch_map(
+            ["a", "b", "c"],
+            lambda item: ctx.agent(f"q {item}", agent_type="worker"),
+        )
+
+
+async def test_batch_map_fn_control_flow_signal_survives_progress_sink_failure() -> None:
+    # #2(b): if fn raises a control-flow signal AND the progress sink also raises, the
+    # control-flow signal must WIN (fail loud) — a sink bug must not mask a budget /
+    # determinism breach by demoting it to an ordinary item failure.
+    leaf = _CountingLeaf(prefix="R")
+
+    def exploding_sink(entry: ProgressEntry) -> None:
+        if entry.kind is ProgressKind.BATCH:
+            raise RuntimeError("sink boom")
+
+    progress = ProgressLog(delivered_count=0, sink=exploding_sink)
+    ctx = _batch_ctx(leaf, InMemoryJournalStore(), progress=progress)
+
+    async def fn(_item: str) -> str:
+        raise WorkflowBudgetExceededError("budget breached")
+
+    with pytest.raises(WorkflowBudgetExceededError):
+        await ctx.batch_map(["a"], fn)
