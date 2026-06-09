@@ -4,13 +4,13 @@ All notable changes to `langchain-dynamic-workflow` are documented here. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-06-09
 
 A use-case-driven batch that approaches — and selectively exceeds — Claude Code's
 Dynamic Workflows. Each milestone landed through full TDD, a real-model end-to-end
-acceptance run, and a two-round cross-model adversarial review. The public API stays
-backward-compatible — every addition is keyword-only or a new symbol. Version not yet
-released; per-milestone tracking lives in `design_docs/v0_3_0_plans/00-roadmap.md`.
+acceptance run, and a cross-model adversarial review. The public API stays
+backward-compatible — every addition is keyword-only or a new symbol. Per-milestone
+tracking lives in `design_docs/v0_3_0_plans/00-roadmap.md`.
 
 ### Added
 
@@ -58,6 +58,19 @@ released; per-milestone tracking lives in `design_docs/v0_3_0_plans/00-roadmap.m
   `PullRequestRef` + offline `LocalPullRequestProvider` finalize a PR into an
   integration branch as host finalization, outside deterministic replay. DANGEROUS
   opt-in — real `git` subprocess.
+- **`ctx.dag` topological fan-out + lifted nesting (M7 · H)** — `ctx.dag(nodes)` runs a
+  dependency graph in topological order (the fourth fan-out frame): each
+  `DagNode(id, deps, run)` runs once its predecessors settle and receives their results;
+  ready nodes run concurrently with no level barrier, a failed node skips its dependents
+  transitively (a legitimately-`None` node does not), and engine signals fail loud after
+  an in-flight drain. `ctx.workflow()` nesting is lifted from a hard 1-level cap to a
+  configurable `max_workflow_depth` (default 8) with name-stack cycle detection. Adds
+  `ctx.loop_until(body, *, done, max_iters)` (a measured-stop loop with a mandatory cap
+  and a full-accumulated stop predicate) and SKILL.md authoring patterns (M1.5). New
+  symbols: `DagNode`, `SpanKind.DAG`, `WorkflowDagError`, `WorkflowCycleError`; all three
+  structural errors (`WorkflowDagError` / `WorkflowCycleError` / `WorkflowNestingError`)
+  join `WORKFLOW_CONTROL_FLOW_SIGNALS` so a depth/cycle/shape breach inside a fan-out
+  fails loud rather than masking as a `None` hole.
 - **Leaf-level live observability (Layer 1)** — `run_workflow` gains keyword-only,
   default-no-op out-of-band sinks: `on_span_begin` (the running edge with a
   resume-stable `span_id`), `on_leaf_event` (a leaf's callback subtree normalized to
