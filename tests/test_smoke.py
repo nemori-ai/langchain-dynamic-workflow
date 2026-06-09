@@ -57,6 +57,23 @@ def test_run_store_surface_exported_eagerly() -> None:
         assert hasattr(ldw, name), f"{name} not importable from the package root"
 
 
+def test_batch_metrics_exported_from_package_root() -> None:
+    """The ``batch_map`` count/ETA value type is exported eagerly from the root.
+
+    ``BatchMetrics`` is a plain frozen dataclass in ``_progress`` (no optional
+    dependency), so it must be both listed in ``__all__`` and importable from the
+    package root, exactly like the reduce/race value types. ``ProgressKind.BATCH``
+    and ``SpanKind.BATCH`` ride the existing enum exports and are checked here too.
+    """
+    import langchain_dynamic_workflow as ldw
+
+    assert "BatchMetrics" in ldw.__all__, "BatchMetrics missing from __all__"
+    assert hasattr(ldw, "BatchMetrics"), "BatchMetrics not importable from the package root"
+    # The new transient-progress / span kinds are members of the already-exported enums.
+    assert ldw.ProgressKind.BATCH.value == "batch"
+    assert ldw.SpanKind.BATCH.value == "batch"
+
+
 def test_real_git_surface_exported_from_package_root() -> None:
     """The real-git worktree + PR seam is exported eagerly with no NEW dependency.
 

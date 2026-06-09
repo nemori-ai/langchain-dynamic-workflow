@@ -51,7 +51,7 @@ from ._observability import (
     SpanKind,
     SpanSink,
 )
-from ._progress import ProgressEntry, ProgressKind, ProgressSink
+from ._progress import BatchMetrics, ProgressEntry, ProgressKind, ProgressSink
 from ._pull_request import LocalPullRequestProvider, PullRequestProvider, PullRequestRef
 from ._race_types import RaceCandidate, RaceResult
 from ._reduce import (
@@ -111,6 +111,7 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "BatchMetrics",
     "BgRunManager",
     "BgRunQuotaExceededError",
     "BgStatus",
