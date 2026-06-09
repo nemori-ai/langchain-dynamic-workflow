@@ -9,7 +9,10 @@ import pytest
 
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
 from langchain_dynamic_workflow._errors import WorkflowBudgetExceededError
-from langchain_dynamic_workflow._pipeline import run_pipeline
+from langchain_dynamic_workflow._pipeline import (
+    _workers_per_stage,  # pyright: ignore[reportPrivateUsage] - engine helper under test
+    run_pipeline,
+)
 
 
 async def test_pipeline_empty_stages_raises() -> None:
@@ -305,3 +308,63 @@ async def test_pipeline_async_iterable_preserves_order_under_backpressure() -> N
         timeout=3.0,
     )
     assert results == [(i + 1) * 2 for i in range(20)]
+
+
+async def test_pipeline_streaming_admission_bounds_source_pulls_below_n() -> None:
+    # The streaming-admission invariant (the headline): the feeder pulls from the
+    # source LAZILY through the bounded queue, so while the barrier holds the count
+    # of items PULLED from the source stays near worker_count + window and NEVER
+    # reaches N. That is the quantity that actually distinguishes streaming from
+    # eager materialization: under list(items) the source is fully drained (N pulls)
+    # before any stage runs, so `pulled_at_barrier < n` would FAIL — the real teeth.
+    # (Measuring in-fn concurrency instead is hollow: it is loop-bounded by
+    # worker_count regardless of admission strategy.) asyncio.wait_for guards against
+    # a backpressure deadlock.
+    n = 400
+    window = 4
+    gate = ConcurrencyGate(limit=64)  # large enough that the WINDOW, not the gate, bounds
+    worker_count = _workers_per_stage(gate, None, window)  # min(64, 4) = 4
+    pulled = 0
+    pulled_at_barrier = 0
+    in_stage = 0
+    barrier_released = asyncio.Event()
+
+    async def asource():
+        nonlocal pulled
+        for value in range(n):
+            pulled += 1  # count every item the feeder pulls off the source
+            yield value
+
+    async def stage(prev: int, item: int, index: int) -> int:
+        nonlocal in_stage, pulled_at_barrier
+        in_stage += 1
+        # Once the workers are saturated the feeder has filled the bounded queue and
+        # is blocked on a full put, so `pulled` now reflects the steady-state
+        # admission window. Snapshot it, then release so the run drains. A plain int
+        # update is safe — asyncio is single-threaded, no await between read/write.
+        if in_stage >= worker_count and not barrier_released.is_set():
+            pulled_at_barrier = pulled
+            barrier_released.set()
+        await barrier_released.wait()
+        await asyncio.sleep(0.0005)
+        in_stage -= 1
+        return item
+
+    results = await asyncio.wait_for(
+        run_pipeline(asource(), [stage], gate=gate, queue_maxsize=window),
+        timeout=5.0,
+    )
+
+    assert results == list(range(n))
+    # The feeder admitted at most ~worker_count + window items before backpressure
+    # blocked it — decoupled from N. The +2 is slack for the item in-flight on put.
+    bound = worker_count + window + 2
+    assert pulled_at_barrier <= bound, (
+        f"pulled {pulled_at_barrier} exceeded admission window bound {bound}"
+    )
+    # The real teeth: the source was NOT fully drained while work was in flight. An
+    # eager list(items) implementation would have pulled all N before any stage ran.
+    assert pulled_at_barrier < n, (
+        f"pulled {pulled_at_barrier} reached N={n} — source fully drained, "
+        "admission not decoupled from total (eager materialization)"
+    )
