@@ -107,10 +107,37 @@ class WorkflowScriptError(RuntimeError):
     """
 
 
+class WorkflowDagError(RuntimeError):
+    """Raised when a ``ctx.dag`` call is structurally invalid before scheduling.
+
+    The DAG is validated eagerly at the top of ``ctx.dag`` — before any node runs —
+    so a duplicate node id, a dependency on an unknown id, a node depending on
+    itself, or a dependency cycle fails loud rather than scheduling a graph with no
+    topological order. It is a control-flow signal: raised from inside a
+    ``parallel`` / ``pipeline`` / ``race`` frame (a nested ``dag``) it must surface,
+    never be masked as a ``None`` hole, because it is an author bug, not a leaf
+    failure.
+    """
+
+
+class WorkflowCycleError(RuntimeError):
+    """Raised when ``ctx.workflow`` would re-enter a workflow already being inlined.
+
+    A workflow may inline other workflows up to ``max_workflow_depth`` levels, but a
+    name that is already on the inlining stack (a workflow calling itself directly,
+    or a mutual cycle such as A->B->A) has no engine-bounded base case and would
+    recurse to the depth cap on every run. The engine refuses the cycle the moment a
+    repeated name is seen, with a clearer diagnostic than the eventual depth-cap
+    breach. Like the other structural signals it fails loud inside a fan-out frame.
+    """
+
+
 WORKFLOW_CONTROL_FLOW_SIGNALS: tuple[type[Exception], ...] = (
     WorkflowBudgetExceededError,
     WorkflowDeterminismError,
     WorkflowCheckpointError,
+    WorkflowDagError,
+    WorkflowCycleError,
 )
 """Engine signals that must fail loud inside a fan-out, never be masked as ``None``.
 
