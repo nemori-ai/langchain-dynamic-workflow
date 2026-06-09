@@ -45,6 +45,7 @@ class SpanKind(StrEnum):
         PIPELINE: A ``pipeline()`` no-barrier streaming fan-out.
         RACE: A ``race()`` best-of-N early-exit fan-out (or a journaled-decision replay).
         DAG: A ``dag()`` topological-order dependency-graph fan-out.
+        BATCH: A ``batch_map()`` bounded-streaming fan-out over an (async) iterable.
     """
 
     AGENT = "agent"
@@ -52,6 +53,7 @@ class SpanKind(StrEnum):
     PIPELINE = "pipeline"
     RACE = "race"
     DAG = "dag"
+    BATCH = "batch"
 
 
 @dataclass(slots=True)
