@@ -63,7 +63,7 @@ DagNode(id: str, deps: Sequence[str], run: Callable[[dict], Coroutine])
 
 ### 确定性与 resume 安全
 
-`ctx.dag` 是扇出帧(递增 `_FANOUT_DEPTH`),其内部节点的 `agent()` 调用不记入顺序序列 guard(完成顺序随墙钟变化)。每个叶子仍由内容哈希 journal 守护——resume 时完成节点零模型成本重放。DAG 图的拓扑结构由脚本代码定义(确定性),故**无需 dag 级 journal 条目**;resume 重新执行调度器,命中的叶子直接短路,未命中的继续运行。
+`ctx.dag` 是扇出帧(递增 `_FANOUT_DEPTH`),其内部节点的 `agent()` 调用不记入顺序序列 guard(完成顺序随墙钟变化)。每个叶子仍由内容哈希 journal 守护——resume 时完成节点零模型成本重放。DAG 图的拓扑结构由脚本代码定义(确定性),故**无需 dag 级 journal 条目**;resume 重新执行调度器,命中的叶子直接短路,未命中的继续运行。**journal 是纯成功记录**（与 `parallel`/`pipeline`/`race` 引擎一致）：失败或被 skip 的节点不入 journal，crash 重试时这些节点会重新运行——完成（成功）节点仍从内容哈希 journal 零成本重放，不重跑模型。
 
 ## 2d. `loop_until` — 有终止保证的顺序循环
 
@@ -83,7 +83,7 @@ DagNode(id: str, deps: Sequence[str], run: Callable[[dict], Coroutine])
 ### 深度上限
 
 - 每次 `ctx.workflow()` 进入时递增 `_WORKFLOW_DEPTH` contextvar;退出时在 `finally` 重置。
-- 若即将超过 `max_workflow_depth`(默认 8)时抛 `WorkflowNestingError`——是"跑飞的递归"的最后防线,**不**并入 `WORKFLOW_CONTROL_FLOW_SIGNALS`(命名限制是作者边界,不是引擎内部信号;越界失败属于合理的有界行为,不需要 fan-out 帧中穿透 mask)。
+- 若即将超过 `max_workflow_depth`(默认 8)时抛 `WorkflowNestingError`——是"跑飞的递归"的最后防线,**并入 `WORKFLOW_CONTROL_FLOW_SIGNALS`**（深度上限越界是结构性/跑飞递归错误,同 `WorkflowDagError`/`WorkflowCycleError`——fan-out 帧内必须 fail-loud,不能被 mask 为 `None` 空洞;Codex 跨模型评审驱动此修正）。
 
 ### 循环检测
 
@@ -285,7 +285,7 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | D22 | 逐叶 live 可观测性 tap 形态(M1) | **选 callback-handler tap**(把 `BaseCallbackHandler` 挂上叶子既有 `leaf_config["callbacks"]`),否决 `astream_events`:叶 `ainvoke` 调用路径不变(folding / 结构化输出 / usage 计量逐字节不动),复用 budget 已走的同一条 callbacks 转发路径。**`metadata` 关联法被否**——deepagents subagent 边界丢弃 `metadata`(只转发 `callbacks`/`tags`/`configurable`),故 `leaf_span_id` 关联改由 per-leaf handler 实例在构造时**闭包**承担(一叶一 handler,它见的每条边按构造即属本叶子)。`SpanBegin` 立为**独立值类型**(非把 begin 字段塞进统一 event),与完成 `Span` 共享 `span_id`。`detail` opt-in 取**单一 bool**(`leaf_event_include_payloads`),不引入更重的 sink-config 对象。replay 策略**随控制流自落**:begin 发于 span 打开、早于 journal 查询故 cached 叶照常重发(配 cached 完成);`on_leaf_event` 只在 miss 路挂 handler,故 journal 命中**零** interior 事件——无需额外开关 |
 | D-M5 | 真本地执行后端形态(M5) | **可插拔 sandbox 工厂 + `LocalSubprocessSandbox`(stdlib-only 全协议后端,per-leaf 临时根)**,默认仍 `InMemorySandbox`(零依赖、离线默认逐字节不变),宿主经 `SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))` 危险 opt-in。选 `Popen`(非 `subprocess.run`)以做进程树清理 + 有界流式抽干(过 cap 标 `truncated` 不无界缓冲、续读到 EOF 防满管道死锁);超时杀**进程组**(`start_new_session` + `os.killpg` SIGTERM→grace→SIGKILL,码 124),准入拒绝码 126。`ExecGate`(`threading.BoundedSemaphore`)与叶级 `ConcurrencyGate`(asyncio)**正交**——`execute` 在 `aexecute→to_thread` worker 上跑,须跨线程闸、一工厂一闸。`before_execute(request)->decision` 为**准入控制非 sink**(allow/reject/缩超时/降 cap/选 profile)。命令可观测性走**专门的带外 sink `on_command`**——execute 体内在 spawn 前后发成对 `CommandEvent`(`"start"`/`"end"`,共享 resume 稳定 `command_id`、携 `leaf_span_id`),是 `on_leaf_event` 在执行面的同构 sink:keyword-only、默认 no-op、不入 journal、miss-only(journal 命中叶不 lease 不跑 subprocess 故零 command 事件)、`output` 默认截尾、`command_include_payloads` 才带全量;引擎经 `set_command_sink` 仅在 lease 真后端时接上(`InMemorySandbox` 无真 execute 边界不发)。rlimit 走**最小化 `preexec_fn`**(父进程预算 soft/hard、子侧只 `setrlimit` 不分配/不 import/不取锁,故 fork-then-exec 窗口内安全;不另起 `python -c` wrapper 省每命令一次解释器启动),默认 generous-but-bounded profile ON(CPU 60s / AS 2 GiB / FSIZE 256 MiB / NOFILE 1024;NPROC 默认 unset——per-user 计数使固定 cap 不可靠)。`ExecDecision.rlimits` 内联 `RLimitProfile` 覆写即"选 profile",否决命名 profile 注册表(v1 过度抽象)。per-leaf 临时根保持**私有**(`/shared/` hand-off 仍走内存 `SharedArtifactStore` 复合,不耦合真 FS 到内存 store)、`close()` 删根幂等(子进程已在每次 `execute` reap)。否决 `run_workflow` 级 `execution=` 旋钮(危险 opt-in 该是审慎的 manager 构造期决定)。诚实非目标明列为 sharp edge:非安全 sandbox、不封闭 FS/网络/cgroup、Windows best-effort。container 后端是同接缝后延后 opt-in extra(仿 `[sqlite]`),M5 不交付。详见 §8b |
 | D-M7a | DAG 调度失败语义 | **独立 `failed: set` + 传递 skip**:节点 `run` 抛 → 该节点 failed、结果 `None`、传递依赖全 skip 到 `None`;合法 `return None` **不触发** skip——二者须可区分,否则"无结论"与"失败"语义混淆。控制流信号穿透:drain 后原样重抛,从不 mask 为 `None` 空洞。 |
-| D-M7b | `WorkflowDagError` / `WorkflowCycleError` 入信号元组 | 两者均**并入 `WORKFLOW_CONTROL_FLOW_SIGNALS`**——dag 格式非法或命名循环是作者 bug、非叶子失败;fan-out 帧内 fail-loud 而非被 mask。`WorkflowNestingError`(深度上限)有意**不**入信号元组:它是由宿主配置的边界行为,越界失败合理,不需穿透 fan-out。 |
+| D-M7b | `WorkflowDagError` / `WorkflowCycleError` / `WorkflowNestingError` 入信号元组 | 三者均**并入 `WORKFLOW_CONTROL_FLOW_SIGNALS`**——dag 格式非法、命名循环、以及深度上限越界均是结构性作者 bug、非叶子失败;fan-out 帧内 fail-loud 而非被 mask。初版设计有意将 `WorkflowNestingError` 排除（"命名边界非引擎信号"），Codex 跨模型评审指出此为 BLOCKER：fan-out 帧内深度越界会被静默 mask 为 `None` 空洞，遮蔽结构错误——已修正，三个结构性错误全部入元组。 |
 | D-M7c | DAG scheduler 不持 gate slot | 调度器不持有并发 gate;`run` 函数内的 `agent()` 才获取。故 dag 嵌套在 dag 节点的 `run` 里不会 deadlock 池,且并发界仍全局有效。 |
 | D-M7d | dag 无需 journal 条目 | DAG 结构由确定性脚本定义;resume 重跑调度器、已完成叶走 journal 短路。无需 dag 级 journal 条目;与 `parallel`/`pipeline`/`race` 的统一处理:结构元数据不入 journal,只有叶子结果入。 |
 | D-M7e | `workflow()` 嵌套:循环检测先于深度检测 | `WorkflowCycleError`(名字已在栈上)优先于 `WorkflowNestingError`(深度超限):循环检测代价低、诊断更精确;深度上限是兜底防线。两个 contextvar(`_WORKFLOW_DEPTH` + `_WORKFLOW_NAME_STACK`)在 `finally` 中各自独立 reset——栈和深度各自恢复,避免其中一个失败导致另一个泄漏。 |
