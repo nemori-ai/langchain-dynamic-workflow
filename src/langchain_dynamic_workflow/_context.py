@@ -887,6 +887,50 @@ class Ctx:
             span.set("surviving_count", sum(1 for v in results.values() if v is not None))
             return results
 
+    async def loop_until[T](
+        self,
+        body: Callable[[int, list[T]], Awaitable[T]],
+        *,
+        done: Callable[[list[T]], bool],
+        max_iters: int,
+    ) -> list[T]:
+        """Run ``body`` until ``done`` holds over the accumulated results, capped at ``max_iters``.
+
+        A measured-stop loop with the two author disciplines baked in: every loop has
+        a mandatory hard cap (``max_iters``), and the stop predicate is checked over
+        the FULL accumulated list (so dedup / convergence is against *everything* seen,
+        not just the last round). Each iteration calls ``body(iter_index, accumulated)``
+        — where ``accumulated`` is a copy of the results so far — appends its result,
+        then checks ``done(accumulated)``; the loop returns as soon as ``done`` holds.
+
+        This is a sequential (depth-0) primitive: ``body``'s direct ``agent()`` calls
+        record into the determinism guard, and the loop count derives from journaled
+        leaf results, so a resume reproduces the same number of iterations and replays
+        completed leaves at zero cost. If the cap is reached without ``done`` ever
+        holding, a (replay-idempotent) ``log`` line is emitted and the accumulated
+        results are returned — a graceful, non-silent stop rather than a raise.
+
+        Args:
+            body: ``(iter_index, accumulated_so_far) -> result`` for one iteration.
+            done: Stop predicate over the full accumulated result list.
+            max_iters: Mandatory hard cap on iterations (must be >= 1).
+
+        Returns:
+            The accumulated results, in iteration order.
+
+        Raises:
+            ValueError: If ``max_iters`` is less than 1.
+        """
+        if max_iters < 1:
+            raise ValueError(f"loop_until requires max_iters >= 1, got {max_iters}")
+        accumulated: list[T] = []
+        for iteration in range(max_iters):
+            accumulated.append(await body(iteration, list(accumulated)))
+            if done(accumulated):
+                return accumulated
+        self.log(f"loop_until reached max_iters={max_iters} without satisfying done()")
+        return accumulated
+
     async def _run_race_candidate(self, candidate: RaceCandidate) -> Any:
         """Dispatch one race candidate by reusing ``agent()`` verbatim.
 
