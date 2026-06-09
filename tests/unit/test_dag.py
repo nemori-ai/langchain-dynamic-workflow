@@ -11,7 +11,11 @@ from langchain_core.runnables import RunnableLambda
 from langchain_dynamic_workflow._codegen import compile_workflow_source
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
 from langchain_dynamic_workflow._context import Ctx, LeafOutcome
-from langchain_dynamic_workflow._dag import DagNode, _validate_dag, run_dag
+from langchain_dynamic_workflow._dag import (
+    DagNode,
+    _validate_dag,  # pyright: ignore[reportPrivateUsage] - internal validator under test
+    run_dag,
+)
 from langchain_dynamic_workflow._engine import run_workflow
 from langchain_dynamic_workflow._errors import WorkflowBudgetExceededError, WorkflowDagError
 from langchain_dynamic_workflow._journal import InMemoryJournalStore
@@ -70,8 +74,11 @@ async def test_run_dag_threads_predecessor_results_in_topo_order() -> None:
         ]
     )
     # symA saw modA's result; modA saw pkg's result -> topological data-flow.
-    assert results["symA"]["saw"]["modA"]["id"] == "modA"
-    assert results["modA"]["saw"]["pkg"]["id"] == "pkg"
+    sym_a = results["symA"]
+    mod_a = results["modA"]
+    assert sym_a is not None and mod_a is not None
+    assert sym_a["saw"]["modA"]["id"] == "modA"
+    assert mod_a["saw"]["pkg"]["id"] == "pkg"
 
 
 async def test_run_dag_failure_skips_dependents_transitively() -> None:
@@ -86,7 +93,9 @@ async def test_run_dag_failure_skips_dependents_transitively() -> None:
     assert results["pkg"] is None
     assert results["modA"] is None
     assert results["symA"] is None
-    assert results["indep"]["id"] == "indep"
+    indep = results["indep"]
+    assert indep is not None
+    assert indep["id"] == "indep"
 
 
 async def test_run_dag_legitimate_none_does_not_skip_dependents() -> None:
