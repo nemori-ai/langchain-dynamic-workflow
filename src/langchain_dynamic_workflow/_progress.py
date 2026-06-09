@@ -21,10 +21,37 @@ class ProgressKind(StrEnum):
     Attributes:
         PHASE: A ``phase(title)`` grouping marker.
         LOG: A ``log(message)`` narration line.
+        BATCH: A transient ``batch_map`` count/ETA refresh (delivered, never recorded).
     """
 
     PHASE = "phase"
     LOG = "log"
+    BATCH = "batch"
+
+
+@dataclass(frozen=True, slots=True)
+class BatchMetrics:
+    """Count/ETA snapshot carried by a transient ``BATCH`` progress entry.
+
+    A live view of a ``batch_map`` fan-out's progress, computed out-of-band from a
+    monotonic clock as items settle. The timestamps are non-deterministic and never
+    reach a journal key; the snapshot is delivered to the sink and discarded.
+
+    Attributes:
+        completed: How many items have settled (returned or failed) so far.
+        elapsed_seconds: Wall-clock seconds since the fan-out started.
+        rate: Items settled per second (``completed / elapsed_seconds``).
+        total: The item count when known (a ``Sized`` input or a ``total=`` hint),
+            else ``None``.
+        eta_seconds: Estimated seconds to completion (``(total - completed) / rate``)
+            when ``total`` is known, else ``None``.
+    """
+
+    completed: int
+    elapsed_seconds: float
+    rate: float
+    total: int | None = None
+    eta_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,12 +59,15 @@ class ProgressEntry:
     """A single progress narration entry.
 
     Attributes:
-        kind: Whether this entry is a phase marker or a log line.
+        kind: Whether this entry is a phase marker, a log line, or a batch refresh.
         message: The phase title or log message text.
+        metrics: The count/ETA snapshot for a ``BATCH`` entry; ``None`` for
+            ``PHASE``/``LOG`` entries.
     """
 
     kind: ProgressKind
     message: str
+    metrics: BatchMetrics | None = None
 
 
 ProgressSink = Callable[[ProgressEntry], None]

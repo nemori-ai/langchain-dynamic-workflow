@@ -7,7 +7,12 @@ entries are suppressed (idempotent) while genuinely new entries still flow.
 
 from __future__ import annotations
 
-from langchain_dynamic_workflow._progress import ProgressEntry, ProgressKind, ProgressLog
+from langchain_dynamic_workflow._progress import (
+    BatchMetrics,
+    ProgressEntry,
+    ProgressKind,
+    ProgressLog,
+)
 
 
 def test_fresh_run_delivers_and_records_every_entry() -> None:
@@ -58,3 +63,54 @@ def test_replay_with_no_new_entries_delivers_nothing() -> None:
 
     assert delivered == []
     assert len(log.entries) == 2
+
+
+def test_batch_metrics_shape() -> None:
+    # BatchMetrics is the structured count/ETA payload a BATCH entry carries.
+    # Non-default fields first, nullable-with-default last (dataclass ordering).
+    metrics = BatchMetrics(
+        completed=340,
+        elapsed_seconds=12.0,
+        rate=28.0,
+        total=1000,
+        eta_seconds=23.5,
+    )
+    assert metrics.completed == 340
+    assert metrics.elapsed_seconds == 12.0
+    assert metrics.rate == 28.0
+    assert metrics.total == 1000
+    assert metrics.eta_seconds == 23.5
+    # Unknown total -> no ETA (graceful degradation): both nullable fields default None.
+    open_ended = BatchMetrics(completed=5, elapsed_seconds=2.0, rate=2.5)
+    assert open_ended.total is None
+    assert open_ended.eta_seconds is None
+
+
+def test_batch_progress_entry_carries_metrics() -> None:
+    metrics = BatchMetrics(
+        completed=340,
+        elapsed_seconds=12.0,
+        rate=28.0,
+        total=1000,
+        eta_seconds=23.5,
+    )
+    entry = ProgressEntry(
+        kind=ProgressKind.BATCH,
+        message="batch: 340/1000 (~24s left)",
+        metrics=metrics,
+    )
+    assert entry.kind == ProgressKind.BATCH
+    assert entry.message == "batch: 340/1000 (~24s left)"
+    assert entry.metrics is metrics
+    # entry.metrics is metrics (asserted above); read through the narrowed local so
+    # pyright strict does not flag Optional member access.
+    assert metrics.completed == 340
+
+
+def test_phase_and_log_entries_have_no_metrics() -> None:
+    # Backward compat: a PHASE/LOG entry built without metrics leaves the new
+    # trailing field None, so existing callers are unaffected.
+    phase = ProgressEntry(kind=ProgressKind.PHASE, message="research")
+    log = ProgressEntry(kind=ProgressKind.LOG, message="found 3 sources")
+    assert phase.metrics is None
+    assert log.metrics is None
