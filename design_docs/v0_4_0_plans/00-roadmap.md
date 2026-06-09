@@ -1,6 +1,6 @@
 # v0.4.0 路线图（Roadmap）— 引擎可观测性 + 交互式体验
 
-> **For agentic workers:** 本文件是 v0.4.0 的**批次总线**。延续 v0.2.0/v0.3.0 的方法：每个目标对应一份独立设计/计划文档（`design_docs/v0_4_0_plans/0N-*.md`，**逐目标增补**，不一次写完）。本批次为**开放状态**——M1 已落地；M2/M3 为 2026-06-09 用户登记的新需求（详细设计待本批次正式启动时展开）；v0.3.0 未尽里程碑（M7、E）与新候选随推进纳入。
+> **For agentic workers:** 本文件是 v0.4.0 的**批次总线**。延续 v0.2.0/v0.3.0 的方法：每个目标对应一份独立设计/计划文档（`design_docs/v0_4_0_plans/0N-*.md`，**逐目标增补**，不一次写完）。本批次为**开放状态**——M1 已落地；M2/M3 为 2026-06-09 用户登记的新需求（详细设计待本批次正式启动时展开）；自 v0.3.0「後續里程碑」backlog 提升的 E（`batch_map`）已落地（M7 已于 v0.3.0 落地，不在本批次）；新候选随推进纳入。
 
 ## 已确认目标
 
@@ -21,6 +21,14 @@
 - `idle` 由**消费者**推断（引擎只 emit running/complete/error；引擎枚举不了未来 leaf）。
 
 完整设计见 [`01-leaf-live-observability.md`](01-leaf-live-observability.md)。
+
+### E · 批处理人体工学（`batch_map` + 流式准入 + count/ETA 进度）— ✅ 已落地
+
+**目标：** 让**大规模 fan-out（数千叶）**人体工学化，作为一个里程碑交付三块耦合能力：① `batch_map`——把一个异步 `fn`（典型为单个 `agent()`）map 到一个 `Iterable`/`AsyncIterable` 的每个 item、结果按输入序回收（`parallel` 的大扇出对位面）；② **流式准入**——输入经有界窗口懒消费，N 千 item 永不一次性物化 N 千 task，内存被窗口而非总量绑定；③ **count/ETA 进度**——随推进自动发实时 `completed/total/elapsed/eta`，长批次无需脚本插桩即可观测。源自社区 use-case study #5（codebase 级 bug/vuln sweep）与"数千叶 vs CC 的 16-并发/1000-总量上限、批处理人体工学如何"的公开提问。
+
+**关键设计（载重）：** 流式准入落在**新 `batch_map`、`parallel` 不动**，内部**广义化既有 `run_pipeline`** 吃任意 `Iterable | AsyncIterable`（拆三处 `len` 依赖、`dict` 按下标保序回收），故在飞 task ≈ `worker_count + queue_maxsize`、与 N 解耦；`pipeline` 的 `Sequence` 快速路径逐字节保持。进度复用 `ProgressSink` + 一个 **transient `ProgressKind.BATCH` 条目**（经 `ProgressLog.emit_transient` 投递到 sink 但**不记录**——不入 `_entries`/`delivered_count`/journal/确定性 guard/replay，故 resume 时 re-emitted-not-replayed）。新增公共面全 additive：`Ctx.batch_map` · `BatchMetrics`（包根导出）· `ProgressKind.BATCH` · `SpanKind.BATCH` · `ProgressEntry.metrics`。
+
+完整设计见 [`02-e-batch-ergonomics.md`](02-e-batch-ergonomics.md)；机制见 [01 §9b](../01-engine-mechanism.md)。
 
 ## 已登记需求（2026-06-09 用户提；详细设计待本批次正式启动展开）
 
@@ -51,4 +59,5 @@
 - **M1 叶子级实时可观测**：✅ 已落地（引擎 hook PR #12 + demo 消费 PR #13）——inline leaf 实时 status + 计时器 + drill-in。
 - **M2 持久侧边栏多-workflow 实时视图**：📝 需求已登记（2026-06-09）；详细设计待 v0.4.0 正式启动。
 - **M3 run board 下钻 + 背景 run 结果回传 host**：📝 需求已登记（2026-06-09）；① context-independent transport 是 M2 + M3① 的**共享承重基建**（v0.4.0 核心攻坚），② 结果回传相对独立、不依赖 transport；详细设计待启动。
-- **其余 v0.4.0 目标**：批次开放，逐项增补（候选：v0.3.0 未尽 M7/E、面向社区的交互式 demo-app 等）。
+- **E 批处理人体工学（`batch_map`）**：✅ 已落地——流式准入大扇出 map（广义化 `run_pipeline`、`parallel` 不动）+ transient count/ETA 进度（`ProgressKind.BATCH`，delivered-not-recorded）；自 v0.3.0「後續里程碑」backlog 提升而来。设计见 [`02-e-batch-ergonomics.md`](02-e-batch-ergonomics.md)。
+- **其余 v0.4.0 目标**：批次开放，逐项增补（候选：面向社区的交互式 demo-app 等；自 v0.3.0 提升的 E 已落地，M7 已于 v0.3.0 落地）。
