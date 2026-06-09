@@ -22,7 +22,7 @@ The set has exactly two layers, with different rules:
   search → extract → adversarial verify → synthesize) on live models with native web
   search and prompt caching. A flagship is expensive to maintain and is **not added
   casually** — the bar is a genuinely new end-to-end story, not a new single feature.
-- **Feature demos** (`features/`, 18 demos): each demonstrates **exactly one**
+- **Feature demos** (`features/`, 19 demos): each demonstrates **exactly one**
   mechanism, runs **fully offline and deterministically**, and needs **no API key**.
   They use the shared scripted fakes in `_shared/offline_models.py`, so they are fast,
   reproducible, and safe to run in CI.
@@ -36,7 +36,7 @@ This table is the authoritative index of every demo. The two flagships:
 | `flagship/deep_research_preset` | Real-model host drives the **registered** `deep_research` workflow: parallel search → extract → adversarial verify → synthesize, with native web search + prompt caching; schema-as-handoff and reduce are embedded in the registered workflow. |
 | `flagship/deep_research_authored` | Real-model host **authors** the deep-research script live and submits it via `run_script` (AST-gate happy path), then runs it on the same web-search + caching leaf stack. |
 
-The 18 feature demos, one mechanism each:
+The 19 feature demos, one mechanism each:
 
 | Demo | Single mechanism |
 |---|---|
@@ -58,13 +58,14 @@ The 18 feature demos, one mechanism each:
 | `features/ast_gate` | meta-layer safety seam: an unsafe script → precise AST-gate rejection → rewrite → run. |
 | `features/host_integration` | `create_workflow_tool` / `create_workflow_middleware` wired into a scripted host; the host launches N background runs and views the aggregate runs board. |
 | `features/signoff` | in-run HITL sign-off: `ctx.checkpoint` parks the run for a human, the host catches `WorkflowSignoffRequired` and resumes with the decision (pre-gate leaf replays for free; approve proceeds, reject holds). |
+| `features/bug_vuln_sweep` | `ctx.batch_map` bounded streaming fan-out over a large file list + live count/ETA `BATCH` progress, results folded with `dedup`. |
 
 ### Suggested learning path
 
 Read in this order to build up from a single leaf to the full flagships:
 
 1. `agent_and_schema` — one leaf, structured handoff.
-2. `parallel` → `pipeline` → `dag` — fan-out with a barrier, a staged flow without one, and dependency-order (topological) fan-out with transitive skip.
+2. `parallel` → `pipeline` → `dag` → `bug_vuln_sweep` — fan-out with a barrier, a staged flow without one, dependency-order (topological) fan-out with transitive skip, and `batch_map` bounded streaming fan-out over a large list with a live count/ETA bar.
 3. `budget` → `observability` → `journal_resume` — loop control, narration, replay.
 4. `reduce` — synthesizing many leaf results into one.
 5. `race` — best-of-N early exit and journaled cancel.
