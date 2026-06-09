@@ -9,7 +9,13 @@ the caller.
 from importlib.metadata import version
 from typing import TYPE_CHECKING, Any
 
-from ._background import BgRunManager, BgRunQuotaExceededError, BgStatus, ResultStore
+from ._background import (
+    BgRunManager,
+    BgRunQuotaExceededError,
+    BgStatus,
+    ResultStore,
+    RunSnapshot,
+)
 from ._budget import Budget
 from ._codegen import compile_workflow_source, extract_meta, run_workflow_from_source
 from ._context import Ctx
@@ -137,6 +143,7 @@ __all__ = [
     "ReviewItem",
     "Roster",
     "RosterEntry",
+    "RunSnapshot",
     "RunSpec",
     "SandboxFactory",
     "SandboxManager",

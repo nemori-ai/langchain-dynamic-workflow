@@ -6,6 +6,7 @@ import { JournalBadge } from "./JournalBadge";
 import { MetaScriptViewer } from "./MetaScriptViewer";
 import { PhaseTimeline } from "./PhaseTimeline";
 import { PullRequestCard } from "./PullRequestCard";
+import { RunBoard } from "./RunBoard";
 import { RunStatusBanner } from "./RunStatusBanner";
 import { SignoffGate } from "./SignoffGate";
 import { TerminalCard } from "./TerminalCard";
@@ -20,8 +21,9 @@ import { TerminalCard } from "./TerminalCard";
  * UiAdapter emits (ui_adapter.py): "phase_timeline", "fanout_graph", "agent_span",
  * "journal_badge", "execution_command", "signoff_gate" — plus "pull_request" (the
  * host-finalized PR card the refactor_swarm run emits after the run), "hello_ui" (the
- * round-trip smoke component), "meta_script" (the meta-layer viewer), and "run_status"
- * (the per-turn offline/online banner the host emits).
+ * round-trip smoke component), "meta_script" (the meta-layer viewer), "run_status"
+ * (the per-turn offline/online banner the host emits), and "run_board" (the host-emitted
+ * aggregate board for several background runs watched side by side).
  *
  * "execution_command" arrives as two same-id edges the SDK folds onto one card: a start
  * edge renders a sky running chip, and a merge end edge flips it to an emerald (exit 0) or
@@ -46,6 +48,7 @@ export const workflowComponents: Record<
   agent_span: AgentSpan as React.FunctionComponent,
   journal_badge: JournalBadge as React.FunctionComponent,
   meta_script: MetaScriptViewer as React.FunctionComponent,
+  run_board: RunBoard as React.FunctionComponent,
   run_status: RunStatusBanner as React.FunctionComponent,
   execution_command: TerminalCard as React.FunctionComponent,
   signoff_gate: SignoffGate as React.FunctionComponent,

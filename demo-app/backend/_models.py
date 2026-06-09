@@ -98,6 +98,7 @@ _HELLO_TOOL_NAME = "run_hello_demo"
 _LIVE_TOOL_NAME = "run_live"
 _META_TOOL_NAME = "run_meta_script"
 _BACKGROUND_TOOL_NAME = "run_background"
+_RUNS_BOARD_TOOL_NAME = "run_runs_board"
 
 # Post-tool final replies, branched on which tool ran (the most recent ToolMessage's
 # ``name``). The offline demo's whole discipline is honesty, so this final sentence must
@@ -122,6 +123,12 @@ _REPLY_META_REJECTED = (
 _REPLY_SIGNOFF_PAUSED = (
     "I've paused for your sign-off — review the gate above, then approve or decline and "
     "I'll continue from there (offline demo mode; set a model key for live model runs)."
+)
+_REPLY_RUNS_BOARD = (
+    "Done — I kicked all of them off together and tracked each one on the board above; "
+    "every run finished and its outcome is shown there. Background runs report their "
+    "aggregate status, not a live per-step view (offline demo mode; set a model key for "
+    "live model runs)."
 )
 # Marker in a ``run_live`` ToolMessage that distinguishes the sign-off PAUSE outcome (the
 # run parked at a ctx.checkpoint gate) from a normal completed run. Kept in sync with the
@@ -232,6 +239,19 @@ _BACKGROUND_CUES = (
     "delegate",
 )
 
+# Cue phrases routing the offline host to the aggregate run board (run_runs_board): the
+# user names several INDEPENDENT jobs to run AT ONCE. Checked BEFORE the background cue (a
+# single detached run) and the live cue. The cues must signal the parallel-runs intent
+# SPECIFICALLY — not generic progress words. Deliberately excludes:
+#   * "a few separate" / "all at once" — also in the refactor-swarm preset ("a few separate
+#     bugs ... fixed all at once"), which must reach its own preset, not the board;
+#   * "keep me posted" / "one at a time" — too generic / an opposite-intent substring that
+#     would mis-route an unrelated request ("fix this and keep me posted") into the board.
+_PARALLEL_RUNS_CUES = (
+    "at the same time",
+    "all three",
+)
+
 
 def _latest_user_text(messages: Sequence[BaseMessage]) -> str | None:
     """Return the most recent human message's lowercased text, if any."""
@@ -292,6 +312,18 @@ def _wants_background_run(messages: Sequence[BaseMessage]) -> bool:
     return text is not None and any(cue in text for cue in _BACKGROUND_CUES)
 
 
+def _wants_parallel_runs(messages: Sequence[BaseMessage]) -> bool:
+    """Return whether the latest user turn asks to run several independent jobs at once.
+
+    A "look into A, B, and C at the same time" request is the run-board cue: the host should
+    fan the jobs out as separate background runs and surface their aggregate status as one
+    board, rather than a single detached run (background) or an inline preset run (live).
+    Checked before both so such a request reaches ``run_runs_board``.
+    """
+    text = _latest_user_text(messages)
+    return text is not None and any(cue in text for cue in _PARALLEL_RUNS_CUES)
+
+
 def _tool_message_this_turn(messages: Sequence[BaseMessage]) -> ToolMessage | None:
     """Return the :class:`ToolMessage` produced for the CURRENT user turn, if any.
 
@@ -342,6 +374,8 @@ def _post_tool_reply(tool_message: ToolMessage) -> str:
     """
     if tool_message.name == _BACKGROUND_TOOL_NAME:
         return _REPLY_BACKGROUND
+    if tool_message.name == _RUNS_BOARD_TOOL_NAME:
+        return _REPLY_RUNS_BOARD
     content = str(tool_message.content).lower()
     if tool_message.name == _META_TOOL_NAME and _META_REJECTED_MARKER in content:
         return _REPLY_META_REJECTED
@@ -452,6 +486,14 @@ class OfflineHostModel(BaseChatModel):
                         "id": "meta-call-1",
                     }
                 ],
+            )
+        elif _wants_parallel_runs(messages):
+            # Several independent jobs at once: fan them out as separate background runs and
+            # surface their aggregate status as one live board. Checked before the background
+            # cue (a single detached run) and the live cue (an inline preset run).
+            message = AIMessage(
+                content="Kicking all of them off together — I'll keep you posted on each.",
+                tool_calls=[{"name": _RUNS_BOARD_TOOL_NAME, "args": {}, "id": "board-call-1"}],
             )
         elif _wants_background_run(messages):
             # Heavy job to hand off: launch it in the background and report its
