@@ -51,6 +51,8 @@
 - **fail-loud 确定性 guard** —— 重放时 `agent()` 调用序列一旦分叉即抛错，绝不喂回错位的缓存。
 - **共享 token 预算** —— 一道上限管住所有叶子，配套 `loop-until-budget` 范式。
 - **默认可观测** —— 每个 `agent` / `parallel` / `pipeline` / `race` 调用都向可选 sink 发一个 span（不接 sink 时零成本）。
+- **大扇出批处理 map** —— `ctx.batch_map` 让 `Iterable` / `AsyncIterable` 经有界准入窗口流式消费，数千 item 永不一次性物化数千 task；结果按输入序回收，并自动发实时 count/ETA 进度。
+- **后台 run 实时下钻** —— detached 后台 run 不再不透明：其运行事件缓冲在 slot 上，活的一轮把它们重放成与 inline run 一模一样的逐叶卡片，故 host 可下钻一个在跑的后台 job，并按需回报每条 run 的结果。
 - **per-leaf sandbox 隔离 + 真执行** —— 执行类叶子各租一个隔离 backend（`/shared/` 路由支持显式的 producer→consumer 交接）；可 opt-in `LocalSubprocessSandbox` 跑真子进程 build/test，带 exit-code gating、资源上限与准入控制。
 - **真 git worktree + 分支/PR** —— 可 opt-in `GitWorktreeProvider`，每个改文件的叶子跑在自己的真 `git worktree` / 真分支里（其权威变更就是真 `git diff`），经真 `git merge` 折进 integration 分支并收口成 PR。
 - **运行中人工签核** —— `ctx.checkpoint` 经 journal 驱动的门把运行中途暂停下来等人工决策再续跑（超越 Claude Code——它运行中不接受输入）。
@@ -198,13 +200,15 @@ LDW_DEMO_REAL_MODEL=anthropic/claude-opus-4.8 uv run python -m examples.flagship
 - **meta 层** —— `compile_workflow_source` / `run_workflow_from_source` / `extract_meta`：把 LLM 当场写的源码经 AST gate 编译并运行。
 - **注册表** —— `Roster` / `RosterEntry`、`WorkflowRegistry`。
 - **host 面** —— `create_workflow_tool`、`create_workflow_middleware`、`skills_path` / `skill_files`。
-- **原语** —— 挂在传给脚本的 `Ctx` 上：`agent` / `parallel` / `pipeline` / `race` / `phase` / `log` / `budget` / `workflow` / `checkpoint`。`ctx.race(candidates, *, win, win_tag="")` 把若干 `RaceCandidate` 并发跑起，返回第一个令 `win` 为真者的 `RaceResult`，其余 cancel；决策内容哈希 journal（`win_tag` 折进 key），故 resume 复现胜者且零派发。`ctx.checkpoint(ask, *, tag="")` 把运行中途暂停下来等人工签核 —— 一道 journal 驱动的门，抛 `WorkflowSignoffRequired`；host 经 `run_workflow(resume=...)` 喂回决策续跑（host 面的 `approve` 工具命令）。
+- **原语** —— 挂在传给脚本的 `Ctx` 上：`agent` / `parallel` / `pipeline` / `race` / `dag` / `loop_until` / `batch_map` / `phase` / `log` / `budget` / `workflow` / `checkpoint`。`ctx.dag(nodes)` 把 `DagNode` 依赖图按拓扑序跑（独立失败跟踪）；`ctx.loop_until(...)` 是有界顺序循环 helper。`ctx.batch_map(items, fn, *, max_in_flight=None, total=None, label="batch_map")` 把一个异步 `fn` map 到 `Iterable` / `AsyncIterable` 的每个 item，经有界准入窗口（在飞 task ≈ `worker_count + queue_maxsize`、与 N 解耦），结果按输入序回收 `list[T | None]`（失败 `fn` 落 `None`、不 abort），并自动发 transient count/ETA 进度。`ctx.race(candidates, *, win, win_tag="")` 把若干 `RaceCandidate` 并发跑起，返回第一个令 `win` 为真者的 `RaceResult`，其余 cancel；决策内容哈希 journal（`win_tag` 折进 key），故 resume 复现胜者且零派发。`ctx.checkpoint(ask, *, tag="")` 把运行中途暂停下来等人工签核 —— 一道 journal 驱动的门，抛 `WorkflowSignoffRequired`；host 经 `run_workflow(resume=...)` 喂回决策续跑（host 面的 `approve` 工具命令）。
 - **跨叶归约** —— 折叠 `parallel` / `pipeline` 返回的结果列表的纯函数：`survives`（refute-by-default 投票）、`dedup`、`reconcile`（双盲复核调解）、`corroborate`（跨叶相互印证），外加 `ReviewItem` / `Reconciled` / `Consensus` 结果类型。同时注入 `run_script` 命名空间——host 当场写的脚本无需 import 即可按名调用。
 - **race 值类型** —— `RaceCandidate`（一份可内容哈希的 agent 调用规格，镜像 `agent()` 调用）与 `RaceResult`（胜者、其下标、`.won`）。两者同样注入 `run_script` 命名空间——host 当场写的脚本无需 import 即可按名构造和读取。
 - **执行与隔离后端** —— `SandboxManager`，外加 host opt-in 的可插拔接缝：真子进程执行的 `LocalSubprocessSandbox` / `local_subprocess_factory` / `ExecPolicy`；per-leaf worktree 隔离的 `WorktreeProvider` / `InMemoryWorktreeProvider` 与真 git 的 `GitWorktreeProvider`；以及 PR 收口的 `PullRequestProvider` / `PullRequestRef` / `LocalPullRequestProvider`。真后端是 DANGEROUS opt-in（真子进程 / `git`），非安全沙箱。
 - **持久化** —— `WorkflowRunStore` / `RunSpec` / `InMemoryRunStore`（默认、零依赖）与 `SqliteWorkflowStore`（可选 `[sqlite]` extra），使 run 可跨进程续跑。
-- **live 可观测 sink** —— `run_workflow` 的 keyword-only `on_span` / `on_span_begin` / `on_leaf_event` / `on_command`（皆默认 no-op、带外），外加值类型 `Span` / `SpanBegin` / `SpanKind` / `LeafEvent` / `CommandEvent` 及其 `*Sink` 别名。
-- **类型与异常** —— `Budget`、`JournalStore` / `InMemoryJournalStore` / `JournalRecord` / `race_key`、`BgRunManager` 家族，以及 `Workflow*Error` 系列异常（`WorkflowScriptError`、`WorkflowSignoffRequired`、`WorkflowCheckpointError` 等）。
+- **live 可观测 sink** —— `run_workflow` 的 keyword-only `on_span` / `on_span_begin` / `on_leaf_event` / `on_command`（皆默认 no-op、带外），外加值类型 `Span` / `SpanBegin` / `SpanKind` / `LeafEvent` / `CommandEvent` 及其 `*Sink` 别名。对 **detached 后台 run**，同一批 sink 喂一个有界的 per-slot buffer —— `BgRunManager.event_sinks(run_id)`（由 `RunEventSinks` 构造、线进 detached 的 `run_workflow`）把事件捕成 `BufferedEvent`，`BgRunManager.buffered_events(run_id)` 取出供活的一轮重放；buffer 是 transient 遥测（不入 journal/replay、隔离保持）。
+- **拓扑扇出 + 嵌套** —— `DagNode`（`ctx.dag` 的节点规格，同样注入 `run_script` 命名空间）与 `WorkflowDagError` / `WorkflowCycleError` 异常。
+- **批处理进度** —— `BatchMetrics`（`ctx.batch_map` 的 count/ETA 载荷）与 `ProgressKind.BATCH` / `ProgressEntry.metrics`。
+- **类型与异常** —— `Budget`、`JournalStore` / `InMemoryJournalStore` / `JournalRecord` / `race_key`、`BgRunManager` 家族（`RunSnapshot`、`BufferedEvent`、`RunEventSinks`），以及 `Workflow*Error` 系列异常（`WorkflowScriptError`、`WorkflowSignoffRequired`、`WorkflowCheckpointError` 等）。
 
 公开签名稳定；新增参数一律 keyword-only 带默认值。以 `_` 开头的模块和成员属于内部实现，可能随时变动。
 
@@ -221,7 +225,7 @@ uv run lint-imports     # 校验 Layer 0/1/2 架构边界
 
 ## 状态
 
-**0.2.0 已发布；0.3.0 进行中 —— 尚未发布到 PyPI。** 三层全部落地、公开 API 稳定。v0.3.0 线已落地跨叶归约（M1）、race（M2）、多并行 run 可观测（M3.5）、跨会话持久（M3）、真本地执行（M5）、运行中人工签核（M4）、真 git worktree + 分支/PR（M6）；拓扑序 fan-out + 深层嵌套（M7）待做。完整日志见 [`CHANGELOG.md`](CHANGELOG.md)。
+**0.3.0 已发布（打 tag `v0.3.0`）；0.4.0 进行中 —— 尚未发布到 PyPI。** 三层全部落地、公开 API 稳定。v0.3.0 线已落地跨叶归约（M1）、race（M2）、多并行 run 可观测（M3.5）、跨会话持久（M3）、真本地执行（M5）、运行中人工签核（M4）、真 git worktree + 分支/PR（M6）、拓扑序 fan-out + 深层嵌套（M7）。v0.4.0 线已落地批处理人体工学（`ctx.batch_map`，E）与后台 run transport —— 实时下钻 + 结果回传（v0.4.0 M3）。完整日志见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 许可证
 
