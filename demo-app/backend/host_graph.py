@@ -59,6 +59,7 @@ from langchain_dynamic_workflow import (
     BgRunManager,
     BgRunQuotaExceededError,
     BgStatus,
+    BufferedEvent,
     Ctx,
     ExecDecision,
     ExecPolicy,
@@ -67,6 +68,8 @@ from langchain_dynamic_workflow import (
     InMemoryJournalStore,
     JournalStore,
     LocalPullRequestProvider,
+    ProgressEntry,
+    ProgressKind,
     PullRequestProvider,
     RunSnapshot,
     SandboxManager,
@@ -1324,6 +1327,111 @@ async def run_runs_board(state: Annotated[dict[str, Any], InjectedState]) -> str
     _emit_run_status(emit)
     return await run_runs_board_live(
         _BG_MANAGER, emit, thread_id=_host_thread_id(), jobs=_RUNS_BOARD_JOBS
+    )
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 M3(1) — drill into one background run: replay its buffered events.
+# ---------------------------------------------------------------------------
+
+# One drill tick fully replays the run's buffer through a FRESH UiAdapter bound to
+# the live turn's emit. Stable engine-minted span_ids make the replay idempotent at
+# the SDK reducer (same id upserts in place), so a poll loop re-replaying each tick
+# never stacks duplicate cards, and a late observer gets the full picture.
+_DRILL_POLL_INTERVAL_S = _BOARD_POLL_INTERVAL_S
+_DRILL_MAX_POLLS = _BOARD_MAX_POLLS
+
+# BufferedEvent.kind -> the UiAdapter consumer method a replay dispatches it to.
+_REPLAY_DISPATCH: dict[str, str] = {
+    "span_begin": "on_span_begin",
+    "span": "on_span",
+    "leaf_event": "on_leaf_event",
+    "progress": "on_progress",
+    "command": "on_command",
+}
+
+
+def _replay_buffered(adapter: UiAdapter, events: Sequence[BufferedEvent]) -> None:
+    """Replay raw buffered engine events into a UiAdapter in arrival order."""
+    for event in events:
+        method = getattr(adapter, _REPLAY_DISPATCH[event.kind])
+        method(event.payload)
+
+
+def _resolve_drill_target(
+    manager: BgRunManager, *, thread_id: str, target: str
+) -> RunSnapshot | None:
+    """Resolve a drill target by exact run_id, exact label, then unique run_id prefix."""
+    snapshots = manager.list_runs(thread_id)
+    for snap in snapshots:
+        if snap.run_id == target:
+            return snap
+    for snap in snapshots:
+        if snap.label == target:
+            return snap
+    matches = [s for s in snapshots if s.run_id.startswith(target)] if target else []
+    return matches[0] if len(matches) == 1 else None
+
+
+async def drill_run_live(
+    manager: BgRunManager,
+    emit: UiEmit,
+    *,
+    thread_id: str,
+    target: str,
+) -> str:
+    """Drill into one background run: poll-replay its buffered events as live cards.
+
+    The engine-facing core of the :func:`drill_run` host tool. Each tick takes a
+    full snapshot of the run's buffered transport events and replays it through a
+    fresh :class:`UiAdapter` bound to THIS turn's emit — producing the same card
+    vocabulary an inline run streams (``agent_span`` / ``fanout_graph`` /
+    ``phase_timeline`` / ``execution_command``), idempotently (stable span_ids
+    upsert in place). The loop ends when the run reaches a terminal status (one
+    final replay included) or the poll cap expires.
+
+    Args:
+        manager: The shared background-run manager.
+        emit: The host-bound, non-blocking UI emit for THIS live turn.
+        thread_id: The host thread id keying the run slots.
+        target: A run id, a run label, or a unique run-id prefix.
+
+    Returns:
+        A short text summary naming the run, its status, and the replayed event count.
+    """
+    snap = _resolve_drill_target(manager, thread_id=thread_id, target=target)
+    if snap is None:
+        available = ", ".join(
+            f"{s.label or s.run_id} ({s.status.value})" for s in manager.list_runs(thread_id)
+        )
+        return (
+            f"no background run matches {target!r}; "
+            f"available runs: {available or '(none on this thread)'}"
+        )
+
+    run_id = snap.run_id
+    events: list[BufferedEvent] = []
+    dropped = 0
+    for _poll in range(_DRILL_MAX_POLLS):
+        events, dropped = manager.buffered_events(run_id, thread_id=thread_id)
+        adapter = UiAdapter(emit=emit)  # fresh per tick: full replay, zero carryover
+        _replay_buffered(adapter, events)
+        if dropped > 0:
+            adapter.on_progress(
+                ProgressEntry(
+                    kind=ProgressKind.LOG,
+                    message=f"[drill] {dropped} events dropped past the buffer cap",
+                )
+            )
+        if manager.poll(run_id, thread_id=thread_id) in _BOARD_TERMINAL:
+            break
+        await asyncio.sleep(_DRILL_POLL_INTERVAL_S)
+
+    status = manager.poll(run_id, thread_id=thread_id)
+    return (
+        f"drilled into run {run_id} ({snap.label or 'unlabelled'}): "
+        f"status={status.value}, replayed {len(events)} events"
+        + (f", {dropped} dropped" if dropped else "")
     )
 
 
