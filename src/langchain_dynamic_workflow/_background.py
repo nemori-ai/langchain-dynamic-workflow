@@ -29,12 +29,18 @@ import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ._errors import WorkflowSignoffRequired
-from ._leaf_events import LeafEvent
-from ._observability import CommandEvent, Span, SpanBegin
-from ._progress import ProgressEntry
+
+if TYPE_CHECKING:
+    # Type-only references for the transport payload union: the background substrate
+    # buffers engine events as opaque payloads and never constructs or inspects them,
+    # so these imports stay out of the runtime import graph (the substrate remains
+    # runtime-independent of the engine internals).
+    from ._leaf_events import LeafEvent
+    from ._observability import CommandEvent, Span, SpanBegin
+    from ._progress import ProgressEntry
 
 
 class BgStatus(StrEnum):
