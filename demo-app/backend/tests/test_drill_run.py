@@ -350,3 +350,52 @@ async def test_drill_ambiguous_label_substring_resolves_to_none() -> None:
         manager, lambda name, props: None, thread_id="t1", target="context"
     )
     assert "no background run matches" in summary, summary
+
+
+async def test_board_then_drill_multiturn_through_host_graph() -> None:
+    """Offline multi-turn THROUGH the real host graph: board fan-out, then drill replay.
+
+    Direct-call drill tests bypass host tool-routing and turn accumulation; this drives
+    ``_build_host_graph`` over two turns on one thread (a checkpointer accumulates history
+    the way ``langgraph dev`` does) so turn B's drill sees turn A's runs on the shared
+    background manager. It pins the headline through the product surface: turn A routes to
+    ``run_runs_board`` (a ``run_board`` card lands), and turn B's drill replays the picked
+    run's per-leaf interior — an ``agent_span`` on the accumulated ui channel, a card the
+    board's aggregate rows never carry. Offline (no keys) so it is deterministic and CI-safe.
+    """
+    from host_graph import _BG_MANAGER, _build_host_graph
+    from langchain_core.messages import HumanMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    _BG_MANAGER._slots.clear()  # pyright: ignore[reportPrivateUsage] - isolate this thread's runs
+    _BG_MANAGER._notices.clear()  # pyright: ignore[reportPrivateUsage]
+    graph = _build_host_graph(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "t-drill-multiturn"}}
+
+    board_msg = (
+        "I've got a few separate things I want looked into at the same time — start all "
+        "three off together and keep me posted on how each one is going."
+    )
+    turn_a = await graph.ainvoke({"messages": [HumanMessage(content=board_msg)]}, config=config)
+    boards = [u for u in turn_a.get("ui", []) if u.get("name") == "run_board"]
+    assert boards, [u.get("name") for u in turn_a.get("ui", [])]
+
+    # The offline scripted host takes the text AFTER "drill into" as the target verbatim,
+    # so it must be the clean run label (the scripted NLU is naive — a real model extracts
+    # the label from richer phrasing). The point here is the multi-turn + replay mechanism.
+    drill_msg = "Drill into RAG vs long-context"
+    turn_b = await graph.ainvoke({"messages": [HumanMessage(content=drill_msg)]}, config=config)
+
+    # drill_run_live's ToolMessage names the replayed event count — proof the drill ran and
+    # replayed the detached run's buffered interior (offline _REPLY_DRILL never carries it).
+    drill_replies = [
+        str(m.content)
+        for m in turn_b["messages"]
+        if type(m).__name__ == "ToolMessage" and "replayed" in str(m.content)
+    ]
+    assert drill_replies, "the drill tool must have run (its reply names the replayed events)"
+
+    # Headline: the drilled detached run's per-leaf interior reached the ui channel — an
+    # agent_span the board's aggregate rows never carry.
+    agent_spans = [u for u in turn_b.get("ui", []) if u.get("name") == "agent_span"]
+    assert agent_spans, [u.get("name") for u in turn_b.get("ui", [])]
