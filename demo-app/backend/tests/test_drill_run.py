@@ -300,3 +300,53 @@ async def test_fetch_run_result_tool_schema_has_target_not_mangled() -> None:
     fields = set(fetch_run_result.get_input_schema().model_fields)
     assert "target" in fields, sorted(fields)
     assert "v__args" not in fields, sorted(fields)
+
+
+async def _two_labelled_runs(manager: Any, labels: tuple[str, str]) -> None:
+    """Launch + settle two background runs with the given display labels."""
+    from host_graph import launch_background_run
+
+    for label in labels:
+        run_id = launch_background_run(
+            manager, thread_id="t1", workflow=_OFFLINE_PRESET, label=label
+        )
+        await manager.wait(run_id, thread_id="t1")
+
+
+async def test_drill_resolves_unique_case_insensitive_label_substring() -> None:
+    """A colloquial target ("RAG") drills the one run whose label contains it.
+
+    A real host turns "look into the RAG one" into ``drill_run(target="RAG")`` — a
+    fragment of the board label "RAG vs long-context", not its exact text. Resolution
+    must fall back to a unique, case-insensitive label substring so the drill lands on
+    the intended run instead of failing on an inexact label.
+    """
+    from host_graph import drill_run_live
+
+    from langchain_dynamic_workflow import BgRunManager
+
+    manager = BgRunManager()
+    await _two_labelled_runs(manager, ("RAG vs long-context", "Agent frameworks"))
+
+    summary = await drill_run_live(manager, lambda name, props: None, thread_id="t1", target="rag")
+    assert "RAG vs long-context" in summary, summary
+    assert "no background run matches" not in summary, summary
+
+
+async def test_drill_ambiguous_label_substring_resolves_to_none() -> None:
+    """An ambiguous substring matching two labels refuses (honest), never guesses.
+
+    "context" is a substring of both labels; with no unique match the drill must
+    report no match (and list what is available) rather than silently picking one.
+    """
+    from host_graph import drill_run_live
+
+    from langchain_dynamic_workflow import BgRunManager
+
+    manager = BgRunManager()
+    await _two_labelled_runs(manager, ("RAG vs long-context", "Long-context models"))
+
+    summary = await drill_run_live(
+        manager, lambda name, props: None, thread_id="t1", target="context"
+    )
+    assert "no background run matches" in summary, summary

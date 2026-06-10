@@ -1404,16 +1404,39 @@ def _replay_buffered(adapter: UiAdapter, events: Sequence[BufferedEvent]) -> Non
 def _resolve_drill_target(
     manager: BgRunManager, *, thread_id: str, target: str
 ) -> RunSnapshot | None:
-    """Resolve a drill target by exact run_id, exact label, then unique run_id prefix."""
+    """Resolve a drill target against the thread's runs, most-precise match first.
+
+    Tried in order: exact run id, exact label, unique run-id prefix, then a unique
+    case-insensitive label substring. The substring fallback exists because a real
+    host turns colloquial phrasing ("look into the RAG one") into a label FRAGMENT,
+    not the board's exact label text — so a fragment resolves as long as it is
+    unambiguous. Ambiguity (a fragment matching two labels) and no match both return
+    ``None`` so the caller refuses honestly rather than guessing a run.
+
+    Args:
+        manager: The background-run manager whose thread runs are searched.
+        thread_id: The host thread whose runs are candidates.
+        target: A run id, exact label, unique id prefix, or unique label substring.
+
+    Returns:
+        The single matching :class:`RunSnapshot`, or ``None`` when nothing matches or
+        a substring is ambiguous.
+    """
     snapshots = manager.list_runs(thread_id)
+    if not target:
+        return None
     for snap in snapshots:
         if snap.run_id == target:
             return snap
     for snap in snapshots:
         if snap.label == target:
             return snap
-    matches = [s for s in snapshots if s.run_id.startswith(target)] if target else []
-    return matches[0] if len(matches) == 1 else None
+    id_prefix = [s for s in snapshots if s.run_id.startswith(target)]
+    if len(id_prefix) == 1:
+        return id_prefix[0]
+    needle = target.casefold()
+    label_substr = [s for s in snapshots if s.label and needle in s.label.casefold()]
+    return label_substr[0] if len(label_substr) == 1 else None
 
 
 async def drill_run_live(
