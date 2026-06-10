@@ -29,6 +29,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Any
@@ -1044,10 +1045,11 @@ def launch_background_run(
     :meth:`BgRunManager.poll` for lifecycle status and :meth:`BgRunManager.get_result`
     for the settled result.
 
-    The detached task intentionally receives NO progress/span sinks: it does not carry
-    the host node context, so a ``push_ui_message`` from inside it would target the wrong
-    (or no) stream. Live streaming is the inline tools' job; the background path surfaces
-    lifecycle status and the final result.
+    The detached task receives the manager's BUFFER sinks (bounded, lock-guarded appends
+    onto the run's slot — never a host ``push_ui_message``, which would target the wrong
+    or no stream from a detached task): its raw span / progress / leaf / command events
+    are captured for an out-of-band drill-in replay via :func:`drill_run`. Live streaming
+    into the chat remains the inline tools' job.
 
     Args:
         manager: The shared :class:`~langchain_dynamic_workflow.BgRunManager` to launch on.
@@ -1067,14 +1069,29 @@ def launch_background_run(
     workflow_fn = workflows.resolve(workflow)  # fail-loud on an unknown name
     resolved_args = workflow_args if workflow_args is not None else {}
 
+    # Pre-resolve the run id so the buffer sinks bind the right slot key before the
+    # detached task starts; the sinks resolve the slot lazily, so building them ahead
+    # of manager.start is harmless.
+    run_id = uuid.uuid4().hex
+    sinks = manager.event_sinks(run_id, thread_id=thread_id)
+
     async def _run() -> str:
         async def _orchestrate(ctx: Ctx) -> Any:
             return await workflow_fn(ctx, resolved_args)
 
-        result = await run_workflow(_orchestrate, roster=make_roster(), workflows=workflows)
+        result = await run_workflow(
+            _orchestrate,
+            roster=make_roster(),
+            workflows=workflows,
+            on_span_begin=sinks.on_span_begin,
+            on_span=sinks.on_span,
+            on_leaf_event=sinks.on_leaf_event,
+            on_progress=sinks.on_progress,
+            on_command=sinks.on_command,
+        )
         return str(result)
 
-    slot = manager.start(_run(), thread_id=thread_id, label=label)
+    slot = manager.start(_run(), run_id=run_id, thread_id=thread_id, label=label)
     return slot.run_id
 
 
