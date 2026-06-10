@@ -23,14 +23,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 import time
 import uuid
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ._errors import WorkflowSignoffRequired
+
+if TYPE_CHECKING:
+    # Type-only references for the transport payload union: the background substrate
+    # buffers engine events as opaque payloads and never constructs or inspects them,
+    # so these imports stay out of the runtime import graph (the substrate remains
+    # runtime-independent of the engine internals).
+    from ._leaf_events import LeafEvent
+    from ._observability import CommandEvent, Span, SpanBegin
+    from ._progress import ProgressEntry
 
 
 class BgStatus(StrEnum):
@@ -80,6 +90,49 @@ class BgRunStateError(RuntimeError):
     running, already done, or was cancelled): there is nothing to continue, so the
     manager refuses loud rather than relaunching a run in the wrong state.
     """
+
+
+type BufferedPayload = SpanBegin | Span | LeafEvent | ProgressEntry | CommandEvent
+"""The verbatim engine event object captured for replay."""
+
+
+@dataclass(frozen=True, slots=True)
+class BufferedEvent:
+    """One raw engine event captured from a detached background run for later replay.
+
+    Attributes:
+        kind: Which engine sink produced it — ``"span_begin"`` / ``"span"`` /
+            ``"leaf_event"`` / ``"progress"`` / ``"command"`` — so a replay
+            dispatches to the matching consumer method without type-sniffing.
+        payload: The verbatim engine event object.
+    """
+
+    kind: str
+    payload: BufferedPayload
+
+
+@dataclass(frozen=True, slots=True)
+class RunEventSinks:
+    """The five engine sinks that buffer a background run's events on its slot.
+
+    Built by :meth:`BgRunManager.event_sinks` and passed verbatim into
+    ``run_workflow``'s keyword-only sink parameters. Each sink is a synchronous,
+    bounded, lock-guarded append that never raises and never blocks — satisfying
+    the engine's inline-sink contract.
+
+    Attributes:
+        on_span_begin: Buffers a span-open edge.
+        on_span: Buffers a completed span.
+        on_leaf_event: Buffers one leaf interior callback edge.
+        on_progress: Buffers a progress entry.
+        on_command: Buffers a real-execution command edge (may fire off-loop).
+    """
+
+    on_span_begin: Callable[[SpanBegin], None]
+    on_span: Callable[[Span], None]
+    on_leaf_event: Callable[[LeafEvent], None]
+    on_progress: Callable[[ProgressEntry], None]
+    on_command: Callable[[CommandEvent], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +252,11 @@ class ResultStore:
         self._payloads.pop(handle, None)
 
 
+def _empty_event_buffer() -> list[BufferedEvent]:
+    """Typed default factory for a slot's bounded event buffer."""
+    return []
+
+
 @dataclass
 class BgRunSlot:
     """Tracking record for one detached background run.
@@ -221,6 +279,11 @@ class BgRunSlot:
             deciding), else ``None``. Cleared when the run is approved.
         parked_at: Monotonic timestamp when the run parked at a sign-off gate, else
             ``None``. Drives the park-TTL expiry in ``sweep``; cleared on approve.
+        events: Bounded raw-event buffer capturing the run's transport events for
+            later replay.
+        dropped: How many events were dropped past the buffer cap.
+        events_lock: Lock guarding buffer reads/writes — ``on_command`` appends
+            from an ``asyncio.to_thread`` worker, off the event loop.
     """
 
     run_id: str
@@ -235,6 +298,9 @@ class BgRunSlot:
     error: str | None = None
     ask: Any = None
     parked_at: float | None = None
+    events: list[BufferedEvent] = field(default_factory=_empty_event_buffer)
+    dropped: int = 0
+    events_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 def _composite_key(thread_id: str, run_id: str) -> tuple[str, str]:
@@ -267,6 +333,9 @@ class BgRunManager:
             ``sweep`` expires it (→ ``CANCELLED`` + notice), so an abandoned sign-off
             does not hold a quota slot forever. Generous by default (a human decision
             may take a long time); a live sign-off still completes on approve.
+        max_buffered_events: Per-run cap on buffered transport events. Past the
+            cap, new events are dropped (drop-newest) and counted in the slot's
+            ``dropped`` tally. Must be positive.
     """
 
     def __init__(
@@ -276,6 +345,7 @@ class BgRunManager:
         idle_ttl_seconds: float = 3600.0,
         max_concurrent_runs: int | None = None,
         park_ttl_seconds: float = 86400.0,
+        max_buffered_events: int = 2000,
     ) -> None:
         if max_concurrent_runs is not None and max_concurrent_runs <= 0:
             # 0/negative is not a meaningful quota: it would refuse every run
@@ -285,6 +355,12 @@ class BgRunManager:
                 f"max_concurrent_runs must be a positive integer or None (unbounded); "
                 f"got {max_concurrent_runs!r}, which would refuse every run"
             )
+        if max_buffered_events <= 0:
+            raise ValueError(
+                f"max_buffered_events must be a positive integer, got {max_buffered_events!r}; "
+                "the per-run event buffer needs a real bound"
+            )
+        self._max_buffered_events = max_buffered_events
         self._result_store = result_store if result_store is not None else ResultStore()
         self._idle_ttl_seconds = idle_ttl_seconds
         self._max_concurrent_runs = max_concurrent_runs
@@ -306,6 +382,11 @@ class BgRunManager:
     def max_concurrent_runs(self) -> int | None:
         """The concurrent-run quota, or ``None`` when unbounded."""
         return self._max_concurrent_runs
+
+    @property
+    def max_buffered_events(self) -> int:
+        """Per-run cap on buffered transport events."""
+        return self._max_buffered_events
 
     def active_run_count(self) -> int:
         """Return how many runs are currently in flight (non-terminal)."""
@@ -360,6 +441,66 @@ class BgRunManager:
             for (slot_thread, _run_id), slot in self._slots.items()
             if slot_thread == thread_id
         ]
+
+    def buffered_events(
+        self, run_id: str, *, thread_id: str | None = None
+    ) -> tuple[list[BufferedEvent], int]:
+        """Return a snapshot copy of a run's buffered events and its dropped count.
+
+        Returns ``([], 0)`` for an unknown run (never created, or reclaimed by
+        ``sweep``) so a replay loop can keep polling without guarding KeyError. The
+        list is a shallow copy taken under the slot's events lock, so a concurrent
+        worker-thread append cannot tear the read.
+
+        Args:
+            run_id: The run whose buffer to snapshot.
+            thread_id: Optional owning thread to disambiguate the composite key.
+
+        Returns:
+            A ``(events, dropped)`` pair: the buffered events in arrival order and
+            how many were dropped past the buffer cap.
+        """
+        slot = self._find(run_id, thread_id)
+        if slot is None:
+            return ([], 0)
+        with slot.events_lock:
+            return (list(slot.events), slot.dropped)
+
+    def event_sinks(self, run_id: str, *, thread_id: str) -> RunEventSinks:
+        """Build append-only transport sinks bound to ``run_id``'s slot buffer.
+
+        Each sink resolves the slot lazily at append time (so the sinks can be built
+        before ``start`` registers the slot, and outlive a swept slot harmlessly),
+        then appends under the slot's events lock, dropping past the buffer cap and
+        counting the drop. Synchronous, never raises, never blocks.
+
+        Args:
+            run_id: The run whose slot buffer receives the events.
+            thread_id: The owning host thread (part of the composite slot key).
+
+        Returns:
+            A :class:`RunEventSinks` bundle for ``run_workflow``'s sink parameters.
+        """
+        key = _composite_key(thread_id, run_id)
+        cap = self._max_buffered_events
+
+        def _append(kind: str, payload: BufferedPayload) -> None:
+            slot = self._slots.get(key)
+            if slot is None:
+                return  # run never registered, or already swept: drop silently
+            with slot.events_lock:
+                if len(slot.events) >= cap:
+                    slot.dropped += 1
+                    return
+                slot.events.append(BufferedEvent(kind=kind, payload=payload))
+
+        return RunEventSinks(
+            on_span_begin=lambda e: _append("span_begin", e),
+            on_span=lambda e: _append("span", e),
+            on_leaf_event=lambda e: _append("leaf_event", e),
+            on_progress=lambda e: _append("progress", e),
+            on_command=lambda e: _append("command", e),
+        )
 
     def start(
         self,

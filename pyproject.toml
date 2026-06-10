@@ -190,6 +190,14 @@ forbidden_modules = [
     "langchain_dynamic_workflow._progress",
     "langchain_dynamic_workflow._context",
 ]
+# The background-run transport buffer types (`BufferedEvent` / `RunEventSinks`)
+# annotate engine event payloads (`ProgressEntry` et al.) but treat them as opaque:
+# the import is TYPE_CHECKING-only in `_background.py`, so the substrate's runtime
+# import graph stays engine-free. import-linter still records guarded imports, so
+# this single type-only edge is whitelisted explicitly.
+ignore_imports = [
+    "langchain_dynamic_workflow._background -> langchain_dynamic_workflow._progress",
+]
 
 # The roster (leaf resolution), the determinism guard, and the AST security gate
 # are deliberately substrate-agnostic: they must never import LangGraph internals.

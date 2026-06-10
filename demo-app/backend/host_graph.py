@@ -29,6 +29,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Any
@@ -58,6 +59,7 @@ from langchain_dynamic_workflow import (
     BgRunManager,
     BgRunQuotaExceededError,
     BgStatus,
+    BufferedEvent,
     Ctx,
     ExecDecision,
     ExecPolicy,
@@ -66,6 +68,8 @@ from langchain_dynamic_workflow import (
     InMemoryJournalStore,
     JournalStore,
     LocalPullRequestProvider,
+    ProgressEntry,
+    ProgressKind,
     PullRequestProvider,
     RunSnapshot,
     SandboxManager,
@@ -1044,10 +1048,11 @@ def launch_background_run(
     :meth:`BgRunManager.poll` for lifecycle status and :meth:`BgRunManager.get_result`
     for the settled result.
 
-    The detached task intentionally receives NO progress/span sinks: it does not carry
-    the host node context, so a ``push_ui_message`` from inside it would target the wrong
-    (or no) stream. Live streaming is the inline tools' job; the background path surfaces
-    lifecycle status and the final result.
+    The detached task receives the manager's BUFFER sinks (bounded, lock-guarded appends
+    onto the run's slot — never a host ``push_ui_message``, which would target the wrong
+    or no stream from a detached task): its raw span / progress / leaf / command events
+    are captured for an out-of-band drill-in replay via :func:`drill_run`. Live streaming
+    into the chat remains the inline tools' job.
 
     Args:
         manager: The shared :class:`~langchain_dynamic_workflow.BgRunManager` to launch on.
@@ -1067,14 +1072,29 @@ def launch_background_run(
     workflow_fn = workflows.resolve(workflow)  # fail-loud on an unknown name
     resolved_args = workflow_args if workflow_args is not None else {}
 
+    # Pre-resolve the run id so the buffer sinks bind the right slot key before the
+    # detached task starts; the sinks resolve the slot lazily, so building them ahead
+    # of manager.start is harmless.
+    run_id = uuid.uuid4().hex
+    sinks = manager.event_sinks(run_id, thread_id=thread_id)
+
     async def _run() -> str:
         async def _orchestrate(ctx: Ctx) -> Any:
             return await workflow_fn(ctx, resolved_args)
 
-        result = await run_workflow(_orchestrate, roster=make_roster(), workflows=workflows)
+        result = await run_workflow(
+            _orchestrate,
+            roster=make_roster(),
+            workflows=workflows,
+            on_span_begin=sinks.on_span_begin,
+            on_span=sinks.on_span,
+            on_leaf_event=sinks.on_leaf_event,
+            on_progress=sinks.on_progress,
+            on_command=sinks.on_command,
+        )
         return str(result)
 
-    slot = manager.start(_run(), thread_id=thread_id, label=label)
+    slot = manager.start(_run(), run_id=run_id, thread_id=thread_id, label=label)
     return slot.run_id
 
 
@@ -1217,6 +1237,42 @@ def _summarize_board(snapshots: Sequence[RunSnapshot], *, launched: int, request
     return f"{head}: {', '.join(parts)}."
 
 
+_REPORT_MAX_CHARS = 600
+"""Per-run cap for the final board report fed back into the host context."""
+
+
+def _cap(text: str, *, max_chars: int) -> str:
+    """Truncate ``text`` to ``max_chars`` with a trailing ellipsis past the cap."""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return text[:max_chars]
+    return text[: max_chars - 3] + "..."
+
+
+def _per_run_report(
+    manager: BgRunManager, snapshots: Sequence[RunSnapshot], *, thread_id: str
+) -> str:
+    """One line per settled run: label, status, capped result substance (+ handle).
+
+    The substance is the run's inlined result when small, else its summary; an
+    offloaded result also names its opaque ``result://`` handle so the host can pull
+    the full payload on demand via :func:`fetch_run_result`.
+    """
+    lines: list[str] = []
+    for snap in snapshots:
+        result = manager.get_result(snap.run_id, thread_id=thread_id)
+        body = result.value if result.value is not None else result.summary
+        line = (
+            f"- {snap.label or snap.run_id} [status={result.status.value}]: "
+            f"{_cap(body, max_chars=_REPORT_MAX_CHARS)}"
+        )
+        if result.handle is not None:
+            line += f" (full result: fetch_run_result {result.handle})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 async def run_runs_board_live(
     manager: BgRunManager,
     emit: UiEmit,
@@ -1234,9 +1290,12 @@ async def run_runs_board_live(
     reaches a terminal status, and returns a short text summary.
 
     A run refused by the manager's concurrency quota stops further launches (the board
-    surfaces "launched X of N" honestly rather than silently dropping a job). Background
-    runs stay UI-dark: the board shows aggregate status + capped summary only, never a
-    detached run's interior fan-out.
+    surfaces "launched X of N" honestly rather than silently dropping a job). The board
+    card itself stays an aggregate view (one row per run); a run's interior fan-out is
+    available on demand through :func:`drill_run_live`, which replays its buffered
+    transport events. The returned text leads with the aggregate summary and then
+    carries one capped result line per run (plus a ``result://`` handle when the full
+    payload was offloaded).
 
     Args:
         manager: The shared :class:`~langchain_dynamic_workflow.BgRunManager`.
@@ -1246,7 +1305,7 @@ async def run_runs_board_live(
         workflow: The preset each job runs; defaults to ``deep_research``.
 
     Returns:
-        A short summary naming how many jobs ran and how many finished.
+        The aggregate summary line followed by one capped result line per run.
     """
     requested = len(jobs)
     launched_ids: list[str] = []
@@ -1280,7 +1339,8 @@ async def run_runs_board_live(
             break
         await asyncio.sleep(_BOARD_POLL_INTERVAL_S)
 
-    return _summarize_board(snapshots, launched=launched, requested=requested)
+    head = _summarize_board(snapshots, launched=launched, requested=requested)
+    return head + "\n" + _per_run_report(manager, snapshots, thread_id=thread_id)
 
 
 @tool
@@ -1292,15 +1352,18 @@ async def run_runs_board(state: Annotated[dict[str, Any], InjectedState]) -> str
     aggregate status as a single board card that updates in place as each run settles —
     rather than serializing the jobs into one long wait.
 
-    Honest limitation: background runs are UI-dark (a detached task does not carry the host
-    node context), so the board shows each run's aggregate status and a capped outcome
-    summary, not its interior per-leaf fan-out.
+    The board card is the aggregate view (one row per run, status + capped outcome).
+    When the user wants to see INSIDE one of the runs — its phase timeline, fan-out,
+    and per-leaf status — use ``drill_run`` with that run's label or id; the buffered
+    transport events replay as the same live cards an inline run shows. The final
+    reply also carries each run's result substance (capped), with a ``result://``
+    handle when the full payload is larger — fetch it via ``fetch_run_result``.
 
     Args:
         state: Injected graph state (used to anchor UI events to the host turn).
 
     Returns:
-        A short summary naming how many jobs ran and how many finished.
+        The aggregate summary plus one capped result line per run.
     """
     anchor = _anchor_message(state.get("messages", []))
     emit = make_host_ui_emit(anchor=anchor)
@@ -1308,6 +1371,214 @@ async def run_runs_board(state: Annotated[dict[str, Any], InjectedState]) -> str
     return await run_runs_board_live(
         _BG_MANAGER, emit, thread_id=_host_thread_id(), jobs=_RUNS_BOARD_JOBS
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 M3(1) — drill into one background run: replay its buffered events.
+# ---------------------------------------------------------------------------
+
+# One drill tick fully replays the run's buffer through a FRESH UiAdapter bound to
+# the live turn's emit. Stable engine-minted span_ids make the replay idempotent at
+# the SDK reducer (same id upserts in place), so a poll loop re-replaying each tick
+# never stacks duplicate cards, and a late observer gets the full picture.
+_DRILL_POLL_INTERVAL_S = _BOARD_POLL_INTERVAL_S
+_DRILL_MAX_POLLS = _BOARD_MAX_POLLS
+
+# BufferedEvent.kind -> the UiAdapter consumer method a replay dispatches it to.
+_REPLAY_DISPATCH: dict[str, str] = {
+    "span_begin": "on_span_begin",
+    "span": "on_span",
+    "leaf_event": "on_leaf_event",
+    "progress": "on_progress",
+    "command": "on_command",
+}
+
+
+def _replay_buffered(adapter: UiAdapter, events: Sequence[BufferedEvent]) -> None:
+    """Replay raw buffered engine events into a UiAdapter in arrival order."""
+    for event in events:
+        method = getattr(adapter, _REPLAY_DISPATCH[event.kind])
+        method(event.payload)
+
+
+def _resolve_drill_target(
+    manager: BgRunManager, *, thread_id: str, target: str
+) -> RunSnapshot | None:
+    """Resolve a drill target against the thread's runs, most-precise match first.
+
+    Tried in order: exact run id, exact label, unique run-id prefix, then a unique
+    case-insensitive label substring. The substring fallback exists because a real
+    host turns colloquial phrasing ("look into the RAG one") into a label FRAGMENT,
+    not the board's exact label text — so a fragment resolves as long as it is
+    unambiguous. Ambiguity (a fragment matching two labels) and no match both return
+    ``None`` so the caller refuses honestly rather than guessing a run.
+
+    Args:
+        manager: The background-run manager whose thread runs are searched.
+        thread_id: The host thread whose runs are candidates.
+        target: A run id, exact label, unique id prefix, or unique label substring.
+
+    Returns:
+        The single matching :class:`RunSnapshot`, or ``None`` when nothing matches or
+        a substring is ambiguous.
+    """
+    snapshots = manager.list_runs(thread_id)
+    if not target:
+        return None
+    for snap in snapshots:
+        if snap.run_id == target:
+            return snap
+    for snap in snapshots:
+        if snap.label == target:
+            return snap
+    id_prefix = [s for s in snapshots if s.run_id.startswith(target)]
+    if len(id_prefix) == 1:
+        return id_prefix[0]
+    needle = target.casefold()
+    label_substr = [s for s in snapshots if s.label and needle in s.label.casefold()]
+    return label_substr[0] if len(label_substr) == 1 else None
+
+
+async def drill_run_live(
+    manager: BgRunManager,
+    emit: UiEmit,
+    *,
+    thread_id: str,
+    target: str,
+) -> str:
+    """Drill into one background run: poll-replay its buffered events as live cards.
+
+    The engine-facing core of the :func:`drill_run` host tool. Each tick takes a
+    full snapshot of the run's buffered transport events and replays it through a
+    fresh :class:`UiAdapter` bound to THIS turn's emit — producing the same card
+    vocabulary an inline run streams (``agent_span`` / ``fanout_graph`` /
+    ``phase_timeline`` / ``execution_command``), idempotently (stable span_ids
+    upsert in place). The loop ends when the run reaches a terminal status (one
+    final replay included) or the poll cap expires.
+
+    Args:
+        manager: The shared background-run manager.
+        emit: The host-bound, non-blocking UI emit for THIS live turn.
+        thread_id: The host thread id keying the run slots.
+        target: A run id, a run label, or a unique run-id prefix.
+
+    Returns:
+        A short text summary naming the run, its status, and the replayed event count.
+    """
+    snap = _resolve_drill_target(manager, thread_id=thread_id, target=target)
+    if snap is None:
+        available = ", ".join(
+            f"{s.label or s.run_id} ({s.status.value})" for s in manager.list_runs(thread_id)
+        )
+        return (
+            f"no background run matches {target!r}; "
+            f"available runs: {available or '(none on this thread)'}"
+        )
+
+    run_id = snap.run_id
+    events: list[BufferedEvent] = []
+    dropped = 0
+    for _poll in range(_DRILL_MAX_POLLS):
+        events, dropped = manager.buffered_events(run_id, thread_id=thread_id)
+        adapter = UiAdapter(emit=emit)  # fresh per tick: full replay, zero carryover
+        _replay_buffered(adapter, events)
+        if dropped > 0:
+            adapter.on_progress(
+                ProgressEntry(
+                    kind=ProgressKind.LOG,
+                    message=f"[drill] {dropped} events dropped past the buffer cap",
+                )
+            )
+        if manager.poll(run_id, thread_id=thread_id) in _BOARD_TERMINAL:
+            break
+        await asyncio.sleep(_DRILL_POLL_INTERVAL_S)
+
+    status = manager.poll(run_id, thread_id=thread_id)
+    return (
+        f"drilled into run {run_id} ({snap.label or 'unlabelled'}): "
+        f"status={status.value}, replayed {len(events)} events"
+        + (f", {dropped} dropped" if dropped else "")
+    )
+
+
+@tool
+async def drill_run(target: str, state: Annotated[dict[str, Any], InjectedState]) -> str:
+    """Drill into one background run and stream its live interior into the chat.
+
+    When the user asks to see what a specific background job is doing ("look into
+    the RAG one", "show me run X"), this replays that run's buffered runtime events
+    — its phase timeline, fan-out graph, and per-leaf status — as the same live
+    cards an inline run shows, updating in place until the run settles.
+
+    Args:
+        target: The run to drill into — a run id, its label, or a unique id prefix.
+        state: Injected graph state (used to anchor UI events to the host turn).
+
+    Returns:
+        A short summary naming the run, its status, and how many events replayed.
+    """
+    anchor = _anchor_message(state.get("messages", []))
+    emit = make_host_ui_emit(anchor=anchor)
+    _emit_run_status(emit)
+    return await drill_run_live(_BG_MANAGER, emit, thread_id=_host_thread_id(), target=target)
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 M3(2) — fetch one background run's FULL result on demand.
+# ---------------------------------------------------------------------------
+
+
+async def fetch_run_result_live(manager: BgRunManager, *, thread_id: str, target: str) -> str:
+    """Fetch the FULL result payload for a settled run, by handle or by run id/label.
+
+    The engine-facing core of the :func:`fetch_run_result` host tool. A ``result://``
+    target goes straight to the result store; anything else resolves like a drill
+    target (exact run id, exact label, unique id prefix) and returns the run's full
+    payload — fetching the offloaded store entry when one exists, else the inlined
+    value. Unknown targets and unsettled runs get an honest message, never an
+    exception.
+
+    Args:
+        manager: The shared background-run manager.
+        thread_id: The host thread id keying the run slots.
+        target: A run id, run label, unique id prefix, or ``result://`` handle.
+
+    Returns:
+        The full result text, or an honest message when it is unknown or unsettled.
+    """
+    if target.startswith("result://"):
+        try:
+            return manager.result_store.fetch(target)
+        except KeyError:
+            return f"unknown result handle {target!r} (expired or never offloaded)"
+    snap = _resolve_drill_target(manager, thread_id=thread_id, target=target)
+    if snap is None:
+        return f"no background run matches {target!r}"
+    result = manager.get_result(snap.run_id, thread_id=thread_id)
+    if result.handle is not None:
+        return manager.result_store.fetch(result.handle)
+    if result.value is not None:
+        return result.value
+    return f"run {snap.run_id} has no result yet (status={result.status.value})"
+
+
+@tool
+async def fetch_run_result(target: str, state: Annotated[dict[str, Any], InjectedState]) -> str:
+    """Fetch a background run's full result when the capped report isn't enough.
+
+    The board's final report keeps each run's result capped; when the user wants
+    the substance of one specific run, fetch the complete payload by its run id,
+    label, or the ``result://`` handle the report names.
+
+    Args:
+        target: A run id, run label, unique id prefix, or ``result://`` handle.
+        state: Injected graph state.
+
+    Returns:
+        The full result text, or an honest message when it is unknown/unsettled.
+    """
+    del state  # no UI events from this tool; injected for host parity
+    return await fetch_run_result_live(_BG_MANAGER, thread_id=_host_thread_id(), target=target)
 
 
 def _build_host_graph(*, checkpointer: BaseCheckpointSaver[Any] | None = None) -> Any:
@@ -1343,7 +1614,15 @@ def _build_host_graph(*, checkpointer: BaseCheckpointSaver[Any] | None = None) -
     return create_deep_agent(
         model=resolve_host_model(),
         system_prompt=HOST_INSTRUCTIONS,
-        tools=[run_hello_demo, run_live, run_meta_script, run_background, run_runs_board],
+        tools=[
+            run_hello_demo,
+            run_live,
+            run_meta_script,
+            run_background,
+            run_runs_board,
+            drill_run,
+            fetch_run_result,
+        ],
         state_schema=HostState,
         middleware=cache_middleware(),
         **extra,

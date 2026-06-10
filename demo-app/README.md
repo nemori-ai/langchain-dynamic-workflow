@@ -270,11 +270,14 @@ investigations and asks to run them *together*. The host fans them out as three 
 renders one **RunBoard** card: a row per run, each flipping `pending → running → done`
 in place as it settles (the board re-emits under a fixed id, so it is one card whose rows
 update, not a new card per tick). A header counter reads "2 running · 1 done · 3 total"
-and updates live; a settled row shows its capped outcome summary. Background runs are
-**UI-dark** (a detached task cannot push interior fan-out to the chat), so the board
-honestly shows each run's *aggregate* status and summary — not its per-leaf stream.
-(Offline-fake caveat: with no key the three runs execute with the deterministic offline
-roster, so the board is honest in both modes — the offline banner still shows above it.)
+and updates live; a settled row shows its capped outcome summary. The board row stays the
+*aggregate* view, but a detached run is **no longer UI-dark** — its runtime events are now
+buffered on its slot, so you can **drill into a run** (ask the host, e.g. "drill into the
+RAG one") and the host replays that run's interior as the same `fanout_graph` / per-leaf
+`agent_span` cards an inline run streams. The board's final reply also carries each run's
+result substance, and you can ask for one run's full result on demand. (Offline-fake
+caveat: with no key the three runs execute with the deterministic offline roster, so the
+board — and a drill replay — are honest in both modes; the offline banner still shows above it.)
 
 ---
 
@@ -293,11 +296,14 @@ intentional and worth knowing:
   running backend process*. Restart `langgraph dev` and the journals are gone —
   there is no on-disk durable store wired up here. It is a true journal replay, but
   not a crash-recovery story.
-- **Background surfaces status + result, not live progress.** A detached background
-  run executes in a task that does **not** carry the host's UI context, so it
-  cannot push live `phase_timeline` / `fanout_graph` updates into the chat. The
-  background scenario deliberately shows lifecycle status and the final result
-  only. Live streaming is the inline path's job (scenarios 1–3).
+- **Background runs stream live only when you drill in, not push.** A detached
+  background run executes in a task that does **not** carry the launching turn's UI
+  context, so it cannot *push* live `phase_timeline` / `fanout_graph` updates into the
+  chat as it goes. Its runtime events are instead **buffered on its slot**, and a live
+  turn **replays** them on demand: ask the host to drill into a run (`drill_run`) and its
+  interior renders as the same cards an inline run streams. So liveness is *pull* (per
+  drill / poll), not the inline path's continuous *push* (scenarios 1–3). The buffer is
+  transient telemetry — gone when the run is reclaimed or the process restarts.
 - **The drill-in is shape-only, and out-of-process sandbox work stays opaque.** A
   fresh leaf's drill-in shows the *shape* of its interior — the chain / model / tool
   callback steps it ran, kinds and names, never their raw args or text. Anything a

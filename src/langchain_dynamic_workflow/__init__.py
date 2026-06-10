@@ -13,7 +13,9 @@ from ._background import (
     BgRunManager,
     BgRunQuotaExceededError,
     BgStatus,
+    BufferedEvent,
     ResultStore,
+    RunEventSinks,
     RunSnapshot,
 )
 from ._budget import Budget
@@ -116,6 +118,7 @@ __all__ = [
     "BgRunQuotaExceededError",
     "BgStatus",
     "Budget",
+    "BufferedEvent",
     "CommandEvent",
     "CommandSink",
     "Consensus",
@@ -148,6 +151,7 @@ __all__ = [
     "ReviewItem",
     "Roster",
     "RosterEntry",
+    "RunEventSinks",
     "RunSnapshot",
     "RunSpec",
     "SandboxFactory",

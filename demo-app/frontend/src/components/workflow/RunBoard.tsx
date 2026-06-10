@@ -11,10 +11,14 @@
  * honest render of `BgRunManager.list_runs` — the header counters are derived here from the
  * rows, not passed in.
  *
- * Honesty: background runs are UI-dark (a detached task cannot push its interior fan-out to
- * the host `ui` channel), so the board shows each run's AGGREGATE status plus a capped
- * outcome summary only — never a per-leaf stream. A row carries no drill-in affordance,
- * because there is no interior to drill into from a detached run.
+ * Drill-in: background runs are no longer UI-dark. The engine buffers each detached run's
+ * raw runtime events on its slot (a bounded transport buffer), and the host's `drill_run`
+ * tool replays that buffer as the same live cards an inline run streams (`agent_span` /
+ * `fanout_graph` / `phase_timeline`), updating in place until the run settles. The board
+ * row itself stays the AGGREGATE view (status chip + capped outcome summary); drilling is
+ * conversational — the user asks the assistant to drill into a run — so the row carries a
+ * hint, not a click handler (UI events flow host -> chat; there is no chat -> host action
+ * pipeline for a card to invoke).
  *
  * Palette mirrors the house convention: slate = pending, sky (with a pulsing dot) =
  * running, emerald = done, rose = failed, slate = cancelled; the card frame and header use
@@ -81,6 +85,7 @@ export function RunBoard(props: { event_id: string; runs?: RunRow[] | null }) {
               data-testid="run-row"
               data-run-id={run.run_id}
               data-status={run.status}
+              title="Ask the assistant to drill into this run"
               className="flex items-center gap-2 rounded border border-slate-100 bg-white/70 px-2 py-1"
             >
               <span

@@ -74,6 +74,14 @@ def test_batch_metrics_exported_from_package_root() -> None:
     assert ldw.SpanKind.BATCH.value == "batch"
 
 
+def test_transport_event_surface_exported_from_package_root() -> None:
+    import langchain_dynamic_workflow as ldw
+
+    assert "BufferedEvent" in ldw.__all__
+    assert "RunEventSinks" in ldw.__all__
+    assert ldw.BufferedEvent is not None and ldw.RunEventSinks is not None
+
+
 def test_real_git_surface_exported_from_package_root() -> None:
     """The real-git worktree + PR seam is exported eagerly with no NEW dependency.
 
