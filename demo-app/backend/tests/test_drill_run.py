@@ -224,3 +224,79 @@ def test_offline_post_tool_reply_for_drill_is_honest() -> None:
         )
     )
     assert "couldn't find" in no_match.lower(), no_match
+
+
+async def test_board_final_report_carries_per_run_results() -> None:
+    """The board's return value carries one line per run with label, status, and substance.
+
+    After all runs settle, the host (and the user) must get each run's actual outcome
+    fed back — not just an aggregate "2 finished" count.
+    """
+    from host_graph import run_runs_board_live
+
+    from langchain_dynamic_workflow import BgRunManager
+
+    manager = BgRunManager()
+    jobs: list[tuple[str, dict[str, Any]]] = [("alpha", {}), ("beta", {})]
+    report = await run_runs_board_live(
+        manager,
+        lambda n, p: None,
+        thread_id="t1",
+        jobs=jobs,
+        workflow=_OFFLINE_PRESET,
+    )
+    assert "alpha" in report and "beta" in report, report
+    # Substance, not just a count: each line carries the run's status + result text.
+    assert report.count("status=done") == 2, report
+
+
+async def test_large_result_reports_summary_plus_handle() -> None:
+    """An offloaded large result surfaces its ``result://`` handle in the board report.
+
+    With a tiny ``inline_max_chars`` the store offloads the run's result; the report
+    must name the opaque handle so ``fetch_run_result`` can pull the full payload.
+    """
+    from host_graph import run_runs_board_live
+
+    from langchain_dynamic_workflow import BgRunManager, ResultStore
+
+    store = ResultStore(inline_max_chars=10)
+    manager = BgRunManager(result_store=store)
+    report = await run_runs_board_live(
+        manager,
+        lambda n, p: None,
+        thread_id="t1",
+        jobs=[("big", {})],
+        workflow=_OFFLINE_PRESET,
+    )
+    assert "result://" in report, report
+
+
+async def test_fetch_run_result_returns_full_payload() -> None:
+    """``fetch_run_result_live`` returns the un-capped payload by handle or by run id."""
+    from host_graph import fetch_run_result_live, launch_background_run
+
+    from langchain_dynamic_workflow import BgRunManager, ResultStore
+
+    store = ResultStore(inline_max_chars=10)
+    manager = BgRunManager(result_store=store)
+    run_id = launch_background_run(manager, thread_id="t1", workflow=_OFFLINE_PRESET)
+    await manager.wait(run_id, thread_id="t1")
+
+    result = manager.get_result(run_id, thread_id="t1")
+    assert result.handle is not None
+
+    full = await fetch_run_result_live(manager, thread_id="t1", target=result.handle)
+    assert len(full) > 10, full  # the un-capped payload, not the 10-char summary
+    by_run = await fetch_run_result_live(manager, thread_id="t1", target=run_id)
+    assert by_run == full
+
+
+async def test_fetch_run_result_tool_schema_has_target_not_mangled() -> None:
+    """The ``fetch_run_result`` tool exists with a ``target`` parameter (no v__args)."""
+    from host_graph import fetch_run_result
+
+    assert fetch_run_result.name == "fetch_run_result"
+    fields = set(fetch_run_result.get_input_schema().model_fields)
+    assert "target" in fields, sorted(fields)
+    assert "v__args" not in fields, sorted(fields)
