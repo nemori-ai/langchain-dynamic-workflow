@@ -1435,6 +1435,28 @@ async def drill_run_live(
     )
 
 
+@tool
+async def drill_run(target: str, state: Annotated[dict[str, Any], InjectedState]) -> str:
+    """Drill into one background run and stream its live interior into the chat.
+
+    When the user asks to see what a specific background job is doing ("look into
+    the RAG one", "show me run X"), this replays that run's buffered runtime events
+    — its phase timeline, fan-out graph, and per-leaf status — as the same live
+    cards an inline run shows, updating in place until the run settles.
+
+    Args:
+        target: The run to drill into — a run id, its label, or a unique id prefix.
+        state: Injected graph state (used to anchor UI events to the host turn).
+
+    Returns:
+        A short summary naming the run, its status, and how many events replayed.
+    """
+    anchor = _anchor_message(state.get("messages", []))
+    emit = make_host_ui_emit(anchor=anchor)
+    _emit_run_status(emit)
+    return await drill_run_live(_BG_MANAGER, emit, thread_id=_host_thread_id(), target=target)
+
+
 def _build_host_graph(*, checkpointer: BaseCheckpointSaver[Any] | None = None) -> Any:
     """Build the host deepagent graph, optionally with an explicit checkpointer.
 
@@ -1468,7 +1490,14 @@ def _build_host_graph(*, checkpointer: BaseCheckpointSaver[Any] | None = None) -
     return create_deep_agent(
         model=resolve_host_model(),
         system_prompt=HOST_INSTRUCTIONS,
-        tools=[run_hello_demo, run_live, run_meta_script, run_background, run_runs_board],
+        tools=[
+            run_hello_demo,
+            run_live,
+            run_meta_script,
+            run_background,
+            run_runs_board,
+            drill_run,
+        ],
         state_schema=HostState,
         middleware=cache_middleware(),
         **extra,

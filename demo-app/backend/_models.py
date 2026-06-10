@@ -99,6 +99,7 @@ _LIVE_TOOL_NAME = "run_live"
 _META_TOOL_NAME = "run_meta_script"
 _BACKGROUND_TOOL_NAME = "run_background"
 _RUNS_BOARD_TOOL_NAME = "run_runs_board"
+_DRILL_TOOL_NAME = "drill_run"
 
 # Post-tool final replies, branched on which tool ran (the most recent ToolMessage's
 # ``name``). The offline demo's whole discipline is honesty, so this final sentence must
@@ -130,6 +131,19 @@ _REPLY_RUNS_BOARD = (
     "aggregate status, not a live per-step view (offline demo mode; set a model key for "
     "live model runs)."
 )
+_REPLY_DRILL = (
+    "Done — I drilled into that background run and replayed its internal activity as "
+    "live cards above (offline demo mode; set a model key for live model runs)."
+)
+_REPLY_DRILL_NO_MATCH = (
+    "I couldn't find a background run matching that — the runs available on this thread "
+    "are named in the reply above (offline demo mode; set a model key for live model runs)."
+)
+# Marker in a ``drill_run`` ToolMessage that distinguishes the no-matching-run outcome
+# from a successful drill (both share the tool name). Kept in sync with the no-match
+# return text in ``host_graph.drill_run_live``.
+_DRILL_NO_MATCH_MARKER = "no background run"
+
 # Marker in a ``run_live`` ToolMessage that distinguishes the sign-off PAUSE outcome (the
 # run parked at a ctx.checkpoint gate) from a normal completed run. Kept in sync with the
 # paused-return text in ``host_graph.run_workflow_live``.
@@ -252,12 +266,29 @@ _PARALLEL_RUNS_CUES = (
     "all three",
 )
 
+# Cue phrases routing the offline host to drill into ONE background run (drill_run): the
+# user names a specific run whose interior they want to see live. The cue must be the
+# explicit drill verb only — NOT generic "look at" / "show me" phrases, which would
+# mis-route unrelated requests (the M3.5 lesson: a broad cue hijacks other scenarios).
+# The text AFTER the cue is the drill target (a run label or id), extracted from the RAW
+# message so a case-sensitive run label survives.
+_DRILL_CUES = (
+    "drill into",
+    "下钻",
+)
+
 
 def _latest_user_text(messages: Sequence[BaseMessage]) -> str | None:
     """Return the most recent human message's lowercased text, if any."""
+    raw = _latest_user_raw_text(messages)
+    return raw.lower() if raw is not None else None
+
+
+def _latest_user_raw_text(messages: Sequence[BaseMessage]) -> str | None:
+    """Return the most recent human message's text with its original casing, if any."""
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
-            return message.text.lower()
+            return message.text
     return None
 
 
@@ -324,6 +355,29 @@ def _wants_parallel_runs(messages: Sequence[BaseMessage]) -> bool:
     return text is not None and any(cue in text for cue in _PARALLEL_RUNS_CUES)
 
 
+def _drill_request(messages: Sequence[BaseMessage]) -> str | None:
+    """Return the drill target the latest user turn names, or ``None`` when not a drill.
+
+    A "drill into <run>" request is the drill cue: the host should replay THAT
+    background run's buffered interior as live cards rather than launch anything new.
+    The target is the text after the cue phrase, taken from the RAW (original-case)
+    message — run labels are case-sensitive — with surrounding quotes and trailing
+    punctuation stripped. Returns an empty string when the cue ends the message (the
+    drill tool then reports the available runs honestly).
+    """
+    raw = _latest_user_raw_text(messages)
+    if raw is None:
+        return None
+    lowered = raw.lower()
+    for cue in _DRILL_CUES:
+        index = lowered.find(cue)
+        if index == -1:
+            continue
+        target = raw[index + len(cue) :].strip().strip("\"'").rstrip(".,!?:;").strip()
+        return target
+    return None
+
+
 def _tool_message_this_turn(messages: Sequence[BaseMessage]) -> ToolMessage | None:
     """Return the :class:`ToolMessage` produced for the CURRENT user turn, if any.
 
@@ -376,6 +430,11 @@ def _post_tool_reply(tool_message: ToolMessage) -> str:
         return _REPLY_BACKGROUND
     if tool_message.name == _RUNS_BOARD_TOOL_NAME:
         return _REPLY_RUNS_BOARD
+    if tool_message.name == _DRILL_TOOL_NAME:
+        drill_content = str(tool_message.content).lower()
+        if _DRILL_NO_MATCH_MARKER in drill_content:
+            return _REPLY_DRILL_NO_MATCH
+        return _REPLY_DRILL
     content = str(tool_message.content).lower()
     if tool_message.name == _META_TOOL_NAME and _META_REJECTED_MARKER in content:
         return _REPLY_META_REJECTED
@@ -484,6 +543,20 @@ class OfflineHostModel(BaseChatModel):
                         "name": _META_TOOL_NAME,
                         "args": {"submit_rejected": rejected},
                         "id": "meta-call-1",
+                    }
+                ],
+            )
+        elif (drill_target := _drill_request(messages)) is not None:
+            # Drill into one named background run: replay its buffered interior as live
+            # cards. Checked before the parallel/background/live cues so a drill request
+            # whose target text mentions "research" etc. cannot mis-route to a new run.
+            message = AIMessage(
+                content="Drilling into that run now — replaying its activity live.",
+                tool_calls=[
+                    {
+                        "name": _DRILL_TOOL_NAME,
+                        "args": {"target": drill_target},
+                        "id": "drill-call-1",
                     }
                 ],
             )

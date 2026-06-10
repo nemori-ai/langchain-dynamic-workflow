@@ -135,3 +135,92 @@ async def test_drill_run_live_surfaces_dropped_as_truncation_log() -> None:
     )
     timeline_msgs = [p.get("message", "") for n, p in captured if n == "phase_timeline"]
     assert any("dropped" in m for m in timeline_msgs), timeline_msgs
+
+
+def test_drill_run_tool_schema_has_target_not_mangled() -> None:
+    """The ``drill_run`` tool exists with a ``target`` parameter — checked through the
+    tool layer, not the bare function (the ``@tool`` wrapper is what the model sees,
+    and LangChain mangles a parameter literally named ``args`` into ``v__args``)."""
+    from host_graph import drill_run
+
+    assert drill_run.name == "drill_run"
+    fields = set(drill_run.get_input_schema().model_fields)
+    assert "target" in fields, sorted(fields)
+    assert "v__args" not in fields, sorted(fields)
+
+
+def _offline_first_tool_call(prompt: str) -> tuple[str, dict[str, Any]]:
+    """Drive the offline host one turn on ``prompt``; return the tool name and its args."""
+    from _models import OfflineHostModel
+    from langchain_core.messages import HumanMessage
+
+    result = OfflineHostModel()._generate([HumanMessage(content=prompt)])
+    message = result.generations[0].message
+    call = message.tool_calls[0]  # type: ignore[attr-defined]
+    return call["name"], call["args"]
+
+
+def test_offline_host_routes_drill_cue_to_drill_run_with_target() -> None:
+    """A "drill into <run>" message routes to ``drill_run`` carrying the named target.
+
+    The target must keep its original casing (run labels are case-sensitive), so the
+    scripted host extracts it from the raw message text after the cue phrase.
+    """
+    name, args = _offline_first_tool_call("Drill into RAG vs long-context")
+    assert name == "drill_run", name
+    assert args["target"] == "RAG vs long-context", args
+
+
+def test_offline_host_does_not_route_generic_look_phrase_to_drill() -> None:
+    """A generic "look at this" must NOT hit the drill tool — the cue stays narrow."""
+    name, _args = _offline_first_tool_call(
+        "Have a look at this module and tell me what it is doing."
+    )
+    assert name != "drill_run", name
+
+
+async def test_drill_run_tool_layer_executes_and_reports_honestly() -> None:
+    """The drill message drives ``drill_run`` through the real graph layer.
+
+    Runs the full offline host graph the way ``langgraph dev`` invokes it: the offline
+    host routes the drill message to the registered ``drill_run`` tool. With no
+    background run on this fresh thread the tool must reply honestly that nothing
+    matches — proving registration + routing + execution end to end.
+    """
+    from host_graph import make_host_graph
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    graph = make_host_graph()
+    out = await graph.ainvoke(
+        {"messages": [HumanMessage(content="Drill into the RAG run")]},
+        config={"configurable": {"thread_id": "test-drill-tool-layer"}},
+    )
+
+    tool_messages = [m for m in out["messages"] if isinstance(m, ToolMessage)]
+    assert tool_messages, "drill_run did not execute"
+    replies = "\n".join(str(m.content) for m in tool_messages)
+    assert "no background run" in replies.lower(), replies
+
+
+def test_offline_post_tool_reply_for_drill_is_honest() -> None:
+    """The offline final reply after a drill must describe a replay, not a live stream."""
+    from _models import _DRILL_TOOL_NAME, _post_tool_reply
+    from langchain_core.messages import ToolMessage
+
+    reply = _post_tool_reply(
+        ToolMessage(
+            content="drilled into run abc (RAG study): status=done, replayed 12 events",
+            name=_DRILL_TOOL_NAME,
+            tool_call_id="drill-call-1",
+        )
+    )
+    assert "drill" in reply.lower(), reply
+
+    no_match = _post_tool_reply(
+        ToolMessage(
+            content="no background run matches 'ghost'; available runs: (none on this thread)",
+            name=_DRILL_TOOL_NAME,
+            tool_call_id="drill-call-2",
+        )
+    )
+    assert "couldn't find" in no_match.lower(), no_match
