@@ -17,6 +17,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Adds `BatchMetrics`, `ProgressKind.BATCH`, `SpanKind.BATCH`, and `ProgressEntry.metrics`. `parallel`
   and `pipeline`'s public contracts are unchanged; the shared `run_pipeline` scheduler is generalized
   to consume an (async) iterable.
+- **Background-run transport — drill-in + result report-back (v0.4.0 · M3)** — a detached background
+  run is no longer UI-dark. `BgRunManager` buffers each run's raw runtime events on its slot
+  (`BufferedEvent`, bounded by a per-run cap with a `dropped` counter; lock-guarded so an off-loop
+  `on_command` edge cannot tear a read), exposed via `BgRunManager.event_sinks(run_id)` (five
+  append-only sinks threaded into the detached `run_workflow`) and `buffered_events(run_id)`. A live
+  turn replays a run's buffer through a fresh adapter — the same card vocabulary an inline run streams
+  (`agent_span` / `fanout_graph` / `phase_timeline`), idempotent via stable span ids. Buffered events
+  are transient telemetry: never journaled, never replayed, host-LLM-context isolation preserved.
+  Adds `BufferedEvent`, `RunEventSinks`, and `BgRunManager.event_sinks` / `buffered_events` /
+  `max_buffered_events`. (Demo consumer: a conversational `drill_run` tool replays one run's interior
+  into the chat; the runs board's final report now carries per-run result substance, and a
+  `fetch_run_result` tool fetches a run's full payload on demand.) `run_workflow`'s sink parameters
+  are unchanged — the detached path simply started using them.
 
 ## [0.3.0] - 2026-06-09
 

@@ -57,7 +57,7 @@
 ## 状态
 
 - **M1 叶子级实时可观测**：✅ 已落地（引擎 hook PR #12 + demo 消费 PR #13）——inline leaf 实时 status + 计时器 + drill-in。
-- **M3 run board 下钻 + 背景 run 结果回传 host**：✅ 设计已定稿（2026-06-10，见 [`03-background-run-transport-and-m3.md`](03-background-run-transport-and-m3.md)，切片 1，实现待启）。① 下钻经 **context-independent transport 底座**（A1：BgRunSlot 有界 raw-event buffer + `event_sinks`/`buffered_events` + 活轮全量重放 fresh UiAdapter），② 结果回传相对独立、复用 RunResult/ResultStore（每 run 摘要 + 按需 fetch handle）。
+- **M3 run board 下钻 + 背景 run 结果回传 host**：✅ 已落地（2026-06-10，设计见 [`03-background-run-transport-and-m3.md`](03-background-run-transport-and-m3.md)，切片 1，引擎 + demo 双轨）。① 下钻经 **context-independent transport 底座**（A1：BgRunSlot 有界 raw-event buffer + `event_sinks`/`buffered_events` + 活轮全量重放 fresh UiAdapter；瞬态遥测不入 journal/replay，隔离照旧），demo 侧 `drill_run` 对话式下钻；② 结果回传复用 RunResult/ResultStore（board 收尾返回每 run 摘要 + `fetch_run_result` 按需拉全文）。验收：引擎全套 + demo 套件绿、全仓 ruff/pyright 0、**gated 真模型 E2E 实跑通过（125s，三个真 deep_research 扇出 → drill 重放真扇出内部到 ui channel）**。`drill target` 解析在精确 id/label/前缀之外，兜底唯一-不区分大小写-子串（口语化指代）。
 - **M2 持久侧边栏多-workflow 实时视图**：🧱 承重底座已随 03 设计完毕（与 M3① 共享 transport 底座）；其侧栏布局 / 多-workflow 并列 / 渲染技术等**细化设计待切片 2 启动**（`04-*.md`）。
 - **E 批处理人体工学（`batch_map`）**：✅ 已落地——流式准入大扇出 map（广义化 `run_pipeline`、`parallel` 不动）+ transient count/ETA 进度（`ProgressKind.BATCH`，delivered-not-recorded）；自 v0.3.0「後續里程碑」backlog 提升而来。设计见 [`02-e-batch-ergonomics.md`](02-e-batch-ergonomics.md)。
 - **其余 v0.4.0 目标**：批次开放，逐项增补（候选：面向社区的交互式 demo-app 等；自 v0.3.0 提升的 E 已落地，M7 已于 v0.3.0 落地）。
