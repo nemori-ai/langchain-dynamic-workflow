@@ -11,9 +11,18 @@ bounds the number of in-flight leaves across every fan-out path.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import json
-from collections.abc import Awaitable, Callable, Sequence
+import time
+from collections.abc import (
+    AsyncIterable,
+    Awaitable,
+    Callable,
+    Iterable,
+    Sequence,
+    Sized,
+)
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar, cast, overload
 
@@ -34,7 +43,7 @@ from ._errors import (
 from ._journal import JournalRecord, JournalStore, journal_key, race_key, signoff_key
 from ._observability import SpanKind, SpanRecorder
 from ._pipeline import Stage, run_pipeline
-from ._progress import ProgressKind, ProgressLog
+from ._progress import BatchMetrics, ProgressKind, ProgressLog
 from ._race_types import RaceCandidate, RaceResult
 from ._result import fold_result, fold_structured
 from ._roster import Roster
@@ -1167,3 +1176,168 @@ class Ctx:
             span.set("won", True)
             span.set("winner_index", winner_index)
             return RaceResult[T](winner=cast(T, winner_result), winner_index=winner_index)
+
+    async def batch_map[X, T](
+        self,
+        items: Iterable[X] | AsyncIterable[X],
+        fn: Callable[[X], Awaitable[T]],
+        *,
+        max_in_flight: int | None = None,
+        total: int | None = None,
+        label: str = "batch_map",
+    ) -> list[T | None]:
+        """Map ``fn`` over ``items`` with bounded streaming admission; collect in order.
+
+        Streaming in, barrier out: items are admitted lazily through a bounded
+        window (so N-thousand items never materialize N-thousand tasks), but
+        results are collected into a list aligned to input order and returned
+        only once every item has settled. ``fn`` is a single-argument async
+        callable applied to each item, typically a single ``agent()`` call; a
+        script that needs the index passes ``enumerate(items)`` and unpacks
+        inside ``fn``. A failing ``fn`` lands ``None`` at its position and never
+        aborts the barrier (filter the holes downstream, e.g. with
+        ``dedup``/``survives``); engine control-flow signals (budget /
+        determinism / checkpoint) are re-raised after a clean drain, never masked
+        as ``None``.
+
+        Concurrency is bounded at the leaf by the shared gate, while the admission
+        ``window`` (``max_in_flight``, defaulting to the gate limit) bounds how
+        many items are concurrently in ``fn`` and provides backpressure so memory
+        stays decoupled from N. Like ``parallel`` / ``pipeline`` / ``dag``, the
+        leaves inside ``fn`` run at a non-zero fan-out depth and are excluded from
+        the determinism sequence guard (their completion order is wall-clock
+        dependent); the content-hash journal still guards each by its inputs, so a
+        resume replays completed items at zero model cost.
+
+        Live ``BATCH`` progress (``completed`` / ``total`` / ``elapsed`` / ``eta``)
+        is emitted to the progress sink as the batch advances, throttled to every
+        ``K`` settled items or every second, plus one final settled entry. A
+        ``Sized`` input takes ``len()`` for ``total`` automatically; a non-``Sized``
+        source (a generator / async iterable) reports ``completed`` only unless a
+        ``total`` hint is supplied, in which case the ETA becomes computable. The
+        progress is transient and out-of-band: it is delivered to the sink but
+        never recorded, journaled, or replayed, because its timestamps are
+        non-deterministic.
+
+        Args:
+            items: The input items; a ``Sized`` ``Iterable``, a generator, or an
+                ``AsyncIterable`` (e.g. a paged API). Consumed lazily through the
+                admission window — never materialized.
+            fn: The single-argument async callable applied to each item.
+            max_in_flight: The admission window (items concurrently in ``fn``).
+                ``None`` defaults to the shared gate limit.
+            total: Optional item-count hint for a non-``Sized`` input, enabling
+                the ETA. A ``Sized`` input takes ``len()`` automatically and
+                ignores this hint.
+            label: The span / progress label for this batch.
+
+        Returns:
+            A list aligned to ``items`` input order; each entry is ``fn``'s result,
+            or ``None`` if ``fn`` raised for that item.
+
+        Raises:
+            ValueError: If ``max_in_flight`` is supplied and is less than 1.
+        """
+        # Fail fast on a meaningless window before opening a span or admitting work.
+        if max_in_flight is not None and max_in_flight < 1:
+            raise ValueError(f"batch_map requires max_in_flight >= 1, got {max_in_flight}")
+        with self._spans.span(SpanKind.BATCH, label) as span:
+            # A Sized input knows its length for free; a non-Sized source falls
+            # back to the caller's total hint (which may be None -> no ETA).
+            known_total = len(items) if isinstance(items, Sized) else total
+            span.set("total", known_total)
+            # The admission window bounds items concurrently in fn; default to the
+            # gate limit (more than the limit only parks extra workers on the gate).
+            window = max_in_flight if max_in_flight is not None else self._gate.limit
+
+            # Live progress is engine-side, out-of-band, and never journaled: the
+            # monotonic clock and the throttle counters live entirely in this
+            # closure. asyncio is single-threaded, so a plain int increment in the
+            # settle path needs no lock.
+            start = time.monotonic()
+            # Single-element lists so the throttle closure can mutate the count and
+            # the last-emit timestamp in place. They are kept separate (not one
+            # dict) so the count stays a strict int and the timestamp a strict
+            # float — pyright would otherwise widen a mixed dict's values.
+            completed_count: list[int] = [0]
+            last_emit: list[float] = [start]
+            # Emit on every K settled items OR every T seconds, whichever comes
+            # first, plus always a final settled entry. K scales with total so a
+            # large batch is not noisy; an unknown total uses a fixed step.
+            throttle_step = max(1, known_total // 100) if known_total else 64
+            throttle_seconds = 1.0
+
+            def _emit_progress(completed: int, *, force: bool = False) -> None:
+                now = time.monotonic()
+                is_final = known_total is not None and completed >= known_total
+                crossed_step = completed % throttle_step == 0
+                crossed_time = (now - last_emit[0]) >= throttle_seconds
+                if not (force or crossed_step or crossed_time or is_final):
+                    return
+                last_emit[0] = now
+                elapsed = now - start
+                rate = completed / elapsed if elapsed > 0 else 0.0
+                eta = (
+                    (known_total - completed) / rate
+                    if known_total is not None and rate > 0
+                    else None
+                )
+                if known_total is not None:
+                    message = f"{label}: {completed}/{known_total}"
+                else:
+                    message = f"{label}: {completed}"
+                self._progress.emit_transient(
+                    message,
+                    metrics=BatchMetrics(
+                        completed=completed,
+                        elapsed_seconds=elapsed,
+                        rate=rate,
+                        total=known_total,
+                        eta_seconds=eta,
+                    ),
+                )
+
+            async def _stage(_payload: Any, item: Any, _index: int) -> Any:
+                # One stage = the whole map: run fn, then advance the shared
+                # completed counter and conditionally emit progress. The counter
+                # advances whether fn succeeds or raises (a raise drops the item to
+                # None in run_pipeline, but it still settled), so progress tracks
+                # settled work, not just successes.
+                fn_raised = True
+                try:
+                    result = await fn(item)
+                    fn_raised = False
+                    return result
+                finally:
+                    completed_count[0] += 1
+                    if fn_raised:
+                        # fn raised (esp. a control-flow signal: budget/determinism/
+                        # checkpoint). A progress-sink failure here must NOT mask fn's
+                        # exception, so swallow it — fn's exception takes priority.
+                        with contextlib.suppress(Exception):
+                            _emit_progress(completed_count[0])
+                    else:
+                        # fn succeeded: a progress-sink failure propagates loud.
+                        _emit_progress(completed_count[0])
+
+            # Mark the fan-out frame BEFORE the engine spawns its workers so each
+            # worker task inherits the depth and its agent() calls skip the
+            # determinism sequence guard; reset in finally even if the run raises.
+            token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
+            try:
+                results = await run_pipeline(
+                    items,
+                    [_stage],
+                    gate=self._gate,
+                    queue_maxsize=window,
+                )
+            finally:
+                _FANOUT_DEPTH.reset(token)
+            # Always emit one final settled entry (force past the throttle) so the
+            # last state is exact even when the throttle skipped it — critical for an
+            # unknown total, where is_final never fires. Skip only the empty input.
+            if completed_count[0] > 0:
+                _emit_progress(completed_count[0], force=True)
+            span.set("admitted_count", completed_count[0])
+            span.set("surviving_count", sum(1 for r in results if r is not None))
+            return cast(list[T | None], results)

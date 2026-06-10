@@ -109,3 +109,22 @@ def test_begin_sink_default_is_a_silent_noop() -> None:
     recorder = SpanRecorder()
     with recorder.span(SpanKind.PIPELINE, "refine") as span:
         span.set("item_count", 3)
+
+
+def test_recorder_emits_a_batch_span() -> None:
+    emitted: list[Span] = []
+    recorder = SpanRecorder(sink=emitted.append)
+
+    with recorder.span(SpanKind.BATCH, "bug_vuln_sweep") as span:
+        span.set("total", 1000)
+        span.set("admitted_count", 1000)
+        span.set("surviving_count", 987)
+
+    assert len(emitted) == 1
+    completed = emitted[0]
+    assert completed.kind == SpanKind.BATCH
+    assert completed.name == "bug_vuln_sweep"
+    assert completed.attributes["total"] == 1000
+    assert completed.attributes["admitted_count"] == 1000
+    assert completed.attributes["surviving_count"] == 987
+    assert completed.error is None

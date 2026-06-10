@@ -5,6 +5,13 @@ map-reduce barrier), so the engine builds its own. Items flow through the stages
 *independently*: item A can be in the last stage while item B is still in the
 first, with no synchronization point between stages.
 
+The scheduler admits items *lazily* through a bounded queue, so the input may be
+any ``Iterable`` or ``AsyncIterable`` — a list, a generator, or an async source
+(a paged API, a streaming line reader) — and the number of live envelopes/tasks
+stays bounded by the admission window, decoupled from the total item count. The
+length is never required up front; results are keyed by input index and the
+ordered list is reconstructed once every item has settled.
+
 Mechanics:
 
 - Each stage owns a bounded :class:`~asyncio.Queue`, providing backpressure so a
@@ -26,7 +33,16 @@ Mechanics:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterable,
+    Awaitable,
+    Callable,
+    Iterable,
+    Sequence,
+    Sized,
+)
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,13 +75,50 @@ class _Envelope:
 _POISON = object()
 
 
-def _workers_per_stage(gate: ConcurrencyGate, item_count: int) -> int:
-    """Pick a worker count per stage, bounded by the gate and the item count."""
-    return max(1, min(gate.limit, item_count))
+async def _drain(
+    items: Iterable[Any] | AsyncIterable[Any],
+) -> AsyncGenerator[tuple[int, Any], None]:
+    """Yield ``(index, item)`` from either a sync or an async input source.
+
+    The ``AsyncIterable`` check comes first: a ``list`` is ``Iterable`` but not
+    ``AsyncIterable``, whereas an async generator is both, so probing for the
+    async protocol first routes each source down its correct branch. The async
+    branch counts manually because there is no async ``enumerate``.
+
+    Args:
+        items: The input source, an ``Iterable`` or an ``AsyncIterable``.
+
+    Yields:
+        ``(index, item)`` pairs, index ascending from zero in source order.
+    """
+    if isinstance(items, AsyncIterable):
+        index = 0
+        async for item in items:
+            yield index, item
+            index += 1
+    else:
+        for index, item in enumerate(items):
+            yield index, item
+
+
+def _workers_per_stage(gate: ConcurrencyGate, length: int | None, max_in_flight: int) -> int:
+    """Pick a worker count per stage, bounded by the gate, length, and window.
+
+    Args:
+        gate: The shared concurrency gate; its limit is an upper bound.
+        length: The input length when known (a ``Sized`` source), else ``None``.
+        max_in_flight: The admission window (the per-stage queue capacity).
+
+    Returns:
+        The per-stage worker count, at least one.
+    """
+    if length is not None:
+        return max(1, min(gate.limit, length, max_in_flight))
+    return max(1, min(gate.limit, max_in_flight))
 
 
 async def run_pipeline(
-    items: Sequence[Any],
+    items: Iterable[Any] | AsyncIterable[Any],
     stages: Sequence[Stage],
     *,
     gate: ConcurrencyGate,
@@ -73,13 +126,23 @@ async def run_pipeline(
 ) -> list[Any | None]:
     """Stream ``items`` through ``stages`` without a barrier and collect results.
 
+    The input is admitted lazily through the bounded queue, so it may be any
+    ``Iterable`` or ``AsyncIterable``: a list takes the length fast path, while a
+    generator or an async source streams without its length ever being read. The
+    number of live envelopes stays bounded by the admission window, decoupled from
+    the total item count.
+
     Args:
-        items: The input items; each travels through every stage independently.
+        items: The input items, an ``Iterable`` or an ``AsyncIterable``; each one
+            travels through every stage independently.
         stages: The ordered stage functions, each ``(prev, original, index)``.
         gate: The shared concurrency gate. Its limit bounds the per-stage worker
             count, and the leaf ``agent()`` calls inside the stages acquire it, so
             leaf concurrency across all stages stays within the cap.
-        queue_maxsize: Bounded capacity of each stage's queue (backpressure).
+        queue_maxsize: Bounded capacity of each stage's queue. It is the admission
+            window: the feeder blocks on a full queue, so the live envelope count
+            stays near ``worker_count + queue_maxsize``, independent of the input
+            size.
 
     Returns:
         A list aligned to ``items`` input order. Each entry is the item's final
@@ -90,12 +153,13 @@ async def run_pipeline(
     """
     if not stages:
         raise ValueError("pipeline requires at least one stage")
-    if not items:
-        return []
 
-    item_count = len(items)
-    results: list[Any | None] = [None] * item_count
-    worker_count = _workers_per_stage(gate, item_count)
+    length = len(items) if isinstance(items, Sized) else None
+    worker_count = _workers_per_stage(gate, length, queue_maxsize)
+    # Order-preserving collection keyed by input index. A length is never required
+    # up front, so a streaming (generator / AsyncIterable) source is collected the
+    # same way a list is, then flattened once every item has settled.
+    results: dict[int, Any | None] = {}
     # First engine control-flow signal (budget/determinism) raised by any stage.
     # Once set, workers drain remaining items WITHOUT running their stages and the
     # run re-raises it after a clean teardown — re-raising from inside a worker
@@ -150,8 +214,18 @@ async def run_pipeline(
 
     async def feeder() -> None:
         """Inject every item into stage 0, then propagate poison pills downstream."""
-        for index, item in enumerate(items):
-            await queues[0].put(_Envelope(index=index, original=item, payload=item))
+        # aclosing closes the (possibly unbounded / paged) async source even when we break
+        # out early on a control-flow abort, releasing its resources.
+        async with aclosing(_drain(items)) as stream:
+            async for index, item in stream:
+                # A stage tripped a fail-loud control-flow signal: stop pulling the source.
+                # Envelopes already queued are still drained + task_done by the workers
+                # (which drop them under ``aborted``), so the join() and poison-pill teardown
+                # below still complete; we only stop admitting new items, so an unbounded
+                # source cannot keep paging after the abort.
+                if aborted:
+                    break
+                await queues[0].put(_Envelope(index=index, original=item, payload=item))
         # Retire each stage's workers in order. Each stage drains fully (every
         # live envelope already forwarded) before its poison pills are consumed,
         # because a worker only pulls a pill after all real envelopes ahead of it.
@@ -180,4 +254,8 @@ async def run_pipeline(
         # A stage tripped an engine control-flow signal; surface it loud now that
         # the pipeline has drained and torn down cleanly.
         raise aborted[0]
-    return results
+    # Flatten the index-keyed results into an ordered list. An empty run yields [];
+    # otherwise positions absent from the dict are filled with None.
+    if not results:
+        return []
+    return [results.get(i) for i in range(max(results) + 1)]

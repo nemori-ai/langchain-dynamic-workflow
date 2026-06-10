@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator, Iterator
 
 import pytest
 
 from langchain_dynamic_workflow._concurrency import ConcurrencyGate
 from langchain_dynamic_workflow._errors import WorkflowBudgetExceededError
-from langchain_dynamic_workflow._pipeline import run_pipeline
+from langchain_dynamic_workflow._pipeline import (
+    _workers_per_stage,  # pyright: ignore[reportPrivateUsage] - engine helper under test
+    run_pipeline,
+)
 
 
 async def test_pipeline_empty_stages_raises() -> None:
@@ -219,3 +223,177 @@ async def test_pipeline_is_faster_than_sequential() -> None:
     sequential = len(items) * 2 * per_stage
     # Overlap must beat naive sequential by a wide margin.
     assert elapsed < sequential * 0.6
+
+
+async def test_pipeline_accepts_sync_generator_without_len() -> None:
+    # A generator is Iterable but NOT Sized: it has no __len__. The generalized
+    # run_pipeline must stream it through without ever calling len(items) and
+    # collect results in the generator's yield order.
+    gate = ConcurrencyGate(limit=4)
+
+    def gen() -> Iterator[int]:  # generator: Iterable, not Sized
+        yield from (10, 20, 30, 40, 50)
+
+    async def stage(prev: int, item: int, index: int) -> int:
+        # Later items finish faster so completion order != input order.
+        await asyncio.sleep((50 - item) * 0.0001)
+        return item + index
+
+    results = await run_pipeline(gen(), [stage], gate=gate)
+    # index threads the yield position: 10+0, 20+1, 30+2, 40+3, 50+4.
+    assert results == [10, 21, 32, 43, 54]
+
+
+async def test_pipeline_accepts_async_iterable() -> None:
+    # An async source (paged API / streaming reader) is the point of streaming
+    # admission. The feeder must drive it via `async for` and preserve order.
+    gate = ConcurrencyGate(limit=4)
+
+    async def asource():
+        for value in range(6):
+            await asyncio.sleep(0.0005)
+            yield value
+
+    async def stage(prev: int, item: int, index: int) -> int:
+        await asyncio.sleep((6 - item) * 0.001)
+        return item * 100
+
+    results = await asyncio.wait_for(
+        run_pipeline(asource(), [stage], gate=gate),
+        timeout=3.0,
+    )
+    assert results == [0, 100, 200, 300, 400, 500]
+
+
+async def test_pipeline_empty_async_iterable_returns_empty() -> None:
+    # An empty AsyncIterable has no __len__ and no __bool__: the old
+    # `if not items: return []` early return would have crashed on it. The
+    # generalized run must drain zero items and return [] via poison-pill teardown.
+    gate = ConcurrencyGate(limit=2)
+
+    async def empty_asource():
+        return
+        yield  # pragma: no cover  -- makes this an async generator
+
+    async def stage(prev: int, item: int, index: int) -> int:  # pragma: no cover
+        raise AssertionError("stage must not run for an empty input")
+
+    results = await asyncio.wait_for(
+        run_pipeline(empty_asource(), [stage], gate=gate),
+        timeout=2.0,
+    )
+    assert results == []
+
+
+async def test_pipeline_async_iterable_preserves_order_under_backpressure() -> None:
+    # An AsyncIterable feeding more items than the queue capacity must apply
+    # backpressure (not deadlock) and still return results in input order, proving
+    # the dict-keyed collection reconstructs order without a pre-allocated length.
+    gate = ConcurrencyGate(limit=4)
+
+    async def asource():
+        for value in range(20):
+            yield value
+
+    async def stage_one(prev: int, item: int, index: int) -> int:
+        await asyncio.sleep(0.001)
+        return item + 1
+
+    async def stage_two(prev: int, item: int, index: int) -> int:
+        await asyncio.sleep(0.001)
+        return prev * 2
+
+    results = await asyncio.wait_for(
+        run_pipeline(asource(), [stage_one, stage_two], gate=gate, queue_maxsize=2),
+        timeout=3.0,
+    )
+    assert results == [(i + 1) * 2 for i in range(20)]
+
+
+async def test_pipeline_streaming_admission_bounds_source_pulls_below_n() -> None:
+    # The streaming-admission invariant (the headline): the feeder pulls from the
+    # source LAZILY through the bounded queue, so while the barrier holds the count
+    # of items PULLED from the source stays near worker_count + window and NEVER
+    # reaches N. That is the quantity that actually distinguishes streaming from
+    # eager materialization: under list(items) the source is fully drained (N pulls)
+    # before any stage runs, so `pulled_at_barrier < n` would FAIL — the real teeth.
+    # (Measuring in-fn concurrency instead is hollow: it is loop-bounded by
+    # worker_count regardless of admission strategy.) asyncio.wait_for guards against
+    # a backpressure deadlock.
+    n = 400
+    window = 4
+    gate = ConcurrencyGate(limit=64)  # large enough that the WINDOW, not the gate, bounds
+    worker_count = _workers_per_stage(gate, None, window)  # min(64, 4) = 4
+    pulled = 0
+    pulled_at_barrier = 0
+    in_stage = 0
+    barrier_released = asyncio.Event()
+
+    async def asource():
+        nonlocal pulled
+        for value in range(n):
+            pulled += 1  # count every item the feeder pulls off the source
+            yield value
+
+    async def stage(prev: int, item: int, index: int) -> int:
+        nonlocal in_stage, pulled_at_barrier
+        in_stage += 1
+        # Once the workers are saturated the feeder has filled the bounded queue and
+        # is blocked on a full put, so `pulled` now reflects the steady-state
+        # admission window. Snapshot it, then release so the run drains. A plain int
+        # update is safe — asyncio is single-threaded, no await between read/write.
+        if in_stage >= worker_count and not barrier_released.is_set():
+            pulled_at_barrier = pulled
+            barrier_released.set()
+        await barrier_released.wait()
+        await asyncio.sleep(0.0005)
+        in_stage -= 1
+        return item
+
+    results = await asyncio.wait_for(
+        run_pipeline(asource(), [stage], gate=gate, queue_maxsize=window),
+        timeout=5.0,
+    )
+
+    assert results == list(range(n))
+    # The feeder admitted at most ~worker_count + window items before backpressure
+    # blocked it — decoupled from N. The +2 is slack for the item in-flight on put.
+    bound = worker_count + window + 2
+    assert pulled_at_barrier <= bound, (
+        f"pulled {pulled_at_barrier} exceeded admission window bound {bound}"
+    )
+    # The real teeth: the source was NOT fully drained while work was in flight. An
+    # eager list(items) implementation would have pulled all N before any stage ran.
+    assert pulled_at_barrier < n, (
+        f"pulled {pulled_at_barrier} reached N={n} — source fully drained, "
+        "admission not decoupled from total (eager materialization)"
+    )
+
+
+async def test_pipeline_stops_pulling_source_after_control_flow_abort() -> None:
+    # #1: when a stage trips a fail-loud control-flow signal, the feeder must STOP
+    # pulling from the source. Otherwise an unbounded / paged AsyncIterable keeps
+    # paging (or hangs) after the abort. Use a large bounded source and assert it is
+    # NOT fully drained. asyncio.wait_for guards against a hang.
+    n = 500
+    window = 4
+    gate = ConcurrencyGate(limit=8)
+    pulled = 0
+
+    async def asource() -> AsyncIterator[int]:
+        nonlocal pulled
+        for v in range(n):
+            pulled += 1
+            yield v
+
+    async def stage(prev: int, item: int, index: int) -> int:
+        raise WorkflowBudgetExceededError("boom")  # first item trips the fail-loud signal
+
+    with pytest.raises(WorkflowBudgetExceededError):
+        await asyncio.wait_for(
+            run_pipeline(asource(), [stage], gate=gate, queue_maxsize=window),
+            timeout=5.0,
+        )
+    # Bug: feeder drains all N before poison pills -> pulled == n.
+    # Fixed: feeder breaks shortly after the abort -> pulled << n.
+    assert pulled < n, f"feeder pulled all {n} items after abort (pulled={pulled}) - #1 not fixed"

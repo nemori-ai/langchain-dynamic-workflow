@@ -161,3 +161,31 @@ async def test_run_script_can_construct_injected_race_types() -> None:
     unused_ctx: Any = object()
     result = await orchestrate(unused_ctx, {"hyps": ["a", "b", "c"]})
     assert result == (3, "inv", True)
+
+
+async def test_run_script_can_call_ctx_batch_map() -> None:
+    # batch_map is a Ctx method, so — like dag / loop_until / race — it needs NO
+    # run_script global injection and is NOT on the AST gate's banned-name list.
+    # This proves a host-authored script COMPILES with a ctx.batch_map(...) call
+    # (the security gate + restricted exec accept it), the dual of the codegen tests
+    # that prove the injected value types resolve. The compiled body is exercised
+    # against a tiny in-process stub ctx whose batch_map applies fn to each item, so
+    # the method-call wiring is proven end to end without a real engine.
+    from langchain_dynamic_workflow._codegen import compile_workflow_source
+
+    source = (
+        "async def orchestrate(ctx, args):\n"
+        "    out = await ctx.batch_map(args['xs'], lambda x: x, max_in_flight=2)\n"
+        "    return out\n"
+    )
+    orchestrate = compile_workflow_source(source)
+
+    class _StubCtx:
+        async def batch_map(
+            self, items: Any, fn: Any, *, max_in_flight: int | None = None
+        ) -> list[Any]:
+            return [fn(x) for x in items]
+
+    stub_ctx: Any = _StubCtx()  # not a real Ctx; the call only needs .batch_map
+    result = await orchestrate(stub_ctx, {"xs": [1, 2, 3]})
+    assert result == [1, 2, 3]

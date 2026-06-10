@@ -4,6 +4,20 @@ All notable changes to `langchain-dynamic-workflow` are documented here. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Batch ergonomics — `ctx.batch_map` (v0.4.0 · E)** — a thin streaming map primitive: applies one
+  async `fn` to every item of an `Iterable`/`AsyncIterable` through a bounded admission window, so a
+  flood of N items never materializes N tasks (memory stays bounded by the window, decoupled from N);
+  results are collected in input order (`list[T | None]`, a failing `fn` lands `None`). Auto-emits live
+  count/ETA progress via a transient `ProgressKind.BATCH` entry + `BatchMetrics` (delivered to the
+  `ProgressSink` but never recorded, so it stays out of the journal / determinism guard / replay).
+  Adds `BatchMetrics`, `ProgressKind.BATCH`, `SpanKind.BATCH`, and `ProgressEntry.metrics`. `parallel`
+  and `pipeline`'s public contracts are unchanged; the shared `run_pipeline` scheduler is generalized
+  to consume an (async) iterable.
+
 ## [0.3.0] - 2026-06-09
 
 A use-case-driven batch that approaches — and selectively exceeds — Claude Code's

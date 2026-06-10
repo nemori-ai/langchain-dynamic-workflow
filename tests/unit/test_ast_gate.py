@@ -76,6 +76,21 @@ def test_rejects_ctx_checkpoint_in_authored_script() -> None:
     assert "checkpoint" in str(exc.value)
 
 
+def test_allows_ctx_batch_map_in_authored_script() -> None:
+    # batch_map is an ordinary orchestration primitive (like parallel / pipeline /
+    # race / dag / loop_until), NOT a registered-workflow-only capability like
+    # checkpoint. The gate must let an authored script call it: it is deliberately
+    # absent from _BANNED_CTX_METHODS. This pins that property so a future tightening
+    # of the gate cannot silently strand batch_map for LLM-authored scripts.
+    validate_workflow_source(
+        _wrap(
+            "files = sorted(args['files'])\n"
+            "findings = await ctx.batch_map("
+            "files, lambda p: ctx.agent(f'Audit {p}', agent_type='finder'), max_in_flight=16)\n"
+        )
+    )  # no raise
+
+
 def test_rejects_subclasses_escape_chain() -> None:
     # The classic sandbox escape: walk the type tree to reach arbitrary classes.
     with pytest.raises(WorkflowScriptError):

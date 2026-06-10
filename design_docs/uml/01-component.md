@@ -27,10 +27,10 @@ flowchart TB
   ST -. "journal_for(canonical run_id)" .-> JN
   ST -. "SqliteWorkflowStore.checkpointer (第二连接)" .-> EP
   subgraph ENG["«subsystem» Engine L0/L1 (agent 不可见)"]
-    CTX["Ctx primitives<br/>agent/parallel/pipeline/race/dag/loop_until/phase/log/budget/workflow"]
+    CTX["Ctx primitives<br/>agent/parallel/pipeline/batch_map/race/dag/loop_until/phase/log/budget/workflow"]
     JN["Journal content-hash, success-only"]
     DG["DeterminismGuard divergence backstop"]
-    PS["PipelineScheduler bounded queue"]
+    PS["PipelineScheduler bounded queue<br/>(pipeline + batch_map 流式准入)"]
     DS["_dag DagScheduler<br/>Kahn in-degree + transitive-skip"]
     ER["_errors WorkflowDagError / WorkflowCycleError<br/>+ WORKFLOW_CONTROL_FLOW_SIGNALS"]
     SM["SandboxManager per-leaf 实例"]

@@ -24,6 +24,7 @@
 | `agent(prompt, *, schema, agent_type, model, label, isolation)` | 起全新 context 的 subagent;带 `schema` 强制结构化输出 + 校验 + 不匹配重试。`schema` 可为 pydantic 类或 **JSON-schema dict(L2 脚本禁 import 时的内联形态,引擎经 `to_pydantic_model` 归一为 pydantic)**;脚本下一行直接属性访问 |
 | `parallel(thunks)` | 并发 + **阻塞 barrier**;thunk 抛错 → 该位 `null`,整体**永不 reject**(用前 `.filter`) |
 | `pipeline(items, *stages)` | 多 stage **无 barrier** 流水线;stage 签名 `(prev_result, original_item, index)`;抛错 → 该 item `null` 跳后续 |
+| `batch_map(items, fn, *, max_in_flight=None, total=None, label="batch_map")` | **流式准入扇出**:把一个异步 `fn` map 到 `Iterable`/`AsyncIterable` 每个 item,经**有界准入窗口**懒消费(N 千 item 永不一次性物化 N 千 task)、结果按输入序回收(`list[T \| null]`,失败叶落 `null`、永不 abort barrier);自动发 transient count/ETA 进度;见 §9b |
 | `race(candidates, *, win, win_tag="")` | **best-of-N 早退**:N 个 `RaceCandidate`(镜像 `agent()` 入参)经 `agent()` 并发,第一个令 `win(result)` 为真者胜,在飞 loser 全数 cancel;决策**内容哈希 journal**(`win_tag` 折进 key)——resume 复现胜者、**零派发**;无胜者**不** journal(resume 可重试)。返回 `RaceResult`(`won`/`winner`/`winner_index`);候选须同构(全无 schema 或全同一 schema)。靠两补丁:race-key 用 content-hash journal、确定性 guard 只在深度 0 observe race-key(候选 `agent()` 在深度 > 0、不入序列,同 `parallel`/`pipeline` 叶) |
 | `dag(nodes)` | **依赖序（拓扑序）fan-out**——第四种扇出帧:见 §2c |
 | `loop_until(body, *, done, max_iters)` | **有终止保证的顺序循环**:见 §2d |
@@ -31,7 +32,7 @@
 | `budget` | `{total, spent(), remaining()}`,**共享池**,到顶 `agent()` 抛 |
 | `workflow(name, args)` | 内联调另一 workflow,深度上限可配置(默认 8 层,含循环检测);见 §2e |
 
-失败语义照搬 Claude Code:`parallel` 永不 reject、`pipeline` 抛错落 `null`;`race` 单个候选叶失败仅淘汰该候选、其余继续,引擎控制流信号(budget/确定性)或 `win` 谓词抛错则在拆除 loser 后**失声而抛**(fail-loud)。
+失败语义照搬 Claude Code:`parallel` 永不 reject、`pipeline` 抛错落 `null`、`batch_map` 失败 `fn` 落 `null` 不 abort(共享 `pipeline` 的 drop-to-`null` 引擎,见 §9b);`race` 单个候选叶失败仅淘汰该候选、其余继续,引擎控制流信号(budget/确定性)或 `win` 谓词抛错则在拆除 loser 后**失声而抛**(fail-loud)。
 
 **跨叶归约 helper(`_reduce`,纯函数,F)**:折叠 `parallel` / `pipeline` 交回的结果列表(失败叶=`None`)的一等公民——`survives`(refute-by-default 投票,`None` 恒计反对的 fail-safe,覆盖 adversarial-verify 与 judge-panel)、`dedup`(丢 `None` + 按 key 去重,保首见序)、`reconcile`(双盲复核分桶 included/excluded/conflicts,`None`/空裁决恒落 conflict)、`corroborate`(按 key 分组、≥`min_support` 才留的跨叶相互印证),配 `ReviewItem` / `Reconciled` / `Consensus` 三个 frozen dataclass。它们**无 `agent()` 调用、无引擎状态**,故天然 replay-safe、不碰 journal/确定性 guard;由包根导出供开发者 workflow `import`,并由 `_codegen` 注入 `run_script` 命名空间(L2 脚本禁 import,故按名直调)。
 
@@ -244,6 +245,34 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 
 底座无任何无-barrier 流式原语(`Send` 是 map-reduce barrier);完全自建。中途异常/预算耗尽须保证队列优雅排空、不死锁。
 
+## 9b. batch_map — 流式准入扇出（E:大规模 fan-out 人体工学）
+
+`ctx.batch_map(items, fn)` 是面向**大规模扇出**(数千叶)的薄 map 原语:把一个异步 `fn`(典型为单个 `agent()`)map 到一个 `Iterable` 或 `AsyncIterable` 的每个 item,结果按**输入序**回收为 `list[T | None]`。它是 `parallel`(吃预物化 thunk 列表)的大扇出对位面——`parallel` = 小已知集 + barrier,`batch_map` = 大流式集 + 进度。**它复用 §9 的 `pipeline` 调度器**,不另起一套:`batch_map(items, fn)` 即"单 stage 的广义 `pipeline` 运行"(stage = `lambda _prev, item, _idx: fn(item)`),白拿失败隔离(抛错落 `None`)、控制流 drain-then-reraise、poison-pill 拆除,以及 `_FANOUT_DEPTH` 帧(内部 `agent()` 跳确定性序列 guard,同 `parallel`/`pipeline`/`dag` 叶)。
+
+### 流式准入不变量（载重)
+
+把 `run_pipeline` 从"`list` 专用"广义化为"吃任意 `Iterable | AsyncIterable`"——只需拆掉三处 `len` 依赖:① feeder 经一个 `_drain(items)` 适配器消费(`AsyncIterable` 走 `async for`、`Iterable` 走 `enumerate`,故 feeder 是 `async for index, item in _drain(items)`,先探 async 协议——`list` 是 `Iterable` 非 `AsyncIterable`、异步生成器二者皆是,先探 async 故各走对支);② 结果回收弃 `[None] * count` 预分配,改 `dict[int, T | None]` 按下标 key,末了 flatten 成 `list`(空 run 回 `[]`,缺位补 `None`)——**保序而无需提前知道长度**;③ worker 数:`Sized` 输入 → `min(gate.limit, len, max_in_flight)`,未知长度 → `min(gate.limit, max_in_flight)`(默认 `gate.limit`)。
+
+**流式准入不变量**:有界 queue(`maxsize = max_in_flight`)已天然提供背压——feeder 在满 queue 上 `put` 阻塞,故任一时刻**在飞 envelope/task 数 ≈ `worker_count + queue_maxsize`、与 N 解耦**。N 千 item 永不一次性物化 N 千 task,内存被窗口而非总量绑定。这是与"急切物化(`list(items)`)"的真正分水岭:急切实现会在任何 stage 跑之前把源**全抽干**(N 次 pull),流式实现在 barrier 处只 pull 到 `~worker_count + window` 就被背压挡住、绝不到 N(headline 不变量测试度量的正是**源 pull 数**,而非 in-`fn` 并发——后者无论准入策略如何都被 `worker_count` 循环界住,度量它是空的)。`asyncio.wait_for` 守背压死锁。
+
+### 流式-IN / barrier-OUT（诚实非目标)
+
+`batch_map` 是**流式准入、barrier 收口**:item 懒进,但结果**收齐才一次性返回**(对齐输入序),不随完成边流式 yield。真流式输出与确定性 replay 冲突(已是 race 的非目标),故不做。ETA 是 `remaining / mean rate` 的朴素线性估计,不建模方差/尾重,是提示非保证。
+
+### count/ETA 进度 — transient 投递的确定性边界（载重)
+
+`batch_map` 随推进自动发**实时 count/ETA 进度**,无需脚本自插桩。新增 `ProgressKind.BATCH` + 一个 frozen `BatchMetrics(completed, elapsed_seconds, rate, total=None, eta_seconds=None)`,经 `ProgressEntry` 的可选 `metrics: BatchMetrics | None = None` 字段搭载(`PHASE`/`LOG` 条目留 `None`,向后兼容)。`rate = completed / elapsed`;`total` 已知(`Sized` 输入取 `len`,或 `total=` 提示)则算 `eta = (total - completed) / rate`,未知 `total` 只发 `completed`、`eta=None`(graceful degradation)。**节流**:每 K item 或每 T 秒发一次而非逐 item(N 千次发射是噪音),`K = max(1, total // 100)`(未知 total 用固定步 64),且**总发一条最终 settled 条目**故末态精确。
+
+**transient 投递是这个里程碑唯一的载重不变量**:`BATCH` 条目是**带外、瞬时、非确定**的,绝不走 `ProgressLog` 的 append-only 记录路径,而经 `ProgressLog.emit_transient` 投递:
+
+- **投递到 sink 但不记录**(不入 `_entries`、不计入 `delivered_count`)。fire-and-forget 刷新,消费者覆写上一条来渲染(进度条),正如 M3.5 upsert `workflow_runs`、M1 带外 tap 叶事件。
+- **绝不进 journal / 确定性 guard / replay 结果**。它携的时间戳(`elapsed`/`eta`)是非确定的,绝不能 key 一条 journal 条目。
+- **resume 时 re-emitted、非 replayed**:resume 重执行脚本,`batch_map` 重跑、实时 BATCH 进度**被重新发出**——作为实时视图重新生成,而非从记录回放(`emit_transient` 刻意永不被 replay 抑制,即便 `delivered_count > 0`)。这不动 journal 分毫:完成叶仍零模型成本重放,且因 BATCH 条目从不入 `_entries`/`delivered_count`/journal/确定性 guard,重发的进度**不携确定性重量**。载重不变量是 **not-recorded**,**不是 not-re-emitted**——进度是实时视图,每跑重生,从不被回放。
+
+### parallel 不动、pipeline 的 Sequence 契约保持
+
+**`parallel` 完全不动**——它仍急切物化、要求 `Sequence`、span 记 `thunk_count`;`batch_map` 是独立的第三条路而非 `parallel` 的改造(改 `parallel` 吃迭代器会牺牲其稳定契约,违反 preserve-public-signatures)。**`pipeline` 的公共契约逐字节保持**:`Sequence` 输入仍走 `len` 快速路径(`length = len(items) if isinstance(items, Sized) else None`),广义化后的同一个 `run_pipeline` 同时服务 `pipeline` 与 `batch_map`,既有 10 个 list-输入 pipeline 测试一字未改照绿。新增公共面全为 additive、keyword-only、有默认:`Ctx.batch_map` · `ProgressKind.BATCH` + `BatchMetrics`(包根导出) · `SpanKind.BATCH`(记 `total`/`admitted_count`/`surviving_count`) · `ProgressEntry.metrics`(可选、默认 `None`)。`batch_map` 是 `Ctx` 方法 → 不在 AST gate 禁用名单、无需 `run_script` 注入(`BatchMetrics` 引擎产、脚本从不构造)。详见 [v0_4_0_plans/02-e-batch-ergonomics.md](v0_4_0_plans/02-e-batch-ergonomics.md)。
+
 ## 10. budget
 
 共享 token 池 `{total, spent(), remaining()}`,到顶 `agent()` 抛。`spent()` 由 journal 中每叶子 usage 重建 → 重放确定。计量底座:`usage_metadata`(AIMessage)+ `UsageMetadataCallbackHandler`;`ModelCallLimitMiddleware` 可作只计次的粗兜底。
@@ -290,6 +319,7 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | D-M7d | dag 无需 journal 条目 | DAG 结构由确定性脚本定义;resume 重跑调度器、已完成叶走 journal 短路。无需 dag 级 journal 条目;与 `parallel`/`pipeline`/`race` 的统一处理:结构元数据不入 journal,只有叶子结果入。 |
 | D-M7e | `workflow()` 嵌套:循环检测先于深度检测 | `WorkflowCycleError`(名字已在栈上)优先于 `WorkflowNestingError`(深度超限):循环检测代价低、诊断更精确;深度上限是兜底防线。两个 contextvar(`_WORKFLOW_DEPTH` + `_WORKFLOW_NAME_STACK`)在 `finally` 中各自独立 reset——栈和深度各自恢复,避免其中一个失败导致另一个泄漏。 |
 | D-M6 | 真 git worktree + 分支/PR 形态(M6) | **方案 1**(经 Codex + in-house 跨模型评审拍板,折入 R1–R10):**git provider 拥有 worktree-rooted 后端 + merge/冲突循环走 journaled 叶 + 脚本变量 fold + PR 作 host finalization**。`LocalSubprocessSandbox(root=, on_close=)` 让叶沙箱根植真 worktree(默认逐字节不变);`GitWorktreeProvider`(`git worktree add -b leaf/<id>`、真 `git diff` 作 collect、幂等 R4 + 异常安全 R3、teardown 绑 `on_close`、`cleanup_all` 由 host 在 `finally` 调 R-host-contract);`SandboxManager(git_worktree_provider=)` 两契约各一分支、离线默认零改动。**三处承重决策**:① **PR/integration 物化移出确定性 replay 作幂等 host finalization**(R1——副作用须在叶边界或 replay 之外,否则 resume 重开);② **worktree 叶权威变更集 = leaf task 内真 `git diff`**(R5,经 `model_validate` 覆写 schema `files`、schema-less/缺字段/错类型皆 fold 期 fail-loud,非模型自报);③ **整合用 merge 叶内一次性 scratch-repo 真 `git merge`**(R7,比 merge-file 忠于 branch 语义且自给自足 resume-safe)。R8:阻塞 git(add + teardown)thread-offload 出 slot 锁(`_admit_slot` 锁内 POP 牺牲 slot + `_pending` 占位、off-loop 关/建)。R6 安全:真 git 执行叶只在 host-trusted roster,untrusted authored-script 走 reasoning-only roster(`make_reasoning_roster`)+ ExecPolicy admission,撤"脚本够不到 git"错误论据。collect 删除 v1 fail-loud(无 tombstone)。真 `gh` provider 降级为示例(R9)。否决方案 2(统一 open/collect/close 生命周期契约——改稳定 seam、共享 integration 工作区与 per-leaf 隔离 + resume 冲突)、方案 3(冲突在单叶内解决——放弃"脚本拥有循环"命门)。详见 §8c |
+| D-E | 批处理人体工学(`batch_map` + 流式准入 + count/ETA 进度,E) | **流式准入落在新 `batch_map`、`parallel` 不动、内部广义化既有 `run_pipeline`**(路线图原写"修 parallel"——改 `parallel` 吃迭代器会牺牲其 `len`/index 预分配/`thunk_count` span 的稳定契约,违反 preserve-public-signatures;分工:`parallel` = 小已知集 + barrier,`batch_map` = 大流式集 + 进度)。`batch_map` 是**薄 map**(单 `fn`),非广义多 stage pipeline 亦非 map+内建 reduce——多 stage 链是 `pipeline` 的活、reduce 留作结果列表上的独立 M1-helper 调用(避两个近同 API + 避耦合,YAGNI)。**进度复用 `ProgressSink` + 一个 transient `BATCH` 条目**,非新 `on_batch_progress` 钩子(零新 API 面;transient/not-recorded 语义已隔离确定性)。**输入从一开始就支持 `Iterable` + `AsyncIterable`**(异步源——paged API/流式行读——正是流式准入的意义,feeder 本就 async)。**载重不变量 = transient 投递的确定性边界**:BATCH 条目 delivered-but-not-recorded(不入 `_entries`/`delivered_count`/journal/确定性 guard),故 resume 时 re-emitted-not-replayed——not-recorded 是命门,not-re-emitted **不是**。流式准入不变量:在飞 task ≈ `worker_count + queue_maxsize`、与 N 解耦。详见 §9b 与 [v0_4_0_plans/02-e-batch-ergonomics.md](v0_4_0_plans/02-e-batch-ergonomics.md) |
 
 ## 13. 实现待核实清单（开工前/中逐条钉测试）
 
