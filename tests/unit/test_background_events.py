@@ -116,3 +116,14 @@ async def test_cross_thread_appends_do_not_tear_reads() -> None:
         t.join()
     events, dropped = manager.buffered_events(run_id, thread_id="t1")
     assert len(events) == 2000 and dropped == 0
+
+
+async def test_sweep_reclaims_buffer_with_slot() -> None:
+    manager = BgRunManager(idle_ttl_seconds=0.0)
+    run_id = await _start_noop_run(manager)
+    sinks = manager.event_sinks(run_id, thread_id="t1")
+    sinks.on_span_begin(_span_begin("x"))
+    assert manager.buffered_events(run_id, thread_id="t1")[0] != []
+    reclaimed = manager.sweep()
+    assert run_id in reclaimed
+    assert manager.buffered_events(run_id, thread_id="t1") == ([], 0)
