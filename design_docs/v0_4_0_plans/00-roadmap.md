@@ -1,6 +1,6 @@
 # v0.4.0 路线图（Roadmap）— 引擎可观测性 + 交互式体验
 
-> **For agentic workers:** 本文件是 v0.4.0 的**批次总线**。延续 v0.2.0/v0.3.0 的方法：每个目标对应一份独立设计/计划文档（`design_docs/v0_4_0_plans/0N-*.md`，**逐目标增补**，不一次写完）。本批次为**开放状态**——M1 已落地；M2/M3 为 2026-06-09 用户登记的新需求（详细设计待本批次正式启动时展开）；自 v0.3.0「後續里程碑」backlog 提升的 E（`batch_map`）已落地（M7 已于 v0.3.0 落地，不在本批次）；新候选随推进纳入。
+> **For agentic workers:** 本文件是 v0.4.0 的**批次总线**。延续 v0.2.0/v0.3.0 的方法：每个目标对应一份独立设计/计划文档（`design_docs/v0_4_0_plans/0N-*.md`，**逐目标增补**，不一次写完）。本批次为**开放状态**——M1 已落地；E（`batch_map`，自 v0.3.0「後續里程碑」backlog 提升）已落地；**M3（transport 底座 + 下钻 + 结果回传）设计已定稿**（2026-06-10，见 [`03-background-run-transport-and-m3.md`](03-background-run-transport-and-m3.md)，切片 1）；M2（持久侧栏）的承重底座已随 03 设计完毕，其侧栏布局细化设计留切片 2（`04-*.md`）展开（M7 已于 v0.3.0 落地，不在本批次）；新候选随推进纳入。
 
 ## 已确认目标
 
@@ -32,7 +32,7 @@
 
 ## 已登记需求（2026-06-09 用户提；详细设计待本批次正式启动展开）
 
-> 下面两块为**需求登记**，不是定稿设计——记录目标、现状缺口与一个已识别的承重架构约束（二者共享 **context-independent transport** 底座），以免 v0.4.0 启动时重新发现。视图复用、渲染技术、回传粒度等细化设计**刻意留空**，待正式启动时讨论。
+> **更新（2026-06-10）：** 下面两块原为需求登记。现 **M3 已完成定稿设计**（transport 底座 + ①下钻 + ②回传，见 [`03-background-run-transport-and-m3.md`](03-background-run-transport-and-m3.md)）：scope=全量登记愿景、排序=切片1（底座+M3①）→切片2（M2）、M3② 独立穿插；transport=A1（缓冲+活轮 pump、raw-event buffer 挂 BgRunSlot、每轮全量重放 fresh UiAdapter）；M3② 回传=每 run 摘要+按需 fetch handle（复用 RunResult/ResultStore）。**M2 的承重底座已随 03 设计完毕，仅其侧栏布局/渲染细化留切片 2（`04`）。** 下面保留原始需求登记原文，作为目标与现状缺口的存档。
 
 ### M2 · 持久侧边栏 — 多-workflow 实时流程图视图
 
@@ -57,7 +57,7 @@
 ## 状态
 
 - **M1 叶子级实时可观测**：✅ 已落地（引擎 hook PR #12 + demo 消费 PR #13）——inline leaf 实时 status + 计时器 + drill-in。
-- **M2 持久侧边栏多-workflow 实时视图**：📝 需求已登记（2026-06-09）；详细设计待 v0.4.0 正式启动。
-- **M3 run board 下钻 + 背景 run 结果回传 host**：📝 需求已登记（2026-06-09）；① context-independent transport 是 M2 + M3① 的**共享承重基建**（v0.4.0 核心攻坚），② 结果回传相对独立、不依赖 transport；详细设计待启动。
+- **M3 run board 下钻 + 背景 run 结果回传 host**：✅ 设计已定稿（2026-06-10，见 [`03-background-run-transport-and-m3.md`](03-background-run-transport-and-m3.md)，切片 1，实现待启）。① 下钻经 **context-independent transport 底座**（A1：BgRunSlot 有界 raw-event buffer + `event_sinks`/`buffered_events` + 活轮全量重放 fresh UiAdapter），② 结果回传相对独立、复用 RunResult/ResultStore（每 run 摘要 + 按需 fetch handle）。
+- **M2 持久侧边栏多-workflow 实时视图**：🧱 承重底座已随 03 设计完毕（与 M3① 共享 transport 底座）；其侧栏布局 / 多-workflow 并列 / 渲染技术等**细化设计待切片 2 启动**（`04-*.md`）。
 - **E 批处理人体工学（`batch_map`）**：✅ 已落地——流式准入大扇出 map（广义化 `run_pipeline`、`parallel` 不动）+ transient count/ETA 进度（`ProgressKind.BATCH`，delivered-not-recorded）；自 v0.3.0「後續里程碑」backlog 提升而来。设计见 [`02-e-batch-ergonomics.md`](02-e-batch-ergonomics.md)。
 - **其余 v0.4.0 目标**：批次开放，逐项增补（候选：面向社区的交互式 demo-app 等；自 v0.3.0 提升的 E 已落地，M7 已于 v0.3.0 落地）。
