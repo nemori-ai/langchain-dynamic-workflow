@@ -26,7 +26,7 @@ import contextlib
 import threading
 import time
 import uuid
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -103,6 +103,30 @@ class BufferedEvent:
 
     kind: str
     payload: BufferedPayload
+
+
+@dataclass(frozen=True, slots=True)
+class RunEventSinks:
+    """The five engine sinks that buffer a background run's events on its slot.
+
+    Built by :meth:`BgRunManager.event_sinks` and passed verbatim into
+    ``run_workflow``'s keyword-only sink parameters. Each sink is a synchronous,
+    bounded, lock-guarded append that never raises and never blocks — satisfying
+    the engine's inline-sink contract.
+
+    Attributes:
+        on_span_begin: Buffers a span-open edge.
+        on_span: Buffers a completed span.
+        on_leaf_event: Buffers one leaf interior callback edge.
+        on_progress: Buffers a progress entry.
+        on_command: Buffers a real-execution command edge (may fire off-loop).
+    """
+
+    on_span_begin: Callable[[SpanBegin], None]
+    on_span: Callable[[Span], None]
+    on_leaf_event: Callable[[LeafEvent], None]
+    on_progress: Callable[[ProgressEntry], None]
+    on_command: Callable[[CommandEvent], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +459,42 @@ class BgRunManager:
             return ([], 0)
         with slot.events_lock:
             return (list(slot.events), slot.dropped)
+
+    def event_sinks(self, run_id: str, *, thread_id: str) -> RunEventSinks:
+        """Build append-only transport sinks bound to ``run_id``'s slot buffer.
+
+        Each sink resolves the slot lazily at append time (so the sinks can be built
+        before ``start`` registers the slot, and outlive a swept slot harmlessly),
+        then appends under the slot's events lock, dropping past the buffer cap and
+        counting the drop. Synchronous, never raises, never blocks.
+
+        Args:
+            run_id: The run whose slot buffer receives the events.
+            thread_id: The owning host thread (part of the composite slot key).
+
+        Returns:
+            A :class:`RunEventSinks` bundle for ``run_workflow``'s sink parameters.
+        """
+        key = _composite_key(thread_id, run_id)
+        cap = self._max_buffered_events
+
+        def _append(kind: str, payload: BufferedPayload) -> None:
+            slot = self._slots.get(key)
+            if slot is None:
+                return  # run never registered, or already swept: drop silently
+            with slot.events_lock:
+                if len(slot.events) >= cap:
+                    slot.dropped += 1
+                    return
+                slot.events.append(BufferedEvent(kind=kind, payload=payload))
+
+        return RunEventSinks(
+            on_span_begin=lambda e: _append("span_begin", e),
+            on_span=lambda e: _append("span", e),
+            on_leaf_event=lambda e: _append("leaf_event", e),
+            on_progress=lambda e: _append("progress", e),
+            on_command=lambda e: _append("command", e),
+        )
 
     def start(
         self,
