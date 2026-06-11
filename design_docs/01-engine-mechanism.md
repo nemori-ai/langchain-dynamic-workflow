@@ -290,6 +290,8 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 
 共享 token 池 `{total, spent(), remaining()}`,到顶 `agent()` 抛。`spent()` 由 journal 中每叶子 usage 重建 → 重放确定。计量底座:`usage_metadata`(AIMessage)+ `UsageMetadataCallbackHandler`;`ModelCallLimitMiddleware` 可作只计次的粗兜底。
 
+**软上限,非硬天花板——并发 fan-out 的过顶界 = 准入宽度,而非 `gate.limit`**:`ensure_within_cap()` 在派发新叶**前**同步检查,`record()` 只在叶完成**后**落账。故 `parallel()` barrier 里 `N` 个叶在池仍有余量时全部通过预派发检查、皆在任一 `record()` 之前过关——过顶量的界是这次**扇出准入宽度**(单个 barrier / fan-out 窗口里、任一记录前被准入的那批叶),**不是**并发闸 `gate.limit`。关键:cap 检查发生在**获闸之前**(journal `get` 在获闸前 yield),闸只串行化叶的**执行**、绝不回收已通过的 cap 检查;故即便 `max_concurrency=1`(`gate.limit==1`),`parallel()` 的 `N` 个叶仍全数准入、过顶到它们 usage 之和(如 budget=10、4 叶各 10 → `spent()==40`,4×;而非 `gate.limit` 隐含的 ≤20)。barrier 收口后**下一个** `agent()` 看到过顶的 `spent()` 即拒派(`WorkflowBudgetExceededError`)——这是有意的软上限取舍:在飞叶保留结果而非被取消回收 token,`remaining()` floors 至 0 故过顶绝不呈负。真正的硬天花板须在准入处做**原子预约**(admission-time atomic reservation),是更大的改动、本端口不做。
+
 ## 11. 并发上限 & 硬上限
 
 - **双层都显式设**:asyncio `Semaphore(min(16, cores-2))` + LangGraph `RunnableConfig.max_concurrency`(底座**默认 None ⇒ 无界**,`_executor.py:135-140`,必须显式设界)。
@@ -365,6 +367,7 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 | (d) | **per-run 规范 id 同时 key journal 谱系与 checkpoint thread** | 每个 run 一个规范来源 id(`RunSpec.journal_run_id`,fresh launch 采自身 `run_id`、resume 从 spec 继承),它**既** key per-run journal(零成本重放谱系)**又** key per-run LangGraph checkpoint thread。**host thread 是另一回事**——只 key BgRunManager 的 manager slot,让发起 launch 的 caller 能 poll。这条切分让一个 host thread 上的多个 run 不塌进同一 checkpoint thread,且 resume 鲁棒地重接原 run 的 thread。 |
 | (e) | **`[sqlite]` 可选 extra 把守持久化** | base 安装零依赖、行为不变(回落 `InMemoryRunStore`)。`SqliteWorkflowStore` 经包根 lazy `__getattr__` 暴露——`import langchain_dynamic_workflow` 不触发 sqlite import;缺 extra 时模块顶 `try/except ImportError` 抛清晰"装 `[sqlite]`"消息。`_persistence` / `_run_store` 入 import-linter Contract 1 `source_modules`,只从 `._engine`(公共墙)import `JournalStore`/`JournalRecord`,**绝不**碰 `._journal`。 |
 | (f) | **schema-version guard(fail-loud)** | `PRAGMA user_version`:`0`(fresh/未追踪)→ 跑 DDL + stamp `_SCHEMA_VERSION`;等于当前版本 → 幂等 proceed;其它非零值 = 不兼容 schema → 立即抛 `IncompatibleSchemaError`,把静默 shape-drift 升成 loud、可诉的失败。 |
+| (g) | **resume-read JSON 解码守卫(fail-loud、可诉)** | resume 路把每 run 的 journal 序列与 launch spec args 从 JSON 列解码重建。一行被撕坏的 JSON(截断 / 手改 / 不兼容写者产出)原本只会抛裸 `json.JSONDecodeError`——既不带 db 路径也不带 `run_id`,operator 无从定位是哪行。故 `get_sequence`(journal 序列)与 `load_spec`(spec args)两处解码边界都裹 `try/except json.JSONDecodeError`,抛 `CorruptJournalRowError`(命 db 路径 + `run_id` + 被解码字段),并把原始 `JSONDecodeError` 链作 `__cause__`(`raise ... from exc`,原始细节不丢)——镜像 `IncompatibleSchemaError`,把静默腐坏升成 loud、可诉的失败。 |
 
 旁注:**save-before-start**——`_launch` 先 `save_spec`(spec 携 stamped `journal_run_id`)**再** `manager.start`,故被准入的 run 总有可 resume 的 spec;quota 拒入(`BgRunQuotaExceededError`)则 `delete_spec` 回滚,refused launch 不留 unresumable 孤儿。**strict-msgpack 诚实**:`AsyncSqliteSaver` 对**每个** `@task` 返回值 msgpack 序列化,叶子状态须保持 msgpack-friendly 形状(经早期 spike 钉死,见下游 plan)。`race()` 无胜者**不** journal → 跨进程 resume 会重派候选(新成本),是记录在案的已知边界。
 

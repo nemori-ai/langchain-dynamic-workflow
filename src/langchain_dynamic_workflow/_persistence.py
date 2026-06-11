@@ -83,6 +83,41 @@ class IncompatibleSchemaError(Exception):
         self.supported_version = supported_version
 
 
+class CorruptJournalRowError(Exception):
+    """Raised when a persisted resume-read row holds undecodable JSON.
+
+    The resume path rebuilds a run's journal sequence and launch spec by decoding
+    JSON columns stored at write time. A row whose JSON is torn (truncated,
+    hand-edited, or written by an incompatible producer) would otherwise surface
+    as a bare :class:`json.JSONDecodeError` naming neither the db file nor the
+    run, leaving the operator no way to locate the offending row. This domain
+    error names the db path, the ``run_id``, and the field being decoded, and
+    chains the original decode error as its cause.
+
+    Args:
+        db_path: Filesystem path to the db file holding the corrupt row.
+        run_id: The run whose resume-read row failed to decode.
+        field: The logical field that was being decoded (e.g. ``journal sequence``).
+    """
+
+    def __init__(self, db_path: str, run_id: str, field: str) -> None:
+        """Build the error with a descriptive, actionable message.
+
+        Args:
+            db_path: Filesystem path to the db file holding the corrupt row.
+            run_id: The run whose resume-read row failed to decode.
+            field: The logical field that was being decoded.
+        """
+        super().__init__(
+            f"Corrupt {field} JSON for run '{run_id}' at db '{db_path}': "
+            "the persisted row holds undecodable JSON and cannot be replayed. "
+            "See the chained JSONDecodeError for the raw decode detail."
+        )
+        self.db_path = db_path
+        self.run_id = run_id
+        self.field = field
+
+
 _SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS run_specs (
     run_id TEXT PRIMARY KEY,
@@ -127,15 +162,18 @@ class _RunScopedJournal:
     store, which closes it in :meth:`SqliteWorkflowStore.aclose`.
     """
 
-    def __init__(self, conn: aiosqlite.Connection, run_id: str) -> None:
+    def __init__(self, conn: aiosqlite.Connection, run_id: str, db_path: str) -> None:
         """Bind the view to a connection and a run id.
 
         Args:
             conn: The shared, autocommit store connection owned by the store.
             run_id: The run whose journal rows this view reads and writes.
+            db_path: Filesystem path to the backing db file, named in the
+                actionable error raised when a resume-read row holds corrupt JSON.
         """
         self._conn = conn
         self._run_id = run_id
+        self._db_path = db_path
 
     async def get(self, key: str) -> JournalRecord | None:
         """Return the cached record for ``key``, or ``None`` on miss.
@@ -183,7 +221,10 @@ class _RunScopedJournal:
             row = await cursor.fetchone()
         if row is None:
             return None
-        decoded: list[str] = json.loads(row[0])
+        try:
+            decoded: list[str] = json.loads(row[0])
+        except json.JSONDecodeError as exc:
+            raise CorruptJournalRowError(self._db_path, self._run_id, "journal sequence") from exc
         return decoded
 
     async def put_sequence(self, sequence: list[str]) -> None:
@@ -267,6 +308,8 @@ class SqliteWorkflowStore:
         store_conn: aiosqlite.Connection,
         checkpointer_conn: aiosqlite.Connection,
         checkpointer: AsyncSqliteSaver,
+        *,
+        db_path: str = "",
     ) -> None:
         """Bind the store to its two connections and checkpointer.
 
@@ -278,10 +321,16 @@ class SqliteWorkflowStore:
             store_conn: The autocommit connection backing the registry + journal.
             checkpointer_conn: The separate connection wrapped by the saver.
             checkpointer: The persistent saver bound to the running loop.
+            db_path: Filesystem path to the backing db file, named in actionable
+                errors raised when a resume-read row holds corrupt JSON.
+                Keyword-only with an empty default so a direct construction that
+                does not supply it stays signature-compatible; :meth:`open` always
+                passes the real path.
         """
         self._store_conn = store_conn
         self._checkpointer_conn = checkpointer_conn
         self._checkpointer = checkpointer
+        self._db_path = db_path
 
     @classmethod
     async def open(cls, db_path: str | os.PathLike[str]) -> SqliteWorkflowStore:
@@ -341,7 +390,7 @@ class SqliteWorkflowStore:
             await _close_quietly(store_conn)
             raise
 
-        return cls(store_conn, checkpointer_conn, checkpointer)
+        return cls(store_conn, checkpointer_conn, checkpointer, db_path=database)
 
     @property
     def checkpointer(self) -> AsyncSqliteSaver:
@@ -411,7 +460,10 @@ class SqliteWorkflowStore:
             row = await cursor.fetchone()
         if row is None:
             return None
-        args: dict[str, Any] = json.loads(row[2])
+        try:
+            args: dict[str, Any] = json.loads(row[2])
+        except json.JSONDecodeError as exc:
+            raise CorruptJournalRowError(self._db_path, run_id, "run spec args") from exc
         return RunSpec(
             kind=row[0],
             name_or_source=row[1],
@@ -431,7 +483,7 @@ class SqliteWorkflowStore:
             is cheap to recreate and holds no resources of its own, so repeated
             calls return fresh, behaviorally identical views.
         """
-        return _RunScopedJournal(self._store_conn, run_id)
+        return _RunScopedJournal(self._store_conn, run_id, self._db_path)
 
     async def __aenter__(self) -> SqliteWorkflowStore:
         """Return the already-opened store for ``async with`` use.

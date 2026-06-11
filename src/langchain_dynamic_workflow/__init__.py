@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     # Surfaced to type checkers without importing the optional-dependency module
     # at runtime: a bare ``import langchain_dynamic_workflow`` must stay
     # dependency-free, so the concrete symbols are resolved lazily in __getattr__.
+    from ._persistence import CorruptJournalRowError as CorruptJournalRowError
     from ._persistence import IncompatibleSchemaError as IncompatibleSchemaError
     from ._persistence import SqliteWorkflowStore as SqliteWorkflowStore
 

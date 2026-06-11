@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from pathlib import Path
 
 import aiosqlite
 import pytest
 
 from langchain_dynamic_workflow._engine import JournalRecord
-from langchain_dynamic_workflow._persistence import SqliteWorkflowStore
+from langchain_dynamic_workflow._persistence import CorruptJournalRowError, SqliteWorkflowStore
 from langchain_dynamic_workflow._run_store import RunSpec, WorkflowRunStore
 
 
@@ -568,3 +569,63 @@ async def test_concurrent_puts_to_same_key_resolve_without_error(tmp_path: Path)
         assert final in written
     finally:
         await store.aclose()
+
+
+async def test_corrupt_resume_read_rows_raise_actionable_error(tmp_path: Path) -> None:
+    """A torn JSON column on a resume-read path raises a domain error, not a bare decode.
+
+    The resume path decodes the persisted journal sequence and run-spec args from
+    JSON columns. A corrupt row (truncated / hand-edited / produced by an
+    incompatible writer) must surface as a :class:`CorruptJournalRowError` that
+    names the db path and the run id and chains the raw ``json.JSONDecodeError`` as
+    its cause — mirroring ``IncompatibleSchemaError``. A bare ``json.JSONDecodeError``
+    naming neither would leave the operator no way to locate the offending row.
+
+    Both resume-read decode boundaries are pinned in one test: the journal sequence
+    (``get_sequence``) and the run-spec args (``load_spec``).
+    """
+    db_path = tmp_path / "workflows.db"
+    store = await SqliteWorkflowStore.open(db_path)
+    try:
+        await store.journal_for("run-1").put_sequence(["k1", "k2"])
+        await store.save_spec(
+            "run-1",
+            RunSpec(
+                kind="name",
+                name_or_source="wf",
+                args={"x": 1},
+                label="L",
+                journal_run_id="run-1",
+            ),
+        )
+    finally:
+        await store.aclose()
+
+    # Tear the JSON on both resume-read columns via a raw connection.
+    raw = await aiosqlite.connect(str(db_path))
+    try:
+        await raw.execute("UPDATE journal_sequence SET sequence='{bad' WHERE run_id='run-1'")
+        await raw.execute("UPDATE run_specs SET args='{bad' WHERE run_id='run-1'")
+        await raw.commit()
+    finally:
+        await raw.close()
+
+    reopened = await SqliteWorkflowStore.open(db_path)
+    try:
+        with pytest.raises(CorruptJournalRowError) as seq_ei:
+            await reopened.journal_for("run-1").get_sequence()
+        seq_message = str(seq_ei.value)
+        # Actionable: the message names the db path AND the run id.
+        assert str(db_path) in seq_message
+        assert "run-1" in seq_message
+        # The raw decode error is preserved as the cause, not discarded.
+        assert isinstance(seq_ei.value.__cause__, json.JSONDecodeError)
+
+        with pytest.raises(CorruptJournalRowError) as spec_ei:
+            await reopened.load_spec("run-1")
+        spec_message = str(spec_ei.value)
+        assert str(db_path) in spec_message
+        assert "run-1" in spec_message
+        assert isinstance(spec_ei.value.__cause__, json.JSONDecodeError)
+    finally:
+        await reopened.aclose()

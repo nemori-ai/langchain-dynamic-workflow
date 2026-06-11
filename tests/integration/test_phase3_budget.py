@@ -324,6 +324,59 @@ async def test_post_overshoot_dispatch_is_refused(make_usage_leaf: UsageLeafFact
         )
 
 
+async def test_parallel_overshoot_is_barrier_width_not_gate_limit_bounded(
+    make_usage_leaf: UsageLeafFactory,
+) -> None:
+    # The soft cap's concurrent overshoot is bounded by the fan-out ADMISSION
+    # WIDTH (a single barrier's worth of leaves admitted before any records), NOT
+    # by the concurrency gate's limit. ensure_within_cap() runs before the gate is
+    # acquired (the journal get yields ahead of the gate), so the gate serializes
+    # EXECUTION but never claws back cap checks that already passed. Pin it with the
+    # adversarial case: budget=10 (one leaf's worth), max_concurrency=1 (gate.limit
+    # == 1), a parallel barrier of 4 leaves metering 10 tokens each. If the gate
+    # bounded the overshoot, spent() would land at the gate-implied 20 (cap 10 +
+    # one in-flight slot 10); it instead lands at 40 — the full four-leaf barrier
+    # width. A future change that quietly moved the cap check under the gate (or
+    # added atomic reservation at admission) would shift this number and fail here.
+    leaf, _model = make_usage_leaf("note", tokens_per_call=10)
+    roster = Roster().register("worker", leaf)
+    captured: dict[str, int] = {}
+
+    async def orchestrate(ctx: Ctx) -> None:
+        await ctx.parallel([lambda i=i: ctx.agent(f"q{i}", agent_type="worker") for i in range(4)])
+        captured["spent"] = ctx.budget.spent()
+
+    await run_workflow(
+        orchestrate,
+        roster=roster,
+        thread_id="t1",
+        budget=10,
+        max_concurrency=1,  # gate.limit == 1: serializes execution, not the cap check
+        on_progress=lambda _e: None,
+    )
+    # Barrier-width bound: all four passed ensure_within_cap() while spent()==0, so
+    # the overshoot is 4 * per_leaf == 40, NOT the gate-limit-implied <= 20.
+    assert captured["spent"] == 40
+
+    # And the cap refuses once spent has overshot: a fresh run against the same
+    # config whose orchestrate dispatches one more agent() after the barrier settles
+    # sees the overshot spend (40 >= 10) and raises. This pins the other half of the
+    # soft-cap contract — the cap is enforced again the moment a new leaf is admitted.
+    async def orchestrate_then_dispatch(ctx: Ctx) -> None:
+        await ctx.parallel([lambda i=i: ctx.agent(f"q{i}", agent_type="worker") for i in range(4)])
+        await ctx.agent("after", agent_type="worker")
+
+    with pytest.raises(WorkflowBudgetExceededError, match="exhausted"):
+        await run_workflow(
+            orchestrate_then_dispatch,
+            roster=roster,
+            thread_id="t2",
+            budget=10,
+            max_concurrency=1,
+            on_progress=lambda _e: None,
+        )
+
+
 async def test_budget_exceeded_inside_parallel_fails_loud(
     make_usage_leaf: UsageLeafFactory,
 ) -> None:
