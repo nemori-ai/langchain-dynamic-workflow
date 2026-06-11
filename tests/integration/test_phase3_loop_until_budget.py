@@ -13,17 +13,35 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
-from langchain_core.runnables import Runnable
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 
 from langchain_dynamic_workflow import (
     Ctx,
     InMemoryJournalStore,
     Roster,
     WorkflowBudgetExceededError,
+    WorkflowDeterminismError,
     run_workflow,
 )
 
 UsageLeafFactory = Callable[..., tuple[Runnable[Any, Any], Any]]
+
+
+def _echo_prompt_leaf(prefix: str) -> Runnable[Any, Any]:
+    """A content-deterministic leaf that returns ``{prefix}{prompt}``.
+
+    The engine invokes a leaf with the prompt as the final human message and folds
+    the final AIMessage content as the agent() result, so the reply is a pure
+    function of the prompt — and thus of the content-hash journal key. This is what
+    lets a resume serve every leaf from the journal and reproduce the same result.
+    """
+
+    async def _call(inp: dict[str, Any], config: RunnableConfig | None = None) -> dict[str, Any]:
+        prompt = inp["messages"][-1].content
+        return {"messages": [*inp["messages"], AIMessage(content=f"{prefix}{prompt}")]}
+
+    return RunnableLambda(_call)
 
 
 def _loop_until_budget(
@@ -123,3 +141,68 @@ async def test_hard_cap_raises_when_loop_overshoots(make_usage_leaf: UsageLeafFa
             budget=30,  # 3 leaves exhaust it; the 4th dispatch is refused
             on_progress=lambda _e: None,
         )
+
+
+async def test_loop_until_fanout_body_iteration_drift_fails_loud_on_resume() -> None:
+    """A fan-out body's loop-count drift is caught by the per-iteration loop key.
+
+    The body does its ``agent()`` work INSIDE ``ctx.parallel``, so the leaves run at
+    fan-out depth > 0 and are excluded from the depth-0 determinism sequence — the
+    loop's leaves contribute zero recorded keys. Without a per-iteration loop key the
+    finalize-time count check (``observed < recorded``) sees 0 < 0 and a resume whose
+    iteration count drifts (an external/mutable ``done`` stop point) silently returns a
+    different-length list. The per-iteration ``loop_key`` makes the drift fail loud:
+    the first run records one loop key per iteration; a resume that runs more
+    iterations observes a key beyond the recorded sequence and raises.
+    """
+    roster = Roster().register("worker", _echo_prompt_leaf("done:"))
+    journal = InMemoryJournalStore()
+    stop_point = {"value": 3}
+
+    async def orchestrate(ctx: Ctx) -> list[Any]:
+        async def body(iteration: int, accumulated: list[Any]) -> Any:
+            results = await ctx.parallel(
+                [lambda it=iteration: ctx.agent(f"iter{it}", agent_type="worker")]
+            )
+            return results[0]
+
+        return await ctx.loop_until(
+            body, done=lambda acc: len(acc) >= stop_point["value"], max_iters=10
+        )
+
+    first = await run_workflow(orchestrate, roster=roster, journal=journal, thread_id="t1")
+    assert len(first) == 3
+
+    # Resume the SAME journal with the external stop point moved out: the loop now
+    # wants 5 iterations. The drift must be caught by the determinism backstop rather
+    # than silently returning a 5-item list.
+    stop_point["value"] = 5
+    with pytest.raises(WorkflowDeterminismError):
+        await run_workflow(orchestrate, roster=roster, journal=journal, thread_id="t2")
+
+
+async def test_loop_until_non_fanout_body_resumes_cleanly_at_zero_drift() -> None:
+    """The per-iteration loop key does not break a deterministic resume (no false positive).
+
+    A loop with a non-fan-out body (its ``agent()`` calls run at depth 0) and a
+    deterministic ``done`` must resume from the journal at zero drift: every leaf AND
+    every loop key replays in the same order, so no spurious ``WorkflowDeterminismError``
+    fires and the result rebuilds identically. This pins that adding the loop key to the
+    determinism sequence leaves the happy path intact.
+    """
+    roster = Roster().register("worker", _echo_prompt_leaf("done:"))
+    journal = InMemoryJournalStore()
+
+    async def orchestrate(ctx: Ctx) -> list[Any]:
+        async def body(iteration: int, accumulated: list[Any]) -> Any:
+            # Depth-0 agent() call: its leaf key AND the iteration's loop key both
+            # land in the determinism sequence, interleaved per iteration.
+            return await ctx.agent(f"iter{iteration}", agent_type="worker")
+
+        return await ctx.loop_until(body, done=lambda acc: len(acc) >= 3, max_iters=10)
+
+    first = await run_workflow(orchestrate, roster=roster, journal=journal, thread_id="t1")
+    assert first == ["done:iter0", "done:iter1", "done:iter2"]
+
+    second = await run_workflow(orchestrate, roster=roster, journal=journal, thread_id="t2")
+    assert second == first  # resume rebuilds identically, no spurious determinism error

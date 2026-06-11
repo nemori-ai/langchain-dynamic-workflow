@@ -41,7 +41,7 @@ from ._errors import (
     WorkflowNestingError,
     WorkflowSignoffRequired,
 )
-from ._journal import JournalRecord, JournalStore, journal_key, race_key, signoff_key
+from ._journal import JournalRecord, JournalStore, journal_key, loop_key, race_key, signoff_key
 from ._observability import SpanKind, SpanRecorder
 from ._pipeline import Stage, run_pipeline
 from ._progress import BatchMetrics, ProgressKind, ProgressLog
@@ -289,6 +289,11 @@ class Ctx:
         # Ordinal of the next ``checkpoint`` call on the sequential path; keys each
         # gate's journaled decision so gates stay distinct and replay in order.
         self._signoff_count = 0
+        # Ordinal of the next ``loop_until`` call on the sequential path; with the
+        # per-iteration index it keys each loop iteration into the determinism
+        # sequence, so a resume whose iteration count drifts fails loud even when the
+        # loop body fans out (its leaves run at depth > 0, outside the sequence guard).
+        self._loop_count = 0
         self._gate = (
             gate if gate is not None else ConcurrencyGate(limit=resolve_max_concurrency(None))
         )
@@ -1019,12 +1024,18 @@ class Ctx:
         — where ``accumulated`` is a copy of the results so far — appends its result,
         then checks ``done(accumulated)``; the loop returns as soon as ``done`` holds.
 
-        This is a sequential (depth-0) primitive: ``body``'s direct ``agent()`` calls
-        record into the determinism guard, and the loop count derives from journaled
-        leaf results, so a resume reproduces the same number of iterations and replays
-        completed leaves at zero cost. If the cap is reached without ``done`` ever
-        holding, a (replay-idempotent) ``log`` line is emitted and the accumulated
-        results are returned — a graceful, non-silent stop rather than a raise.
+        This is a sequential (depth-0) primitive: each iteration records its own
+        depth-0 :func:`loop_key` into the determinism sequence BEFORE running ``body``,
+        so the iteration count is guarded independently of whether the body fans out.
+        A body that does its ``agent()`` work directly contributes those leaf keys too;
+        a body that fans out (``parallel`` / ``race`` / ``dag``) runs its leaves at
+        depth > 0 (excluded from the guard by design), but the per-iteration loop key
+        still makes a resume whose iteration count drifts — e.g. an external/mutable
+        ``done`` that stops at a different point — fail loud with
+        :class:`WorkflowDeterminismError` instead of silently returning a
+        different-length list. If the cap is reached without ``done`` ever holding, a
+        (replay-idempotent) ``log`` line is emitted and the accumulated results are
+        returned — a graceful, non-silent stop rather than a raise.
 
         Args:
             body: ``(iter_index, accumulated_so_far) -> result`` for one iteration.
@@ -1036,12 +1047,63 @@ class Ctx:
 
         Raises:
             ValueError: If ``max_iters`` is less than 1.
+            WorkflowDeterminismError: On resume, if the iteration count drifts from
+                the first run (a per-iteration loop key diverges from the recorded
+                sequence).
+            Exception: If ``body`` raises a regular (non-control-flow) exception, the
+                same exception instance is re-raised with a ``.partial`` attribute
+                carrying the results accumulated before the failure
+                (fail-fast-but-recoverable). A body exception that cannot carry
+                attributes (a frozen dataclass, ``__slots__`` without ``partial``, or a
+                blocking ``__setattr__``) propagates without ``.partial`` — its type is
+                still preserved. A control-flow signal raised by ``body`` (e.g. an
+                exhausted budget) aborts cleanly and propagates UNTOUCHED, with no
+                ``.partial`` attribute.
         """
         if max_iters < 1:
             raise ValueError(f"loop_until requires max_iters >= 1, got {max_iters}")
+        # Take this loop's ordinal among loop_until calls ONCE at entry; combined with
+        # the per-iteration index it keys each iteration into the determinism sequence.
+        position = self._loop_count
+        self._loop_count += 1
         accumulated: list[T] = []
         for iteration in range(max_iters):
-            accumulated.append(await body(iteration, list(accumulated)))
+            # Record this iteration's depth-0 key into the determinism sequence BEFORE
+            # running the body, so the iteration count is guarded even when the body
+            # fans out (its leaves run at depth > 0 and are excluded from the sequence)
+            # — on resume a divergent or out-of-range loop key fails loud here. The
+            # observe is a synchronous point-event, not a span held across an await: a
+            # non-fan-out body's own depth-0 ``agent()`` calls run sequentially AFTER
+            # this, never concurrently with it, so the in-flight counter must be
+            # released immediately rather than held across the body — holding it would
+            # false-trip the depth-0 concurrency guard the moment the body issues an
+            # ``agent()`` call. ``_observe_depth0`` increments the counter only AFTER its
+            # ``observe`` succeeds, so a replay divergence raises out of here with the
+            # counter untouched (``counted`` unbound, nothing to release). It is a no-op
+            # at depth > 0, so a loop_until nested inside a fan-out frame neither
+            # double-counts nor trips that guard.
+            counted = self._observe_depth0(loop_key(position=position, iteration=iteration))
+            if counted:
+                self._depth0_inflight -= 1
+            try:
+                result = await body(iteration, list(accumulated))
+            except WORKFLOW_CONTROL_FLOW_SIGNALS:
+                # A clean engine abort (budget / determinism / checkpoint / dag /
+                # cycle / nesting): propagate untouched, with no partial channel.
+                raise
+            except Exception as exc:
+                # A regular body failure: attach the survivors accumulated before the
+                # failure and re-raise the SAME instance, preserving its type so a
+                # caller's ``except SpecificError`` still catches it. If the exception
+                # is immutable (a frozen dataclass, ``__slots__`` without ``partial``,
+                # or a blocking ``__setattr__``), the attach is skipped — the original
+                # exception still propagates cleanly (no partial channel for that exotic
+                # case), never masked by an assignment error (which would lose BOTH the
+                # original exception type and the partial, strictly worse than baseline).
+                with contextlib.suppress(AttributeError, TypeError):
+                    exc.partial = list(accumulated)  # type: ignore[attr-defined]
+                raise
+            accumulated.append(result)
             if done(accumulated):
                 return accumulated
         self.log(f"loop_until reached max_iters={max_iters} without satisfying done()")

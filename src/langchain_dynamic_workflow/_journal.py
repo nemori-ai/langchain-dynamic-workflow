@@ -127,6 +127,36 @@ def signoff_key(*, position: int, tag: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def loop_key(*, position: int, iteration: int) -> str:
+    """Compute the content-hash determinism key for one ``ctx.loop_until`` iteration.
+
+    A ``loop_until`` whose body fans out (its ``agent()`` work runs inside
+    ``parallel`` / ``race`` / ``dag``) contributes no leaf keys to the depth-0
+    determinism sequence — the fan-out leaves run at depth > 0 and are excluded by
+    design. To keep the loop's iteration count guarded independently of whether the
+    body fans out, the loop records one key per iteration into that same ordered
+    sequence. The key is the SHA-256 of the loop's ordinal position among the run's
+    ``loop_until`` calls plus the iteration index, under a ``"loop"`` namespace
+    marker so it can never collide with a leaf :func:`journal_key`, a
+    :func:`race_key`, or a :func:`signoff_key`.
+
+    Args:
+        position: The loop's zero-based ordinal among the run's ``loop_until``
+            calls (deterministic on the sequential, depth-0 path).
+        iteration: The zero-based iteration index within this loop.
+
+    Returns:
+        A hex SHA-256 digest uniquely identifying this loop iteration.
+    """
+    payload: dict[str, Any] = {
+        "kind": "loop",
+        "position": position,
+        "iteration": iteration,
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 @runtime_checkable
 class JournalStore(Protocol):
     """Storage backend for journaled leaf results and the call sequence.

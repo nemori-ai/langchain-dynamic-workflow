@@ -76,7 +76,9 @@ DagNode(id: str, deps: Sequence[str], run: Callable[[dict], Coroutine])
 
 签名:`body(iter_index, accumulated_so_far) -> result`;每轮调用一次,结果 append 进 `accumulated`,然后检查 `done(accumulated)`,满足即提前返回。
 
-顺序运行意味着 `body` 内的直接 `agent()` 调用记入确定性序列;resume 时循环次数由 journal 结果自然恢复(相同的 `done` 条件在相同的累积结果下产生相同的停止轮次),完成叶零成本重放。
+**循环次数本身入确定性序列(每轮一个 `loop_key`)**:`body` 内的直接 `agent()` 调用固然记入确定性序列,但当 `body` 把 `agent()` 工作放进 `parallel`/`race`/`dag` 扇出帧时,那些叶子跑在深度 > 0、被序列 guard 排除(同其他扇出叶),循环便对序列**零贡献**——`finalize` 只在 `observed_count < recorded_count` 时炸,扇出 body 下两者皆 0(`0 < 0` 为假),resume 时循环次数漂移(如外部/可变 `done` 致首跑停在 3、resume 停在 5)会**静默**返回一个不同长度的列表。故 `loop_until` 在每轮**运行 `body` 之前**向序列 observe 一个深度-0 的 `loop_key(position, iteration)`(`position` 为本循环在所有 `loop_until` 调用中的序号、入口处取一次;`"loop"` 命名空间标记保证绝不与叶子 `journal_key`/`race_key`/`signoff_key` 撞键)——首跑记下每轮一个 loop key;resume 若循环次数漂移则观测到越界或不匹配的 loop key,**fail-loud 抛 `WorkflowDeterminismError`**,独立于 body 是否扇出。该 observe 是同步点事件、非跨 await 持有的 span:in-flight 计数器在 observe 后**立即**释放(非 fan-out body 的 `agent()` 调用顺序在其**之后**、绝非与之并发),否则会误触深度-0 并发 guard;`_observe_depth0` 在深度 > 0 是 no-op,故 `loop_until` 嵌于扇出帧时既不重复计数也不触并发 guard,与 `agent()`/`checkpoint()` 用法一致。
+
+**body 失败 = fail-fast-but-recoverable 的 `.partial` 通道**:`body` 抛出**普通异常**时,引擎把失败前已积累的存活结果挂到**同一异常实例**的 `.partial` 属性上后**原样重抛**(保留异常类型,故调用方的 `except SpecificError` 仍能捕获)——区别于 `parallel`(失败落 `None`)与 `race`(拆 loser 后重抛),给单轮失败一条可恢复的优雅降级通道。而**控制流信号**(`WORKFLOW_CONTROL_FLOW_SIGNALS`——budget/确定性/checkpoint/dag/cycle/nesting)是**干净的引擎中止**,**原样穿透、不挂 `.partial`**:它拆除整 run、不交回存活结果,与可恢复失败路径结构性区分。
 
 ## 2e. 命名工作流嵌套:深度上限 + 循环检测
 
