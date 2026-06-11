@@ -16,6 +16,7 @@ import pytest
 from langchain_dynamic_workflow._background import (
     BgRunManager,
     BgRunQuotaExceededError,
+    BgRunStateError,
     BgStatus,
     ResultStore,
     RunSnapshot,
@@ -201,6 +202,51 @@ async def test_max_concurrent_runs_quota_refuses_when_full() -> None:
     assert s4.run_id == "r4"
     release.set()
     await manager.wait("r4", thread_id="t1")
+
+
+async def test_start_refuses_live_duplicate_composite_key_without_leaking_canonical() -> None:
+    # Slot-overwrite guard: reusing a LIVE (thread_id, run_id) with a DIFFERENT
+    # canonical would overwrite the slot and orphan the first run's canonical (its
+    # later _settle would look up the new slot and discard the wrong canonical),
+    # leaking the old lineage live forever. start refuses the live-key duplicate
+    # loud and adds NO claim for it, so neither canonical is corrupted.
+    manager = BgRunManager()
+    release = asyncio.Event()
+
+    async def slow(value: str) -> str:
+        await release.wait()
+        return value
+
+    first = manager.start(slow("a"), run_id="r1", thread_id="t1", canonical="canon-A")
+    assert first.canonical == "canon-A"
+    assert manager.poll("r1", thread_id="t1") in {BgStatus.PENDING, BgStatus.RUNNING}
+
+    # A second start on the SAME live (t1, r1) key with a different canonical is
+    # refused — the first run still owns that key.
+    with pytest.raises(BgRunStateError) as excinfo:
+        manager.start(slow("b"), run_id="r1", thread_id="t1", canonical="canon-B")
+    assert "r1" in str(excinfo.value)
+
+    live_canonicals: set[str] = getattr(manager, "_live_canonicals")  # noqa: B009 - introspection
+    # The first run's canonical stays claimed; the refused run's canonical never
+    # entered the live set (no leak, no premature release).
+    assert "canon-A" in live_canonicals
+    assert "canon-B" not in live_canonicals
+    # The slot under the key is still the FIRST run (not overwritten).
+    assert manager.poll("r1", thread_id="t1") in {BgStatus.PENDING, BgStatus.RUNNING}
+
+    # Once the first run SETTLES, its canonical is released and the key is free to
+    # reuse — a fresh start under the same key with a new canonical succeeds.
+    release.set()
+    await manager.wait("r1", thread_id="t1")
+    assert manager.poll("r1", thread_id="t1") == BgStatus.DONE
+    assert "canon-A" not in live_canonicals  # released on terminal settle
+
+    reused = manager.start(slow("c"), run_id="r1", thread_id="t1", canonical="canon-C")
+    assert reused.canonical == "canon-C"
+    assert "canon-C" in live_canonicals
+    release.set()
+    await manager.wait("r1", thread_id="t1")
 
 
 async def test_list_runs_enumerates_thread_runs_with_status() -> None:

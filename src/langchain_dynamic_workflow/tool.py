@@ -27,7 +27,13 @@ from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from ._background import BgRunManager, BgRunQuotaExceededError, BgRunStateError, BgStatus
+from ._background import (
+    BgRunManager,
+    BgRunQuotaExceededError,
+    BgRunStateError,
+    BgStatus,
+    CanonicalRunInFlightError,
+)
 
 # The meta-layer codegen (AST gate + restricted exec) and its error type sit in
 # Layer 2 alongside this tool; the `run_script` command compiles an untrusted
@@ -275,12 +281,24 @@ def create_workflow_tool(
         await run_store.save_spec(run_id, spec_to_save)
         # The label travels with the manager slot so the `runs` listing can name the
         # run authoritatively, not via this tool's bookkeeping. The slot is keyed by
-        # the current caller's host thread so the caller can poll the run.
+        # the current caller's host thread so the caller can poll the run. The
+        # canonical reservation is the real single-live-run enforcer: the manager
+        # refuses a launch whose canonical is already live in this process (the
+        # origin still running, a prior resume-child still live, or a racing second
+        # resume), regardless of host thread.
         try:
-            manager.start(_coro(), run_id=run_id, thread_id=host_thread_id, label=spec.label)
-        except BgRunQuotaExceededError:
+            manager.start(
+                _coro(),
+                run_id=run_id,
+                thread_id=host_thread_id,
+                label=spec.label,
+                canonical=canonical,
+            )
+        except (BgRunQuotaExceededError, CanonicalRunInFlightError):
             # The run was refused before it could run: roll back the spec we saved
-            # above so a refused launch leaves no unresumable orphan in the registry.
+            # above (a brand-new row under this launch's own run_id — never the
+            # origin's spec, even on resume) so a refused launch leaves no
+            # unresumable orphan in the registry.
             await run_store.delete_spec(run_id)
             raise
         return run_id
@@ -400,19 +418,66 @@ def create_workflow_tool(
         spec = await run_store.load_spec(run_id)
         if spec is None:
             return f"resume: unknown run_id {run_id!r}; nothing to resume."
+        thread_id = _host_thread_id(runtime)
+        # Resume is for a SETTLED or crashed run, never one still in flight: a duplicate
+        # launch would fan two runs onto the SAME canonical journal + checkpoint thread,
+        # each with a FRESH (unshared) ConcurrencyGate and Budget, both writing the same
+        # journal sequence/progress.
+        #
+        # Two layers enforce this. (1) A friendly poll of the run_id on the caller's
+        # thread gives a precise message when the run is observable here — still
+        # running, or parked awaiting a sign-off (use approve, not resume). (2) The
+        # AUTHORITATIVE enforcer is the manager's canonical reservation in `_launch`
+        # below: it refuses a launch whose canonical journal lineage is already live in
+        # this process, which catches the cases the per-(thread, run_id) poll cannot —
+        # the origin running under a DIFFERENT host thread, a TERMINAL origin whose
+        # prior resume-child is still live, and two concurrent resumes racing (only one
+        # claims the canonical; the other is refused).
+        #
+        # Known limitation: the live set is process-local. A still-running origin in a
+        # DIFFERENT live process sharing the store is invisible here, so its canonical
+        # is absent from this process's set and the resume proceeds. That is by design —
+        # cross-process resume is for crash recovery (a dead origin); a durable
+        # cross-process lease is future work.
+        poll_status = manager.poll(run_id, thread_id=thread_id)
+        if poll_status in {BgStatus.PENDING, BgStatus.RUNNING}:
+            return (
+                f"resume: run {run_id!r} is {poll_status.value} on this process; the origin is "
+                "still running. Resuming would launch a concurrent duplicate against the "
+                "shared journal and checkpoint thread. Wait for it to settle (or cancel it) "
+                "before resuming."
+            )
+        if poll_status == BgStatus.AWAITING_SIGNOFF:
+            return (
+                f"resume: run {run_id!r} is awaiting sign-off, not settled; resume is for a "
+                "settled or crashed run. Continue it with command='approve' and this run_id."
+            )
         workflow_fn = _resolve_spec(spec)
         label = spec.label
+        canonical = spec.journal_run_id or run_id
         # The spec carries the canonical origin (journal_run_id), so the relaunch
         # rejoins the ORIGIN's journal (completed leaves replay from cache) and the
         # ORIGIN's checkpoint thread — even when resuming a resume-issued run_id,
         # because each saved spec inherits the same origin. The manager slot is
         # keyed by the CURRENT caller's host thread so the caller who issued the
         # resume can poll the new run.
-        new_run_id = await _launch(
-            workflow_fn=workflow_fn,
-            spec=spec,
-            host_thread_id=_host_thread_id(runtime),
-        )
+        try:
+            new_run_id = await _launch(
+                workflow_fn=workflow_fn,
+                spec=spec,
+                host_thread_id=thread_id,
+            )
+        except CanonicalRunInFlightError:
+            # The canonical lineage is already live in this process (origin running on
+            # another host thread, a prior resume-child still live, or a racing resume
+            # that claimed first). Refuse with a string — never a duplicate launch.
+            return (
+                f"resume: run {run_id!r} cannot resume — its canonical journal {canonical!r} "
+                "already has a live run in this process (the origin or a prior resume is "
+                "still running). Wait for it to settle (or cancel it) before resuming."
+            )
+        except BgRunQuotaExceededError as exc:
+            return f"resume: {exc}"
         message = (
             f"Resumed {label!r} from run {run_id!r} against its journal. "
             f"New run_id: {new_run_id}. Completed steps replay at zero model cost."

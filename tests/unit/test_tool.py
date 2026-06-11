@@ -556,6 +556,173 @@ async def test_resume_unknown_run_id_reports_unknown(
     assert "ghost" in out
 
 
+async def test_resume_of_a_still_running_origin_is_refused(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # The resume guard (mirrors approve's poll): resuming a run whose origin is STILL
+    # in flight on this process must be refused with a plain string, never relaunched.
+    # Without the guard, resume launches a concurrent DUPLICATE against the same
+    # canonical journal + checkpoint thread, each with a FRESH ConcurrencyGate and
+    # Budget — so a budget=N run can spend ~2N and both write the same journal.
+    leaf, _state = make_fake_leaf("research-output")
+    roster = Roster().register("researcher", leaf)
+    release = asyncio.Event()
+
+    async def slow_orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        await release.wait()  # the single leaf blocks until the test releases it
+        return await ctx.agent("Research X", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("research", slow_orchestrate)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+    runtime = _runtime(thread_id="host-1")
+
+    run_out = await _ainvoke_command(tool, {"command": "run", "workflow": "research"}, runtime)
+    run_id = _launched_run_id(run_out)
+    # The origin is in flight (still blocked on release), never settled.
+    assert manager.poll(run_id, thread_id="host-1") in {BgStatus.PENDING, BgStatus.RUNNING}
+
+    try:
+        out = await _ainvoke_command(tool, {"command": "resume", "run_id": run_id}, runtime)
+        # A still-running origin is REFUSED with a string (as approve does for a
+        # non-parked run), never relaunched as a concurrent duplicate.
+        assert isinstance(out, str)
+        assert "running" in out.lower()
+    finally:
+        release.set()
+        await manager.wait(run_id, thread_id="host-1")
+
+
+async def test_resume_of_a_live_origin_from_a_different_host_thread_is_refused(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Cross-thread duplicate: the origin runs on host-A (still live). A resume issued
+    # on host-B polls UNKNOWN there (its slot is keyed under host-A), so the friendly
+    # per-(thread, run_id) poll cannot see it. The AUTHORITATIVE canonical reservation
+    # in the manager still catches it: the canonical journal lineage is live, so the
+    # cross-thread resume is refused — never relaunched as a concurrent duplicate.
+    leaf, _state = make_fake_leaf("research-output")
+    roster = Roster().register("researcher", leaf)
+    release = asyncio.Event()
+
+    async def slow_orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        await release.wait()
+        return await ctx.agent("Research X", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("research", slow_orchestrate)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+
+    run_out = await _ainvoke_command(
+        tool, {"command": "run", "workflow": "research"}, _runtime(thread_id="host-A")
+    )
+    run_id = _launched_run_id(run_out)
+    assert manager.poll(run_id, thread_id="host-A") in {BgStatus.PENDING, BgStatus.RUNNING}
+    # The resuming thread (host-B) cannot see the origin's slot by poll.
+    assert manager.poll(run_id, thread_id="host-B") == BgStatus.UNKNOWN
+
+    try:
+        out = await _ainvoke_command(
+            tool, {"command": "resume", "run_id": run_id}, _runtime(thread_id="host-B")
+        )
+        # Refused despite the UNKNOWN poll on host-B: the canonical reservation is the
+        # real enforcer, not the per-thread slot poll.
+        assert isinstance(out, str)
+        assert "canonical" in out.lower()
+    finally:
+        release.set()
+        await manager.wait(run_id, thread_id="host-A")
+
+
+async def test_resume_of_terminal_origin_with_a_live_resume_child_is_refused(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Terminal-origin-with-live-child: the origin settles DONE (poll is terminal, the
+    # friendly guard would wave it through), but a PRIOR resume's child is still live
+    # against the same canonical journal. A second resume must be refused so it does
+    # not duplicate the live resume-child onto the shared journal + checkpoint thread.
+    leaf, _state = make_fake_leaf("research-output")
+    roster = Roster().register("researcher", leaf)
+    release = asyncio.Event()
+
+    async def gated_orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        await release.wait()  # blocks every pass until the test releases it
+        return await ctx.agent("Research X", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("research", gated_orchestrate)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+    runtime = _runtime(thread_id="host-1")
+
+    # Origin runs to DONE (release, then re-gate for the resume-child).
+    run_out = await _ainvoke_command(tool, {"command": "run", "workflow": "research"}, runtime)
+    origin_id = _launched_run_id(run_out)
+    release.set()
+    await manager.wait(origin_id, thread_id="host-1")
+    assert manager.poll(origin_id, thread_id="host-1") == BgStatus.DONE
+    release.clear()
+
+    # R1 resume of the now-terminal origin: it claims the canonical and blocks live.
+    r1_out = await _ainvoke_command(tool, {"command": "resume", "run_id": origin_id}, runtime)
+    r1_id = _launched_run_id(r1_out)
+    assert manager.poll(r1_id, thread_id="host-1") in {BgStatus.PENDING, BgStatus.RUNNING}
+
+    try:
+        # A SECOND resume of the (terminal) origin: poll is terminal/UNKNOWN, but R1's
+        # child still holds the canonical, so this is refused — no concurrent duplicate.
+        out = await _ainvoke_command(tool, {"command": "resume", "run_id": origin_id}, runtime)
+        assert isinstance(out, str)
+        assert "canonical" in out.lower()
+    finally:
+        release.set()
+        await manager.wait(r1_id, thread_id="host-1")
+
+
+async def test_two_concurrent_resumes_of_one_canonical_admit_exactly_one(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # TOCTOU double-resume: two resumes of the same settled origin fire concurrently.
+    # The canonical claim in the manager is a synchronous, no-await check-and-add, so
+    # exactly ONE wins the canonical and launches; the other is refused. Without it,
+    # both poll the terminal origin, both pass, both launch a duplicate.
+    leaf, _state = make_fake_leaf("research-output")
+    roster = Roster().register("researcher", leaf)
+    release = asyncio.Event()
+
+    async def gated_orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        await release.wait()
+        return await ctx.agent("Research X", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("research", gated_orchestrate)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+    runtime = _runtime(thread_id="host-1")
+
+    run_out = await _ainvoke_command(tool, {"command": "run", "workflow": "research"}, runtime)
+    origin_id = _launched_run_id(run_out)
+    release.set()
+    await manager.wait(origin_id, thread_id="host-1")
+    release.clear()  # the resume-child re-gates so the winner stays live
+
+    # Fire both resumes concurrently against the one settled canonical.
+    out_a, out_b = await asyncio.gather(
+        _ainvoke_command(tool, {"command": "resume", "run_id": origin_id}, runtime),
+        _ainvoke_command(tool, {"command": "resume", "run_id": origin_id}, runtime),
+    )
+    outs: list[Any] = [out_a, out_b]
+    commands: list[Command[Any]] = [o for o in outs if isinstance(o, Command)]
+    refusals: list[str] = [o for o in outs if isinstance(o, str)]
+    try:
+        # Exactly one launched (a Command), exactly one refused (a string).
+        assert len(commands) == 1, outs
+        assert len(refusals) == 1
+        assert "canonical" in refusals[0].lower()
+    finally:
+        release.set()
+        winner_id = _launched_run_id(commands[0])
+        await manager.wait(winner_id, thread_id="host-1")
+
+
 async def test_resume_from_different_host_thread_is_pollable_by_that_thread(
     make_deep_leaf: Callable[[str], tuple[Runnable[Any, Any], Any]],
 ) -> None:
