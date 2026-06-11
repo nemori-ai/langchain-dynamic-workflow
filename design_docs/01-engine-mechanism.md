@@ -32,7 +32,7 @@
 | `budget` | `{total, spent(), remaining()}`,**共享池**,到顶 `agent()` 抛 |
 | `workflow(name, args)` | 内联调另一 workflow,深度上限可配置(默认 8 层,含循环检测);见 §2e |
 
-失败语义照搬 Claude Code:`parallel` 永不 reject、`pipeline` 抛错落 `null`、`batch_map` 失败 `fn` 落 `null` 不 abort(共享 `pipeline` 的 drop-to-`null` 引擎,见 §9b);`race` 单个候选叶失败仅淘汰该候选、其余继续,引擎控制流信号(budget/确定性)或 `win` 谓词抛错则在拆除 loser 后**失声而抛**(fail-loud)。
+失败语义照搬 Claude Code:`parallel` 永不 reject、`pipeline` 抛错落 `null`、`batch_map` 失败 `fn` 落 `null` 不 abort(共享 `pipeline` 的 drop-to-`null` 引擎,见 §9b);`race` 单个候选叶失败仅淘汰该候选、其余继续,引擎控制流信号(budget/确定性)或 `win` 谓词抛错则在拆除 loser 后**失声而抛**(fail-loud)。**内部 `CancelledError`(thunk/stage 的子任务被取消、而非整 run 被外部拆除)按普通叶失败掉 `null`**,不混作控制流信号抛——内/外取消之分与拆除 await 见 §9。
 
 **跨叶归约 helper(`_reduce`,纯函数,F)**:折叠 `parallel` / `pipeline` 交回的结果列表(失败叶=`None`)的一等公民——`survives`(refute-by-default 投票,`None` 恒计反对的 fail-safe,覆盖 adversarial-verify 与 judge-panel)、`dedup`(丢 `None` + 按 key 去重,保首见序)、`reconcile`(双盲复核分桶 included/excluded/conflicts,`None`/空裁决恒落 conflict)、`corroborate`(按 key 分组、≥`min_support` 才留的跨叶相互印证),配 `ReviewItem` / `Reconciled` / `Consensus` 三个 frozen dataclass。它们**无 `agent()` 调用、无引擎状态**,故天然 replay-safe、不碰 journal/确定性 guard;由包根导出供开发者 workflow `import`,并由 `_codegen` 注入 `run_script` 命名空间(L2 脚本禁 import,故按名直调)。
 
@@ -248,6 +248,10 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 ```
 
 底座无任何无-barrier 流式原语(`Send` 是 map-reduce barrier);完全自建。中途异常/预算耗尽须保证队列优雅排空、不死锁。
+
+**CancelledError 内/外之分(并发×取消命门)**:`CancelledError` 是 `BaseException`(非 `Exception`),既是 asyncio 外部拆除一个 task 的手段,也可能由 stage/leaf 自身内部冒出(它 await 的子任务被取消)。stage_worker 用 `asyncio.current_task().cancelling() > 0` 区分二者:① **`cancelling()>0`**——本 worker 的 task 正被**外部**取消(整个 run 在拆除),直接 re-raise 让 `run_pipeline` 的 `finally`(cancel + `await gather`)干净拆除;② **`cancelling()==0` 的 `CancelledError`**——**内部**取消(stage 的子任务被取消、本 worker 并未被拆),按文档化 stage-抛错契约**掉 `None`**、其余 item 存活、绝不令整条流水线 reject(同 `parallel` thunk 内部 `CancelledError` 掉 `None`:`parallel` 用 `gather(return_exceptions=True)` 只把**子任务内部** `CancelledError` 收进 settled 列表——外部取消会从 `await gather` 自身抛出、不进列表,故列表里的 `CancelledError` 必为内部);③ **`cancelling()==0` 的其它 `BaseException`**(`KeyboardInterrupt`/`SystemExit`)——既不能静默吞(失声而抛),又不能裸 re-raise 杀死独 worker 致 feeder 永挂 `join()`,故镜像控制流-信号 abort 路:记入 `aborted`、掉本 item、worker 续活排空+吃毒丸,`run_pipeline` 在干净拆除后再 `raise aborted[0]`(fail-loud、不死锁)。
+
+**取消即拆除须 await(无泄漏 task)**:`run_pipeline` 的 `finally` 在外部取消时不只 `cancel` worker/feeder,还 `await asyncio.gather(*pending, return_exceptions=True)`——同 `dag`/`race`/`parallel`,故 `run_pipeline` 抛回 `CancelledError` 前 worker/feeder(及源的 `aclosing` finally)的拆除已**完成**,无 "Task was destroyed but it is pending"、无在飞 leaf/源清理被甩为 detached。**前提是取消协作**:一个抑制 `CancelledError` 或在 await 中永不返回的病态 stage/源 cleanup 会令此 teardown await 滞留(属病态用户代码,v1 不加 teardown 超时——宁滞留可诊断,不静默泄漏)。另:feeder 阻塞在 async 源 `__anext__` 时内部 abort 不唤醒它(须等源 yield),为既有特性,新 BaseException abort 路同样继承。
 
 ## 9b. batch_map — 流式准入扇出（E:大规模 fan-out 人体工学）
 

@@ -196,6 +196,106 @@ async def test_pipeline_control_flow_error_fails_loud_across_workers_and_drains(
         )
 
 
+async def test_pipeline_stage_interior_cancellederror_drops_one_item_not_whole_run() -> None:
+    # A stage that surfaces a bare INTERIOR CancelledError (a child task it awaited was
+    # cancelled while the worker's own task is NOT being torn down) must drop that ONE
+    # item to None — the documented stage-raise contract — not re-raise out of the whole
+    # pipeline and lose every other item. CancelledError is a BaseException, so neither
+    # `except WORKFLOW_CONTROL_FLOW_SIGNALS` nor `except Exception` would catch it.
+    gate = ConcurrencyGate(limit=4)
+    stage_two_seen: list[int] = []
+
+    async def stage_one(prev: int, item: int, index: int) -> int:
+        await asyncio.sleep(0.005)
+        if item == 3:
+            raise asyncio.CancelledError("interior child cancelled")
+        return item
+
+    async def stage_two(prev: int, item: int, index: int) -> int:
+        stage_two_seen.append(item)
+        return prev * 10
+
+    results = await asyncio.wait_for(
+        run_pipeline(list(range(8)), [stage_one, stage_two], gate=gate, queue_maxsize=2),
+        timeout=3.0,
+    )
+    assert results[3] is None  # only the cancelled item dropped
+    assert results[0] == 0 and results[7] == 70  # other items survive
+    assert 3 not in stage_two_seen  # the dropped item never reached stage two
+
+
+async def test_pipeline_sole_worker_base_exception_fails_loud_not_deadlock() -> None:
+    # Rank 4 deadlock manifestation: with worker_count==1 (gate.limit==1) a stage
+    # raising a genuinely-propagating BaseException (KeyboardInterrupt/SystemExit — a
+    # non-droppable reason) must NOT wedge the feeder on queues[0].join() forever. The
+    # worker death must trigger the abort/drain path so teardown completes, then the
+    # BaseException surfaces loud (fail loud, no silent swallow, no hang).
+    gate = ConcurrencyGate(limit=1)
+
+    async def stage(prev: int, item: int, index: int) -> int:
+        if item == 1:
+            raise KeyboardInterrupt("boom")
+        await asyncio.sleep(0.001)
+        return item
+
+    with pytest.raises(BaseException) as exc_info:  # asserting it is NOT a hang below
+        await asyncio.wait_for(
+            run_pipeline(list(range(10)), [stage], gate=gate, queue_maxsize=4),
+            timeout=2.0,
+        )
+    assert not isinstance(exc_info.value, asyncio.TimeoutError), (
+        "run_pipeline hung on a sole-worker BaseException (deadlock) instead of failing loud"
+    )
+    assert isinstance(exc_info.value, KeyboardInterrupt)  # surfaced loud, not swallowed
+
+
+async def test_pipeline_sole_worker_interior_cancel_drops_item_not_deadlock() -> None:
+    # The drop-to-None contract must hold even with worker_count==1: a sole-worker
+    # interior CancelledError drops just that item and the run still completes (no
+    # deadlock) — the same trigger as the deadlock case, but droppable.
+    gate = ConcurrencyGate(limit=1)
+
+    async def stage(prev: int, item: int, index: int) -> int:
+        if item == 1:
+            raise asyncio.CancelledError("interior child cancelled")
+        await asyncio.sleep(0.001)
+        return item
+
+    results = await asyncio.wait_for(
+        run_pipeline(list(range(5)), [stage], gate=gate, queue_maxsize=4),
+        timeout=2.0,
+    )
+    assert results == [0, None, 2, 3, 4]
+
+
+async def test_pipeline_cancellation_awaits_worker_cleanup_no_leak() -> None:
+    # Rank 7: when run_pipeline's own task is cancelled externally mid-flight while a
+    # stage's CancelledError cleanup needs more than one loop turn, the finally must
+    # cancel AND await the worker/feeder tasks (mirroring dag), so no task is left
+    # pending when run_pipeline propagates. The single-turn case would pass trivially;
+    # the >1-turn async teardown is the genuine red-light.
+    gate = ConcurrencyGate(limit=4)
+    cleanups: list[int] = []
+
+    async def slow(prev: int, item: int, index: int) -> int:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)  # multi-turn async teardown
+            cleanups.append(item)
+            raise
+        return item  # pragma: no cover
+
+    task = asyncio.create_task(run_pipeline(list(range(8)), [slow], gate=gate, queue_maxsize=4))
+    await asyncio.sleep(0.05)  # let the stage workers start their slow stages
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=3.0)
+    await asyncio.sleep(0)  # one turn to settle
+    leaked = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    assert leaked == []  # no pending pipeline worker/feeder tasks survive teardown
+
+
 async def test_pipeline_empty_items_returns_empty() -> None:
     gate = ConcurrencyGate(limit=2)
 

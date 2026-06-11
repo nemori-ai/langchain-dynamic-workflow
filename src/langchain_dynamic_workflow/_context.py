@@ -878,7 +878,16 @@ class Ctx:
             results: list[T | None] = []
             control_flow_error: BaseException | None = None
             for outcome in settled:
-                if isinstance(outcome, BaseException):
+                if isinstance(outcome, asyncio.CancelledError):
+                    # An INTERIOR CancelledError (a thunk awaited a child that was
+                    # cancelled while this barrier's own task is NOT being torn down).
+                    # return_exceptions=True can only place a CancelledError into the
+                    # settled list for an interior raise: an EXTERNAL cancel of this
+                    # task raises out of `await gather(...)` itself and never reaches
+                    # here. So an interior CancelledError is masked as a leaf failure
+                    # (None), like any other failed leaf — never re-raised.
+                    results.append(None)
+                elif isinstance(outcome, BaseException):
                     # Only re-raised control-flow signals reach here (leaf failures
                     # are already None via _guarded). Remember the first; fail loud.
                     control_flow_error = control_flow_error or outcome
