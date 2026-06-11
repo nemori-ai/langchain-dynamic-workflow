@@ -21,7 +21,7 @@ import asyncio
 import fnmatch
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
@@ -437,6 +437,47 @@ class _Closeable(Protocol):
         ...
 
 
+async def _shielded_drain[T](coro: Coroutine[object, object, T]) -> tuple[T, bool]:
+    """Run ``coro`` to completion even while the current task is cancelling.
+
+    A ``CancelledError`` delivered to a leaf mid-lease (a ``race()`` loser, a
+    cancelled background run) can land at two cancellation-unsafe points in
+    :meth:`SandboxManager._admit_slot`: the off-loop ``to_thread`` build (whose
+    worker may already have produced a backend) and the post-build cleanup (whose
+    backend close + condition-lock re-acquire themselves await). A plain ``await``
+    of either in an already-cancelling task re-raises ``CancelledError`` immediately
+    — orphaning the just-built backend and stranding the pending claim. Shielding
+    ``coro`` and re-awaiting the shield each time the outer await is cancelled drives
+    it to completion; whether a cancellation was observed is returned so the caller
+    can re-raise it after the backend is safely accounted for.
+
+    Args:
+        coro: The coroutine to run to completion under a cancellation shield.
+
+    Returns:
+        A ``(result, was_cancelled)`` pair: ``coro``'s return value, and whether the
+        outer task was cancelled while ``coro`` ran (the caller must re-raise the
+        cancellation once its own cleanup is done).
+
+    Raises:
+        asyncio.CancelledError: If the shielded coroutine itself is cancelled (as
+            opposed to only the outer await being cancelled).
+    """
+    task = asyncio.ensure_future(coro)
+    observed_cancel = False
+    while True:
+        try:
+            return await asyncio.shield(task), observed_cancel
+        except asyncio.CancelledError:
+            if task.cancelled():
+                # The shielded coroutine itself was cancelled (not merely our await
+                # of it); there is nothing left to drive — propagate.
+                raise
+            # Only our await was cancelled; the shielded coroutine is still running.
+            # Record the deferred cancellation and re-await so it runs to completion.
+            observed_cancel = True
+
+
 def _close_backend(backend: SandboxBackendProtocol) -> None:
     """Release a backend's host-side resources if it supports closing.
 
@@ -473,6 +514,28 @@ class _SandboxSlot:
     created_at: float
     last_used_at: float
     in_use: int = field(default=0)
+
+
+class _LostAdmissionRace(Exception):
+    """Internal signal: a concurrent lease installed the slot while we built.
+
+    Raised inside :meth:`SandboxManager._admit_slot` from under the admission lock so
+    the loser's redundant-backend close can happen OUTSIDE the lock and OFF the event
+    loop (R8: a real-git backend's ``close`` runs blocking ``git`` subprocesses). The
+    installed winner is carried so the handler can return it after the off-loop close,
+    reusing the same cancellation-safe reclaim machinery as every other admit exit.
+
+    Attributes:
+        installed: The slot a concurrent lease installed; the caller reuses it (its
+            ``in_use`` was already incremented for the caller under the lock).
+        redundant: This lease's now-redundant freshly-built backend, for the handler
+            to close off-loop.
+    """
+
+    def __init__(self, installed: _SandboxSlot, redundant: SandboxBackendProtocol) -> None:
+        super().__init__("a concurrent lease installed the slot while this one built")
+        self.installed = installed
+        self.redundant = redundant
 
 
 class SandboxManager:
@@ -753,11 +816,27 @@ class SandboxManager:
         try:
             yield slot.sandbox
         finally:
-            async with self._slot_freed:
-                slot.in_use -= 1
-                slot.last_used_at = self._clock()
-                # Wake one parked lease so it can re-check for room.
-                self._slot_freed.notify()
+            await self._release_lease(slot)
+
+    async def _release_lease(self, slot: _SandboxSlot) -> None:
+        """Drop one lease on ``slot``: decrement ``in_use`` and wake a parked lease.
+
+        The single place a held lease is given back, so the bookkeeping (the
+        ``in_use`` decrement, the idle-clock reset, the wake of one parked lease) lives
+        in one spot. :meth:`lease` calls it in its ``finally`` for the normal path; the
+        lost-race handler in :meth:`_admit_slot` calls it to rebalance the winner's
+        optimistic ``in_use`` bump when the redundant-backend close fails or an
+        observed cancellation means the caller will never reach :meth:`lease`'s
+        ``finally``.
+
+        Args:
+            slot: The slot whose lease is being released.
+        """
+        async with self._slot_freed:
+            slot.in_use -= 1
+            slot.last_used_at = self._clock()
+            # Wake one parked lease so it can re-check for room.
+            self._slot_freed.notify()
 
     async def _admit_slot(self, leaf_id: str, isolation: str) -> _SandboxSlot:
         """Find-or-create the leaf's slot, building the backend OUTSIDE the lock.
@@ -784,6 +863,9 @@ class SandboxManager:
         Returns:
             The leaf's slot with ``in_use`` already incremented for the caller.
         """
+        # Phase A — quota decision (under the lock). Pop any victims to free quota and
+        # claim this leaf via self._pending; nothing here awaits after _pending.add, so
+        # this section is not itself a cancellation point once the claim is made.
         victims: list[SandboxBackendProtocol] = []
         async with self._slot_freed:
             while True:
@@ -822,69 +904,189 @@ class SandboxManager:
                             # Every slot is genuinely in use: park until a release.
                             await self._slot_freed.wait()
                             continue
-                # Room exists (or was just freed). Claim it: mark this leaf pending so
-                # a concurrent lease counts it toward the quota and parks, then close
-                # the popped victims off-loop (lock released) before building.
+                # Room exists (or was just freed). Claim it: mark this leaf pending so a
+                # concurrent lease counts it toward the quota and parks.
                 self._pending.add(leaf_id)
                 break
-            if victims:
-                await self._close_backends_off_loop(victims)
-        # Build the backend OUTSIDE the lock (R8): a git provider's worktree add is
-        # blocking, so thread-offload it and never run it on the event loop.
+
+        # Phase B — admit (lock released). From here every exit-by-exception/
+        # cancellation must run the full reclaim, because the claim (self._pending +
+        # the popped victims that are already out of the pool) is now live and there
+        # are three real cancellation/suspension points before a slot is installed:
+        #   (1) the pre-build off-loop victim close,
+        #   (2) the off-loop backend build,
+        #   (3) the post-build lock re-acquire + install.
+        # A CancelledError landing at ANY of them — without this guard — would strand
+        # leaf_id in self._pending (permanently consuming a max_active slot, parking
+        # every future same-leaf lease forever) and leak host-side resources: unclosed
+        # popped victims (pure leaks — already out of the pool) and/or a built-but-
+        # uninstalled backend (a real git-worktree dir + leaf/<id> branch orphaned).
+        # `handed_off` tracks whether the built backend's ownership has transferred
+        # (installed into a slot, or already closed as a lost-race redundant); only an
+        # un-handed-off backend is the orphan the reclaim must close — so the happy and
+        # lost-race paths are never double-closed. `victims_closed` flips once the
+        # pre-build batch close has run so the reclaim does not double-close them.
+        sandbox: SandboxBackendProtocol | None = None
+        handed_off = False
+        victims_closed = False
         try:
-            sandbox = await asyncio.to_thread(self._new_sandbox, leaf_id, isolation)
-        except BaseException:
-            # The build failed: release the pending claim and wake a parked lease so
-            # the failure does not strand the leaf id as permanently pending.
+            # (1) Close the popped victims OFF-loop (lock released): a real-git
+            # backend's teardown runs blocking git subprocesses (R8). Best-effort +
+            # cancellation-drained inside, so a cancel here cannot leave a popped
+            # victim unclosed; victims_closed then guards against a double-close. The
+            # close always completes; a cancellation observed during it is surfaced and
+            # re-raised here so the reclaim (below) discards the pending claim — without
+            # this, _shielded_drain would have swallowed the cancellation, leaving the
+            # leaf stranded in _pending and the lease silently continuing to build.
+            if victims:
+                victims_cancelled = await self._close_backends_off_loop(victims)
+                victims_closed = True
+                if victims_cancelled:
+                    raise asyncio.CancelledError
+            else:
+                victims_closed = True
+
+            # (2) Build the backend OFF-loop (R8). The build is driven to completion
+            # under a cancellation shield: a CancelledError can land mid-build after
+            # the worker thread has ALREADY produced the backend, and asyncio.to_thread
+            # discards that product when its await is cancelled — orphaning a real
+            # git-worktree dir. Shielding guarantees the produced backend reaches this
+            # coroutine so the reclaim can close it; a cancellation observed during the
+            # build is carried in build_cancelled and re-raised once the backend is
+            # safely accounted for. _new_sandbox MUST be bounded (a git worktree add or
+            # an in-memory construction) — a factory that blocks forever would hang the
+            # lease regardless, since a worker thread cannot be cancelled.
+            sandbox, build_cancelled = await _shielded_drain(
+                asyncio.to_thread(self._new_sandbox, leaf_id, isolation)
+            )
+            if build_cancelled:
+                # Cancelled during the shielded build: do not install a slot for a
+                # caller that will never use it. Re-raise into the reclaim below, which
+                # closes the just-built backend (handed_off is still False).
+                raise asyncio.CancelledError
+
+            # (3) Install the finished slot (re-acquire the lock).
             async with self._slot_freed:
                 self._pending.discard(leaf_id)
+                installed = self._slots.get(leaf_id)
+                if installed is not None:
+                    # Lost a race (a concurrent path installed the slot while we built):
+                    # reuse the installed winner and discard our now-redundant backend.
+                    # The redundant close must NOT run synchronously under the lock on
+                    # the event loop (R8: a real backend's close runs blocking git
+                    # subprocesses), so it is handed to the lost-race handler below via a
+                    # sentinel — the handler closes it off-loop. The winner's in_use is
+                    # bumped OPTIMISTICALLY here (so a concurrent eviction cannot reclaim
+                    # it out from under us); if the handler's redundant close fails or an
+                    # observed cancellation means the caller never reaches lease()'s
+                    # finally, the handler rebalances that bump before propagating.
+                    installed.in_use += 1
+                    self._slot_freed.notify_all()
+                    raise _LostAdmissionRace(installed, sandbox)
+                now = self._clock()
+                slot = _SandboxSlot(sandbox=sandbox, created_at=now, last_used_at=now)
+                self._slots[leaf_id] = slot
+                slot.in_use += 1
+                handed_off = True
+                # A build can free a parked same-leaf lease (now it finds the slot) and
+                # change the pending count other leases wait on, so wake them to re-check.
                 self._slot_freed.notify_all()
-            raise
-        async with self._slot_freed:
-            self._pending.discard(leaf_id)
-            installed = self._slots.get(leaf_id)
-            if installed is not None:
-                # Lost a race (a concurrent path installed the slot while we built);
-                # close our now-redundant backend and reuse the installed one so no
-                # worktree leaks.
-                _close_backend(sandbox)
-                installed.in_use += 1
-                self._slot_freed.notify_all()
-                return installed
-            now = self._clock()
-            slot = _SandboxSlot(sandbox=sandbox, created_at=now, last_used_at=now)
-            self._slots[leaf_id] = slot
-            slot.in_use += 1
-            # A build can free a parked same-leaf lease (now it finds the slot) and
-            # change the pending count other leases wait on, so wake them to re-check.
-            self._slot_freed.notify_all()
-            return slot
+                return slot
+        except _LostAdmissionRace as race_loss:
+            # Lost-race: close our redundant backend OFF-loop (R8), then hand the
+            # installed winner back to the caller. The pending claim was already
+            # discarded under the lock before the install check, so only the redundant
+            # backend (and, on a non-normal exit, the winner's optimistic in_use bump)
+            # needs reclaiming here. The winner's in_use is released ONLY when the caller
+            # will not reach lease()'s finally — i.e. the close raised or a cancellation
+            # was observed; on the normal path the bump is the caller's live lease.
+            try:
+                _result, was_cancelled = await _shielded_drain(
+                    asyncio.to_thread(_close_backend, race_loss.redundant)
+                )
+            except BaseException:
+                # The redundant close failed: this method raises, so the caller never
+                # reaches lease()'s finally and cannot release the winner's bump —
+                # release it here (shielded, so a further cancel cannot skip it), then
+                # propagate. Otherwise the winner keeps a phantom in_use forever,
+                # blocking its eviction/reclaim and parking future leases under quota.
+                await _shielded_drain(self._release_lease(race_loss.installed))
+                raise
+            if was_cancelled:
+                # A cancellation landed during the redundant close. Honor it (a race()
+                # loser / cancelled background run must abort, not keep running its leaf
+                # body) — but first rebalance the winner's bump the caller will never
+                # release, then re-raise so cancellation propagates.
+                await _shielded_drain(self._release_lease(race_loss.installed))
+                raise asyncio.CancelledError from None
+            return race_loss.installed
+        except BaseException:
+            # Any exception/cancellation at windows (1)/(2)/(3) before a successful
+            # hand-off. Drive the full reclaim to completion under a cancellation shield
+            # (a plain await here would be re-cancelled immediately and skip the
+            # cleanup): close any not-yet-closed popped victims AND the built-but-
+            # uninstalled backend, then discard the pending claim and wake parked
+            # same-leaf leases. Then re-raise so cancellation still propagates.
+            #
+            # EVERY close is best-effort (one gather, return_exceptions=True): a close
+            # that raises must NOT abort the reclaim before the pending discard, or the
+            # leaf would strand in self._pending permanently (the original bug, for the
+            # close-itself-fails branch). The discard + notify therefore always run.
+            async def _reclaim() -> None:
+                pending_closes: list[Coroutine[object, object, None]] = []
+                if not victims_closed and victims:
+                    pending_closes.extend(
+                        asyncio.to_thread(_close_backend, victim) for victim in victims
+                    )
+                if sandbox is not None and not handed_off:
+                    pending_closes.append(asyncio.to_thread(_close_backend, sandbox))
+                if pending_closes:
+                    await asyncio.gather(*pending_closes, return_exceptions=True)
+                async with self._slot_freed:
+                    self._pending.discard(leaf_id)
+                    self._slot_freed.notify_all()
 
-    async def _close_backends_off_loop(self, backends: list[SandboxBackendProtocol]) -> None:
-        """Close popped victim backends OFF the event loop (H3).
+            await _shielded_drain(_reclaim())
+            raise
+
+    async def _close_backends_off_loop(self, backends: list[SandboxBackendProtocol]) -> bool:
+        """Close popped victim backends OFF the event loop (H3), best-effort.
 
         The victim slots were already removed from the pool under the lock, so the
-        quota is free; this releases the ``self._slot_freed`` lock (held by the
-        caller), closes each backend on a worker thread via ``asyncio.to_thread``
-        (a real-git backend's ``close`` runs blocking ``git worktree remove`` /
-        ``git branch -D`` subprocesses), then re-acquires the lock and wakes parked
-        leases (the pool changed). Releasing the lock during the blocking teardown is
-        what keeps a single slow ``git`` teardown from wedging the event loop or
-        stalling an unrelated lease. Must be called while holding ``self._slot_freed``.
+        quota is free — which means an unclosed victim is a pure leak (it is in no
+        ``_slots`` entry and no future teardown path can reach it). This closes every
+        backend on a worker thread via ``asyncio.to_thread`` (a real-git backend's
+        ``close`` runs blocking ``git worktree remove`` / ``git branch -D``
+        subprocesses), draining the whole batch to completion under a cancellation
+        shield so a ``CancelledError`` mid-batch cannot leave later popped victims
+        unclosed. Closes are gathered with ``return_exceptions=True`` so one failing
+        teardown does not abort the rest — every popped victim is always closed.
+
+        Must NOT be called while holding ``self._slot_freed``: the blocking teardown
+        runs lock-free so a slow ``git`` close never wedges the event loop or stalls
+        an unrelated lease.
 
         Args:
             backends: The popped backends to close off-loop.
+
+        Returns:
+            Whether the caller's task was cancelled while the batch closed. The batch
+            always completes (no victim leaks); the caller re-raises the deferred
+            cancellation once it has finished its own reclaim.
         """
-        # Release the caller-held condition lock for the blocking teardown, then
-        # re-acquire it before returning so the caller's `async with` stays balanced.
-        self._slot_freed.release()
-        try:
-            for backend in backends:
-                await asyncio.to_thread(_close_backend, backend)
-        finally:
-            await self._slot_freed.acquire()
-        # The pool freed slots while unlocked; wake parked leases to re-check quota.
-        self._slot_freed.notify_all()
+
+        async def _close_all() -> None:
+            await asyncio.gather(
+                *(asyncio.to_thread(_close_backend, backend) for backend in backends),
+                return_exceptions=True,
+            )
+
+        # Drive every close to completion even if the caller is being cancelled: the
+        # victims are already out of the pool, so abandoning the close mid-batch would
+        # leak the unclosed ones. Surface whether a cancellation was observed so the
+        # caller re-raises it (rather than swallowing it here).
+        _result, was_cancelled = await _shielded_drain(_close_all())
+        return was_cancelled
 
     def _would_exceed_quota(self, leaf_id: str) -> bool:
         """Whether admitting a *new* sandbox for ``leaf_id`` would breach the cap.
