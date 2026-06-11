@@ -1390,25 +1390,49 @@ class Ctx:
                 last_emit[0] = now
                 elapsed = now - start
                 rate = completed / elapsed if elapsed > 0 else 0.0
+                # A `total=` hint over a non-Sized source can under-count: once
+                # `completed` exceeds it, the hint is proven wrong, so for THIS emit
+                # treat the total as UNKNOWN (drop to the completed-only view) rather
+                # than reporting a misleading "10/3" or clamping to "10/10" (which
+                # would falsely imply completion). The Sized / accurate-hint happy
+                # path (completed <= known_total) is unchanged. The eta guard requires
+                # completed <= known_total so it can never be negative.
+                effective_total = (
+                    known_total if known_total is not None and completed <= known_total else None
+                )
                 eta = (
-                    (known_total - completed) / rate
-                    if known_total is not None and rate > 0
+                    (effective_total - completed) / rate
+                    if effective_total is not None and rate > 0
                     else None
                 )
-                if known_total is not None:
-                    message = f"{label}: {completed}/{known_total}"
+                if effective_total is not None:
+                    message = f"{label}: {completed}/{effective_total}"
                 else:
                     message = f"{label}: {completed}"
-                self._progress.emit_transient(
-                    message,
-                    metrics=BatchMetrics(
-                        completed=completed,
-                        elapsed_seconds=elapsed,
-                        rate=rate,
-                        total=known_total,
-                        eta_seconds=eta,
-                    ),
-                )
+                # Progress is out-of-band, transient, best-effort observability:
+                # delivered to the sink but never recorded, journaled, or replayed. A
+                # host sink that raises is the host's own telemetry bug; isolating it at
+                # this single emit chokepoint means EVERY call site — the per-item
+                # `_stage` finally AND the post-pipeline final forced emit below — is
+                # covered, so a sink fault can never corrupt a result (run_pipeline's
+                # `except Exception` would otherwise demote a successful item to None)
+                # nor turn a computationally-successful batch into a propagated failure.
+                # Only emit_transient can raise (the throttle/metrics arithmetic above
+                # cannot), so the suppress wraps it alone — the computation is
+                # unaffected: a failed fn still lands None, and the engine's control-flow
+                # signals (budget / determinism / checkpoint) are raised by
+                # `await fn(item)` in `_stage`'s try body, never inside this emit.
+                with contextlib.suppress(Exception):
+                    self._progress.emit_transient(
+                        message,
+                        metrics=BatchMetrics(
+                            completed=completed,
+                            elapsed_seconds=elapsed,
+                            rate=rate,
+                            total=effective_total,
+                            eta_seconds=eta,
+                        ),
+                    )
 
             async def _stage(_payload: Any, item: Any, _index: int) -> Any:
                 # One stage = the whole map: run fn, then advance the shared
@@ -1416,22 +1440,16 @@ class Ctx:
                 # advances whether fn succeeds or raises (a raise drops the item to
                 # None in run_pipeline, but it still settled), so progress tracks
                 # settled work, not just successes.
-                fn_raised = True
                 try:
-                    result = await fn(item)
-                    fn_raised = False
-                    return result
+                    return await fn(item)
                 finally:
                     completed_count[0] += 1
-                    if fn_raised:
-                        # fn raised (esp. a control-flow signal: budget/determinism/
-                        # checkpoint). A progress-sink failure here must NOT mask fn's
-                        # exception, so swallow it — fn's exception takes priority.
-                        with contextlib.suppress(Exception):
-                            _emit_progress(completed_count[0])
-                    else:
-                        # fn succeeded: a progress-sink failure propagates loud.
-                        _emit_progress(completed_count[0])
+                    # The emit is isolated centrally inside _emit_progress (a sink fault
+                    # is suppressed at the chokepoint), so this is a plain call: fn's own
+                    # exceptions / control-flow signals propagate from `await fn(item)`
+                    # in the try body, never masked, while a progress-sink fault can
+                    # neither corrupt this item's result nor abort the batch.
+                    _emit_progress(completed_count[0])
 
             # Mark the fan-out frame BEFORE the engine spawns its workers so each
             # worker task inherits the depth and its agent() calls skip the

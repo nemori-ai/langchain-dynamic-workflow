@@ -286,29 +286,74 @@ async def test_batch_map_rejects_non_positive_max_in_flight() -> None:
     assert leaf.calls == 0  # the guard fired before any fn / leaf ran
 
 
-async def test_batch_map_progress_sink_failure_is_loud_not_swallowed() -> None:
-    # #2(a): an on_progress sink that raises while emitting a BATCH update must NOT be
-    # swallowed into per-item None holes (corrupting a successful fn result). It should
-    # fail loud, like ctx.phase / log sink failures do.
+async def test_batch_map_interior_sink_failure_does_not_corrupt_successful_result() -> None:
+    # A progress sink that raises on an INTERIOR success emit must never corrupt the
+    # genuinely-successful result at that position. Progress is best-effort, out-of-band
+    # observability (delivered, never recorded/journaled/replayed); a host sink that
+    # raises is the host's telemetry bug, isolated on every emit so it cannot demote a
+    # real result to a None hole (which run_pipeline's `except Exception` would do if the
+    # fault propagated out of _stage) nor abort the batch. With max_in_flight=1 settles
+    # are strictly sequential, so the sink fault lands exactly on the item at completed==2
+    # (index 1) — and that result must still be the correct value, not None.
     leaf = _CountingLeaf(prefix="R")
 
     def exploding_sink(entry: ProgressEntry) -> None:
-        if entry.kind is ProgressKind.BATCH:
-            raise RuntimeError("sink boom")
+        if (
+            entry.kind is ProgressKind.BATCH
+            and entry.metrics is not None
+            and entry.metrics.completed == 2
+        ):
+            raise RuntimeError("interior sink boom")
 
     progress = ProgressLog(delivered_count=0, sink=exploding_sink)
     ctx = _batch_ctx(leaf, InMemoryJournalStore(), progress=progress)
-    with pytest.raises(RuntimeError, match="sink boom"):
-        await ctx.batch_map(
-            ["a", "b", "c"],
-            lambda item: ctx.agent(f"q {item}", agent_type="worker"),
-        )
+
+    # The run returns normally (the sink fault neither raises nor aborts) AND the
+    # correct result survives at the position whose emit raised.
+    results = await ctx.batch_map(
+        ["a", "b", "c", "d", "e"],
+        lambda item: ctx.agent(f"q {item}", agent_type="worker"),
+        max_in_flight=1,
+    )
+    assert results == ["R:q a", "R:q b", "R:q c", "R:q d", "R:q e"]
+    assert results[1] is not None  # the sink fault did NOT corrupt the real result
 
 
-async def test_batch_map_fn_control_flow_signal_survives_progress_sink_failure() -> None:
-    # #2(b): if fn raises a control-flow signal AND the progress sink also raises, the
-    # control-flow signal must WIN (fail loud) — a sink bug must not mask a budget /
-    # determinism breach by demoting it to an ordinary item failure.
+async def test_batch_map_final_forced_emit_sink_failure_does_not_abort_batch() -> None:
+    # The post-pipeline FINAL forced emit (fired once run_pipeline returns, to make the
+    # last settled state exact) is a distinct emit site from the per-item _stage finally.
+    # A sink that raises ONLY on that final emit must not turn a computationally-successful
+    # batch into a propagated failure — the isolation is centralized at the emit chokepoint
+    # so every emit, per-item AND final, is covered. The sink raises at completed == 3 (the
+    # terminal settled count for a 3-item input), which the forced final emit always fires;
+    # the batch must still RETURN its results, not raise RuntimeError.
+    leaf = _CountingLeaf(prefix="R")
+
+    def exploding_sink(entry: ProgressEntry) -> None:
+        if (
+            entry.kind is ProgressKind.BATCH
+            and entry.metrics is not None
+            and entry.metrics.completed == 3
+        ):
+            raise RuntimeError("final sink boom")
+
+    progress = ProgressLog(delivered_count=0, sink=exploding_sink)
+    ctx = _batch_ctx(leaf, InMemoryJournalStore(), progress=progress)
+
+    results = await ctx.batch_map(
+        ["a", "b", "c"],
+        lambda item: ctx.agent(f"q {item}", agent_type="worker"),
+        max_in_flight=1,
+    )
+    assert results == ["R:q a", "R:q b", "R:q c"]  # batch returned normally, did not raise
+
+
+async def test_batch_map_fn_control_flow_signal_propagates_past_suppressed_emit() -> None:
+    # The symmetric finally suppress wraps ONLY the emit, never `await fn(item)`. A
+    # control-flow signal raised by fn ITSELF (not the sink) must still surface loud —
+    # a budget / determinism breach is part of the computation and is never masked. The
+    # progress sink also raising must not change that: the signal propagates from the
+    # try body, the sink fault is independently suppressed in the finally.
     leaf = _CountingLeaf(prefix="R")
 
     def exploding_sink(entry: ProgressEntry) -> None:
@@ -323,3 +368,70 @@ async def test_batch_map_fn_control_flow_signal_survives_progress_sink_failure()
 
     with pytest.raises(WorkflowBudgetExceededError):
         await ctx.batch_map(["a"], fn)
+
+
+async def test_batch_map_underestimated_total_drops_to_unknown_no_negative_eta() -> None:
+    # A non-Sized source with a `total=` hint that under-counts: once completed exceeds
+    # the hint, the hint is proven wrong, so the emit drops to unknown-total mode (total
+    # None, eta None, message shows completed only) rather than reporting a negative ETA
+    # or a misleading "10/3". Every emitted BATCH entry must therefore satisfy: eta is
+    # None-or-non-negative, total is None or completed <= total, and no message shows
+    # completed > total. throttle_step == max(1, 3 // 100) == 1, so every settle emits
+    # and the would-be-bad entries (completed 4..10) all reach the sink.
+    leaf = _CountingLeaf(prefix="R")
+    delivered: list[ProgressEntry] = []
+    progress = ProgressLog(delivered_count=0, sink=delivered.append)
+    ctx = _batch_ctx(leaf, InMemoryJournalStore(), progress=progress)
+
+    async def gen() -> AsyncIterator[str]:
+        for i in range(10):
+            yield f"item-{i}"
+
+    await ctx.batch_map(
+        gen(),
+        lambda item: ctx.agent(f"q {item}", agent_type="worker"),
+        total=3,
+    )
+
+    batch_entries = [
+        e for e in delivered if e.kind is ProgressKind.BATCH and isinstance(e.metrics, BatchMetrics)
+    ]
+    assert batch_entries, "expected at least one BATCH progress entry"
+    for entry in batch_entries:
+        metrics = entry.metrics
+        assert metrics is not None
+        assert metrics.eta_seconds is None or metrics.eta_seconds >= 0
+        assert metrics.total is None or metrics.completed <= metrics.total
+        # Once the hint is exceeded the message is completed-only (no "/N"); while the
+        # hint still holds it stays "completed/total".
+        if metrics.total is None:
+            assert entry.message == f"batch_map: {metrics.completed}"
+        else:
+            assert entry.message == f"batch_map: {metrics.completed}/{metrics.total}"
+
+
+async def test_batch_map_accurate_total_keeps_k_over_n_with_nonnegative_eta() -> None:
+    # Guard against regressing the happy path: a Sized input (len() known up front, an
+    # always-accurate total) keeps the "k/N" message, a preserved total, completed <= N
+    # throughout, and a non-negative ETA — byte-identical to the pre-fix behavior.
+    leaf = _CountingLeaf(prefix="R")
+    delivered: list[ProgressEntry] = []
+    progress = ProgressLog(delivered_count=0, sink=delivered.append)
+    ctx = _batch_ctx(leaf, InMemoryJournalStore(), progress=progress)
+
+    await ctx.batch_map(
+        [f"item-{i}" for i in range(5)],
+        lambda item: ctx.agent(f"q {item}", agent_type="worker"),
+    )
+
+    batch_entries = [
+        e for e in delivered if e.kind is ProgressKind.BATCH and isinstance(e.metrics, BatchMetrics)
+    ]
+    assert batch_entries, "expected at least one BATCH progress entry"
+    for entry in batch_entries:
+        metrics = entry.metrics
+        assert metrics is not None
+        assert metrics.total == 5  # the Sized total is preserved on every emit
+        assert metrics.completed <= metrics.total
+        assert metrics.eta_seconds is None or metrics.eta_seconds >= 0
+        assert entry.message == f"batch_map: {metrics.completed}/5"

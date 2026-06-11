@@ -277,6 +277,8 @@ stage 抛错 → 该 item 掉 null 跳后续;结果按输入下标回收保序
 - **投递到 sink 但不记录**(不入 `_entries`、不计入 `delivered_count`)。fire-and-forget 刷新,消费者覆写上一条来渲染(进度条),正如 M3.5 upsert `workflow_runs`、M1 带外 tap 叶事件。
 - **绝不进 journal / 确定性 guard / replay 结果**。它携的时间戳(`elapsed`/`eta`)是非确定的,绝不能 key 一条 journal 条目。
 - **resume 时 re-emitted、非 replayed**:resume 重执行脚本,`batch_map` 重跑、实时 BATCH 进度**被重新发出**——作为实时视图重新生成,而非从记录回放(`emit_transient` 刻意永不被 replay 抑制,即便 `delivered_count > 0`)。这不动 journal 分毫:完成叶仍零模型成本重放,且因 BATCH 条目从不入 `_entries`/`delivered_count`/journal/确定性 guard,重发的进度**不携确定性重量**。载重不变量是 **not-recorded**,**不是 not-re-emitted**——进度是实时视图,每跑重生,从不被回放。
+- **sink 抛错被隔离,绝不腐蚀计算**:进度是带外、瞬时、尽力而为的可观测性,投递到 sink 但从不记录/journal/replay;一个抛错的宿主 sink 是宿主自己的遥测 bug。引擎在**每一次** emit(`_stage` 的 `finally`,无论 `fn` 成功还是抛错)都把 emit 包进抑制,故 sink 故障**既不能把一个真正成功的结果降级为 `None` 洞**(否则 `run_pipeline` 的 `except Exception` 会把它误当作 item 失败掉 `null`)**也不能 abort 整批**。计算本身不受影响:失败的 `fn` 仍落 `None`,引擎控制流信号(budget/确定性/checkpoint)由 try body 里的 `await fn(item)` 抛出、照常传播——抑制只裹住 emit,绝不裹 `fn`。"无静默失败"治的是**计算**(失败叶落 `None`、控制流信号重抛),非宿主的尽力而为遥测 sink。
+- **低估的 `total` 提示触发 drop-to-unknown**:非 `Sized` 源配一个**低估**的 `total=` 提示时(如 `total=3` 配 10 item 生成器),一旦 `completed` 超过该提示,提示即被证伪——该次 emit 把 total 当作**未知**(`total=None`、`eta=None`、消息只显 `completed`),而非发负 ETA 或误导的 "10/3",也不夹紧成 "10/10"(会假装已完成)。`Sized`/准确提示的 happy path(`completed <= total`)逐字节不变;ETA 计算仅在 `completed <= total` 时进行,故永不为负。
 
 ### parallel 不动、pipeline 的 Sequence 契约保持
 
