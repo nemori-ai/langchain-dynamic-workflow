@@ -61,6 +61,7 @@ DagNode(id: str, deps: Sequence[str], run: Callable[[dict], Coroutine])
 3. **失败与跳过的区分**:一个节点的 `run` 抛出普通异常 → 该节点 `failed`,结果置 `None`;所有**传递依赖**于它的节点均被 **skip** 至 `None`(不会启动)。但节点**合法返回 `None`** 不会触发 skip——失败状态和 `None` 返回值用**独立的 `failed: set`** 跟踪。
 4. **控制流信号穿透**:budget / determinism / 格式非法的嵌套 dag(`WorkflowDagError`/`WorkflowCycleError`)属于 `WORKFLOW_CONTROL_FLOW_SIGNALS`;任一节点抛出时,记录信号、停止发射新节点、等在飞节点排空(drain),然后**原样重新抛出**——绝不被 mask 为 `None` 空洞。
 5. **并发闸归属于叶子**:调度器本身不持有任何并发 gate slot;`run` 函数内的 `agent()` 调用才获取共享闸——故一个 `dag` 嵌套在另一 `dag` 节点的 `run` 内不会死锁池。
+6. **同步抛出的节点构造同样被隔离(三路区分,与异步路径对齐)**:`node.run(deps_view)` 在交给 `asyncio.create_task` 之前是**同步求值**的(非 async 可调用、async 函数的同步前奏抛出、或返回非协程致 `create_task` 抛 `TypeError`,三者皆在此点同步抛出)。调度器以三个分支处理这次同步抛出,与第 4 条的异步路径逐字对齐:**普通 `Exception`** → 该节点 `failed`、结果置 `None`、传递依赖照常 skip(健康的兄弟节点继续运行,绝不被整图拆除);**引擎控制流信号**(`WORKFLOW_CONTROL_FLOW_SIGNALS`,须排在 `except Exception` 之前)→ 捕入 `aborted`、drain 后**原样重抛**;**真正的进程/控制 `BaseException`**(`asyncio.CancelledError` / `KeyboardInterrupt` / `SystemExit`)→ 两个 `except` 子句皆不捕获,**原样向上传播**(对齐异步路径——`Task.exception()` 对被取消的节点 task 会重抛取消——与全仓"进程/控制信号 fail-loud、绝不被 mask 为 `None` 空洞"的策略)。绝不用裸 `except BaseException` 把取消 / 中断吞成 `None`。
 
 ### 确定性与 resume 安全
 

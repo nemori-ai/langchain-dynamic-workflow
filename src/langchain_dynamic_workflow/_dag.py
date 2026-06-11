@@ -154,7 +154,31 @@ async def run_dag(nodes: Sequence[DagNode]) -> dict[str, Any | None]:
             failed.add(node_id)
             return _release(node_id)
         deps_view = {dep: results[dep] for dep in node.deps}
-        running[asyncio.create_task(node.run(deps_view))] = node_id
+        try:
+            # ``node.run`` is invoked synchronously to construct the coroutine before
+            # ``create_task`` receives it; a non-async callable, an async function
+            # whose synchronous prologue raises, or one returning a non-coroutine all
+            # raise here.
+            task = asyncio.create_task(node.run(deps_view))
+        except WORKFLOW_CONTROL_FLOW_SIGNALS as exc:
+            # An engine control-flow signal (budget / determinism / checkpoint /
+            # malformed nested dag) raised in construction: capture the first and
+            # re-raise after the graph drains, identical to the async settle path.
+            if not aborted:
+                aborted.append(exc)
+            failed.add(node_id)
+            return _release(node_id)
+        except Exception:
+            # A regular exception from synchronous construction: isolate it the same
+            # way the settle loop isolates a node *task* failure — record None, skip
+            # dependents, healthy siblings keep running.
+            failed.add(node_id)
+            return _release(node_id)
+        # A non-control-flow BaseException (asyncio.CancelledError / KeyboardInterrupt /
+        # SystemExit) is caught by neither clause and propagates — matching the async
+        # path (Task.exception() re-raises a cancellation) and the repo-wide policy that
+        # process/control signals surface loud rather than become a None hole.
+        running[task] = node_id
         return []
 
     pending = [node_id for node_id, degree in indegree.items() if degree == 0]
