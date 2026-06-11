@@ -26,6 +26,7 @@ from ._engine import Orchestrator, run_workflow
 from ._errors import (
     WorkflowBudgetExceededError,
     WorkflowCheckpointError,
+    WorkflowConcurrencyError,
     WorkflowCycleError,
     WorkflowDagError,
     WorkflowDeterminismError,
@@ -163,6 +164,7 @@ __all__ = [
     "SpanSink",
     "WorkflowBudgetExceededError",
     "WorkflowCheckpointError",
+    "WorkflowConcurrencyError",
     "WorkflowCycleError",
     "WorkflowDagError",
     "WorkflowDeterminismError",
