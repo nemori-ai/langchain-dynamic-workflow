@@ -115,8 +115,11 @@ async def test_checkpoint_in_fanout_fails_loud(make_fake_leaf: FakeLeafFactory) 
 
 
 async def test_checkpoint_returns_resume_value_directly() -> None:
-    # The minimal primitive: no leaves before the gate, the resume value flows
-    # straight back as checkpoint()'s return value (any shape, including a mapping).
+    # The minimal primitive: no leaves before the gate, the resume value comes back
+    # as checkpoint()'s return value JSON-normalized (the decision is journaled as
+    # JSON and read back the same way). A JSON-stable mapping is unchanged by the
+    # round-trip, so == still holds; see test_checkpoint_approve_decision_is_json_
+    # normalized for the type-stabilizing case (tuple -> list, int keys -> str keys).
     roster = Roster()
     journal = InMemoryJournalStore()
 
@@ -135,6 +138,82 @@ async def test_checkpoint_returns_resume_value_directly() -> None:
         resume={"approved": True, "note": "lgtm"},
     )
     assert result == {"approved": True, "note": "lgtm"}
+
+
+async def test_checkpoint_approve_decision_is_json_normalized() -> None:
+    # The approve path must hand the script the SAME JSON-normalized shape a replay
+    # reads back (the decision is journaled as JSON), not the raw Python object: a
+    # tuple becomes a list and int dict-keys become str keys. Pins normalize-on-approve
+    # directly in a single run, without a third replay run.
+    roster = Roster()
+    journal = InMemoryJournalStore()
+    approved: list[Any] = []
+
+    async def orchestrate(ctx: Ctx) -> Any:
+        decision = await ctx.checkpoint({"ask": "go?"}, tag="g1")
+        approved.append(decision)
+        return decision
+
+    with pytest.raises(WorkflowSignoffRequired):
+        await run_workflow(orchestrate, roster=roster, journal=journal, thread_id="t")
+
+    result = await run_workflow(
+        orchestrate,
+        roster=roster,
+        journal=journal,
+        thread_id="t",
+        resume={"items": (1, 2, 3), "scores": {1: "a"}},
+    )
+    # The approve run already returns the normalized shape: tuple -> list, int key -> str.
+    assert result == approved[0]
+    assert result["items"] == [1, 2, 3] and isinstance(result["items"], list)
+    assert list(result["scores"]) == ["1"]
+
+
+async def test_checkpoint_decision_type_stable_across_approve_and_replay() -> None:
+    # Regression for the approve-vs-replay type split: the SAME gate must hand the
+    # script a type-identical value on the approving run and on every later replay.
+    # Run-1 parks at gate-1; run-2 approves gate-1 with a JSON-UNSTABLE value (a tuple
+    # and an int-keyed dict) and re-parks at gate-2 (so the approving run's gate-1
+    # value is captured via the side-effect list, NOT the caller return); run-3 replays
+    # the same journal and captures gate-1's replayed return. Both must be JSON-normalized.
+    roster = Roster()
+    journal = InMemoryJournalStore()
+    unstable: dict[str, Any] = {"items": (1, 2, 3), "scores": {1: "a"}}
+    seen: list[Any] = []
+
+    async def orchestrate(ctx: Ctx) -> list[Any]:
+        d1 = await ctx.checkpoint({"ask": "go?"}, tag="g1")
+        seen.append(d1)
+        d2 = await ctx.checkpoint({"ask": "go again?"}, tag="g2")
+        return [d1, d2]
+
+    # Run 1: park at gate-1.
+    with pytest.raises(WorkflowSignoffRequired) as e1:
+        await run_workflow(orchestrate, roster=roster, journal=journal, thread_id="t")
+    assert e1.value.tag == "g1"
+
+    # Run 2: approve gate-1 with the JSON-unstable value; re-park at gate-2. gate-1's
+    # value is captured via `seen` (the approving run never returns past gate-2).
+    with pytest.raises(WorkflowSignoffRequired) as e2:
+        await run_workflow(
+            orchestrate, roster=roster, journal=journal, thread_id="t", resume=unstable
+        )
+    assert e2.value.tag == "g2"
+
+    # Run 3: a pure replay (no resume value) of the same journal — gate-1 replays its
+    # journaled decision via json.loads and the run re-parks at the still-undecided
+    # gate-2. (Passing resume="D2" would approve gate-2 and complete the run, so gate-1
+    # would never be re-observed: the replay capture requires the no-resume path.)
+    with pytest.raises(WorkflowSignoffRequired):
+        await run_workflow(orchestrate, roster=roster, journal=journal, thread_id="t")
+
+    assert len(seen) >= 2, "gate-1 was not observed on both the approve and the replay run"
+    approve, replay = seen[0], seen[1]
+    # Type-identical across the human pause: both lists, both str keys.
+    assert type(approve["items"]) is type(replay["items"])
+    assert isinstance(approve["items"], list)
+    assert list(approve["scores"]) == list(replay["scores"]) == ["1"]
 
 
 async def test_resume_with_no_gate_to_consume_fails_loud() -> None:

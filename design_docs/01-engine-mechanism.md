@@ -387,6 +387,7 @@ spike(`@entrypoint`+`@task` 真跑 interrupt/resume,langgraph 1.2.2)证实 inter
 | (d) | **/shared/ artifact 不跨签核门存活** | per-run `SharedArtifactStore` 在 approve 重启时重建为空;门前叶重放其**结果**但不重填 `/shared/`——同崩溃-resume 边界。跨门状态须走脚本变量(M5 fix_loop 范式),真 worktree 持久是 M6。 |
 | (e) | **门入确定性序列(漂移 fail-loud)** | `checkpoint` 把门键 `signoff_key(position, tag)` 经 `sequence_guard.observe` 记入与叶调用同一条有序序列,故全量 resume 时门顺序/身份漂移(前面插/删了叶或门、或同位换了 tag)**失声而抛**而非把决策静默绑错门(叶漂移 fail-loud,门也须)。门身份是 `(position, tag)`——`ask` 因可能携非确定内容(如模型评估)被排除出键,故**不同门必须用不同 tag**,且编辑脚本门/叶结构会作废 parked journal(同叶键边界)。评审 M5 硬化。 |
 | (f) | **决策必 JSON-可序列化 + 消费前序列化** | 决策被 `json.dumps` 记进 journal;`checkpoint` 在**消费 pending 之前**序列化,故非 JSON 决策抛清晰 `WorkflowCheckpointError` 且门保持未决(仍可重批),不丢值不留半门。评审 Codex#4 硬化。 |
+| (g) | **决策经 JSON 往返归一(approve 与 replay 同形)** | 批准的门决策以 JSON 记进 journal,且**在 approve 当跑与每次 replay 上都经 `json.loads` 往返后**才交回脚本(approve 路返回 `json.loads(serialized)`、非未往返的原始对象,与 replay 路 `json.loads(recorded.result)` 同形)。故脚本在人审暂停前后看到的决策**类型稳定**——不会出现"approve 当跑收到原始 tuple / int 字典键,replay 却收到 list / str 键"的漂移(tuple→list、int 键→str 键在两侧一致),正是 journal 要防的 replay drift。评审 v0.4.0 硬化。 |
 
 ### host 面(BgRunManager + workflow tool)
 

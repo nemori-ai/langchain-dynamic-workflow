@@ -496,7 +496,14 @@ class Ctx:
                 echoed back on the parked status.
 
         Returns:
-            The value supplied on approve (``run_workflow(..., resume=value)``).
+            The value supplied on approve (``run_workflow(..., resume=value)``),
+            normalized through a JSON round-trip. Because the decision is
+            journaled as JSON and read back the same way, the script sees the
+            identical post-round-trip shape on the approving run and on every
+            replay (e.g. a tuple becomes a list, int dict-keys become str keys),
+            so the value is type-stable across the human pause and across
+            replays. Supply only JSON-stable shapes to a script that depends on
+            the decision's runtime type.
 
         Raises:
             WorkflowCheckpointError: If called from inside a fan-out frame.
@@ -553,7 +560,13 @@ class Ctx:
                     ) from exc
                 self._pending_signoff = UNSET
                 await self._journal.put(key, JournalRecord(result=serialized, usage=0))
-                return decision
+                # Return the JSON-normalized shape the replay branch above returns
+                # (json.loads of the same serialized record), not the raw object: a
+                # replay reads the decision back via json.loads, so handing the script
+                # the un-round-tripped object here would make the SAME gate type-unstable
+                # (raw tuple / int keys on the approve, list / str keys on every replay)
+                # — replay drift the journal exists to prevent.
+                return json.loads(serialized)
             # No decision and nothing to inject: park here for a human sign-off. The
             # finally still decrements so a resume's re-reached gate is not flagged.
             raise WorkflowSignoffRequired(ask, tag=tag, gate_key=key)
