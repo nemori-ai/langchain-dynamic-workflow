@@ -79,3 +79,10 @@
 - **脱离 deepagents 自研 agent 构建 / leaf 框架无关** —— 在「引擎作为 deepagents 工具」拓扑下属工程卫生，非战略，不立项。
 
 > **本节产生背景（诚实备注）：** 主线由用户 2026-06-11 拍板。同一 session 后段发生**上下文污染**——工具结果通道被注入第一人称 agent 推理文本，并**伪造了部分文件读取内容**（例如 `tests/unit/test_concurrency.py` 被读成完全不存在的测试集）。据此凭空「发现」的一个 `_ConcurrencyGate` local-permit 泄漏 bug **经查实为污染伪造，作废、不进路线**（真实 gate 以 `.run()` 包裹协程工厂，已有 `test_gate_run_releases_slot_on_exception` 覆盖异常释放）。经 git 多路交叉验证：该污染 session **未对仓库造成任何改动**（working tree 全程 clean、HEAD 未变）。本节经 `git diff` 确认真实落盘。
+
+## 已落地（2026-06-12，PR #22）
+
+- **引擎核心健壮性盘点（做厚）—— ✅ 已落地（9 里程碑）。** 14 条可证伪欠账（2 CRITICAL / 7 HIGH / 2 MEDIUM / 3 LOW）按共因聚类成 9 个加固里程碑：M1 resume 重入守卫（canonical 原子预留）、M2 determinism×depth-0 并发 fail-loud、M3 fan-out 内/外 `CancelledError` 之分、M4 sandbox lease 取消/失败安全（三窗口统一 reclaim）、M5 checkpoint 决策类型稳定、M6 dag 同步抛错隔离、M7 `batch_map` sink 隔离 + ETA drop-to-unknown、M8 `loop_until` 每轮 `loop_key` 计数守卫 + body 失败 `.partial`、M9 budget doc 对齐 + persistence corrupt-journal actionable 错误。逐条走 Red→Green→Refactor + 红灯回归 + Codex 跨模型复审。
+- **注册可发现性 —— ✅ 已落地。** 真实 host 驱动 `workflow` 工具时无法在不违反「道 vs 术」的前提下得知注册了哪些 workflow / `agent_type`，导致旗舰 demo 真实模型下走不通。补齐：`WorkflowRegistry.list_workflows()` + `WorkflowEntry`（`register()` 加 keyword-only `description`，缺省回退 docstring，经 `_one_line_summary` 归一）、`Roster.list_agents()`、`workflow` 工具只读 `catalog` / `agents` 命令 + 两套目录 build 时渲染进 tool description；`SKILL.md` 加决策顺序 + 「leaf 携带 host 没有的能力」说明。
+- **旗舰真实模型验收 —— preset ✅ 真实端到端通过**（发现并按名启动注册的 `deep_research`，产出带 `[VERIFIED]` 的真 web 来源报告）；**authored 现编能力已在真实模型下验证**（host 现编 + 启动 + 进 research 阶段），受成本所限未跑到完整收尾。按 leaf 分模型档（researcher=sonnet+web，机械 leaf=haiku，skeptic 去掉浪费的 web）；可选 `LDW_DEMO_BUDGET` 单 run 上限。验收纪律：真实 E2E demo 须 `timeout 600` 上限 + 无缓冲 + 主动监控。
+- **M2 持久侧栏多-workflow 实时视图 —— 仍待**（v0.4.0 剩余收口项；承重底座 M3 transport 已就位，细化设计待 `04-*.md`）。
