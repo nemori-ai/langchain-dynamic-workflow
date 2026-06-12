@@ -152,6 +152,17 @@ class Roster:
             self._built[cache_key] = built
             return built
 
+    def list_agents(self) -> list[RosterEntry]:
+        """Return the registered leaf agents as catalog entries, sorted by name.
+
+        Mirrors the script-level workflow catalog: a host LLM enumerates the
+        registered ``agent_type`` names (and their descriptions) to author a script
+        without those names being hard-coded in its prompt. The stored
+        :class:`RosterEntry` objects are returned as-is, so every field travels with
+        the catalog entry.
+        """
+        return [self._entries[name] for name in sorted(self._entries)]
+
     def __contains__(self, name: object) -> bool:
         return name in self._entries
 

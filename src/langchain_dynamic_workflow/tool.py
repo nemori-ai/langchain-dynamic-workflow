@@ -52,7 +52,16 @@ from ._roster import Roster
 # WorkflowRunStore; the in-memory default keeps the base install dependency-free
 # while a sqlite-backed store extends durability across process restarts.
 from ._run_store import InMemoryRunStore, RunSpec, WorkflowRunStore
-from ._workflows import WorkflowFn, WorkflowRegistry
+
+# `_one_line_summary` is reused (not duplicated) so a leaf description is collapsed
+# to one bounded catalog line exactly as a workflow summary is — one normalization
+# behind both registries' renders. It is module-private but imported in-package, so
+# the strict private-usage check is suppressed for this single deliberate reuse.
+from ._workflows import (
+    WorkflowFn,
+    WorkflowRegistry,
+    _one_line_summary,  # pyright: ignore[reportPrivateUsage]
+)
 
 # The tool is agnostic to the host's concrete context/state types, so the runtime
 # and Command updates are parameterized with Any (the host state schema, not the
@@ -71,9 +80,17 @@ class WorkflowToolSchema(BaseModel):
     is never advertised to the model; the model supplies only these fields.
     """
 
-    command: Literal["run", "run_script", "status", "resume", "cancel", "runs", "approve"] = Field(
-        description="Which workflow operation to perform."
-    )
+    command: Literal[
+        "run",
+        "run_script",
+        "status",
+        "resume",
+        "cancel",
+        "runs",
+        "approve",
+        "catalog",
+        "agents",
+    ] = Field(description="Which workflow operation to perform.")
     workflow: str | None = Field(
         default=None,
         description="The registered workflow name to launch (required for 'run').",
@@ -122,6 +139,15 @@ Commands (pass `command`):
     against its journal so completed steps replay at zero cost. Returns a new run.
     (Use `approve`, not `resume`, to answer a sign-off — `resume` injects no value.)
 - `cancel`: given a `run_id`, stop an in-flight run (including one awaiting sign-off).
+- `catalog`: list the workflows registered for this host (name + one-line summary)
+    so you can discover what `run` can launch by name without those names being
+    baked into your prompt. Takes no arguments. The same catalog is also rendered at
+    the end of this description.
+- `agents`: list the leaf agents registered for this host (name + one-line summary)
+    so you know which `agent_type` names you may name in a `run_script` script — the
+    `ctx.agent(..., agent_type=...)` calls a script makes — without those names being
+    baked into your prompt. Takes no arguments. The same catalog is also rendered at
+    the end of this description.
 - `runs`: list every run you launched on this thread with its workflow label and
     live status (and a short outcome preview once settled), so you can see all of
     them at once instead of polling each `run_id`. Takes no arguments.
@@ -131,6 +157,61 @@ Commands (pass `command`):
     already-approved gates replay at zero cost; the run may pause again at a later
     gate or finish.
 """
+
+
+def _render_catalog(workflows: WorkflowRegistry) -> str:
+    """Render the registered-workflow catalog as host-facing text.
+
+    Each entry renders as ``- <name> — <description>``. An empty registry renders
+    guidance to author an ad-hoc script via ``run_script`` instead, since there is
+    nothing to launch by name. This one render is reused for both the tool's
+    description (appended at build time) and the ``catalog`` command's reply.
+
+    Args:
+        workflows: The named-workflow registry to enumerate.
+
+    Returns:
+        The rendered catalog text.
+    """
+    entries = workflows.list_workflows()
+    if not entries:
+        return (
+            "Registered workflows: none. There are no workflows registered for this "
+            "host, so command='run' has nothing to launch by name — author an "
+            "orchestration script and submit it with command='run_script' instead."
+        )
+    lines = [f"- {entry.name} — {entry.description}" for entry in entries]
+    header = "Registered workflows (launch by name with command='run'):"
+    return header + "\n" + "\n".join(lines)
+
+
+def _render_agents(roster: Roster) -> str:
+    """Render the registered leaf-agent catalog as host-facing text.
+
+    Each entry renders as ``- <name> — <description>``, with the description
+    collapsed to one bounded line by the shared :func:`_one_line_summary` (reused
+    from the workflow catalog) so a multi-line or over-long leaf description cannot
+    inject a fake catalog line. An empty roster renders one-line guidance: with no
+    leaves a script's ``ctx.agent`` cannot be called at all, so there is nothing to
+    name as ``agent_type``. This one render is reused for both the tool's description
+    (appended at build time) and the ``agents`` command's reply.
+
+    Args:
+        roster: The leaf registry to enumerate.
+
+    Returns:
+        The rendered agent-catalog text.
+    """
+    entries = roster.list_agents()
+    if not entries:
+        return (
+            "Registered leaf agents: none. No leaf agents are registered for this "
+            "host, so a script's ctx.agent(...) cannot be called and there is no "
+            "agent_type to name."
+        )
+    lines = [f"- {entry.name} — {_one_line_summary(entry.description)}" for entry in entries]
+    header = "Registered leaf agents (name one as agent_type=... when you author a run_script):"
+    return header + "\n" + "\n".join(lines)
 
 
 def _host_thread_id(runtime: _ToolRuntime) -> str:
@@ -155,11 +236,22 @@ def create_workflow_tool(
 
     Args:
         roster: The leaf registry passed through to every launched ``run_workflow``.
+            Its catalog is rendered into the built tool's description and returned by
+            the ``agents`` command, so a host model can discover which ``agent_type``
+            names a ``run_script`` script may name without those names being
+            hard-coded in its prompt. The description snapshots the catalog at build
+            time, so register every leaf before building the tool; the ``agents``
+            command re-renders the registry live and reflects any later registration.
         manager: The background run manager; share the *same* instance with
             :func:`~langchain_dynamic_workflow.middleware.create_workflow_middleware`
             so completion notices land in the host context.
         workflows: The named-workflow registry resolved by the ``run`` / ``resume``
-            commands.
+            commands. Its catalog is rendered into the built tool's description and
+            returned by the ``catalog`` command, so a host model can discover the
+            registered workflows without their names being hard-coded in its prompt.
+            The description snapshots the catalog at build time, so register every
+            workflow before building the tool; the ``catalog`` command re-renders the
+            registry live and reflects any later registration.
         checkpointer: Optional LangGraph checkpointer for launched runs.
         max_concurrency: Optional explicit concurrency cap forwarded to runs.
         budget: Optional shared token ceiling forwarded to runs.
@@ -169,8 +261,10 @@ def create_workflow_tool(
             survive a process restart.
 
     Returns:
-        A :class:`StructuredTool` exposing the ``run`` / ``status`` / ``resume`` /
-        ``cancel`` commands.
+        A :class:`StructuredTool` exposing the ``run`` / ``run_script`` / ``status`` /
+        ``resume`` / ``cancel`` / ``runs`` / ``approve`` / ``catalog`` / ``agents``
+        commands, with the registered-workflow and leaf-agent catalogs rendered into
+        its description.
     """
     # The run registry persists each launch's spec (so `resume` can rebuild the
     # original callable, label, and thread) and hands out a per-run journal (so
@@ -557,6 +651,24 @@ def create_workflow_tool(
             }
         )
 
+    def _catalog_command() -> str:
+        """Return the registered-workflow catalog on demand.
+
+        A read-only host-tool command: it renders the same catalog appended to the
+        tool's description and touches no run state (no journal, determinism guard,
+        run store, or manager).
+        """
+        return _render_catalog(workflows)
+
+    def _agents_command() -> str:
+        """Return the registered leaf-agent catalog on demand.
+
+        A read-only host-tool command: it renders the same catalog appended to the
+        tool's description and touches no run state (no journal, determinism guard,
+        run store, or manager). Takes no arguments.
+        """
+        return _render_agents(roster)
+
     def _runs_command(runtime: _ToolRuntime) -> str:
         """List every run on the host thread with its label and live status.
 
@@ -594,7 +706,7 @@ def create_workflow_tool(
         *,
         runtime: _ToolRuntime,
     ) -> str | _Command:
-        """Dispatch one workflow command (run / run_script / status / resume / cancel).
+        """Dispatch one workflow command (run / status / resume / cancel / catalog / agents / ...).
 
         ``runtime`` is keyword-only and injected by the tool node; it is never
         part of the model-facing schema.
@@ -613,9 +725,13 @@ def create_workflow_tool(
             return _runs_command(runtime)
         if command == "approve":
             return await _approve_command(runtime, run_id=run_id, args=args)
+        if command == "catalog":
+            return _catalog_command()
+        if command == "agents":
+            return _agents_command()
         return (
             f"unknown command {command!r}; expected one of: "
-            "run, run_script, status, resume, cancel, runs, approve."
+            "run, run_script, status, resume, cancel, runs, approve, catalog, agents."
         )
 
     # Under ``from __future__ import annotations`` the ``runtime`` annotation is a
@@ -625,6 +741,19 @@ def create_workflow_tool(
     # resolved type on the runtime parameter so it is detected as an injected arg.
     workflow_tool.__annotations__["runtime"] = ToolRuntime
 
+    # Build the model-facing description dynamically: the static command reference,
+    # then the registered-workflow catalog, then the leaf-agent catalog — all
+    # rendered at build time, so the host model sees both the launch-by-name menu and
+    # the agent_type menu up front (the same renders the `catalog` and `agents`
+    # commands return on demand) without those names being hard-coded in its prompt.
+    description = (
+        _WORKFLOW_TOOL_DESCRIPTION
+        + "\n"
+        + _render_catalog(workflows)
+        + "\n"
+        + _render_agents(roster)
+    )
+
     # An explicit args_schema (infer_schema=False) keeps the injected ToolRuntime
     # parameter out of the model-facing schema; schema inference cannot handle it.
     # from_function is typed loosely upstream; the constructed value is a
@@ -632,7 +761,7 @@ def create_workflow_tool(
     tool: StructuredTool = StructuredTool.from_function(  # pyright: ignore[reportUnknownMemberType]
         coroutine=workflow_tool,
         name="workflow",
-        description=_WORKFLOW_TOOL_DESCRIPTION,
+        description=description,
         infer_schema=False,
         args_schema=WorkflowToolSchema,
     )

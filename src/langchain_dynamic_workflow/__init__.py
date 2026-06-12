@@ -70,7 +70,7 @@ from ._result import fold_result
 from ._roster import Roster, RosterEntry
 from ._run_store import InMemoryRunStore, RunSpec, WorkflowRunStore
 from ._sandbox import SandboxFactory, SandboxManager, local_subprocess_factory
-from ._workflows import WorkflowRegistry
+from ._workflows import WorkflowEntry, WorkflowRegistry
 from ._worktree import InMemoryWorktreeProvider, WorktreeProvider
 from .middleware import create_workflow_middleware
 from .skills import skill_files, skills_path
@@ -169,6 +169,7 @@ __all__ = [
     "WorkflowCycleError",
     "WorkflowDagError",
     "WorkflowDeterminismError",
+    "WorkflowEntry",
     "WorkflowNestingError",
     "WorkflowRegistry",
     "WorkflowRunStore",
