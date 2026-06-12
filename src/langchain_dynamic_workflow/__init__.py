@@ -26,6 +26,7 @@ from ._engine import Orchestrator, run_workflow
 from ._errors import (
     WorkflowBudgetExceededError,
     WorkflowCheckpointError,
+    WorkflowConcurrencyError,
     WorkflowCycleError,
     WorkflowDagError,
     WorkflowDeterminismError,
@@ -69,7 +70,7 @@ from ._result import fold_result
 from ._roster import Roster, RosterEntry
 from ._run_store import InMemoryRunStore, RunSpec, WorkflowRunStore
 from ._sandbox import SandboxFactory, SandboxManager, local_subprocess_factory
-from ._workflows import WorkflowRegistry
+from ._workflows import WorkflowEntry, WorkflowRegistry
 from ._worktree import InMemoryWorktreeProvider, WorktreeProvider
 from .middleware import create_workflow_middleware
 from .skills import skill_files, skills_path
@@ -79,6 +80,7 @@ if TYPE_CHECKING:
     # Surfaced to type checkers without importing the optional-dependency module
     # at runtime: a bare ``import langchain_dynamic_workflow`` must stay
     # dependency-free, so the concrete symbols are resolved lazily in __getattr__.
+    from ._persistence import CorruptJournalRowError as CorruptJournalRowError
     from ._persistence import IncompatibleSchemaError as IncompatibleSchemaError
     from ._persistence import SqliteWorkflowStore as SqliteWorkflowStore
 
@@ -163,9 +165,11 @@ __all__ = [
     "SpanSink",
     "WorkflowBudgetExceededError",
     "WorkflowCheckpointError",
+    "WorkflowConcurrencyError",
     "WorkflowCycleError",
     "WorkflowDagError",
     "WorkflowDeterminismError",
+    "WorkflowEntry",
     "WorkflowNestingError",
     "WorkflowRegistry",
     "WorkflowRunStore",

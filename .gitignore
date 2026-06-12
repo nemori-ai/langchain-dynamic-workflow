@@ -114,6 +114,7 @@ CLAUDE.local.md
 .claude/worktrees/
 .claude/scheduled_tasks.lock
 .claude/pr-artifacts/
+.claude/cc-master/
 
 # Superpowers / gstack tooling caches
 .superpowers/

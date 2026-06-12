@@ -204,6 +204,39 @@ async def run_pipeline(
                     # Failure isolation: drop this item, skip remaining stages.
                     drop(envelope)
                     continue
+                except BaseException as exc:
+                    # A non-Exception BaseException escaped both clauses above.
+                    # CancelledError is the headline case and is ambiguous, so the
+                    # CURRENT task's cancelling() count discriminates the two origins:
+                    #   - cancelling() > 0: THIS worker's own task is being cancelled
+                    #     externally (the whole run is being torn down). Propagate the
+                    #     CancelledError so teardown stays clean; the run_pipeline
+                    #     finally cancels + awaits every sibling worker/feeder.
+                    #   - cancelling() == 0: a stray/interior cancellation (a child the
+                    #     stage awaited was cancelled) or another propagating
+                    #     BaseException (KeyboardInterrupt / SystemExit). The worker is
+                    #     NOT being torn down, so killing it here would strand stage 0's
+                    #     queue and deadlock the feeder's join() when this is the sole
+                    #     worker.
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling() > 0:
+                        raise
+                    if isinstance(exc, asyncio.CancelledError):
+                        # Interior cancellation == a leaf failure: drop this one item,
+                        # keep draining (siblings survive, run does not hang).
+                        drop(envelope)
+                        continue
+                    # A genuinely-propagating BaseException (KeyboardInterrupt /
+                    # SystemExit): it must surface loud, but a bare re-raise here would
+                    # kill the worker and deadlock the feeder. Mirror the control-flow
+                    # abort path — record the first, drop this item, and keep the worker
+                    # alive to drain remaining items + poison pills so join() completes;
+                    # run_pipeline re-raises it after a clean teardown (fail loud, no
+                    # silent swallow, no deadlock).
+                    if not aborted:
+                        aborted.append(exc)
+                    drop(envelope)
+                    continue
                 if is_last:
                     results[envelope.index] = next_payload
                 else:
@@ -244,12 +277,17 @@ async def run_pipeline(
         await feeder_task
         await asyncio.gather(*workers)
     finally:
-        # Defensive cleanup: cancel anything still pending so we never leak tasks.
-        for worker in workers:
-            if not worker.done():
-                worker.cancel()
-        if not feeder_task.done():
-            feeder_task.cancel()
+        # Defensive cleanup: cancel anything still pending, then AWAIT it so teardown
+        # is complete before run_pipeline returns/propagates — no leaked pending tasks
+        # and no in-flight stage/source cleanup left detached. Mirrors dag/race/parallel
+        # (cancel + await gather); a bare cancel without awaiting would leave the
+        # cancelled worker/feeder (and the source's aclosing finally) pending on an
+        # external cancel mid-flight. return_exceptions swallows their CancelledError.
+        pending_teardown = [task for task in (*workers, feeder_task) if not task.done()]
+        for task in pending_teardown:
+            task.cancel()
+        if pending_teardown:
+            await asyncio.gather(*pending_teardown, return_exceptions=True)
     if aborted:
         # A stage tripped an engine control-flow signal; surface it loud now that
         # the pipeline has drained and torn down cleanly.

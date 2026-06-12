@@ -18,12 +18,18 @@ dispatched, but ``record()`` runs only after the leaf completes. So in a
 ``parallel()`` barrier of ``N`` leaves dispatched while the pool still has
 headroom, all ``N`` can pass the pre-dispatch check before any has recorded its
 usage. The barrier can therefore overshoot ``total`` by up to the combined usage
-of the leaves admitted in that window — bounded by the concurrency gate's limit
-(at most ``gate.limit`` leaves run at once) and never beyond a single barrier's
-worth of work. The next ``agent()`` after the barrier settles sees the overshot
-``spent()`` and refuses. This is the intended trade: in-flight leaves keep their
-results rather than being cancelled to claw back tokens, and ``remaining()``
-floors at zero so the overshoot never surfaces as a negative figure.
+of the leaves admitted in that window. The bound is the fan-out *admission
+width* — a single barrier's (or fan-out window's) worth of leaves admitted
+before any of them records — and is **not** the concurrency gate's limit. The
+cap check passes *before* the gate is acquired (the journal ``get`` yields ahead
+of the gate), so the gate serializes leaf *execution* but never claws back cap
+checks that already passed; a ``parallel()`` of ``N`` leaves under a gate limit
+of ``1`` still admits all ``N`` and overshoots by their combined usage, not by
+one gate slot's worth. The next ``agent()`` after the barrier settles sees the
+overshot ``spent()`` and refuses. This is the intended trade: in-flight leaves
+keep their results rather than being cancelled to claw back tokens, and
+``remaining()`` floors at zero so the overshoot never surfaces as a negative
+figure.
 
 A symmetric edge runs the other way for *concurrent identical* leaves: if two
 calls sharing one call-key are dispatched in the same fan-out window, both miss
@@ -68,7 +74,7 @@ def total_tokens_from_handler(handler: UsageMetadataCallbackHandler) -> int:
 
 
 class Budget:
-    """A shared token pool with replay-reconstructable spend and a hard cap.
+    """A shared token pool with replay-reconstructable spend and a soft cap.
 
     Args:
         total: The token ceiling, or ``None`` for an unbounded budget.

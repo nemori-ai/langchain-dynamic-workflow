@@ -21,6 +21,65 @@ class WorkflowDeterminismError(RuntimeError):
     """
 
 
+class WorkflowConcurrencyError(RuntimeError):
+    """Raised when two depth-0 orchestration calls run concurrently at the top level.
+
+    The determinism backstop records the ordered sequence of call-keys on the
+    sequential (fan-out depth-0) path and validates that order on resume. Three
+    primitives observe into that same ordered sequence at depth 0 — ``agent()``,
+    ``race()`` and ``checkpoint()`` — and issuing two of them concurrently at depth 0
+    (e.g. a hand-written orchestration doing a raw ``await asyncio.gather(branch_a(ctx),
+    branch_b(ctx))`` where each branch calls ``ctx.agent(...)`` / ``ctx.race(...)``)
+    observes their keys in wall-clock order, which flips run to run. A
+    logically-deterministic resume (same leaves, all journal hits) would then observe
+    a different order and trip a spurious :class:`WorkflowDeterminismError` at replay,
+    leaving a correct workflow permanently un-resumable.
+
+    The engine refuses this the moment two depth-0 observes overlap, on the *first*
+    run, rather than letting the divergence surface as a confusing replay-time false
+    positive. Concurrent fan-out must go through ``ctx.parallel()`` / ``ctx.dag()`` /
+    ``ctx.race()``: those frames mark the fan-out so their leaves are excluded from
+    the positional guard (their completion order is wall-clock-dependent by design)
+    and the journal still guards each leaf by content hash.
+
+    Best-effort by design: the guard fires when two depth-0 observes actually
+    *overlap*. The only undetected case is two ``agent()`` / ``race()`` calls that are
+    BOTH journal cache hits — every depth-0 ``await`` (including a cache hit's
+    ``journal.get``) is a scheduling point, so the sibling interleaves and is observed
+    while the first is still in flight, EXCEPT when both resolve their hits without the
+    event loop preferring the sibling in between, in which case they run effectively
+    sequentially in argument order: a deterministic order that resumes stably with no
+    order-flip and no spurious determinism error (results stay correct via
+    content-hash). That residual case is exactly the benign one. Any call that runs a
+    live leaf overlaps and is caught.
+
+    A concurrent ``checkpoint()`` that parks is NOT a concern, but the reason is the
+    durable executor, NOT ``gather``. A bare ``asyncio.gather`` with the default
+    ``return_exceptions=False`` does NOT cancel its sibling awaitables when one raises
+    (per the CPython docs: the others "won't be cancelled and will continue to run") —
+    verified directly on this runtime, where the sibling ran to completion. The
+    no-work-past-park guarantee instead comes from the engine path: ``orchestrate``
+    runs inside a LangGraph ``@entrypoint`` driven by the pregel executor, and when
+    that node raises — a ``checkpoint`` park raises :class:`WorkflowSignoffRequired` —
+    the durable executor tears the node down and cancels the run's still-pending child
+    tasks. The orphaned gathered ``agent()`` task is therefore cancelled at its next
+    ``await`` (its ``journal.get`` / leaf dispatch) BEFORE its leaf runs, during
+    ``run_workflow``'s own unwind — so even a persistent host loop that stays open
+    after the park never lets the leaf run (empirically verified, including a probe
+    that kept the loop alive 100ms past the park: the agent was cancelled, the leaf
+    never ran). Concurrent fan-out should still use ``ctx.parallel()`` / ``ctx.dag()``
+    / ``ctx.race()``: those frames manage sibling teardown deterministically rather
+    than relying on the executor's unwind timing.
+
+    This is a depth-0-only signal: the in-flight counter that detects it is gated on
+    fan-out depth 0, so it can never be raised from inside a ``parallel`` /
+    ``pipeline`` / ``race`` / ``dag`` frame. It is listed in
+    ``WORKFLOW_CONTROL_FLOW_SIGNALS`` alongside the other structural signals purely
+    for consistency (it would fail loud rather than be masked as a ``None`` hole),
+    not because any fan-out path can actually emit it.
+    """
+
+
 class WorkflowBudgetExceededError(RuntimeError):
     """Raised when a new ``agent()`` call is attempted after the budget is exhausted.
 
@@ -140,6 +199,7 @@ class WorkflowCycleError(RuntimeError):
 
 WORKFLOW_CONTROL_FLOW_SIGNALS: tuple[type[Exception], ...] = (
     WorkflowBudgetExceededError,
+    WorkflowConcurrencyError,
     WorkflowDeterminismError,
     WorkflowCheckpointError,
     WorkflowDagError,

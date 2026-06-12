@@ -92,6 +92,24 @@ class BgRunStateError(RuntimeError):
     """
 
 
+class CanonicalRunInFlightError(RuntimeError):
+    """Raised when a launch would duplicate a canonical journal that is still live.
+
+    The manager enforces an at-most-one-live-run-per-canonical invariant within this
+    process: a canonical ``journal_run_id`` identifies one run lineage (its journal
+    and its checkpoint thread). Admitting a second live run against an already-live
+    canonical would fan two runs onto the same journal sequence and checkpoint thread,
+    each with its own (unshared) concurrency gate and token budget — a duplicate the
+    manager refuses loud rather than silently double-spending.
+
+    Scope: the live set is process-local. A run launched in a *different* live process
+    sharing the same persistent store is invisible here, so a cross-process duplicate
+    cannot be detected. That is by design — cross-process ``resume`` is for crash
+    recovery (a dead origin), where the canonical is absent from this process's set and
+    the resume legitimately proceeds. A durable cross-process lease is future work.
+    """
+
+
 type BufferedPayload = SpanBegin | Span | LeafEvent | ProgressEntry | CommandEvent
 """The verbatim engine event object captured for replay."""
 
@@ -265,6 +283,9 @@ class BgRunSlot:
         run_id: The run's identifier (host-supplied or generated).
         thread_id: The host thread that launched the run.
         task: The detached ``asyncio.Task`` executing the wrapped coroutine.
+        canonical: The canonical ``journal_run_id`` this run holds while live, or
+            ``None`` when the launcher reserved no canonical. Used to release the
+            process-local single-live-run reservation when the run settles terminal.
         status: The slot's current lifecycle status.
         label: An opaque display label for the run (e.g. its workflow name),
             carried so an aggregate listing can name the run without depending on
@@ -289,6 +310,7 @@ class BgRunSlot:
     run_id: str
     thread_id: str
     task: asyncio.Task[Any]
+    canonical: str | None = None
     status: BgStatus = BgStatus.PENDING
     label: str | None = None
     created_at: float = field(default_factory=time.monotonic)
@@ -372,6 +394,13 @@ class BgRunManager:
         self._slots: dict[tuple[str, str], BgRunSlot] = {}
         # Pending completion notices keyed by host thread, drained FIFO.
         self._notices: dict[str, list[Notice]] = {}
+        # The canonical journal_run_ids with a currently-live (non-terminal) run.
+        # Enforces at most one live run per canonical lineage IN THIS PROCESS so a
+        # launch never fans two runs onto one journal + checkpoint thread (cross
+        # host thread, terminal-origin-with-live-resume-child, or a double-fired
+        # resume). A canonical is claimed synchronously at ``start`` and released on
+        # the terminal ``_settle`` only (a parked/approved run keeps its claim).
+        self._live_canonicals: set[str] = set()
 
     @property
     def result_store(self) -> ResultStore:
@@ -509,6 +538,7 @@ class BgRunManager:
         run_id: str | None = None,
         thread_id: str,
         label: str | None = None,
+        canonical: str | None = None,
     ) -> BgRunSlot:
         """Detach ``coro`` onto the event loop and return its slot immediately.
 
@@ -516,6 +546,16 @@ class BgRunManager:
         is updated and a completion notice is enqueued for ``thread_id``. The
         caller gets the slot back before the coroutine runs, so the host turn is
         never blocked.
+
+        When ``canonical`` is supplied, the launch claims that canonical lineage in
+        the process-local live set and refuses if it is already live — enforcing at
+        most one live run per canonical journal + checkpoint thread within this
+        process, regardless of host thread. The claim is a synchronous check-and-add
+        with no ``await`` between the "already live?" test and the add, so two
+        concurrent launches of one canonical cannot both pass it (asyncio is
+        single-threaded; a no-await critical section is atomic). The claim is
+        released on the run's terminal settle only; a parked (awaiting sign-off) run
+        keeps it across the human pause and its approve continuation.
 
         Args:
             coro: The coroutine to run in the background; must resolve to the
@@ -525,6 +565,9 @@ class BgRunManager:
             thread_id: The host thread launching the run (part of the slot key).
             label: Optional opaque display label (e.g. the workflow name) stored on
                 the slot so an aggregate listing can name the run.
+            canonical: Optional canonical ``journal_run_id`` this run claims while
+                live. ``None`` skips the single-live-run reservation (callers that do
+                not share a journal/checkpoint lineage, e.g. direct utility starts).
 
         Returns:
             The :class:`BgRunSlot` tracking the detached run.
@@ -533,6 +576,14 @@ class BgRunManager:
             BgRunQuotaExceededError: If a ``max_concurrent_runs`` quota is set and
                 that many runs are already in flight. The passed coroutine is
                 closed (never scheduled) so a refused run leaks no task or warning.
+            BgRunStateError: If the ``(thread_id, run_id)`` composite key already maps
+                to a LIVE (non-terminal) slot. Overwriting it would orphan the live
+                run and leak its canonical, so the launch is refused; the passed
+                coroutine is closed and no claim is added. A settled slot under the
+                key may be reused.
+            CanonicalRunInFlightError: If ``canonical`` is already live in this
+                process. The passed coroutine is closed (never scheduled), and no
+                claim is added, so a refused launch leaks no task and holds nothing.
         """
         if (
             self._max_concurrent_runs is not None
@@ -549,10 +600,44 @@ class BgRunManager:
             )
         resolved_run_id = run_id if run_id is not None else uuid.uuid4().hex
         key = _composite_key(thread_id, resolved_run_id)
+        # Reject a launch whose composite key already maps to a LIVE (non-terminal)
+        # slot: overwriting it would orphan that run's slot, so the orphaned run's
+        # later _settle would resolve the NEW slot and discard the WRONG canonical —
+        # leaking the live run's canonical forever (its lineage becomes permanently
+        # un-resumable) and prematurely releasing the new one. A settled slot under
+        # the key may be reused (a finished run's key is free), so refuse only when
+        # the existing slot is still live.
+        existing = self._slots.get(key)
+        if existing is not None and existing.status not in _TERMINAL_STATUSES:
+            coro.close()
+            raise BgRunStateError(
+                f"run {resolved_run_id!r} on thread {thread_id!r} is already live "
+                f"({existing.status.value}); refusing to launch over its slot "
+                "(wait for it to settle or cancel it, or use a distinct run_id)"
+            )
+        # Synchronous canonical reservation: the duplicate-key check above and the
+        # "is it live?" check + add here all sit in ONE no-await critical section, so
+        # two interleaved launches of the same key or canonical cannot both pass
+        # (TOCTOU-free under single-threaded asyncio).
+        if canonical is not None and canonical in self._live_canonicals:
+            coro.close()
+            raise CanonicalRunInFlightError(
+                f"canonical run {canonical!r} is already live in this process; refusing "
+                "to launch a duplicate against the same journal and checkpoint thread "
+                "(wait for the live run to settle or cancel it first)"
+            )
+        if canonical is not None:
+            self._live_canonicals.add(canonical)
         task: asyncio.Task[str] = asyncio.ensure_future(
             self._run_wrapped(coro, key=key, thread_id=thread_id)
         )
-        slot = BgRunSlot(run_id=resolved_run_id, thread_id=thread_id, task=task, label=label)
+        slot = BgRunSlot(
+            run_id=resolved_run_id,
+            thread_id=thread_id,
+            task=task,
+            canonical=canonical,
+            label=label,
+        )
         self._slots[key] = slot
         return slot
 
@@ -690,6 +775,11 @@ class BgRunManager:
             return
         slot.status = status
         slot.settled_at = time.monotonic()
+        # Release the canonical reservation: this run is now terminal, so the lineage
+        # is free for a legitimate resume to re-claim. Only the terminal settle frees
+        # it — a parked run (handled by _park) keeps its claim across the human pause.
+        if slot.canonical is not None:
+            self._live_canonicals.discard(slot.canonical)
         summary: str
         detail: str | None = None
         if status == BgStatus.DONE and result is not None:

@@ -61,3 +61,28 @@
 - **M2 持久侧边栏多-workflow 实时视图**：🧱 承重底座已随 03 设计完毕（与 M3① 共享 transport 底座）；其侧栏布局 / 多-workflow 并列 / 渲染技术等**细化设计待切片 2 启动**（`04-*.md`）。
 - **E 批处理人体工学（`batch_map`）**：✅ 已落地——流式准入大扇出 map（广义化 `run_pipeline`、`parallel` 不动）+ transient count/ETA 进度（`ProgressKind.BATCH`，delivered-not-recorded）；自 v0.3.0「後續里程碑」backlog 提升而来。设计见 [`02-e-batch-ergonomics.md`](02-e-batch-ergonomics.md)。
 - **其余 v0.4.0 目标**：批次开放，逐项增补（候选：面向社区的交互式 demo-app 等；自 v0.3.0 提升的 E 已落地，M7 已于 v0.3.0 落地）。
+
+## 下一步推进顺序（2026-06-11 用户拍板）
+
+> 本节为某次 session 剔除上下文污染后、由用户明确确认的干净主线。
+
+**总优先级（用户明确）：** 引擎本身的能力与功能做扎实 = 根本；对外集成放后面。
+
+1. **引擎核心健壮性盘点（做厚）—— 首位。** 拿 `AGENTS.md` 的工业级韧性原则当准星，逐个犁编排原语（`parallel` / `pipeline` / `race` / `dag` / `loop_until` / `batch_map`）+ 韧性机制（`journal` / `determinism guard` / `resume` / `budget`），产出「健壮性欠账清单 + 严重度」。判据：每条发现须**可证伪**——精确 `file:line` + 触发条件 + 后果 + 一个能亮红灯的测试；写不出红灯测试的不计入。高危区在**结合部**（并发×取消、确定性×resume、资源界×异常路径、错误传播×隔离）。
+2. **按欠账清单排健壮性加固里程碑**，逐条走完整 TDD 闭环（Red→Green→Refactor + 真模型 E2E + 跨模型评审 + evergreen docs 同步）。
+3. **M2 持久侧栏多-workflow 实时视图 —— 排在健壮性之后。** 本批次唯一剩的已确认目标，但性质属「可观测 / 人机交互」（demo 消费侧、引擎零改动），按「引擎本身优先」让位于核心加固；做完顺带收口 v0.4.0。承重底座（M3 transport）已就位，细化设计仍待 `04-*.md`。
+4. **对外集成（`workflow` tool 界面成熟度、leaf 框架无关 / 自研 agent 构建等）—— 最后。** 引擎仍在实验迭代期、对外集成方式可能变，不为可能要变的边界提前抛光。
+
+**已否决 / 不立项：**
+
+- **tool 界面成熟度审计** —— 与「对外放后面」冲突，砍掉。
+- **脱离 deepagents 自研 agent 构建 / leaf 框架无关** —— 在「引擎作为 deepagents 工具」拓扑下属工程卫生，非战略，不立项。
+
+> **本节产生背景（诚实备注）：** 主线由用户 2026-06-11 拍板。同一 session 后段发生**上下文污染**——工具结果通道被注入第一人称 agent 推理文本，并**伪造了部分文件读取内容**（例如 `tests/unit/test_concurrency.py` 被读成完全不存在的测试集）。据此凭空「发现」的一个 `_ConcurrencyGate` local-permit 泄漏 bug **经查实为污染伪造，作废、不进路线**（真实 gate 以 `.run()` 包裹协程工厂，已有 `test_gate_run_releases_slot_on_exception` 覆盖异常释放）。经 git 多路交叉验证：该污染 session **未对仓库造成任何改动**（working tree 全程 clean、HEAD 未变）。本节经 `git diff` 确认真实落盘。
+
+## 已落地（2026-06-12，PR #22）
+
+- **引擎核心健壮性盘点（做厚）—— ✅ 已落地（9 里程碑）。** 14 条可证伪欠账（2 CRITICAL / 7 HIGH / 2 MEDIUM / 3 LOW）按共因聚类成 9 个加固里程碑：M1 resume 重入守卫（canonical 原子预留）、M2 determinism×depth-0 并发 fail-loud、M3 fan-out 内/外 `CancelledError` 之分、M4 sandbox lease 取消/失败安全（三窗口统一 reclaim）、M5 checkpoint 决策类型稳定、M6 dag 同步抛错隔离、M7 `batch_map` sink 隔离 + ETA drop-to-unknown、M8 `loop_until` 每轮 `loop_key` 计数守卫 + body 失败 `.partial`、M9 budget doc 对齐 + persistence corrupt-journal actionable 错误。逐条走 Red→Green→Refactor + 红灯回归 + Codex 跨模型复审。
+- **注册可发现性 —— ✅ 已落地。** 真实 host 驱动 `workflow` 工具时无法在不违反「道 vs 术」的前提下得知注册了哪些 workflow / `agent_type`，导致旗舰 demo 真实模型下走不通。补齐：`WorkflowRegistry.list_workflows()` + `WorkflowEntry`（`register()` 加 keyword-only `description`，缺省回退 docstring，经 `_one_line_summary` 归一）、`Roster.list_agents()`、`workflow` 工具只读 `catalog` / `agents` 命令 + 两套目录 build 时渲染进 tool description；`SKILL.md` 加决策顺序 + 「leaf 携带 host 没有的能力」说明。
+- **旗舰真实模型验收 —— preset ✅ 真实端到端通过**（发现并按名启动注册的 `deep_research`，产出带 `[VERIFIED]` 的真 web 来源报告）；**authored 现编能力已在真实模型下验证**（host 现编 + 启动 + 进 research 阶段），受成本所限未跑到完整收尾。按 leaf 分模型档（researcher=sonnet+web，机械 leaf=haiku，skeptic 去掉浪费的 web）；可选 `LDW_DEMO_BUDGET` 单 run 上限。验收纪律：真实 E2E demo 须 `timeout 600` 上限 + 无缓冲 + 主动监控。
+- **M2 持久侧栏多-workflow 实时视图 —— 仍待**（v0.4.0 剩余收口项；承重底座 M3 transport 已就位，细化设计待 `04-*.md`）。

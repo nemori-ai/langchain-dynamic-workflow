@@ -556,6 +556,173 @@ async def test_resume_unknown_run_id_reports_unknown(
     assert "ghost" in out
 
 
+async def test_resume_of_a_still_running_origin_is_refused(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # The resume guard (mirrors approve's poll): resuming a run whose origin is STILL
+    # in flight on this process must be refused with a plain string, never relaunched.
+    # Without the guard, resume launches a concurrent DUPLICATE against the same
+    # canonical journal + checkpoint thread, each with a FRESH ConcurrencyGate and
+    # Budget — so a budget=N run can spend ~2N and both write the same journal.
+    leaf, _state = make_fake_leaf("research-output")
+    roster = Roster().register("researcher", leaf)
+    release = asyncio.Event()
+
+    async def slow_orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        await release.wait()  # the single leaf blocks until the test releases it
+        return await ctx.agent("Research X", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("research", slow_orchestrate)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+    runtime = _runtime(thread_id="host-1")
+
+    run_out = await _ainvoke_command(tool, {"command": "run", "workflow": "research"}, runtime)
+    run_id = _launched_run_id(run_out)
+    # The origin is in flight (still blocked on release), never settled.
+    assert manager.poll(run_id, thread_id="host-1") in {BgStatus.PENDING, BgStatus.RUNNING}
+
+    try:
+        out = await _ainvoke_command(tool, {"command": "resume", "run_id": run_id}, runtime)
+        # A still-running origin is REFUSED with a string (as approve does for a
+        # non-parked run), never relaunched as a concurrent duplicate.
+        assert isinstance(out, str)
+        assert "running" in out.lower()
+    finally:
+        release.set()
+        await manager.wait(run_id, thread_id="host-1")
+
+
+async def test_resume_of_a_live_origin_from_a_different_host_thread_is_refused(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Cross-thread duplicate: the origin runs on host-A (still live). A resume issued
+    # on host-B polls UNKNOWN there (its slot is keyed under host-A), so the friendly
+    # per-(thread, run_id) poll cannot see it. The AUTHORITATIVE canonical reservation
+    # in the manager still catches it: the canonical journal lineage is live, so the
+    # cross-thread resume is refused — never relaunched as a concurrent duplicate.
+    leaf, _state = make_fake_leaf("research-output")
+    roster = Roster().register("researcher", leaf)
+    release = asyncio.Event()
+
+    async def slow_orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        await release.wait()
+        return await ctx.agent("Research X", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("research", slow_orchestrate)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+
+    run_out = await _ainvoke_command(
+        tool, {"command": "run", "workflow": "research"}, _runtime(thread_id="host-A")
+    )
+    run_id = _launched_run_id(run_out)
+    assert manager.poll(run_id, thread_id="host-A") in {BgStatus.PENDING, BgStatus.RUNNING}
+    # The resuming thread (host-B) cannot see the origin's slot by poll.
+    assert manager.poll(run_id, thread_id="host-B") == BgStatus.UNKNOWN
+
+    try:
+        out = await _ainvoke_command(
+            tool, {"command": "resume", "run_id": run_id}, _runtime(thread_id="host-B")
+        )
+        # Refused despite the UNKNOWN poll on host-B: the canonical reservation is the
+        # real enforcer, not the per-thread slot poll.
+        assert isinstance(out, str)
+        assert "canonical" in out.lower()
+    finally:
+        release.set()
+        await manager.wait(run_id, thread_id="host-A")
+
+
+async def test_resume_of_terminal_origin_with_a_live_resume_child_is_refused(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Terminal-origin-with-live-child: the origin settles DONE (poll is terminal, the
+    # friendly guard would wave it through), but a PRIOR resume's child is still live
+    # against the same canonical journal. A second resume must be refused so it does
+    # not duplicate the live resume-child onto the shared journal + checkpoint thread.
+    leaf, _state = make_fake_leaf("research-output")
+    roster = Roster().register("researcher", leaf)
+    release = asyncio.Event()
+
+    async def gated_orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        await release.wait()  # blocks every pass until the test releases it
+        return await ctx.agent("Research X", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("research", gated_orchestrate)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+    runtime = _runtime(thread_id="host-1")
+
+    # Origin runs to DONE (release, then re-gate for the resume-child).
+    run_out = await _ainvoke_command(tool, {"command": "run", "workflow": "research"}, runtime)
+    origin_id = _launched_run_id(run_out)
+    release.set()
+    await manager.wait(origin_id, thread_id="host-1")
+    assert manager.poll(origin_id, thread_id="host-1") == BgStatus.DONE
+    release.clear()
+
+    # R1 resume of the now-terminal origin: it claims the canonical and blocks live.
+    r1_out = await _ainvoke_command(tool, {"command": "resume", "run_id": origin_id}, runtime)
+    r1_id = _launched_run_id(r1_out)
+    assert manager.poll(r1_id, thread_id="host-1") in {BgStatus.PENDING, BgStatus.RUNNING}
+
+    try:
+        # A SECOND resume of the (terminal) origin: poll is terminal/UNKNOWN, but R1's
+        # child still holds the canonical, so this is refused — no concurrent duplicate.
+        out = await _ainvoke_command(tool, {"command": "resume", "run_id": origin_id}, runtime)
+        assert isinstance(out, str)
+        assert "canonical" in out.lower()
+    finally:
+        release.set()
+        await manager.wait(r1_id, thread_id="host-1")
+
+
+async def test_two_concurrent_resumes_of_one_canonical_admit_exactly_one(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # TOCTOU double-resume: two resumes of the same settled origin fire concurrently.
+    # The canonical claim in the manager is a synchronous, no-await check-and-add, so
+    # exactly ONE wins the canonical and launches; the other is refused. Without it,
+    # both poll the terminal origin, both pass, both launch a duplicate.
+    leaf, _state = make_fake_leaf("research-output")
+    roster = Roster().register("researcher", leaf)
+    release = asyncio.Event()
+
+    async def gated_orchestrate(ctx: Ctx, args: dict[str, Any]) -> str:
+        await release.wait()
+        return await ctx.agent("Research X", agent_type="researcher")
+
+    workflows = WorkflowRegistry().register("research", gated_orchestrate)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=workflows)
+    runtime = _runtime(thread_id="host-1")
+
+    run_out = await _ainvoke_command(tool, {"command": "run", "workflow": "research"}, runtime)
+    origin_id = _launched_run_id(run_out)
+    release.set()
+    await manager.wait(origin_id, thread_id="host-1")
+    release.clear()  # the resume-child re-gates so the winner stays live
+
+    # Fire both resumes concurrently against the one settled canonical.
+    out_a, out_b = await asyncio.gather(
+        _ainvoke_command(tool, {"command": "resume", "run_id": origin_id}, runtime),
+        _ainvoke_command(tool, {"command": "resume", "run_id": origin_id}, runtime),
+    )
+    outs: list[Any] = [out_a, out_b]
+    commands: list[Command[Any]] = [o for o in outs if isinstance(o, Command)]
+    refusals: list[str] = [o for o in outs if isinstance(o, str)]
+    try:
+        # Exactly one launched (a Command), exactly one refused (a string).
+        assert len(commands) == 1, outs
+        assert len(refusals) == 1
+        assert "canonical" in refusals[0].lower()
+    finally:
+        release.set()
+        winner_id = _launched_run_id(commands[0])
+        await manager.wait(winner_id, thread_id="host-1")
+
+
 async def test_resume_from_different_host_thread_is_pollable_by_that_thread(
     make_deep_leaf: Callable[[str], tuple[Runnable[Any, Any], Any]],
 ) -> None:
@@ -719,3 +886,259 @@ async def test_run_refused_when_concurrent_run_quota_full(
     release.set()
     await manager.wait(first_id, thread_id="host-1")
     assert manager.poll(first_id, thread_id="host-1") == BgStatus.DONE
+
+
+def _registry_with_descriptions() -> WorkflowRegistry:
+    """A registry whose entries carry both explicit and docstring-derived summaries."""
+
+    async def deep_research(ctx: Ctx, args: dict[str, Any]) -> str:
+        return await ctx.agent("research", agent_type="researcher")
+
+    async def code_review(ctx: Ctx, args: dict[str, Any]) -> str:
+        """Review a diff and report findings."""
+        return await ctx.agent("review", agent_type="researcher")
+
+    return (
+        WorkflowRegistry()
+        .register(
+            "deep_research", deep_research, description="Fan out web research and synthesize."
+        )
+        .register("code_review", code_review)  # docstring-first-line fallback
+    )
+
+
+async def test_built_tool_description_lists_registered_catalog(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Discoverability surface #1: the built tool's description renders the registry
+    # catalog (name + one-line description) so a host model sees the menu up front,
+    # WITHOUT the names being hard-coded in its prompt.
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("researcher", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=_registry_with_descriptions())
+
+    description = tool.description
+    assert "deep_research" in description
+    assert "Fan out web research and synthesize." in description
+    assert "code_review" in description
+    assert "Review a diff and report findings." in description  # docstring fallback rendered
+    # The catalog is introduced as a launch-by-name menu for command='run'.
+    assert "Registered workflows" in description
+    assert "command='run'" in description
+
+
+async def test_built_tool_description_for_empty_registry_points_to_run_script(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # An empty registry renders explicit guidance: no registered workflows, author a
+    # script via run_script instead.
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("researcher", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+
+    description = tool.description
+    assert "run_script" in description
+    lowered = description.lower()
+    assert "no registered workflows" in lowered or "none" in lowered
+
+
+async def test_built_tool_description_documents_the_catalog_command(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # The `catalog` command must be documented in the Commands list of the description.
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("researcher", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=_registry_with_descriptions())
+
+    assert "`catalog`" in tool.description
+
+
+async def test_catalog_command_returns_registered_names_and_descriptions(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Discoverability surface #2: the `catalog` command returns the same catalog on
+    # demand. It is a read-only host-tool command (takes no args).
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("researcher", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=_registry_with_descriptions())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(tool, {"command": "catalog"}, runtime)
+    assert isinstance(out, str)
+    assert "deep_research" in out
+    assert "Fan out web research and synthesize." in out
+    assert "code_review" in out
+    assert "Review a diff and report findings." in out
+
+
+async def test_catalog_command_renders_same_text_as_description_section(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # One render helper backs both surfaces: the `catalog` command's text is a
+    # substring of the built tool description (the description appends the same
+    # rendered catalog section).
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("researcher", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=_registry_with_descriptions())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(tool, {"command": "catalog"}, runtime)
+    assert isinstance(out, str)
+    assert out in tool.description
+
+
+async def test_catalog_command_on_empty_registry_points_to_run_script(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    leaf, _state = make_fake_leaf("x")
+    roster = Roster().register("researcher", leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(tool, {"command": "catalog"}, runtime)
+    assert isinstance(out, str)
+    assert "run_script" in out
+    assert "no registered workflows" in out.lower() or "none" in out.lower()
+
+
+# --- leaf-agent (roster) discoverability, mirroring the workflow catalog above ---
+
+
+def _roster_with_descriptions(make_fake_leaf: FakeLeafFactory) -> Roster:
+    """A roster whose entries carry distinct, human-readable descriptions."""
+    researcher, _ = make_fake_leaf("r")
+    writer, _ = make_fake_leaf("w")
+    return (
+        Roster()
+        .register("researcher", researcher, description="Fan out web research and synthesize.")
+        .register("writer", writer, description="Draft polished prose from notes.")
+    )
+
+
+async def test_built_tool_description_lists_registered_agents(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Discoverability surface #1: the built tool's description renders the roster
+    # catalog (name + description) so a host model knows which agent_type names it
+    # may name in a run_script, WITHOUT them being hard-coded in its prompt.
+    roster = _roster_with_descriptions(make_fake_leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+
+    description = tool.description
+    assert "researcher" in description
+    assert "Fan out web research and synthesize." in description
+    assert "writer" in description
+    assert "Draft polished prose from notes." in description
+    # The agent catalog is introduced as the agent_type menu for authoring scripts.
+    assert "Registered leaf agents" in description
+    assert "agent_type" in description
+
+
+async def test_built_tool_description_for_empty_roster_gives_guidance(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # An empty roster renders one-line guidance: with no leaves, ctx.agent cannot be
+    # called at all, so there is nothing to name as agent_type.
+    del make_fake_leaf
+    roster = Roster()
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+
+    description = tool.description
+    lowered = description.lower()
+    assert "leaf agents" in lowered
+    assert "none" in lowered or "no leaf" in lowered
+
+
+async def test_built_tool_description_documents_the_agents_command(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # The `agents` command must be documented in the Commands list of the description.
+    roster = _roster_with_descriptions(make_fake_leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+
+    assert "`agents`" in tool.description
+
+
+async def test_agents_command_returns_registered_names_and_descriptions(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # Discoverability surface #2: the `agents` command returns the same catalog on
+    # demand. It is a read-only host-tool command (takes no args).
+    roster = _roster_with_descriptions(make_fake_leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(tool, {"command": "agents"}, runtime)
+    assert isinstance(out, str)
+    assert "researcher" in out
+    assert "Fan out web research and synthesize." in out
+    assert "writer" in out
+    assert "Draft polished prose from notes." in out
+
+
+async def test_agents_command_renders_same_text_as_description_section(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # One render helper backs both surfaces: the `agents` command's text is a
+    # substring of the built tool description (the description appends the same
+    # rendered agent-catalog section).
+    roster = _roster_with_descriptions(make_fake_leaf)
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(tool, {"command": "agents"}, runtime)
+    assert isinstance(out, str)
+    assert out in tool.description
+
+
+async def test_agents_command_on_empty_roster_gives_guidance(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    del make_fake_leaf
+    roster = Roster()
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(tool, {"command": "agents"}, runtime)
+    assert isinstance(out, str)
+    lowered = out.lower()
+    assert "leaf agents" in lowered
+    assert "none" in lowered or "no leaf" in lowered
+
+
+async def test_agent_catalog_collapses_multiline_description_to_one_line(
+    make_fake_leaf: FakeLeafFactory,
+) -> None:
+    # A multi-line / over-long leaf description must render as exactly ONE catalog
+    # line in both the description and the `agents` output — the same normalization
+    # the workflow catalog uses (reused _one_line_summary), so a stray newline can
+    # never inject a fake catalog entry.
+    leaf, _ = make_fake_leaf("x")
+    roster = Roster().register(
+        "researcher",
+        leaf,
+        description="line one\nline two\n\tindented three",
+    )
+    manager = BgRunManager()
+    tool = create_workflow_tool(roster, manager=manager, workflows=WorkflowRegistry())
+    runtime = _runtime(thread_id="host-1")
+
+    out = await _ainvoke_command(tool, {"command": "agents"}, runtime)
+    assert isinstance(out, str)
+    # The single entry renders on one line with whitespace collapsed.
+    entry_lines = [line for line in out.splitlines() if line.startswith("- researcher")]
+    assert entry_lines == ["- researcher — line one line two indented three"]
+    # And the same single, collapsed line appears in the built description.
+    assert "- researcher — line one line two indented three" in tool.description

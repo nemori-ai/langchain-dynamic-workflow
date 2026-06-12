@@ -21,6 +21,7 @@ from langchain_dynamic_workflow._journal import journal_key
 from langchain_dynamic_workflow._sandbox import (
     InMemorySandbox,
     SandboxManager,
+    _SandboxSlot,  # pyright: ignore[reportPrivateUsage]
     leaf_id_from_key,
 )
 
@@ -555,3 +556,461 @@ async def test_blocking_teardown_on_eviction_is_offloaded_off_the_event_loop() -
     # => teardown was thread-offloaded, not run on (and wedging) the event loop.
     assert offloaded.is_set(), "event loop was wedged by a blocking teardown under the slot lock"
     await manager.stop("L2")
+
+
+class _TrackingSandbox(InMemorySandbox):
+    """An offline sandbox that records its ``close`` calls into a shared list.
+
+    Lets a test assert that a built backend was (or was not) closed by leaf
+    identity, so a cancellation/leak guard can prove no backend is orphaned and no
+    backend is double-closed on the happy / lost-race paths.
+    """
+
+    def __init__(self, *, identity: str, closed: list[str]) -> None:
+        super().__init__(identity=identity)
+        self._closed = closed
+
+    def close(self) -> None:
+        self._closed.append(self.id)
+
+
+async def test_admit_slot_cancel_after_build_closes_backend_and_clears_pending() -> None:
+    # A CancelledError delivered at the POST-build lock re-acquire (after the
+    # backend is already built, before/at the slot install) must not leak the
+    # built backend and must not strand the leaf id in _pending. Otherwise a real
+    # git-worktree backend's on-disk worktree + branch orphan, and the stranded
+    # pending permanently consumes a max_active slot — every future lease of the
+    # same leaf id parks forever on the condition.
+    built: list[str] = []
+    closed: list[str] = []
+    build_done = threading.Event()
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        # Runs inside asyncio.to_thread (off-loop). Sleep so the build is in flight
+        # while the test grabs the post-build lock, then signal completion.
+        built.append(leaf_id)
+        threading.Event().wait(0.08)
+        build_done.set()
+        return _TrackingSandbox(identity=leaf_id, closed=closed)
+
+    manager = SandboxManager(max_active=4, sandbox_factory=factory)
+
+    async def leaser() -> None:
+        async with manager.lease(leaf_id="leafA", needs_execution=True):
+            pass  # pragma: no cover - cancelled before the body runs
+
+    task = asyncio.create_task(leaser())
+    # Let the leaser reach the fast-path, mark pending, and enter to_thread.
+    while "leafA" not in manager._pending:  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0)
+    # Hold the condition lock so the coroutine's post-build re-acquire suspends.
+    await manager._slot_freed.acquire()  # pyright: ignore[reportPrivateUsage]
+    try:
+        # Wait until the off-loop build actually produced the backend.
+        while not build_done.is_set():
+            await asyncio.sleep(0)
+        # Cancel now: the coroutine is parked waiting for the post-build lock, so
+        # the CancelledError lands at the post-build section — not in the build
+        # try/except that only guards the to_thread call.
+        task.cancel()
+    finally:
+        manager._slot_freed.release()  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # No strand: the leaf id was discarded from _pending on the cancelled exit.
+    assert "leafA" not in manager._pending  # pyright: ignore[reportPrivateUsage]
+    # No leak: every built backend was either installed into a slot or closed.
+    assert len(built) == len(closed) + len(manager._slots)  # pyright: ignore[reportPrivateUsage]
+    assert closed == ["leafA"]  # the orphaned backend was closed exactly once
+    # A future same-leaf lease must not park forever on the stranded pending; it
+    # builds fresh and completes.
+    async with manager.lease(leaf_id="leafA", needs_execution=True) as backend:
+        assert isinstance(backend, SandboxBackendProtocol)
+    await manager.stop("leafA")
+
+
+async def test_admit_slot_second_cancel_during_orphan_close_still_cleans_up() -> None:
+    # Edge case: a SECOND cancellation delivered while the orphan-close cleanup is
+    # in flight (the off-loop close is blocking) must not re-strand the leaf id in
+    # _pending nor leak the backend. The cleanup is driven to completion under a
+    # cancellation shield, so the close finishes and _pending is cleared even though
+    # the leaser is being cancelled twice over.
+    built: list[str] = []
+    closed: list[str] = []
+    build_done = threading.Event()
+    close_started = threading.Event()
+    close_release = threading.Event()
+
+    class _BlockingTrackingSandbox(InMemorySandbox):
+        def close(self) -> None:
+            close_started.set()
+            # Block in the worker thread so a second cancel can land during close.
+            close_release.wait(timeout=10.0)
+            closed.append(self.id)
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        built.append(leaf_id)
+        threading.Event().wait(0.05)
+        build_done.set()
+        return _BlockingTrackingSandbox(identity=leaf_id)
+
+    manager = SandboxManager(max_active=4, sandbox_factory=factory)
+
+    async def leaser() -> None:
+        async with manager.lease(leaf_id="leafA", needs_execution=True):
+            pass  # pragma: no cover - cancelled before the body runs
+
+    task = asyncio.create_task(leaser())
+    while "leafA" not in manager._pending:  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0)
+    await manager._slot_freed.acquire()  # pyright: ignore[reportPrivateUsage]
+    try:
+        while not build_done.is_set():
+            await asyncio.sleep(0)
+        task.cancel()  # first cancel: lands at the post-build lock re-acquire
+    finally:
+        manager._slot_freed.release()  # pyright: ignore[reportPrivateUsage]
+
+    # Wait until the orphan-close has begun (and is blocking) off-loop.
+    await asyncio.wait_for(asyncio.to_thread(close_started.wait, 5.0), timeout=5.0)
+    task.cancel()  # second cancel: delivered DURING the off-loop close
+    await asyncio.sleep(0)
+    close_release.set()  # let the off-loop close finish
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert "leafA" not in manager._pending  # pyright: ignore[reportPrivateUsage]
+    assert closed == ["leafA"]  # close ran to completion despite the second cancel
+    assert not _is_live(manager, "leafA")  # no slot leaked
+
+
+async def test_admit_slot_happy_path_installs_once_without_spurious_close() -> None:
+    # The uncancelled happy path must install the built backend exactly once and
+    # never close it on the way in — the cancellation guard must not regress a
+    # clean lease into a spurious teardown.
+    built: list[str] = []
+    closed: list[str] = []
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        built.append(leaf_id)
+        return _TrackingSandbox(identity=leaf_id, closed=closed)
+
+    manager = SandboxManager(max_active=4, sandbox_factory=factory)
+    async with manager.lease(leaf_id="leafA", needs_execution=True) as backend:
+        assert isinstance(backend, SandboxBackendProtocol)
+        assert backend.id == "leafA"
+    assert built == ["leafA"]
+    assert closed == []  # installed, not closed
+    assert _is_live(manager, "leafA")  # slot installed exactly once
+    await manager.stop("leafA")
+    assert closed == ["leafA"]  # closed once, only on teardown
+
+
+async def test_admit_slot_lost_race_closes_redundant_backend_once_and_reuses_winner() -> None:
+    # When a concurrent lease installs the slot while THIS lease's backend is still
+    # building, the loser must close its now-redundant backend exactly once and
+    # reuse the installed winner — never install a second slot, never leak. The
+    # cancellation guard must not double-close the loser's backend on this path.
+    built: list[str] = []
+    closed: list[str] = []
+    first_in_thread = threading.Event()
+    release_build = threading.Event()
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        built.append(leaf_id)
+        # The FIRST builder blocks until the test releases it; this widens the race
+        # window so a second same-leaf lease can install the slot meanwhile.
+        if len(built) == 1:
+            first_in_thread.set()
+            release_build.wait(timeout=10.0)
+        return _TrackingSandbox(identity=leaf_id, closed=closed)
+
+    manager = SandboxManager(max_active=4, sandbox_factory=factory)
+
+    async def lease_once() -> str:
+        async with manager.lease(leaf_id="leafA", needs_execution=True) as backend:
+            assert isinstance(backend, SandboxBackendProtocol)
+            return backend.id
+
+    first = asyncio.create_task(lease_once())
+    # Let the first lease mark pending and enter its (blocked) build.
+    await asyncio.wait_for(asyncio.to_thread(first_in_thread.wait, 10.0), timeout=10.0)
+    # Force the first builder to "lose": drop its pending marker and install a
+    # winning slot directly, exactly as a concurrent admit would have.
+    winner = _TrackingSandbox(identity="leafA", closed=closed)
+    async with manager._slot_freed:  # pyright: ignore[reportPrivateUsage]
+        manager._pending.discard("leafA")  # pyright: ignore[reportPrivateUsage]
+        manager._slots["leafA"] = _SandboxSlot(  # pyright: ignore[reportPrivateUsage]
+            sandbox=winner, created_at=0.0, last_used_at=0.0
+        )
+    # Now let the first builder finish; it must detect the installed winner.
+    release_build.set()
+    leased_id = await asyncio.wait_for(first, timeout=10.0)
+
+    assert leased_id == "leafA"
+    assert built == ["leafA"]  # only the first builder ran its factory
+    assert closed == ["leafA"]  # its redundant backend closed once (not the winner)
+    assert manager._slots["leafA"].sandbox is winner  # pyright: ignore[reportPrivateUsage]
+    assert manager._slots["leafA"].in_use == 0  # pyright: ignore[reportPrivateUsage]
+    await manager.stop("leafA")
+
+
+async def test_admit_slot_lost_race_redundant_close_runs_off_the_event_loop() -> None:
+    # R8: the lost-race redundant-backend close must NOT run synchronously on the
+    # event loop / under the admission lock — a real git-worktree backend's close
+    # runs blocking git subprocesses. Prove it runs on a worker thread (the asyncio
+    # to_thread offload), not the loop thread.
+    loop_thread = threading.get_ident()
+    closed_on: list[int] = []
+    built: list[str] = []
+    first_in_thread = threading.Event()
+    release_build = threading.Event()
+
+    class _ThreadRecordingSandbox(InMemorySandbox):
+        def close(self) -> None:
+            closed_on.append(threading.get_ident())
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        built.append(leaf_id)
+        if len(built) == 1:
+            first_in_thread.set()
+            release_build.wait(timeout=10.0)
+        return _ThreadRecordingSandbox(identity=leaf_id)
+
+    manager = SandboxManager(max_active=4, sandbox_factory=factory)
+
+    async def lease_once() -> str:
+        async with manager.lease(leaf_id="leafA", needs_execution=True) as backend:
+            assert isinstance(backend, SandboxBackendProtocol)
+            return backend.id
+
+    first = asyncio.create_task(lease_once())
+    await asyncio.wait_for(asyncio.to_thread(first_in_thread.wait, 10.0), timeout=10.0)
+    winner = _ThreadRecordingSandbox(identity="leafA")
+    async with manager._slot_freed:  # pyright: ignore[reportPrivateUsage]
+        manager._pending.discard("leafA")  # pyright: ignore[reportPrivateUsage]
+        manager._slots["leafA"] = _SandboxSlot(  # pyright: ignore[reportPrivateUsage]
+            sandbox=winner, created_at=0.0, last_used_at=0.0
+        )
+    release_build.set()
+    await asyncio.wait_for(first, timeout=10.0)
+
+    assert len(closed_on) == 1  # the redundant backend closed exactly once
+    assert closed_on[0] != loop_thread  # ... and OFF the event loop thread (R8)
+    await manager.stop("leafA")
+
+
+async def test_admit_slot_cancel_during_prebuild_victim_close_is_safe() -> None:
+    # A CancelledError landing during the PRE-build off-loop victim close (the third
+    # cancellation window) must not strand leaf_id in _pending and must not leave the
+    # popped victim unclosed. The victim was already removed from _slots, so an
+    # unclosed victim is a pure leak; the stranded pending would permanently consume
+    # a max_active slot and park every future same-leaf lease forever.
+    closed: list[str] = []
+    victim_close_started = threading.Event()
+    victim_close_release = threading.Event()
+    build_started = threading.Event()
+
+    class _BlockingVictimSandbox(InMemorySandbox):
+        def close(self) -> None:
+            # Block in the worker thread so a cancel can land while the victim close
+            # is in flight (the pre-build _close_backends_off_loop await).
+            victim_close_started.set()
+            victim_close_release.wait(timeout=10.0)
+            closed.append(self.id)
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        if leaf_id == "leafA":
+            build_started.set()  # pragma: no cover - the leaser is cancelled first
+        return _BlockingVictimSandbox(identity=leaf_id)
+
+    # max_active=1 so leasing leafA must evict the idle victim leafV.
+    manager = SandboxManager(max_active=1, sandbox_factory=factory)
+    # Seed an idle victim slot (leased + released -> idle, eligible for eviction).
+    async with manager.lease(leaf_id="leafV", needs_execution=True):
+        pass
+    assert _is_live(manager, "leafV")
+
+    async def leaser() -> None:
+        async with manager.lease(leaf_id="leafA", needs_execution=True):
+            pass  # pragma: no cover - cancelled during the pre-build victim close
+
+    task = asyncio.create_task(leaser())
+    # Wait until leafA has claimed pending and the victim close is in flight.
+    await asyncio.wait_for(asyncio.to_thread(victim_close_started.wait, 10.0), timeout=10.0)
+    assert "leafA" in manager._pending  # pyright: ignore[reportPrivateUsage]
+    # Cancel now: the CancelledError lands at the pre-build victim-close await.
+    task.cancel()
+    await asyncio.sleep(0)
+    victim_close_release.set()  # let the (drained) victim close finish
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not build_started.is_set()  # cancelled before the leafA build ran
+    assert "leafA" not in manager._pending  # pyright: ignore[reportPrivateUsage]
+    assert "leafV" in closed  # the popped victim was closed (no leak)
+    assert not _is_live(manager, "leafA")  # no slot installed for the cancelled leaf
+    # No permanent strand: a fresh same-leaf lease proceeds (does not park forever).
+    async with manager.lease(leaf_id="leafA", needs_execution=True) as backend:
+        assert isinstance(backend, SandboxBackendProtocol)
+    await manager.stop("leafA")
+
+
+async def test_admit_slot_lost_race_close_failure_rebalances_winner_in_use() -> None:
+    # [P1 #2] If the lost-race redundant-backend close RAISES, _admit_slot raises
+    # before lease() reaches its finally, so the finally cannot release the winner's
+    # optimistic in_use bump. The handler must release that bump itself before
+    # propagating — otherwise the winner (someone else's live slot) keeps a phantom
+    # in_use forever, blocking its eviction/reclaim and parking future leases.
+    built: list[str] = []
+    first_in_thread = threading.Event()
+    release_build = threading.Event()
+
+    class _RaisingCloseSandbox(InMemorySandbox):
+        def close(self) -> None:
+            raise RuntimeError("redundant close failed (e.g. git teardown error)")
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        built.append(leaf_id)
+        if len(built) == 1:
+            first_in_thread.set()
+            release_build.wait(timeout=10.0)
+        # The first builder's backend (the redundant one) raises on close.
+        return _RaisingCloseSandbox(identity=leaf_id)
+
+    manager = SandboxManager(max_active=4, sandbox_factory=factory)
+
+    async def lease_once() -> None:
+        async with manager.lease(leaf_id="leafA", needs_execution=True):
+            pass  # pragma: no cover - the redundant close raises before the body
+
+    first = asyncio.create_task(lease_once())
+    await asyncio.wait_for(asyncio.to_thread(first_in_thread.wait, 10.0), timeout=10.0)
+    # Install a winning slot directly (the concurrent winner), with in_use=0.
+    winner = InMemorySandbox(identity="leafA")
+    async with manager._slot_freed:  # pyright: ignore[reportPrivateUsage]
+        manager._pending.discard("leafA")  # pyright: ignore[reportPrivateUsage]
+        manager._slots["leafA"] = _SandboxSlot(  # pyright: ignore[reportPrivateUsage]
+            sandbox=winner, created_at=0.0, last_used_at=0.0
+        )
+    release_build.set()
+
+    # The failing redundant close propagates as the lease's failure.
+    with pytest.raises(RuntimeError, match="redundant close failed"):
+        await asyncio.wait_for(first, timeout=10.0)
+
+    # The winner's in_use bump was rebalanced: it is idle again (not stranded), so a
+    # quota-pressure eviction can reclaim it and a fresh distinct-leaf lease proceeds.
+    assert manager._slots["leafA"].in_use == 0  # pyright: ignore[reportPrivateUsage]
+    await manager.stop("leafA")
+
+
+async def test_admit_slot_lost_race_cancel_during_redundant_close_propagates_and_rebalances() -> (
+    None
+):
+    # [P2 #3] A CancelledError landing during the lost-race redundant close must
+    # PROPAGATE (a race() loser / cancelled background run must abort, not keep
+    # running its leaf body) AND the winner's optimistic in_use bump must be released
+    # (the caller never reaches lease()'s finally). Otherwise the cancel is swallowed
+    # and/or the winner is stranded, parking future leases under quota.
+    built: list[str] = []
+    first_in_thread = threading.Event()
+    release_build = threading.Event()
+    redundant_close_started = threading.Event()
+    redundant_close_release = threading.Event()
+
+    class _BlockingCloseSandbox(InMemorySandbox):
+        def close(self) -> None:
+            redundant_close_started.set()
+            redundant_close_release.wait(timeout=10.0)
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        built.append(leaf_id)
+        if len(built) == 1:
+            first_in_thread.set()
+            release_build.wait(timeout=10.0)
+        return _BlockingCloseSandbox(identity=leaf_id)
+
+    manager = SandboxManager(max_active=4, sandbox_factory=factory)
+
+    async def lease_once() -> None:
+        async with manager.lease(leaf_id="leafA", needs_execution=True):
+            pass  # pragma: no cover - cancelled during the redundant close
+
+    first = asyncio.create_task(lease_once())
+    await asyncio.wait_for(asyncio.to_thread(first_in_thread.wait, 10.0), timeout=10.0)
+    winner = InMemorySandbox(identity="leafA")
+    async with manager._slot_freed:  # pyright: ignore[reportPrivateUsage]
+        manager._pending.discard("leafA")  # pyright: ignore[reportPrivateUsage]
+        manager._slots["leafA"] = _SandboxSlot(  # pyright: ignore[reportPrivateUsage]
+            sandbox=winner, created_at=0.0, last_used_at=0.0
+        )
+    release_build.set()
+    # Wait until the redundant close is in flight (off-loop), then cancel.
+    await asyncio.wait_for(asyncio.to_thread(redundant_close_started.wait, 10.0), timeout=10.0)
+    first.cancel()
+    await asyncio.sleep(0)
+    redundant_close_release.set()  # let the drained close finish
+
+    # The observed cancellation propagates (not swallowed by the lost-race return).
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(first, timeout=10.0)
+
+    # The winner's in_use bump was rebalanced despite the cancel.
+    assert manager._slots["leafA"].in_use == 0  # pyright: ignore[reportPrivateUsage]
+    await manager.stop("leafA")
+
+
+async def test_admit_slot_reclaim_clears_pending_even_if_built_close_raises() -> None:
+    # [P1 #1] A cancellation at the post-build install window triggers the generic
+    # reclaim, which closes the built-but-uninstalled backend. If THAT close raises,
+    # the reclaim must still discard _pending + notify (every close is best-effort) —
+    # otherwise the leaf strands in _pending permanently (the original bug, resurrected
+    # for the close-itself-fails branch).
+    built: list[str] = []
+    build_done = threading.Event()
+
+    class _RaisingCloseSandbox(InMemorySandbox):
+        def close(self) -> None:
+            raise RuntimeError("built-backend close failed during reclaim")
+
+    def factory(leaf_id: str) -> SandboxBackendProtocol:
+        built.append(leaf_id)
+        threading.Event().wait(0.08)
+        build_done.set()
+        return _RaisingCloseSandbox(identity=leaf_id)
+
+    manager = SandboxManager(max_active=4, sandbox_factory=factory)
+
+    async def leaser() -> None:
+        async with manager.lease(leaf_id="leafA", needs_execution=True):
+            pass  # pragma: no cover - cancelled at the post-build install window
+
+    task = asyncio.create_task(leaser())
+    while "leafA" not in manager._pending:  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0)
+    await manager._slot_freed.acquire()  # pyright: ignore[reportPrivateUsage]
+    try:
+        while not build_done.is_set():
+            await asyncio.sleep(0)
+        task.cancel()  # lands at the post-build lock re-acquire -> generic reclaim
+    finally:
+        manager._slot_freed.release()  # pyright: ignore[reportPrivateUsage]
+
+    # The original cancellation still propagates (the failing close does not mask it).
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=10.0)
+
+    # No strand despite the close failure: _pending was discarded, so a fresh same-leaf
+    # lease proceeds rather than parking forever on the condition. (No stop() here: the
+    # backend's close raises, and stop() closes synchronously; lease's own exit only
+    # releases the lease, it does not close — so this exercises the no-strand fix
+    # without tripping the raising teardown.)
+    assert "leafA" not in manager._pending  # pyright: ignore[reportPrivateUsage]
+    assert not _is_live(manager, "leafA")
+    async with manager.lease(leaf_id="leafA", needs_execution=True) as backend:
+        assert isinstance(backend, SandboxBackendProtocol)

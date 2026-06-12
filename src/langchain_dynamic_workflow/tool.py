@@ -27,7 +27,13 @@ from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from ._background import BgRunManager, BgRunQuotaExceededError, BgRunStateError, BgStatus
+from ._background import (
+    BgRunManager,
+    BgRunQuotaExceededError,
+    BgRunStateError,
+    BgStatus,
+    CanonicalRunInFlightError,
+)
 
 # The meta-layer codegen (AST gate + restricted exec) and its error type sit in
 # Layer 2 alongside this tool; the `run_script` command compiles an untrusted
@@ -46,7 +52,16 @@ from ._roster import Roster
 # WorkflowRunStore; the in-memory default keeps the base install dependency-free
 # while a sqlite-backed store extends durability across process restarts.
 from ._run_store import InMemoryRunStore, RunSpec, WorkflowRunStore
-from ._workflows import WorkflowFn, WorkflowRegistry
+
+# `_one_line_summary` is reused (not duplicated) so a leaf description is collapsed
+# to one bounded catalog line exactly as a workflow summary is — one normalization
+# behind both registries' renders. It is module-private but imported in-package, so
+# the strict private-usage check is suppressed for this single deliberate reuse.
+from ._workflows import (
+    WorkflowFn,
+    WorkflowRegistry,
+    _one_line_summary,  # pyright: ignore[reportPrivateUsage]
+)
 
 # The tool is agnostic to the host's concrete context/state types, so the runtime
 # and Command updates are parameterized with Any (the host state schema, not the
@@ -65,9 +80,17 @@ class WorkflowToolSchema(BaseModel):
     is never advertised to the model; the model supplies only these fields.
     """
 
-    command: Literal["run", "run_script", "status", "resume", "cancel", "runs", "approve"] = Field(
-        description="Which workflow operation to perform."
-    )
+    command: Literal[
+        "run",
+        "run_script",
+        "status",
+        "resume",
+        "cancel",
+        "runs",
+        "approve",
+        "catalog",
+        "agents",
+    ] = Field(description="Which workflow operation to perform.")
     workflow: str | None = Field(
         default=None,
         description="The registered workflow name to launch (required for 'run').",
@@ -116,6 +139,15 @@ Commands (pass `command`):
     against its journal so completed steps replay at zero cost. Returns a new run.
     (Use `approve`, not `resume`, to answer a sign-off — `resume` injects no value.)
 - `cancel`: given a `run_id`, stop an in-flight run (including one awaiting sign-off).
+- `catalog`: list the workflows registered for this host (name + one-line summary)
+    so you can discover what `run` can launch by name without those names being
+    baked into your prompt. Takes no arguments. The same catalog is also rendered at
+    the end of this description.
+- `agents`: list the leaf agents registered for this host (name + one-line summary)
+    so you know which `agent_type` names you may name in a `run_script` script — the
+    `ctx.agent(..., agent_type=...)` calls a script makes — without those names being
+    baked into your prompt. Takes no arguments. The same catalog is also rendered at
+    the end of this description.
 - `runs`: list every run you launched on this thread with its workflow label and
     live status (and a short outcome preview once settled), so you can see all of
     them at once instead of polling each `run_id`. Takes no arguments.
@@ -125,6 +157,61 @@ Commands (pass `command`):
     already-approved gates replay at zero cost; the run may pause again at a later
     gate or finish.
 """
+
+
+def _render_catalog(workflows: WorkflowRegistry) -> str:
+    """Render the registered-workflow catalog as host-facing text.
+
+    Each entry renders as ``- <name> — <description>``. An empty registry renders
+    guidance to author an ad-hoc script via ``run_script`` instead, since there is
+    nothing to launch by name. This one render is reused for both the tool's
+    description (appended at build time) and the ``catalog`` command's reply.
+
+    Args:
+        workflows: The named-workflow registry to enumerate.
+
+    Returns:
+        The rendered catalog text.
+    """
+    entries = workflows.list_workflows()
+    if not entries:
+        return (
+            "Registered workflows: none. There are no workflows registered for this "
+            "host, so command='run' has nothing to launch by name — author an "
+            "orchestration script and submit it with command='run_script' instead."
+        )
+    lines = [f"- {entry.name} — {entry.description}" for entry in entries]
+    header = "Registered workflows (launch by name with command='run'):"
+    return header + "\n" + "\n".join(lines)
+
+
+def _render_agents(roster: Roster) -> str:
+    """Render the registered leaf-agent catalog as host-facing text.
+
+    Each entry renders as ``- <name> — <description>``, with the description
+    collapsed to one bounded line by the shared :func:`_one_line_summary` (reused
+    from the workflow catalog) so a multi-line or over-long leaf description cannot
+    inject a fake catalog line. An empty roster renders one-line guidance: with no
+    leaves a script's ``ctx.agent`` cannot be called at all, so there is nothing to
+    name as ``agent_type``. This one render is reused for both the tool's description
+    (appended at build time) and the ``agents`` command's reply.
+
+    Args:
+        roster: The leaf registry to enumerate.
+
+    Returns:
+        The rendered agent-catalog text.
+    """
+    entries = roster.list_agents()
+    if not entries:
+        return (
+            "Registered leaf agents: none. No leaf agents are registered for this "
+            "host, so a script's ctx.agent(...) cannot be called and there is no "
+            "agent_type to name."
+        )
+    lines = [f"- {entry.name} — {_one_line_summary(entry.description)}" for entry in entries]
+    header = "Registered leaf agents (name one as agent_type=... when you author a run_script):"
+    return header + "\n" + "\n".join(lines)
 
 
 def _host_thread_id(runtime: _ToolRuntime) -> str:
@@ -149,11 +236,22 @@ def create_workflow_tool(
 
     Args:
         roster: The leaf registry passed through to every launched ``run_workflow``.
+            Its catalog is rendered into the built tool's description and returned by
+            the ``agents`` command, so a host model can discover which ``agent_type``
+            names a ``run_script`` script may name without those names being
+            hard-coded in its prompt. The description snapshots the catalog at build
+            time, so register every leaf before building the tool; the ``agents``
+            command re-renders the registry live and reflects any later registration.
         manager: The background run manager; share the *same* instance with
             :func:`~langchain_dynamic_workflow.middleware.create_workflow_middleware`
             so completion notices land in the host context.
         workflows: The named-workflow registry resolved by the ``run`` / ``resume``
-            commands.
+            commands. Its catalog is rendered into the built tool's description and
+            returned by the ``catalog`` command, so a host model can discover the
+            registered workflows without their names being hard-coded in its prompt.
+            The description snapshots the catalog at build time, so register every
+            workflow before building the tool; the ``catalog`` command re-renders the
+            registry live and reflects any later registration.
         checkpointer: Optional LangGraph checkpointer for launched runs.
         max_concurrency: Optional explicit concurrency cap forwarded to runs.
         budget: Optional shared token ceiling forwarded to runs.
@@ -163,8 +261,10 @@ def create_workflow_tool(
             survive a process restart.
 
     Returns:
-        A :class:`StructuredTool` exposing the ``run`` / ``status`` / ``resume`` /
-        ``cancel`` commands.
+        A :class:`StructuredTool` exposing the ``run`` / ``run_script`` / ``status`` /
+        ``resume`` / ``cancel`` / ``runs`` / ``approve`` / ``catalog`` / ``agents``
+        commands, with the registered-workflow and leaf-agent catalogs rendered into
+        its description.
     """
     # The run registry persists each launch's spec (so `resume` can rebuild the
     # original callable, label, and thread) and hands out a per-run journal (so
@@ -275,12 +375,24 @@ def create_workflow_tool(
         await run_store.save_spec(run_id, spec_to_save)
         # The label travels with the manager slot so the `runs` listing can name the
         # run authoritatively, not via this tool's bookkeeping. The slot is keyed by
-        # the current caller's host thread so the caller can poll the run.
+        # the current caller's host thread so the caller can poll the run. The
+        # canonical reservation is the real single-live-run enforcer: the manager
+        # refuses a launch whose canonical is already live in this process (the
+        # origin still running, a prior resume-child still live, or a racing second
+        # resume), regardless of host thread.
         try:
-            manager.start(_coro(), run_id=run_id, thread_id=host_thread_id, label=spec.label)
-        except BgRunQuotaExceededError:
+            manager.start(
+                _coro(),
+                run_id=run_id,
+                thread_id=host_thread_id,
+                label=spec.label,
+                canonical=canonical,
+            )
+        except (BgRunQuotaExceededError, CanonicalRunInFlightError):
             # The run was refused before it could run: roll back the spec we saved
-            # above so a refused launch leaves no unresumable orphan in the registry.
+            # above (a brand-new row under this launch's own run_id — never the
+            # origin's spec, even on resume) so a refused launch leaves no
+            # unresumable orphan in the registry.
             await run_store.delete_spec(run_id)
             raise
         return run_id
@@ -400,19 +512,66 @@ def create_workflow_tool(
         spec = await run_store.load_spec(run_id)
         if spec is None:
             return f"resume: unknown run_id {run_id!r}; nothing to resume."
+        thread_id = _host_thread_id(runtime)
+        # Resume is for a SETTLED or crashed run, never one still in flight: a duplicate
+        # launch would fan two runs onto the SAME canonical journal + checkpoint thread,
+        # each with a FRESH (unshared) ConcurrencyGate and Budget, both writing the same
+        # journal sequence/progress.
+        #
+        # Two layers enforce this. (1) A friendly poll of the run_id on the caller's
+        # thread gives a precise message when the run is observable here — still
+        # running, or parked awaiting a sign-off (use approve, not resume). (2) The
+        # AUTHORITATIVE enforcer is the manager's canonical reservation in `_launch`
+        # below: it refuses a launch whose canonical journal lineage is already live in
+        # this process, which catches the cases the per-(thread, run_id) poll cannot —
+        # the origin running under a DIFFERENT host thread, a TERMINAL origin whose
+        # prior resume-child is still live, and two concurrent resumes racing (only one
+        # claims the canonical; the other is refused).
+        #
+        # Known limitation: the live set is process-local. A still-running origin in a
+        # DIFFERENT live process sharing the store is invisible here, so its canonical
+        # is absent from this process's set and the resume proceeds. That is by design —
+        # cross-process resume is for crash recovery (a dead origin); a durable
+        # cross-process lease is future work.
+        poll_status = manager.poll(run_id, thread_id=thread_id)
+        if poll_status in {BgStatus.PENDING, BgStatus.RUNNING}:
+            return (
+                f"resume: run {run_id!r} is {poll_status.value} on this process; the origin is "
+                "still running. Resuming would launch a concurrent duplicate against the "
+                "shared journal and checkpoint thread. Wait for it to settle (or cancel it) "
+                "before resuming."
+            )
+        if poll_status == BgStatus.AWAITING_SIGNOFF:
+            return (
+                f"resume: run {run_id!r} is awaiting sign-off, not settled; resume is for a "
+                "settled or crashed run. Continue it with command='approve' and this run_id."
+            )
         workflow_fn = _resolve_spec(spec)
         label = spec.label
+        canonical = spec.journal_run_id or run_id
         # The spec carries the canonical origin (journal_run_id), so the relaunch
         # rejoins the ORIGIN's journal (completed leaves replay from cache) and the
         # ORIGIN's checkpoint thread — even when resuming a resume-issued run_id,
         # because each saved spec inherits the same origin. The manager slot is
         # keyed by the CURRENT caller's host thread so the caller who issued the
         # resume can poll the new run.
-        new_run_id = await _launch(
-            workflow_fn=workflow_fn,
-            spec=spec,
-            host_thread_id=_host_thread_id(runtime),
-        )
+        try:
+            new_run_id = await _launch(
+                workflow_fn=workflow_fn,
+                spec=spec,
+                host_thread_id=thread_id,
+            )
+        except CanonicalRunInFlightError:
+            # The canonical lineage is already live in this process (origin running on
+            # another host thread, a prior resume-child still live, or a racing resume
+            # that claimed first). Refuse with a string — never a duplicate launch.
+            return (
+                f"resume: run {run_id!r} cannot resume — its canonical journal {canonical!r} "
+                "already has a live run in this process (the origin or a prior resume is "
+                "still running). Wait for it to settle (or cancel it) before resuming."
+            )
+        except BgRunQuotaExceededError as exc:
+            return f"resume: {exc}"
         message = (
             f"Resumed {label!r} from run {run_id!r} against its journal. "
             f"New run_id: {new_run_id}. Completed steps replay at zero model cost."
@@ -492,6 +651,24 @@ def create_workflow_tool(
             }
         )
 
+    def _catalog_command() -> str:
+        """Return the registered-workflow catalog on demand.
+
+        A read-only host-tool command: it renders the same catalog appended to the
+        tool's description and touches no run state (no journal, determinism guard,
+        run store, or manager).
+        """
+        return _render_catalog(workflows)
+
+    def _agents_command() -> str:
+        """Return the registered leaf-agent catalog on demand.
+
+        A read-only host-tool command: it renders the same catalog appended to the
+        tool's description and touches no run state (no journal, determinism guard,
+        run store, or manager). Takes no arguments.
+        """
+        return _render_agents(roster)
+
     def _runs_command(runtime: _ToolRuntime) -> str:
         """List every run on the host thread with its label and live status.
 
@@ -529,7 +706,7 @@ def create_workflow_tool(
         *,
         runtime: _ToolRuntime,
     ) -> str | _Command:
-        """Dispatch one workflow command (run / run_script / status / resume / cancel).
+        """Dispatch one workflow command (run / status / resume / cancel / catalog / agents / ...).
 
         ``runtime`` is keyword-only and injected by the tool node; it is never
         part of the model-facing schema.
@@ -548,9 +725,13 @@ def create_workflow_tool(
             return _runs_command(runtime)
         if command == "approve":
             return await _approve_command(runtime, run_id=run_id, args=args)
+        if command == "catalog":
+            return _catalog_command()
+        if command == "agents":
+            return _agents_command()
         return (
             f"unknown command {command!r}; expected one of: "
-            "run, run_script, status, resume, cancel, runs, approve."
+            "run, run_script, status, resume, cancel, runs, approve, catalog, agents."
         )
 
     # Under ``from __future__ import annotations`` the ``runtime`` annotation is a
@@ -560,6 +741,19 @@ def create_workflow_tool(
     # resolved type on the runtime parameter so it is detected as an injected arg.
     workflow_tool.__annotations__["runtime"] = ToolRuntime
 
+    # Build the model-facing description dynamically: the static command reference,
+    # then the registered-workflow catalog, then the leaf-agent catalog — all
+    # rendered at build time, so the host model sees both the launch-by-name menu and
+    # the agent_type menu up front (the same renders the `catalog` and `agents`
+    # commands return on demand) without those names being hard-coded in its prompt.
+    description = (
+        _WORKFLOW_TOOL_DESCRIPTION
+        + "\n"
+        + _render_catalog(workflows)
+        + "\n"
+        + _render_agents(roster)
+    )
+
     # An explicit args_schema (infer_schema=False) keeps the injected ToolRuntime
     # parameter out of the model-facing schema; schema inference cannot handle it.
     # from_function is typed loosely upstream; the constructed value is a
@@ -567,7 +761,7 @@ def create_workflow_tool(
     tool: StructuredTool = StructuredTool.from_function(  # pyright: ignore[reportUnknownMemberType]
         coroutine=workflow_tool,
         name="workflow",
-        description=_WORKFLOW_TOOL_DESCRIPTION,
+        description=description,
         infer_schema=False,
         args_schema=WorkflowToolSchema,
     )

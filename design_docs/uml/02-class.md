@@ -30,9 +30,10 @@ classDiagram
   }
   class Roster {
     -_built: dict~tuple, Runnable~
-    +register(name, runnable, *, builder, needs_execution, default_model)
+    +register(name, runnable, *, builder, description, needs_execution, default_model)
     +resolve(name) RosterEntry
     +runnable_for(name, *, response_format) Runnable
+    +list_agents() list~RosterEntry~ (按名排序目录; 供 agents/catalog 发现)
   }
   class RosterEntry {
     +name
@@ -160,7 +161,8 @@ classDiagram
   }
   class WorkflowTool {
     <<BaseTool, multi-command>>
-    +run / status / resume / cancel
+    +run / run_script / status / resume / cancel / runs / approve
+    +catalog / agents (只读: 渲染注册 workflow / leaf 目录, 同样内联进 tool description)
   }
   class WorkflowMiddleware {
     <<AgentMiddleware>>
@@ -398,7 +400,7 @@ classDiagram
 
 ## 分层归属
 
-- **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`、`create_workflow_tool`(产 `WorkflowTool`)、`create_workflow_middleware`(产 `WorkflowMiddleware`)、`InMemoryWorktreeProvider`/`WorktreeProvider`(worktree 隔离 seam)、`read_only_leaf`/`read_only_builder`(只读裁判叶,deny-write permission,D-G4)、跨叶归约 helper `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`,`_reduce` 纯函数,F)、race 值类型 `RaceCandidate`/`RaceResult`(+ `race_key`,`_race_types` 纯类型,B,配 `ctx.race` 原语)、**DAG 值类型 `DagNode`(`_dag`,M7,配 `ctx.dag` 原语;`_codegen` 注入 `run_script` 命名空间)** + **`WorkflowDagError`/`WorkflowCycleError`(M7,从包根导出,入 `WORKFLOW_CONTROL_FLOW_SIGNALS`)**、可观测性值类型与 sink 别名 `Span`/`SpanBegin`/`SpanKind`/`LeafEvent`/`CommandEvent`(+ `SpanSink`/`SpanBeginSink`/`LeafEventSink`/`CommandSink`,供宿主消费 `run_workflow` 的 `on_span`/`on_span_begin`/`on_leaf_event`/`on_command` 带外边——`CommandEvent`/`on_command` 是执行面同构 sink,在真 subprocess 边界发成对命令生命周期边;`SpanKind.DAG` 标注 dag fan-out span)、**真执行 opt-in 面 `LocalSubprocessSandbox`/`SandboxFactory`/`local_subprocess_factory` + 策略值类型 `ExecPolicy`/`ExecRequest`/`ExecDecision`/`RLimitProfile`(M5,`_local_subprocess`/`_sandbox`,供宿主 `SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))` 注入真本地执行——危险 opt-in,非安全 sandbox)**。`LeafEventHandler` 是引擎内部(不导出)的回调 normalizer,一叶一实例、闭包持 `leaf_span_id` 关联(见 [01 §2b](../01-engine-mechanism.md))。
+- **公共面(开发者)**：`run_workflow`、`Roster`/`RosterEntry`(+ `Roster.list_agents()` 目录)、`WorkflowRegistry`/`WorkflowEntry`(命名 workflow 注册表 + `list_workflows()` 目录条目;`register(description=)` 缺省回退 callable docstring、经 `_one_line_summary` 归一为单行有界)、`create_workflow_tool`(产 `WorkflowTool`;新增只读 `catalog`/`agents` 命令 + 两套目录 build 时渲染进 tool description,使真实 host 不靠 prompt 写死名字即可发现注册的 workflow/`agent_type`——解「道 vs 术」死结)、`create_workflow_middleware`(产 `WorkflowMiddleware`)、`InMemoryWorktreeProvider`/`WorktreeProvider`(worktree 隔离 seam)、`read_only_leaf`/`read_only_builder`(只读裁判叶,deny-write permission,D-G4)、跨叶归约 helper `survives`/`dedup`/`reconcile`/`corroborate`(+ `ReviewItem`/`Reconciled`/`Consensus`,`_reduce` 纯函数,F)、race 值类型 `RaceCandidate`/`RaceResult`(+ `race_key`,`_race_types` 纯类型,B,配 `ctx.race` 原语)、**DAG 值类型 `DagNode`(`_dag`,M7,配 `ctx.dag` 原语;`_codegen` 注入 `run_script` 命名空间)** + **`WorkflowDagError`/`WorkflowCycleError`(M7)/`WorkflowConcurrencyError`(v0.4.0 M2:depth-0 并发 fail-loud),从包根导出,入 `WORKFLOW_CONTROL_FLOW_SIGNALS`**、可观测性值类型与 sink 别名 `Span`/`SpanBegin`/`SpanKind`/`LeafEvent`/`CommandEvent`(+ `SpanSink`/`SpanBeginSink`/`LeafEventSink`/`CommandSink`,供宿主消费 `run_workflow` 的 `on_span`/`on_span_begin`/`on_leaf_event`/`on_command` 带外边——`CommandEvent`/`on_command` 是执行面同构 sink,在真 subprocess 边界发成对命令生命周期边;`SpanKind.DAG` 标注 dag fan-out span)、**真执行 opt-in 面 `LocalSubprocessSandbox`/`SandboxFactory`/`local_subprocess_factory` + 策略值类型 `ExecPolicy`/`ExecRequest`/`ExecDecision`/`RLimitProfile`(M5,`_local_subprocess`/`_sandbox`,供宿主 `SandboxManager(sandbox_factory=local_subprocess_factory(ExecPolicy(...)))` 注入真本地执行——危险 opt-in,非安全 sandbox)**。`LeafEventHandler` 是引擎内部(不导出)的回调 normalizer,一叶一实例、闭包持 `leaf_span_id` 关联(见 [01 §2b](../01-engine-mechanism.md))。
 - **agent 面(运行时)**：`WorkflowTool`(多命令)。
 - **host 后台机制**：`WorkflowMiddleware` + `BgRunManager` + `BgRunSlot` + `ResultStore`。
 - **跨会话持久化(M3,Layer 2 host-wiring)**：`WorkflowRunStore`(协议)+ `RunSpec`(可 resume 的 launch 描述,携规范 `journal_run_id` 谱系)+ `InMemoryRunStore`(默认、零依赖)+ `SqliteWorkflowStore`(`[sqlite]` extra:统一 sqlite db 文件 + 两条连接——autocommit store 背 registry + `RunScopedJournal` per-run journal、第二连接背持久 `AsyncSqliteSaver` checkpointer)。`_persistence` / `_run_store` 只从 `._engine`(公共墙)import `JournalStore`/`JournalRecord`,故 import-linter Contract 1 把这两模块列入 `source_modules`。零成本重放由持久 journal 交付,checkpointer 是 durable add-on。

@@ -29,6 +29,8 @@ the meta-layer path is exercised end to end with no API key.
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from collections.abc import Sequence
 from typing import Any
 
@@ -78,11 +80,13 @@ REFUTATIONS_TO_KILL = 2
 _RUN_ID_BOX: dict[str, str] = {}
 
 HOST_SYSTEM_PROMPT = (
-    "You are a capable analyst. When a task has many independent parts, you think in terms "
-    "of decomposing it, working the parts in parallel, and folding the results into a single "
-    "synthesis — and when no ready-made procedure fits the task, you compose one yourself "
-    "rather than doing everything in a single pass. Make full use of the tools and skills "
-    "available to you, and present a clear, well-reasoned result."
+    "You are a capable research analyst. You do not answer research questions from memory — "
+    "you investigate with real, current sources and synthesize what you actually find. When a "
+    "task has many independent parts, you decompose it, work the parts in parallel, and fold "
+    "the results into a single synthesis; and when no ready-made procedure fits the task, you "
+    "compose one yourself and run that heavier, multi-step work as a background investigation "
+    "rather than cramming everything into a single inline pass. Make full use of the tools and "
+    "skills available to you, and present a clear, well-sourced result."
 )
 
 
@@ -180,9 +184,13 @@ async def orchestrate(ctx, args):
 # ── leaves (real deepagents when env-gated, deterministic fakes offline) ──────
 
 
-def _build_leaf(role: str, *, web_search: bool = False) -> Any:
-    """Build a schema-less text leaf (researcher / writer / extractor)."""
-    model = real_leaf_model(web_search=web_search)
+def _build_leaf(role: str, *, web_search: bool = False, light: bool = False) -> Any:
+    """Build a schema-less text leaf (researcher / writer / extractor).
+
+    ``light=True`` selects the cheaper light-leaf model for mechanical roles (e.g. the
+    writer) that need neither web search nor frontier reasoning.
+    """
+    model = real_leaf_model(web_search=web_search, light=light)
     if model is not None:
         return create_deep_agent(model=model, middleware=demo_cache_middleware())
     return echo_leaf(role)
@@ -196,8 +204,11 @@ def _build_skeptic(*, response_format: Any = None) -> Any:
     tool boundary, so a hallucinated edit can never escape the verifier. Offline it is
     a structured fake whose verdict text never refutes — every claim survives — keeping
     the happy-path run deterministic; the real path exercises genuine refutation.
+
+    The skeptic judges a claim from its own knowledge (its prompt asks for correctness,
+    not citations), so it runs on the cheaper light-leaf model with no web search.
     """
-    model = real_leaf_model(web_search=True)
+    model = real_leaf_model(light=True)
     if model is not None:
         return read_only_builder(model, middleware=demo_cache_middleware())(
             response_format=response_format
@@ -210,7 +221,7 @@ def _build_skeptic(*, response_format: Any = None) -> Any:
 
 def _build_extractor(*, response_format: Any = None) -> Any:
     """Builder for the ``extractor`` leaf, forwarding ``response_format`` (Claim)."""
-    model = real_leaf_model()
+    model = real_leaf_model(light=True)
     if model is not None:
         return create_deep_agent(
             model=model, response_format=response_format, middleware=demo_cache_middleware()
@@ -296,6 +307,16 @@ def _tool_call(command: str, *, run_id: str) -> ChatResult:
 # ── driver ───────────────────────────────────────────────────────────────────
 
 
+def _demo_budget() -> int | None:
+    """Optional token-budget ceiling for launched runs, from ``LDW_DEMO_BUDGET``.
+
+    A safety cap so a real host that fires several heavy runs (or one that runs away)
+    cannot burn unbounded model spend; unset means no cap (the default).
+    """
+    raw = os.environ.get("LDW_DEMO_BUDGET")
+    return int(raw) if raw else None
+
+
 async def main() -> None:
     load_demo_env()
     # Guard the authored source compiles through the gate, so a regression in the
@@ -308,15 +329,21 @@ async def main() -> None:
         .register(
             "researcher",
             _build_leaf("researcher", web_search=True),
-            description="Researches one angle",
+            description="Researches one angle using live web search",
         )
         .register("extractor", builder=_build_extractor, description="Extracts a falsifiable claim")
         .register("skeptic", builder=_build_skeptic, description="Adversarially verifies a claim")
-        .register("writer", _build_leaf("writer"), description="Synthesizes the final report")
+        .register(
+            "writer",
+            _build_leaf("writer", light=True),
+            description="Synthesizes the final report",
+        )
     )
     # No registered workflows: the host must author its own script via run_script.
     manager = BgRunManager()
-    middleware = create_workflow_middleware(roster, workflows=WorkflowRegistry(), manager=manager)
+    middleware = create_workflow_middleware(
+        roster, workflows=WorkflowRegistry(), manager=manager, budget=_demo_budget()
+    )
 
     host_kwargs: dict[str, Any] = {"middleware": [middleware, *demo_cache_middleware()]}
     if host_model is not None:
@@ -336,33 +363,57 @@ async def main() -> None:
     state1 = await host.ainvoke(
         {
             "messages": [
-                {"role": "user", "content": f"Do deep, fact-checked research on: {QUESTION}"}
+                {
+                    "role": "user",
+                    "content": (
+                        "I keep running into conflicting takes on this and I need a properly "
+                        "sourced, cross-checked write-up I can actually trust — grounded in real "
+                        "current sources, not a from-memory summary. Here's the question: "
+                        f"{QUESTION}"
+                    ),
+                }
             ]
         },
         config=config,
     )
     runs = state1.get("workflow_runs", [])
     if not runs:
+        # The whole point of this flagship is that the host authors and runs a script.
+        # A no-launch answered inline is a FALSE pass, not a soft skip — fail loud so the
+        # headline path is never silently bypassed.
         print("[turn 1] host did not launch a script. reply:", state1["messages"][-1].text)
-        return
-    run_id = runs[-1]["run_id"]
-    _RUN_ID_BOX["run_id"] = run_id
-    print(f"[turn 1] launched run_id={run_id} (workflow label: {runs[-1].get('workflow')!r})")
+        sys.exit(1)
+    print(f"[turn 1] launched: {[(run['run_id'], run.get('workflow')) for run in runs]}")
     print(f"[turn 1] host reply: {state1['messages'][-1].text}")
 
-    # Let the background run settle.
-    await manager.wait(run_id, thread_id="demo-authored")
-    assert manager.poll(run_id, thread_id="demo-authored") == BgStatus.DONE
-    print("[background] authored deep research finished")
+    # Headline: the host AUTHORED a script and ran it via run_script. No workflow is
+    # registered for this host (the tool catalog reports none), so every launched run
+    # here is an ad-hoc authored script. A capable host may fire several, so accept ANY
+    # that reached DONE rather than assuming exactly one, last-is-done launch.
+    done_run_id: str | None = None
+    for run in runs:
+        candidate = run["run_id"]
+        await manager.wait(candidate, thread_id="demo-authored")
+        if manager.poll(candidate, thread_id="demo-authored") == BgStatus.DONE:
+            done_run_id = candidate
+            break
+    assert done_run_id is not None, "at least one authored run must finish DONE"
+    _RUN_ID_BOX["run_id"] = done_run_id
+    print(f"[background] authored script finished: {done_run_id}")
 
-    # Turn 2: notification is injected; the host fetches the report and presents it.
+    # Turn 2: notification is injected; the host fetches the report and presents it. A
+    # real host often already presented the full report in turn 1; the offline host
+    # presents it here. Accept the synthesized report from EITHER turn.
     state2 = await host.ainvoke(
         {"messages": [{"role": "user", "content": "Is the research done? Give me the report."}]},
         config=config,
     )
     print(f"[turn 2] final answer:\n{state2['messages'][-1].text}")
 
-    assert runs, "host must have launched the authored script"
+    presented = (state1["messages"][-1].text + "\n" + state2["messages"][-1].text).lower()
+    assert "research report" in presented or len(presented) > 800, (
+        "flagship must present a synthesized report (in turn 1 or turn 2)"
+    )
     print("OK: host authored a deep-research script and ran it via run_script (gate happy path).")
 
 

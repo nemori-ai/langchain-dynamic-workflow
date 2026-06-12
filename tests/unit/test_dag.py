@@ -161,6 +161,112 @@ async def test_run_dag_cancellation_does_not_leak_tasks() -> None:
     assert leaked == [], f"leaked {len(leaked)} pending task(s) after run_dag cancellation"
 
 
+async def test_run_dag_isolates_a_synchronously_raising_run_callable() -> None:
+    # A node whose `run` raises SYNCHRONOUSLY (a non-async callable, an async function
+    # whose prologue raises, or one returning a non-coroutine) is constructed before
+    # `create_task` receives it. The synchronous raise must be isolated exactly like an
+    # async node-task failure — recorded as a None result with dependents skipped — not
+    # allowed to escape `_start` and tear the whole graph down, destroying the healthy
+    # independent `good` node.
+    def sync_raiser(_d: dict[str, object]) -> Any:
+        raise KeyError("missing")  # raises before returning a coroutine
+
+    async def ok(_d: dict[str, object]) -> str:
+        return "ok"
+
+    results = await run_dag(
+        [
+            DagNode("bad", deps=[], run=sync_raiser),
+            DagNode("good", deps=[], run=ok),
+        ]
+    )
+    assert results["bad"] is None  # recorded as a failed node, not propagated raw
+    assert results["good"] == "ok"  # the healthy sibling ran; the graph was not torn down
+
+
+async def test_run_dag_synchronous_control_flow_signal_aborts_the_dag() -> None:
+    # A control-flow signal raised SYNCHRONOUSLY during node construction must be
+    # captured in `aborted` and re-raised after the graph drains — exactly like the
+    # async path — never swallowed as a None hole. This pins the regular-exception vs.
+    # control-flow-signal distinction across the synchronous-raise branch so a future
+    # refactor cannot silently mask a budget/determinism/dag signal raised in `run`.
+    #
+    # The `sibling_ran` probe discriminates a clean capture-then-drain (the signal is
+    # recorded, no further nodes launch, in-flight drains, then it re-raises) from a raw
+    # escape: a sibling node already in flight must be awaited to completion under the
+    # `finally` teardown rather than orphaned when the exception tears `run_dag` down.
+    sibling_ran = asyncio.Event()
+
+    def sync_budget_breach(_d: dict[str, object]) -> Any:
+        raise WorkflowBudgetExceededError("pool exhausted")  # raises synchronously
+
+    async def slow_sibling(_d: dict[str, object]) -> str:
+        await asyncio.sleep(0.02)  # in flight when the signal is captured
+        sibling_ran.set()
+        return "ok"
+
+    with pytest.raises(WorkflowBudgetExceededError):
+        await run_dag(
+            [
+                # The ready queue is a LIFO stack popped from the end, so `slow_sibling`
+                # (last) is launched FIRST and is genuinely in flight when the next pop
+                # constructs `sync_budget_breach` and it raises synchronously.
+                DagNode("breach", deps=[], run=sync_budget_breach),
+                DagNode("sibling", deps=[], run=slow_sibling),
+            ]
+        )
+    assert sibling_ran.is_set(), "the in-flight sibling must drain before the signal re-raises"
+
+
+async def test_run_dag_synchronous_cancellation_propagates_not_swallowed() -> None:
+    # A true process/control BaseException raised SYNCHRONOUSLY during node construction
+    # — here asyncio.CancelledError (a race() loser / externally-cancelled run whose
+    # cancellation lands during `node.run` construction) — must PROPAGATE out of run_dag,
+    # never be recorded as a None hole. This matches the async settle path, where
+    # Task.exception() re-raises a cancelled node task, and the repo-wide policy that
+    # process/control signals (CancelledError / KeyboardInterrupt / SystemExit) surface
+    # loud. CancelledError is NOT a member of WORKFLOW_CONTROL_FLOW_SIGNALS and is not an
+    # `Exception` subclass, so it must be caught by neither isolation clause.
+    def sync_cancel(_d: dict[str, object]) -> Any:
+        raise asyncio.CancelledError  # process/control signal, not a leaf failure
+
+    async def ok(_d: dict[str, object]) -> str:
+        return "ok"
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_dag(
+            [
+                DagNode("bad", deps=[], run=sync_cancel),
+                DagNode("good", deps=[], run=ok),
+            ]
+        )
+
+
+async def test_run_dag_synchronous_raise_skips_dependents() -> None:
+    # The synchronous-raise isolation must cascade like an ordinary node failure: a
+    # node depending on the sync-raising node is skipped and lands as None, while an
+    # unrelated node survives.
+    def sync_raiser(_d: dict[str, object]) -> Any:
+        raise KeyError("missing")
+
+    async def child(_d: dict[str, object]) -> str:
+        return "child ran"
+
+    async def ok(_d: dict[str, object]) -> str:
+        return "ok"
+
+    results = await run_dag(
+        [
+            DagNode("bad", deps=[], run=sync_raiser),
+            DagNode("dependent", deps=["bad"], run=child),  # depends on failed bad -> skipped
+            DagNode("indep", deps=[], run=ok),  # independent -> survives
+        ]
+    )
+    assert results["bad"] is None
+    assert results["dependent"] is None  # skipped because its predecessor failed
+    assert results["indep"] == "ok"
+
+
 async def test_run_dag_nesting_error_fails_loud() -> None:
     # A WorkflowNestingError (depth-cap breach) raised by a dag node must be
     # re-raised after drain, not masked as a None hole. This is the regression

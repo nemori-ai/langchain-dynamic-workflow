@@ -19,15 +19,22 @@ turn-by-turn decisions: loops, branching, and fan-out are deterministic, the
 intermediate results stay in script variables, and only the final result is
 returned to you.
 
-A script is an `async def orchestrate(ctx, args)` coroutine. There are two ways to
-run one:
+A script is an `async def orchestrate(ctx, args)` coroutine. When you take on a task
+that needs control-flow inversion — fan-out, looping, or multi-step research you
+cannot reliably do in one inline pass — decide how to run one **in this order**:
 
-- **Launch a registered workflow by name** (`run`) — when a task fits a workflow
-  someone wired into the roster ahead of time, recognize it and launch it by name.
-- **Author an ad-hoc script and submit it** (`run_script`) — when no registered
-  workflow fits, write the `orchestrate` coroutine yourself with the DSL below and
-  submit the source. A security gate checks it first; if it is rejected, the exact
-  violations come back so you fix them and resubmit.
+1. **Prefer a registered workflow** (`run`) — the `workflow` tool's description lists
+   the workflows already wired into this host, and `command='catalog'` re-lists them
+   with their descriptions on demand. If one fits your task, launch it by name with
+   `command='run'`: a ready-made, tested procedure beats reinventing it.
+2. **Otherwise author one** (`run_script`) — when nothing registered fits, write the
+   `orchestrate` coroutine yourself with the DSL below and submit the source. A
+   security gate checks it first; if it is rejected, the exact violations come back so
+   you fix them and resubmit.
+
+When a task asks for sourced, fact-checked, or current findings and you have no direct
+way to consult live sources yourself, that is exactly the work to route through a
+workflow — whose leaves can search and verify — rather than answering from memory.
 
 The DSL, determinism rules, and patterns below describe how these scripts are
 built — both so you can pick the right registered workflow and so you can author a
@@ -41,7 +48,13 @@ correct one yourself.
   imports needed) — it returns a **validated structured object** you read by
   attribute, so the next line is plain Python over typed data. `agent_type` names a
   registered leaf; a schema requires that leaf to be registered with a builder.
-  This is the only place a model runs. Pass `isolation="worktree"` only for a leaf
+  This is the only place a model runs. Each leaf runs with **its own tools and
+  capabilities** — web search, a shell, filesystem access — that you, the
+  orchestrator, may not have yourself; delegating to a leaf is how work that needs
+  live sources or tools actually gets done, even when you cannot reach them directly.
+  The tool's description lists the registered `agent_type`s and what each is for (and
+  `command='agents'` re-lists them on demand), so you author against real leaves
+  rather than guessing names. Pass `isolation="worktree"` only for a leaf
   that **mutates files in parallel** with its siblings (e.g. one fixer per file in a
   fix swarm): it runs in its own copy of a seeded base workspace, isolated from the
   others, and should hand back its change as a structured patch. Read-only and

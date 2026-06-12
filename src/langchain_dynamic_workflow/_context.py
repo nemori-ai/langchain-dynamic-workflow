@@ -36,11 +36,12 @@ from ._determinism import CallSequenceGuard
 from ._errors import (
     WORKFLOW_CONTROL_FLOW_SIGNALS,
     WorkflowCheckpointError,
+    WorkflowConcurrencyError,
     WorkflowCycleError,
     WorkflowNestingError,
     WorkflowSignoffRequired,
 )
-from ._journal import JournalRecord, JournalStore, journal_key, race_key, signoff_key
+from ._journal import JournalRecord, JournalStore, journal_key, loop_key, race_key, signoff_key
 from ._observability import SpanKind, SpanRecorder
 from ._pipeline import Stage, run_pipeline
 from ._progress import BatchMetrics, ProgressKind, ProgressLog
@@ -288,6 +289,11 @@ class Ctx:
         # Ordinal of the next ``checkpoint`` call on the sequential path; keys each
         # gate's journaled decision so gates stay distinct and replay in order.
         self._signoff_count = 0
+        # Ordinal of the next ``loop_until`` call on the sequential path; with the
+        # per-iteration index it keys each loop iteration into the determinism
+        # sequence, so a resume whose iteration count drifts fails loud even when the
+        # loop body fans out (its leaves run at depth > 0, outside the sequence guard).
+        self._loop_count = 0
         self._gate = (
             gate if gate is not None else ConcurrencyGate(limit=resolve_max_concurrency(None))
         )
@@ -303,6 +309,24 @@ class Ctx:
         self._workflows = workflows
         self._spans = spans if spans is not None else SpanRecorder()
         self._max_workflow_depth = max_workflow_depth
+        # Count of depth-0 sequence-guard ``observe`` sites currently in flight —
+        # ``agent()``, ``race()``, and ``checkpoint()`` all record into the SAME
+        # ordered determinism sequence at fan-out depth 0. The backstop validates that
+        # order on resume; two such depth-0 observes running concurrently (e.g. a raw
+        # ``asyncio.gather`` of two ``ctx.agent`` / ``ctx.race`` branches) would
+        # observe their keys in wall-clock order, which flips run to run and spuriously
+        # trips the backstop on a deterministic resume. This counter detects that and
+        # fails loud on the first run instead. It is a plain instance attribute (not a
+        # ContextVar) precisely because the gathered branches must see each other's
+        # increment: ``asyncio`` copies the context into each spawned task, so a
+        # ContextVar mutation in one branch would be invisible to its sibling, whereas
+        # the shared ``ctx`` object is visible to both. The check and increment happen
+        # synchronously (no await between them) so two concurrent entries cannot both
+        # pass: the first increments before its first await, and the second's
+        # synchronous check then sees the counter at ``1``. Every site that increments
+        # decrements in a ``finally`` on every exit path. ``_observe_depth0`` is the
+        # single choke point all three sites share.
+        self._depth0_inflight = 0
 
     @property
     def observed_call_sequence(self) -> list[str]:
@@ -328,6 +352,50 @@ class Ctx:
     def budget(self) -> Budget:
         """The shared token budget for this run (``.total`` / ``.spent()`` / ``.remaining()``)."""
         return self._budget
+
+    def _observe_depth0(self, key: str) -> bool:
+        """Record ``key`` into the determinism sequence, guarding depth-0 concurrency.
+
+        The single choke point shared by every site that observes into the ordered
+        determinism sequence at fan-out depth 0 (``agent`` / ``race`` / ``checkpoint``).
+        At depth 0 it fails loud if another depth-0 observe is already in flight (two
+        concurrent depth-0 calls observe in wall-clock order, which flips run to run
+        and would trip a spurious determinism failure on a faithful resume), otherwise
+        records the key and increments the in-flight counter. At depth > 0 it is a
+        no-op (fan-out leaf ordering is excluded from the sequence by design).
+
+        The check, ``observe``, and increment run synchronously (no ``await`` between
+        them) so two concurrent depth-0 entries cannot both pass: the first increments
+        before its caller's first ``await``, and the second's synchronous check then
+        sees the counter at ``1``.
+
+        Args:
+            key: The content-hash key to record into the determinism sequence.
+
+        Returns:
+            ``True`` if this call incremented the in-flight counter — the caller MUST
+            then decrement ``self._depth0_inflight`` in a ``finally`` on every exit
+            path. ``False`` at depth > 0 (nothing was observed or incremented).
+
+        Raises:
+            WorkflowConcurrencyError: At depth 0, if another depth-0 observe is already
+                in flight (concurrent fan-out at the top level).
+        """
+        if _FANOUT_DEPTH.get() != 0:
+            return False
+        if self._depth0_inflight >= 1:
+            raise WorkflowConcurrencyError(
+                "two depth-0 orchestration calls (agent() / race() / checkpoint()) are "
+                "running concurrently at the top level (fan-out depth 0); this is "
+                "non-deterministic for resume — their observe order flips run to run and a "
+                "faithful resume would trip a spurious determinism failure. Concurrent "
+                "fan-out must use ctx.parallel() / ctx.dag() / ctx.race(), which mark their "
+                "fan-out so the determinism guard correctly excludes the leaf ordering (each "
+                "leaf is still guarded by its content hash)."
+            )
+        self._sequence_guard.observe(key)
+        self._depth0_inflight += 1
+        return True
 
     def phase(self, title: str) -> None:
         """Open a named progress phase grouping subsequent work.
@@ -433,7 +501,14 @@ class Ctx:
                 echoed back on the parked status.
 
         Returns:
-            The value supplied on approve (``run_workflow(..., resume=value)``).
+            The value supplied on approve (``run_workflow(..., resume=value)``),
+            normalized through a JSON round-trip. Because the decision is
+            journaled as JSON and read back the same way, the script sees the
+            identical post-round-trip shape on the approving run and on every
+            replay (e.g. a tuple becomes a list, int dict-keys become str keys),
+            so the value is type-stable across the human pause and across
+            replays. Supply only JSON-stable shapes to a script that depends on
+            the decision's runtime type.
 
         Raises:
             WorkflowCheckpointError: If called from inside a fan-out frame.
@@ -461,32 +536,48 @@ class Ctx:
         # and editing the script's gate/leaf structure invalidates a parked journal (same
         # boundary as leaf keys). The guard catches drift across a full resume; across a
         # single park→approve the sequence is not yet persisted (it records, not validates).
-        self._sequence_guard.observe(key)
-        # A gate approved on a prior run replays its decision from the journal at
-        # zero cost, keeping the run deterministic across the human pause.
-        recorded = await self._journal.get(key)
-        if recorded is not None:
-            return json.loads(recorded.result)
-        # The first un-decided gate consumes the pending resume value (an approve);
-        # record it so a later resume replays this gate instead of re-asking.
-        if not isinstance(self._pending_signoff, _Unset):
-            decision = self._pending_signoff
-            # Serialize BEFORE consuming the pending value: the decision is journaled as
-            # the gate's record, so a non-JSON-serializable decision must fail with a clear
-            # error and leave the gate un-decided (still re-approvable) rather than losing
-            # the value and parking unjournaled.
-            try:
-                serialized = json.dumps(decision)
-            except TypeError as exc:
-                raise WorkflowCheckpointError(
-                    "ctx.checkpoint decision (the resume value) must be JSON-serializable "
-                    f"— it is journaled as the gate's recorded decision: {exc}"
-                ) from exc
-            self._pending_signoff = UNSET
-            await self._journal.put(key, JournalRecord(result=serialized, usage=0))
-            return decision
-        # No decision and nothing to inject: park here for a human sign-off.
-        raise WorkflowSignoffRequired(ask, tag=tag, gate_key=key)
+        # ``_observe_depth0`` shares the depth-0 concurrency guard with agent()/race():
+        # checkpoint already refuses depth > 0 above, so this always observes + increments
+        # at depth 0; the finally below decrements on every exit (cache replay, approve,
+        # JSON error, park) so a depth-0 checkpoint concurrent with another depth-0 observe
+        # fails loud rather than racing the shared sequence.
+        counted = self._observe_depth0(key)
+        try:
+            # A gate approved on a prior run replays its decision from the journal at
+            # zero cost, keeping the run deterministic across the human pause.
+            recorded = await self._journal.get(key)
+            if recorded is not None:
+                return json.loads(recorded.result)
+            # The first un-decided gate consumes the pending resume value (an approve);
+            # record it so a later resume replays this gate instead of re-asking.
+            if not isinstance(self._pending_signoff, _Unset):
+                decision = self._pending_signoff
+                # Serialize BEFORE consuming the pending value: the decision is journaled
+                # as the gate's record, so a non-JSON-serializable decision must fail with
+                # a clear error and leave the gate un-decided (still re-approvable) rather
+                # than losing the value and parking unjournaled.
+                try:
+                    serialized = json.dumps(decision)
+                except TypeError as exc:
+                    raise WorkflowCheckpointError(
+                        "ctx.checkpoint decision (the resume value) must be JSON-serializable "
+                        f"— it is journaled as the gate's recorded decision: {exc}"
+                    ) from exc
+                self._pending_signoff = UNSET
+                await self._journal.put(key, JournalRecord(result=serialized, usage=0))
+                # Return the JSON-normalized shape the replay branch above returns
+                # (json.loads of the same serialized record), not the raw object: a
+                # replay reads the decision back via json.loads, so handing the script
+                # the un-round-tripped object here would make the SAME gate type-unstable
+                # (raw tuple / int keys on the approve, list / str keys on every replay)
+                # — replay drift the journal exists to prevent.
+                return json.loads(serialized)
+            # No decision and nothing to inject: park here for a human sign-off. The
+            # finally still decrements so a resume's re-reached gate is not flagged.
+            raise WorkflowSignoffRequired(ask, tag=tag, gate_key=key)
+        finally:
+            if counted:
+                self._depth0_inflight -= 1
 
     @overload
     async def agent(
@@ -615,111 +706,123 @@ class Ctx:
             # run under real (variable-latency) leaves, so recording them would trip
             # the backstop spuriously on a deterministic resume. The journal still
             # guards fan-out leaves by content hash; only their *ordering* is excluded.
-            if _FANOUT_DEPTH.get() == 0:
-                self._sequence_guard.observe(key)
-            cached = await self._journal.get(key)
-            if cached is not None:
-                # Resume re-counts the cached leaf's usage from the journal record,
-                # so spent() rebuilds to the first run's cumulative total without a
-                # model call. A cache hit never consumes a budget slot beyond its
-                # own usage. The span reports the hit so a trace distinguishes a
-                # replayed leaf from a fresh one. A schema-bound result was stored
-                # as model_dump_json, so it is restored via model_validate_json.
-                self._budget.record(key, cached.usage)
-                span.set("cached", True)
-                span.set("usage_tokens", cached.usage)
-                if structured_model is not None:
-                    return structured_model.model_validate_json(cached.result)
-                return cached.result
-            # Cap is checked only before dispatching a *new* leaf: an exhausted pool
-            # refuses fresh work while in-flight leaves finish and keep their results.
-            self._budget.ensure_within_cap()
-            # Sandbox admission: derive the leaf's stable identity from its
-            # content-hash key and tell the runner whether this leaf needs an
-            # isolated execution sandbox. The runner (engine side) leases the right
-            # backend per leaf_id and threads it into the leaf config; reasoning
-            # leaves allocate nothing. The identity is the same key that dedups the
-            # journal, so it is stable across retry/resume by construction.
-            leaf_id = leaf_id_from_key(key)
-            # A schema binds the leaf to a ToolStrategy(model) so it emits a
-            # validated structured_response; schema-less calls pass None. The same
-            # response_format is threaded through to the roster's builder.
-            response_format = (
-                ToolStrategy(structured_model, handle_errors=True)
-                if structured_model is not None
-                else None
-            )
-            # The gate bounds the number of leaves actually in flight; a journal hit
-            # above never consumes a slot, keeping resume cheap. The leaf runner
-            # receives the *effective* model so the config it threads matches the key.
-            outcome = await self._gate.run(
-                lambda: self._leaf_runner(
-                    agent_type,
-                    prompt,
-                    effective_model,
-                    leaf_id=leaf_id,
-                    needs_execution=entry.needs_execution,
-                    response_format=response_format,
-                    isolation=isolation,
-                    leaf_span_id=span.span_id,
+            # ``_observe_depth0`` also fails loud if a sibling depth-0 observe is
+            # already in flight (raw concurrent fan-out), returning whether this call
+            # incremented the shared counter so the finally below decrements exactly
+            # the calls that did, on every exit path.
+            counted = self._observe_depth0(key)
+            try:
+                cached = await self._journal.get(key)
+                if cached is not None:
+                    # Resume re-counts the cached leaf's usage from the journal record,
+                    # so spent() rebuilds to the first run's cumulative total without a
+                    # model call. A cache hit never consumes a budget slot beyond its
+                    # own usage. The span reports the hit so a trace distinguishes a
+                    # replayed leaf from a fresh one. A schema-bound result was stored
+                    # as model_dump_json, so it is restored via model_validate_json.
+                    self._budget.record(key, cached.usage)
+                    span.set("cached", True)
+                    span.set("usage_tokens", cached.usage)
+                    if structured_model is not None:
+                        return structured_model.model_validate_json(cached.result)
+                    return cached.result
+                # Cap is checked only before dispatching a *new* leaf: an exhausted pool
+                # refuses fresh work while in-flight leaves finish and keep their results.
+                self._budget.ensure_within_cap()
+                # Sandbox admission: derive the leaf's stable identity from its
+                # content-hash key and tell the runner whether this leaf needs an
+                # isolated execution sandbox. The runner (engine side) leases the right
+                # backend per leaf_id and threads it into the leaf config; reasoning
+                # leaves allocate nothing. The identity is the same key that dedups the
+                # journal, so it is stable across retry/resume by construction.
+                leaf_id = leaf_id_from_key(key)
+                # A schema binds the leaf to a ToolStrategy(model) so it emits a
+                # validated structured_response; schema-less calls pass None. The same
+                # response_format is threaded through to the roster's builder.
+                response_format = (
+                    ToolStrategy(structured_model, handle_errors=True)
+                    if structured_model is not None
+                    else None
                 )
-            )
-            # Authoritative changeset (R5): a real-git worktree execution leaf has its
-            # real `git diff` folded into the leaf state by the engine. When present
-            # it MUST be surfaced as the authoritative file source — the model's
-            # self-reported file bytes can never win over what the leaf actually wrote
-            # (mirroring M5's "gate on the real exit code, not the model's boolean").
-            # A schema-less worktree leaf would collect a diff it can never surface,
-            # so the boundary would be only half-closed; a worktree schema lacking the
-            # `files` field, or typing it as anything but dict[str, str], would either
-            # drop the diff or (under model_copy) journal a type-mismatched payload
-            # that crashes on a later resume. All three fail loud here, at fold time.
-            changeset = outcome.state.get(WORKTREE_CHANGESET_KEY)
-            # With a schema, fold the validated structured object and journal its
-            # canonical JSON; without one, fold the final text directly.
-            folded_obj: str | BaseModel
-            if structured_model is not None:
-                folded_obj = fold_structured(outcome.state, structured_model)
-                if changeset is not None:
-                    if _WORKTREE_FILES_FIELD not in type(folded_obj).model_fields:
+                # The gate bounds the number of leaves actually in flight; a journal hit
+                # above never consumes a slot, keeping resume cheap. The leaf runner
+                # receives the *effective* model so the config it threads matches the key.
+                outcome = await self._gate.run(
+                    lambda: self._leaf_runner(
+                        agent_type,
+                        prompt,
+                        effective_model,
+                        leaf_id=leaf_id,
+                        needs_execution=entry.needs_execution,
+                        response_format=response_format,
+                        isolation=isolation,
+                        leaf_span_id=span.span_id,
+                    )
+                )
+                # Authoritative changeset (R5): a real-git worktree execution leaf has its
+                # real `git diff` folded into the leaf state by the engine. When present
+                # it MUST be surfaced as the authoritative file source — the model's
+                # self-reported file bytes can never win over what the leaf actually wrote
+                # (mirroring M5's "gate on the real exit code, not the model's boolean").
+                # A schema-less worktree leaf would collect a diff it can never surface,
+                # so the boundary would be only half-closed; a worktree schema lacking the
+                # `files` field, or typing it as anything but dict[str, str], would either
+                # drop the diff or (under model_copy) journal a type-mismatched payload
+                # that crashes on a later resume. All three fail loud here, at fold time.
+                changeset = outcome.state.get(WORKTREE_CHANGESET_KEY)
+                # With a schema, fold the validated structured object and journal its
+                # canonical JSON; without one, fold the final text directly.
+                folded_obj: str | BaseModel
+                if structured_model is not None:
+                    folded_obj = fold_structured(outcome.state, structured_model)
+                    if changeset is not None:
+                        if _WORKTREE_FILES_FIELD not in type(folded_obj).model_fields:
+                            raise ValueError(
+                                f"a git-worktree execution leaf (agent_type {agent_type!r}) must "
+                                f"declare a schema with a {_WORKTREE_FILES_FIELD!r}: "
+                                "dict[str, str] field to carry its authoritative changeset; the "
+                                f"bound schema {structured_model.__name__!r} has no such field"
+                            )
+                        # Override `files` THROUGH validation (not model_copy, which
+                        # bypasses it): a wrong-typed `files` field then fails loud here on
+                        # the first run, never journaling a payload that would crash on a
+                        # resume's model_validate_json.
+                        folded_obj = type(folded_obj).model_validate(
+                            {
+                                **folded_obj.model_dump(by_alias=False),
+                                _WORKTREE_FILES_FIELD: changeset,
+                            }
+                        )
+                    # Dump by alias with round-trip semantics so a schema with field
+                    # aliases survives resume: model_validate_json (the replay path)
+                    # validates by alias by default, so the stored JSON must use aliases
+                    # too. For alias-free models this is identical to a plain dump.
+                    result_str = folded_obj.model_dump_json(by_alias=True, round_trip=True)
+                else:
+                    if changeset is not None:
                         raise ValueError(
                             f"a git-worktree execution leaf (agent_type {agent_type!r}) must "
                             f"declare a schema with a {_WORKTREE_FILES_FIELD!r}: dict[str, str] "
-                            "field to carry its authoritative changeset; the bound schema "
-                            f"{structured_model.__name__!r} has no such field"
+                            "field to carry its authoritative changeset (schema-less worktree "
+                            "leaves are not supported)"
                         )
-                    # Override `files` THROUGH validation (not model_copy, which
-                    # bypasses it): a wrong-typed `files` field then fails loud here on
-                    # the first run, never journaling a payload that would crash on a
-                    # resume's model_validate_json.
-                    folded_obj = type(folded_obj).model_validate(
-                        {
-                            **folded_obj.model_dump(by_alias=False),
-                            _WORKTREE_FILES_FIELD: changeset,
-                        }
-                    )
-                # Dump by alias with round-trip semantics so a schema with field
-                # aliases survives resume: model_validate_json (the replay path)
-                # validates by alias by default, so the stored JSON must use aliases
-                # too. For alias-free models this is identical to a plain dump.
-                result_str = folded_obj.model_dump_json(by_alias=True, round_trip=True)
-            else:
-                if changeset is not None:
-                    raise ValueError(
-                        f"a git-worktree execution leaf (agent_type {agent_type!r}) must declare a "
-                        f"schema with a {_WORKTREE_FILES_FIELD!r}: dict[str, str] field to carry "
-                        "its authoritative changeset (schema-less worktree leaves are not "
-                        "supported)"
-                    )
-                folded_obj = fold_result(outcome.state)
-                result_str = folded_obj
-            # success-only: unreachable if the leaf raised. Usage is journaled so
-            # the spend is reconstructable on resume.
-            await self._journal.put(key, JournalRecord(result=result_str, usage=outcome.usage))
-            self._budget.record(key, outcome.usage)
-            span.set("cached", False)
-            span.set("usage_tokens", outcome.usage)
-            return folded_obj
+                    folded_obj = fold_result(outcome.state)
+                    result_str = folded_obj
+                # success-only: unreachable if the leaf raised. Usage is journaled so
+                # the spend is reconstructable on resume.
+                await self._journal.put(key, JournalRecord(result=result_str, usage=outcome.usage))
+                self._budget.record(key, outcome.usage)
+                span.set("cached", False)
+                span.set("usage_tokens", outcome.usage)
+                return folded_obj
+            finally:
+                # Release the depth-0 in-flight slot on both success and failure so the
+                # counter reflects only calls actually running now. A depth-0 agent()
+                # that itself errors (leaf raise, budget breach, worktree fold error)
+                # still decrements here, so a subsequent sequential call is never falsely
+                # flagged as concurrent. Only an entry that incremented decrements.
+                if counted:
+                    self._depth0_inflight -= 1
 
     async def parallel(self, thunks: Sequence[Callable[[], Awaitable[T]]]) -> list[T | None]:
         """Fan out a list of thunks concurrently with a blocking barrier.
@@ -793,7 +896,16 @@ class Ctx:
             results: list[T | None] = []
             control_flow_error: BaseException | None = None
             for outcome in settled:
-                if isinstance(outcome, BaseException):
+                if isinstance(outcome, asyncio.CancelledError):
+                    # An INTERIOR CancelledError (a thunk awaited a child that was
+                    # cancelled while this barrier's own task is NOT being torn down).
+                    # return_exceptions=True can only place a CancelledError into the
+                    # settled list for an interior raise: an EXTERNAL cancel of this
+                    # task raises out of `await gather(...)` itself and never reaches
+                    # here. So an interior CancelledError is masked as a leaf failure
+                    # (None), like any other failed leaf — never re-raised.
+                    results.append(None)
+                elif isinstance(outcome, BaseException):
                     # Only re-raised control-flow signals reach here (leaf failures
                     # are already None via _guarded). Remember the first; fail loud.
                     control_flow_error = control_flow_error or outcome
@@ -912,12 +1024,18 @@ class Ctx:
         — where ``accumulated`` is a copy of the results so far — appends its result,
         then checks ``done(accumulated)``; the loop returns as soon as ``done`` holds.
 
-        This is a sequential (depth-0) primitive: ``body``'s direct ``agent()`` calls
-        record into the determinism guard, and the loop count derives from journaled
-        leaf results, so a resume reproduces the same number of iterations and replays
-        completed leaves at zero cost. If the cap is reached without ``done`` ever
-        holding, a (replay-idempotent) ``log`` line is emitted and the accumulated
-        results are returned — a graceful, non-silent stop rather than a raise.
+        This is a sequential (depth-0) primitive: each iteration records its own
+        depth-0 :func:`loop_key` into the determinism sequence BEFORE running ``body``,
+        so the iteration count is guarded independently of whether the body fans out.
+        A body that does its ``agent()`` work directly contributes those leaf keys too;
+        a body that fans out (``parallel`` / ``race`` / ``dag``) runs its leaves at
+        depth > 0 (excluded from the guard by design), but the per-iteration loop key
+        still makes a resume whose iteration count drifts — e.g. an external/mutable
+        ``done`` that stops at a different point — fail loud with
+        :class:`WorkflowDeterminismError` instead of silently returning a
+        different-length list. If the cap is reached without ``done`` ever holding, a
+        (replay-idempotent) ``log`` line is emitted and the accumulated results are
+        returned — a graceful, non-silent stop rather than a raise.
 
         Args:
             body: ``(iter_index, accumulated_so_far) -> result`` for one iteration.
@@ -929,12 +1047,63 @@ class Ctx:
 
         Raises:
             ValueError: If ``max_iters`` is less than 1.
+            WorkflowDeterminismError: On resume, if the iteration count drifts from
+                the first run (a per-iteration loop key diverges from the recorded
+                sequence).
+            Exception: If ``body`` raises a regular (non-control-flow) exception, the
+                same exception instance is re-raised with a ``.partial`` attribute
+                carrying the results accumulated before the failure
+                (fail-fast-but-recoverable). A body exception that cannot carry
+                attributes (a frozen dataclass, ``__slots__`` without ``partial``, or a
+                blocking ``__setattr__``) propagates without ``.partial`` — its type is
+                still preserved. A control-flow signal raised by ``body`` (e.g. an
+                exhausted budget) aborts cleanly and propagates UNTOUCHED, with no
+                ``.partial`` attribute.
         """
         if max_iters < 1:
             raise ValueError(f"loop_until requires max_iters >= 1, got {max_iters}")
+        # Take this loop's ordinal among loop_until calls ONCE at entry; combined with
+        # the per-iteration index it keys each iteration into the determinism sequence.
+        position = self._loop_count
+        self._loop_count += 1
         accumulated: list[T] = []
         for iteration in range(max_iters):
-            accumulated.append(await body(iteration, list(accumulated)))
+            # Record this iteration's depth-0 key into the determinism sequence BEFORE
+            # running the body, so the iteration count is guarded even when the body
+            # fans out (its leaves run at depth > 0 and are excluded from the sequence)
+            # — on resume a divergent or out-of-range loop key fails loud here. The
+            # observe is a synchronous point-event, not a span held across an await: a
+            # non-fan-out body's own depth-0 ``agent()`` calls run sequentially AFTER
+            # this, never concurrently with it, so the in-flight counter must be
+            # released immediately rather than held across the body — holding it would
+            # false-trip the depth-0 concurrency guard the moment the body issues an
+            # ``agent()`` call. ``_observe_depth0`` increments the counter only AFTER its
+            # ``observe`` succeeds, so a replay divergence raises out of here with the
+            # counter untouched (``counted`` unbound, nothing to release). It is a no-op
+            # at depth > 0, so a loop_until nested inside a fan-out frame neither
+            # double-counts nor trips that guard.
+            counted = self._observe_depth0(loop_key(position=position, iteration=iteration))
+            if counted:
+                self._depth0_inflight -= 1
+            try:
+                result = await body(iteration, list(accumulated))
+            except WORKFLOW_CONTROL_FLOW_SIGNALS:
+                # A clean engine abort (budget / determinism / checkpoint / dag /
+                # cycle / nesting): propagate untouched, with no partial channel.
+                raise
+            except Exception as exc:
+                # A regular body failure: attach the survivors accumulated before the
+                # failure and re-raise the SAME instance, preserving its type so a
+                # caller's ``except SpecificError`` still catches it. If the exception
+                # is immutable (a frozen dataclass, ``__slots__`` without ``partial``,
+                # or a blocking ``__setattr__``), the attach is skipped — the original
+                # exception still propagates cleanly (no partial channel for that exotic
+                # case), never masked by an assignment error (which would lose BOTH the
+                # original exception type and the partial, strictly worse than baseline).
+                with contextlib.suppress(AttributeError, TypeError):
+                    exc.partial = list(accumulated)  # type: ignore[attr-defined]
+                raise
+            accumulated.append(result)
             if done(accumulated):
                 return accumulated
         self.log(f"loop_until reached max_iters={max_iters} without satisfying done()")
@@ -1063,119 +1232,125 @@ class Ctx:
         with self._spans.span(SpanKind.RACE, win_tag or "race") as span:
             span.set("candidate_count", len(candidates))
             # The race decision is one sequential step: its content-stable key is
-            # recorded / validated once at depth 0. The candidate agent() calls run
-            # at depth > 0 and are excluded from the sequence (their completion order
-            # varies run to run), mirroring leaves inside parallel() / pipeline().
-            if _FANOUT_DEPTH.get() == 0:
-                self._sequence_guard.observe(rkey)
-
-            # Replay: a journaled race decision reproduces the winner deterministically
-            # and dispatches NOTHING — the losers never re-run, so a resumed race is
-            # cheaper than the first (correct: the decision is already made). The
-            # envelope is self-contained so replay needs no candidate leaf entry.
-            cached = await self._journal.get(rkey)
-            if cached is not None:
-                decision = json.loads(cached.result)
-                cached_index = int(decision["winner_index"])
-                cached_result_str = decision["result"]
-                # Reconstruct the winner's spend under its OWN leaf key — the key the
-                # fresh run counted it under — NOT the race-key. The journal hit on
-                # rkey guarantees identical candidates (rkey is derived from their leaf
-                # keys), so leaf_keys[cached_index] is the winner's key. Recording per
-                # leaf key keeps spend reconstructable AND idempotent: a later agent()
-                # with the winner's exact params hits the same key and is not
-                # double-counted (recording under rkey would, since rkey != leaf_key).
-                self._budget.record(leaf_keys[cached_index], cached.usage)
-                decoded: Any = (
-                    schema_model.model_validate_json(cached_result_str)
-                    if schema_model is not None
-                    else cached_result_str
-                )
-                span.set("replayed", True)
-                span.set("won", True)
-                span.set("winner_index", cached_index)
-                return RaceResult[T](winner=cast(T, decoded), winner_index=cached_index)
-            span.set("replayed", False)
-
-            # Fresh run: dispatch all candidates concurrently; first to satisfy wins.
-            # The depth is incremented just before the try and the tasks are created
-            # INSIDE it, so the finally always tears the tasks down and resets the
-            # depth even if task creation raises — mirroring parallel()/pipeline().
-            winner_index: int | None = None
-            winner_result: Any = None
-            to_raise: BaseException | None = None
-            tasks: list[asyncio.Task[Any]] = []
-            token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
+            # recorded / validated once at depth 0 via the shared depth-0 choke point,
+            # which also fails loud if a sibling depth-0 observe (another race / an
+            # agent / a checkpoint) is concurrently in flight. The candidate agent()
+            # calls run at depth > 0 and are excluded from the sequence (their
+            # completion order varies run to run), mirroring leaves inside parallel() /
+            # pipeline(). The finally decrements the in-flight slot on every exit
+            # (cache replay, no-winner, control-flow re-raise, journaled win).
+            counted = self._observe_depth0(rkey)
             try:
-                tasks = [
-                    asyncio.ensure_future(self._run_race_candidate(candidate))
-                    for candidate in candidates
-                ]
-                index_of = {task: index for index, task in enumerate(tasks)}
-                remaining = set(tasks)
-                while remaining and winner_index is None and to_raise is None:
-                    done, remaining = await asyncio.wait(
-                        remaining, return_when=asyncio.FIRST_COMPLETED
+                # Replay: a journaled race decision reproduces the winner deterministically
+                # and dispatches NOTHING — the losers never re-run, so a resumed race is
+                # cheaper than the first (correct: the decision is already made). The
+                # envelope is self-contained so replay needs no candidate leaf entry.
+                cached = await self._journal.get(rkey)
+                if cached is not None:
+                    decision = json.loads(cached.result)
+                    cached_index = int(decision["winner_index"])
+                    cached_result_str = decision["result"]
+                    # Reconstruct the winner's spend under its OWN leaf key — the key the
+                    # fresh run counted it under — NOT the race-key. The journal hit on
+                    # rkey guarantees identical candidates (rkey is derived from their leaf
+                    # keys), so leaf_keys[cached_index] is the winner's key. Recording per
+                    # leaf key keeps spend reconstructable AND idempotent: a later agent()
+                    # with the winner's exact params hits the same key and is not
+                    # double-counted (recording under rkey would, since rkey != leaf_key).
+                    self._budget.record(leaf_keys[cached_index], cached.usage)
+                    decoded: Any = (
+                        schema_model.model_validate_json(cached_result_str)
+                        if schema_model is not None
+                        else cached_result_str
                     )
-                    # Deterministic tie-break: decide same-wakeup completions in
-                    # ascending candidate index, never set-iteration order.
-                    for task in sorted(done, key=lambda finished: index_of[finished]):
-                        error = task.exception()
-                        if error is not None:
-                            if isinstance(error, WORKFLOW_CONTROL_FLOW_SIGNALS):
-                                # Engine control-flow signal: fail loud, never mask.
-                                to_raise = error
+                    span.set("replayed", True)
+                    span.set("won", True)
+                    span.set("winner_index", cached_index)
+                    return RaceResult[T](winner=cast(T, decoded), winner_index=cached_index)
+                span.set("replayed", False)
+
+                # Fresh run: dispatch all candidates concurrently; first to satisfy wins.
+                # The depth is incremented just before the try and the tasks are created
+                # INSIDE it, so the finally always tears the tasks down and resets the
+                # depth even if task creation raises — mirroring parallel()/pipeline().
+                winner_index: int | None = None
+                winner_result: Any = None
+                to_raise: BaseException | None = None
+                tasks: list[asyncio.Task[Any]] = []
+                token = _FANOUT_DEPTH.set(_FANOUT_DEPTH.get() + 1)
+                try:
+                    tasks = [
+                        asyncio.ensure_future(self._run_race_candidate(candidate))
+                        for candidate in candidates
+                    ]
+                    index_of = {task: index for index, task in enumerate(tasks)}
+                    remaining = set(tasks)
+                    while remaining and winner_index is None and to_raise is None:
+                        done, remaining = await asyncio.wait(
+                            remaining, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        # Deterministic tie-break: decide same-wakeup completions in
+                        # ascending candidate index, never set-iteration order.
+                        for task in sorted(done, key=lambda finished: index_of[finished]):
+                            error = task.exception()
+                            if error is not None:
+                                if isinstance(error, WORKFLOW_CONTROL_FLOW_SIGNALS):
+                                    # Engine control-flow signal: fail loud, never mask.
+                                    to_raise = error
+                                    break
+                                # Ordinary leaf failure: this candidate is out; others go on.
+                                continue
+                            candidate_result = task.result()
+                            try:
+                                satisfied = win(cast(T, candidate_result))
+                            except Exception as predicate_error:
+                                # Predicate raise is a script bug: fail loud after teardown.
+                                to_raise = predicate_error
                                 break
-                            # Ordinary leaf failure: this candidate is out; others go on.
-                            continue
-                        candidate_result = task.result()
-                        try:
-                            satisfied = win(cast(T, candidate_result))
-                        except Exception as predicate_error:
-                            # Predicate raise is a script bug: fail loud after teardown.
-                            to_raise = predicate_error
-                            break
-                        if satisfied:
-                            winner_index = index_of[task]
-                            winner_result = candidate_result
-                            break
+                            if satisfied:
+                                winner_index = index_of[task]
+                                winner_result = candidate_result
+                                break
+                finally:
+                    # Teardown: cancel every still-running loser and await all tasks so
+                    # none is orphaned and every gate slot is released. return_exceptions
+                    # absorbs the CancelledErrors (and any loser exception) raised here.
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    _FANOUT_DEPTH.reset(token)
+
+                if to_raise is not None:
+                    raise to_raise
+
+                if winner_index is None:
+                    # No winner: do NOT journal a decision (a resume may retry the race).
+                    span.set("won", False)
+                    span.set("winner_index", None)
+                    return RaceResult[T](winner=None, winner_index=None)
+
+                # Journal a self-contained decision under the namespaced race-key: the
+                # winner index plus the canonical result string agent() produced, carrying
+                # the winner's usage so resume rebuilds spend. The winner's own leaf entry
+                # already recorded its usage under its leaf key on this fresh run, so the
+                # race-key is NOT re-recorded into the budget (that would double-count).
+                winner_record = await self._journal.get(leaf_keys[winner_index])
+                winner_usage = winner_record.usage if winner_record is not None else 0
+                if schema_model is not None:
+                    winner_result_str = cast(BaseModel, winner_result).model_dump_json(
+                        by_alias=True, round_trip=True
+                    )
+                else:
+                    winner_result_str = cast(str, winner_result)
+                envelope = json.dumps({"winner_index": winner_index, "result": winner_result_str})
+                await self._journal.put(rkey, JournalRecord(result=envelope, usage=winner_usage))
+                span.set("won", True)
+                span.set("winner_index", winner_index)
+                return RaceResult[T](winner=cast(T, winner_result), winner_index=winner_index)
             finally:
-                # Teardown: cancel every still-running loser and await all tasks so
-                # none is orphaned and every gate slot is released. return_exceptions
-                # absorbs the CancelledErrors (and any loser exception) raised here.
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                _FANOUT_DEPTH.reset(token)
-
-            if to_raise is not None:
-                raise to_raise
-
-            if winner_index is None:
-                # No winner: do NOT journal a decision (a resume may retry the race).
-                span.set("won", False)
-                span.set("winner_index", None)
-                return RaceResult[T](winner=None, winner_index=None)
-
-            # Journal a self-contained decision under the namespaced race-key: the
-            # winner index plus the canonical result string agent() produced, carrying
-            # the winner's usage so resume rebuilds spend. The winner's own leaf entry
-            # already recorded its usage under its leaf key on this fresh run, so the
-            # race-key is NOT re-recorded into the budget (that would double-count).
-            winner_record = await self._journal.get(leaf_keys[winner_index])
-            winner_usage = winner_record.usage if winner_record is not None else 0
-            if schema_model is not None:
-                winner_result_str = cast(BaseModel, winner_result).model_dump_json(
-                    by_alias=True, round_trip=True
-                )
-            else:
-                winner_result_str = cast(str, winner_result)
-            envelope = json.dumps({"winner_index": winner_index, "result": winner_result_str})
-            await self._journal.put(rkey, JournalRecord(result=envelope, usage=winner_usage))
-            span.set("won", True)
-            span.set("winner_index", winner_index)
-            return RaceResult[T](winner=cast(T, winner_result), winner_index=winner_index)
+                if counted:
+                    self._depth0_inflight -= 1
 
     async def batch_map[X, T](
         self,
@@ -1277,25 +1452,49 @@ class Ctx:
                 last_emit[0] = now
                 elapsed = now - start
                 rate = completed / elapsed if elapsed > 0 else 0.0
+                # A `total=` hint over a non-Sized source can under-count: once
+                # `completed` exceeds it, the hint is proven wrong, so for THIS emit
+                # treat the total as UNKNOWN (drop to the completed-only view) rather
+                # than reporting a misleading "10/3" or clamping to "10/10" (which
+                # would falsely imply completion). The Sized / accurate-hint happy
+                # path (completed <= known_total) is unchanged. The eta guard requires
+                # completed <= known_total so it can never be negative.
+                effective_total = (
+                    known_total if known_total is not None and completed <= known_total else None
+                )
                 eta = (
-                    (known_total - completed) / rate
-                    if known_total is not None and rate > 0
+                    (effective_total - completed) / rate
+                    if effective_total is not None and rate > 0
                     else None
                 )
-                if known_total is not None:
-                    message = f"{label}: {completed}/{known_total}"
+                if effective_total is not None:
+                    message = f"{label}: {completed}/{effective_total}"
                 else:
                     message = f"{label}: {completed}"
-                self._progress.emit_transient(
-                    message,
-                    metrics=BatchMetrics(
-                        completed=completed,
-                        elapsed_seconds=elapsed,
-                        rate=rate,
-                        total=known_total,
-                        eta_seconds=eta,
-                    ),
-                )
+                # Progress is out-of-band, transient, best-effort observability:
+                # delivered to the sink but never recorded, journaled, or replayed. A
+                # host sink that raises is the host's own telemetry bug; isolating it at
+                # this single emit chokepoint means EVERY call site — the per-item
+                # `_stage` finally AND the post-pipeline final forced emit below — is
+                # covered, so a sink fault can never corrupt a result (run_pipeline's
+                # `except Exception` would otherwise demote a successful item to None)
+                # nor turn a computationally-successful batch into a propagated failure.
+                # Only emit_transient can raise (the throttle/metrics arithmetic above
+                # cannot), so the suppress wraps it alone — the computation is
+                # unaffected: a failed fn still lands None, and the engine's control-flow
+                # signals (budget / determinism / checkpoint) are raised by
+                # `await fn(item)` in `_stage`'s try body, never inside this emit.
+                with contextlib.suppress(Exception):
+                    self._progress.emit_transient(
+                        message,
+                        metrics=BatchMetrics(
+                            completed=completed,
+                            elapsed_seconds=elapsed,
+                            rate=rate,
+                            total=effective_total,
+                            eta_seconds=eta,
+                        ),
+                    )
 
             async def _stage(_payload: Any, item: Any, _index: int) -> Any:
                 # One stage = the whole map: run fn, then advance the shared
@@ -1303,22 +1502,16 @@ class Ctx:
                 # advances whether fn succeeds or raises (a raise drops the item to
                 # None in run_pipeline, but it still settled), so progress tracks
                 # settled work, not just successes.
-                fn_raised = True
                 try:
-                    result = await fn(item)
-                    fn_raised = False
-                    return result
+                    return await fn(item)
                 finally:
                     completed_count[0] += 1
-                    if fn_raised:
-                        # fn raised (esp. a control-flow signal: budget/determinism/
-                        # checkpoint). A progress-sink failure here must NOT mask fn's
-                        # exception, so swallow it — fn's exception takes priority.
-                        with contextlib.suppress(Exception):
-                            _emit_progress(completed_count[0])
-                    else:
-                        # fn succeeded: a progress-sink failure propagates loud.
-                        _emit_progress(completed_count[0])
+                    # The emit is isolated centrally inside _emit_progress (a sink fault
+                    # is suppressed at the chokepoint), so this is a plain call: fn's own
+                    # exceptions / control-flow signals propagate from `await fn(item)`
+                    # in the try body, never masked, while a progress-sink fault can
+                    # neither corrupt this item's result nor abort the batch.
+                    _emit_progress(completed_count[0])
 
             # Mark the fan-out frame BEFORE the engine spawns its workers so each
             # worker task inherits the depth and its agent() calls skip the

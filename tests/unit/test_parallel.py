@@ -100,6 +100,53 @@ async def test_parallel_reraises_nesting_error_loud() -> None:
         await ctx.parallel([_breach])
 
 
+async def test_parallel_inner_cancellederror_masked_as_leaf_failure() -> None:
+    # A thunk that surfaces a bare INTERIOR CancelledError (e.g. a child task it
+    # awaited was cancelled while the parallel's own task is NOT being torn down)
+    # must land as a None hole like any failed leaf, never re-raise and discard the
+    # sibling results. CancelledError is a BaseException, so the guard cannot rely on
+    # `except Exception`; it classifies an interior CancelledError out of the settled
+    # list (which return_exceptions=True can only contain for an interior raise — an
+    # external cancel propagates straight out of the await).
+    ctx = _ctx()
+
+    async def inner_cancel() -> int:
+        raise asyncio.CancelledError("child task inside thunk cancelled")
+
+    async def ok(value: int) -> int:
+        await asyncio.sleep(0.01)
+        return value
+
+    results = await ctx.parallel([lambda: ok(1), inner_cancel, lambda: ok(3)])
+    assert results[0] == 1 and results[2] == 3  # siblings preserved
+    assert results[1] is None  # the cancelled thunk masked like any leaf failure
+
+
+async def test_parallel_external_cancel_propagates_and_tears_down_cleanly() -> None:
+    # Discriminator: when the parallel's OWN task is cancelled externally (the run is
+    # being torn down), CancelledError MUST propagate — it is NOT an interior leaf
+    # failure to be swallowed — and no thunk task may be left pending afterwards.
+    ctx = _ctx()
+    started = asyncio.Event()
+
+    async def slow(value: int) -> int:
+        started.set()
+        await asyncio.sleep(10)
+        return value  # pragma: no cover - cancelled before it returns
+
+    async def driver() -> list[int | None]:
+        return await ctx.parallel([lambda: slow(1), lambda: slow(2)])
+
+    task = asyncio.create_task(driver())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)  # one turn to settle teardown
+    leaked = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    assert leaked == []
+
+
 async def test_parallel_respects_concurrency_gate() -> None:
     # The shared gate caps in-flight LEAVES (agent() calls), the real unit of
     # work — not orchestration frames. Thunks fan out through ctx.agent, whose
