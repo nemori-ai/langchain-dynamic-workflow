@@ -10,8 +10,9 @@ The real path needs the demo dependency group, installed with
 ``uv sync --group example``. Set ``LDW_DEMO_REAL_MODEL`` to a truthy value to use
 the default models — ``anthropic/claude-opus-4.8`` for the host
 (:func:`real_model`) and ``anthropic/claude-sonnet-4.6`` for the leaves
-(:func:`real_leaf_model`) — or set it to an OpenRouter ``provider/model`` slug to
-override the host model.
+(:func:`real_leaf_model`), or the cheaper ``anthropic/claude-haiku-4.5`` for the
+mechanical light leaves (:func:`real_leaf_model` with ``light=True``) — or set it to
+an OpenRouter ``provider/model`` slug to override the host model.
 
 Provider lock, web search, prompt caching. Every real model pins OpenRouter routing
 to Anthropic (:data:`ANTHROPIC_PROVIDER`), which is required for the two capabilities
@@ -42,6 +43,10 @@ DEFAULT_OPENROUTER_MODEL = "anthropic/claude-opus-4.8"
 
 DEFAULT_LEAF_MODEL = "anthropic/claude-sonnet-4.6"
 """Leaf model slug for the research fan-out — strong enough to drive web search."""
+
+DEFAULT_LIGHT_LEAF_MODEL = "anthropic/claude-haiku-4.5"
+"""Cheaper leaf slug for the mechanical leaves (extract / judge / synthesize) that need
+neither web search nor frontier reasoning — keeps each node's model tier proportionate."""
 
 _REAL_MODEL_ENV = "LDW_DEMO_REAL_MODEL"
 
@@ -156,25 +161,30 @@ def real_model() -> BaseChatModel | None:
     return _build_routed_openrouter(model_slug, web_search=False)
 
 
-def real_leaf_model(*, web_search: bool = False) -> BaseChatModel | None:
+def real_leaf_model(*, web_search: bool = False, light: bool = False) -> BaseChatModel | None:
     """Return the OpenRouter LEAF chat model when gated live, else ``None``.
 
-    Mirrors :func:`real_model` but always uses :data:`DEFAULT_LEAF_MODEL` (the host's
-    ``LDW_DEMO_REAL_MODEL`` slug override does not apply to leaves) and pins the Anthropic
-    provider. With ``web_search=True`` the model carries OpenRouter's native web search
-    tool, appended on every ``bind_tools`` (so it survives deepagents' tool binding) and
-    raw (so the ``openrouter:`` marker reaches OpenRouter for server-side execution).
+    Mirrors :func:`real_model` but uses a leaf slug (the host's ``LDW_DEMO_REAL_MODEL``
+    override does not apply to leaves) and pins the Anthropic provider. With
+    ``web_search=True`` the model carries OpenRouter's native web search tool, appended on
+    every ``bind_tools`` (so it survives deepagents' tool binding) and raw (so the
+    ``openrouter:`` marker reaches OpenRouter for server-side execution). With
+    ``light=True`` it uses the cheaper :data:`DEFAULT_LIGHT_LEAF_MODEL` for mechanical
+    leaves (extract / judge / synthesize) that need neither web search nor frontier
+    reasoning; otherwise it uses :data:`DEFAULT_LEAF_MODEL`.
 
     Args:
         web_search: When ``True``, bind the native web search tool so the leaf grounds
             its work in live web sources.
+        light: When ``True``, use the cheaper light-leaf slug instead of the default.
 
     Returns:
         A configured ``ChatOpenRouter`` (the leaf model), or ``None`` to run offline.
     """
     if not os.environ.get(_REAL_MODEL_ENV):
         return None
-    return _build_routed_openrouter(DEFAULT_LEAF_MODEL, web_search=web_search)
+    slug = DEFAULT_LIGHT_LEAF_MODEL if light else DEFAULT_LEAF_MODEL
+    return _build_routed_openrouter(slug, web_search=web_search)
 
 
 def demo_cache_middleware() -> list[Any]:
